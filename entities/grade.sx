@@ -1,0 +1,1249 @@
+/// Intelligo LMS - Grade Entity
+///
+/// Grades represent the evaluation results for student submissions.
+/// They include points, percentages, letter grades, rubric assessments,
+/// AI grading results, feedback, and audit trails.
+
+module intelligo::entities::grade
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// GRADE ENTITY
+// =============================================================================
+
+/// A grade record for a student submission
+type Grade {
+    /// Unique identifier
+    id: GradeId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Bundle type (points_grade, rubric_grade, pass_fail_grade, etc.)
+    bundle: String,
+
+    /// Submission being graded
+    submission_id: SubmissionId,
+
+    /// Assessment context
+    assessment_id: AssessmentId,
+
+    /// Course context
+    course_id: CourseId,
+
+    /// Enrollment context
+    enrollment_id: EnrollmentId,
+
+    /// Student being graded
+    student_id: StudentId,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    // =========================================================================
+    // Score
+    // =========================================================================
+
+    /// Points earned
+    points_earned: f32,
+
+    /// Maximum points possible
+    max_points: f32,
+
+    /// Percentage score (0-100)
+    percentage: f32,
+
+    /// Letter grade (if applicable)
+    letter_grade: Option<String>,
+
+    /// GPA points (if applicable)
+    gpa_points: Option<f32>,
+
+    /// Pass/Fail result (if applicable)
+    passed: Option<Bool>,
+
+    // =========================================================================
+    // Adjustments
+    // =========================================================================
+
+    /// Raw points before adjustments
+    raw_points: f32,
+
+    /// Late penalty applied
+    late_penalty: Option<LatePenaltyApplied>,
+
+    /// Extra credit points
+    extra_credit: f32,
+
+    /// Manual adjustments
+    adjustments: List<GradeAdjustment>,
+
+    /// Final adjusted points
+    adjusted_points: f32,
+
+    // =========================================================================
+    // Grading Method
+    // =========================================================================
+
+    /// How this was graded
+    grading_method: GradingMethod,
+
+    /// Rubric assessment (if rubric-graded)
+    rubric_assessment: Option<RubricAssessment>,
+
+    /// AI grading result (if AI-graded)
+    ai_grading: Option<AiGradingResult>,
+
+    /// Peer reviews (if peer-graded)
+    peer_reviews: List<PeerReview>,
+
+    /// Question-level scores (for quizzes)
+    question_scores: List<QuestionScore>,
+
+    // =========================================================================
+    // Feedback
+    // =========================================================================
+
+    /// Overall feedback
+    feedback: GradeFeedback,
+
+    /// Inline annotations (on documents)
+    annotations: List<Annotation>,
+
+    // =========================================================================
+    // Status
+    // =========================================================================
+
+    /// Grading status
+    status: GradeStatus,
+
+    /// Whether visible to student
+    is_published: Bool,
+
+    /// When published to student
+    published_at: Option<DateTime>,
+
+    /// Whether student has viewed
+    viewed_by_student: Bool,
+
+    /// When student viewed
+    viewed_at: Option<DateTime>,
+
+    // =========================================================================
+    // Grader Info
+    // =========================================================================
+
+    /// Who graded this
+    graded_by: Option<UserId>,
+
+    /// Grader role
+    grader_role: Option<GraderRole>,
+
+    /// When grading was completed
+    graded_at: Option<DateTime>,
+
+    // =========================================================================
+    // Audit Trail
+    // =========================================================================
+
+    /// Grade history
+    history: List<GradeHistoryEntry>,
+
+    /// Current version number
+    version: i32,
+
+    // =========================================================================
+    // Metadata
+    // =========================================================================
+
+    /// Additional metadata
+    metadata: Map<String, Dynamic>,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+// =============================================================================
+// SCORE TYPES
+// =============================================================================
+
+/// Late penalty that was applied
+type LatePenaltyApplied {
+    /// Original points
+    original_points: f32,
+
+    /// Points after penalty
+    penalized_points: f32,
+
+    /// Penalty percentage
+    penalty_percentage: f32,
+
+    /// Penalty type used
+    penalty_type: PenaltyType,
+
+    /// Duration late
+    late_duration: Duration,
+
+    /// Whether within grace period
+    within_grace_period: Bool
+}
+
+/// Penalty type
+enum PenaltyType {
+    None,
+    PercentPerDay,
+    FlatPercent,
+    ZeroAfterDeadline
+}
+
+/// A manual grade adjustment
+type GradeAdjustment {
+    /// Unique identifier
+    id: String,
+
+    /// Adjustment type
+    adjustment_type: AdjustmentType,
+
+    /// Points added (positive) or subtracted (negative)
+    points: f32,
+
+    /// Reason for adjustment
+    reason: String,
+
+    /// Who made the adjustment
+    adjusted_by: UserId,
+
+    /// When adjusted
+    adjusted_at: DateTime
+}
+
+/// Types of grade adjustments
+enum AdjustmentType {
+    /// Manual point adjustment
+    ManualAdjustment,
+    /// Curve applied
+    Curve,
+    /// Extra credit
+    ExtraCredit,
+    /// Penalty
+    Penalty,
+    /// Accommodation
+    Accommodation,
+    /// Error correction
+    ErrorCorrection,
+    /// Other
+    Other { reason: String }
+}
+
+// =============================================================================
+// RUBRIC ASSESSMENT
+// =============================================================================
+
+/// Rubric-based assessment result
+type RubricAssessment {
+    /// Rubric used
+    rubric_id: RubricId,
+
+    /// Criterion scores
+    criterion_scores: List<CriterionScore>,
+
+    /// Total points from rubric
+    total_points: f32,
+
+    /// Maximum possible from rubric
+    max_rubric_points: f32,
+
+    /// Rubric percentage
+    rubric_percentage: f32
+}
+
+/// Score for a single rubric criterion
+type CriterionScore {
+    /// Criterion ID
+    criterion_id: String,
+
+    /// Criterion name
+    criterion_name: String,
+
+    /// Level selected
+    level_id: String,
+
+    /// Level name
+    level_name: String,
+
+    /// Points awarded
+    points: f32,
+
+    /// Maximum points for criterion
+    max_points: f32,
+
+    /// Comments for this criterion
+    comments: Option<String>,
+
+    /// Scored by
+    scored_by: Option<UserId>
+}
+
+// =============================================================================
+// AI GRADING
+// =============================================================================
+
+/// AI grading result
+type AiGradingResult {
+    /// Model used
+    model: String,
+
+    /// Model version
+    model_version: String,
+
+    /// Suggested score
+    suggested_score: f32,
+
+    /// Confidence level (0-1)
+    confidence: f32,
+
+    /// Whether auto-accepted
+    auto_accepted: Bool,
+
+    /// Human review required
+    requires_review: Bool,
+
+    /// Human reviewed
+    was_reviewed: Bool,
+
+    /// Reviewer
+    reviewed_by: Option<UserId>,
+
+    /// Review result
+    review_decision: Option<AiReviewDecision>,
+
+    /// Final score (after any review)
+    final_score: f32,
+
+    /// AI-generated feedback
+    generated_feedback: Option<String>,
+
+    /// Grading criteria matched
+    criteria_matches: List<AiCriteriaMatch>,
+
+    /// Explanation of score
+    explanation: Option<String>,
+
+    /// When graded
+    graded_at: DateTime,
+
+    /// Processing time (ms)
+    processing_time_ms: i64
+}
+
+/// Human review decision on AI grade
+enum AiReviewDecision {
+    /// Accepted as-is
+    Accepted,
+    /// Modified by human
+    Modified { original_score: f32 },
+    /// Rejected and regraded manually
+    Rejected
+}
+
+/// AI criteria matching result
+type AiCriteriaMatch {
+    /// Criterion or rubric element
+    criterion: String,
+
+    /// Whether criterion was met
+    met: Bool,
+
+    /// Partial match score (0-1)
+    match_score: f32,
+
+    /// Evidence found in submission
+    evidence: Option<String>,
+
+    /// Explanation
+    explanation: Option<String>
+}
+
+// =============================================================================
+// PEER REVIEW
+// =============================================================================
+
+/// A peer review of a submission
+type PeerReview {
+    /// Unique identifier
+    id: String,
+
+    /// Reviewer (student) ID
+    reviewer_id: StudentId,
+
+    /// Reviewer's enrollment ID
+    reviewer_enrollment_id: EnrollmentId,
+
+    /// Whether anonymous
+    is_anonymous: Bool,
+
+    /// Score given
+    score: f32,
+
+    /// Maximum possible score
+    max_score: f32,
+
+    /// Rubric assessment (if using rubric)
+    rubric_assessment: Option<RubricAssessment>,
+
+    /// Written feedback
+    feedback: String,
+
+    /// Quality rating of this review (by instructor)
+    review_quality: Option<ReviewQuality>,
+
+    /// When submitted
+    submitted_at: DateTime,
+
+    /// Whether visible to submitter
+    is_published: Bool
+}
+
+/// Quality assessment of a peer review
+type ReviewQuality {
+    /// Rating (1-5)
+    rating: i32,
+
+    /// Comments on review quality
+    comments: Option<String>,
+
+    /// Rated by
+    rated_by: UserId,
+
+    /// Rated at
+    rated_at: DateTime
+}
+
+// =============================================================================
+// QUESTION SCORES
+// =============================================================================
+
+/// Score for an individual question
+type QuestionScore {
+    /// Question ID
+    question_id: String,
+
+    /// Points earned
+    points_earned: f32,
+
+    /// Maximum points
+    max_points: f32,
+
+    /// Whether correct (for auto-graded)
+    is_correct: Option<Bool>,
+
+    /// Partial credit (0-1)
+    partial_credit: Option<f32>,
+
+    /// Grading method used
+    grading_method: QuestionGradingMethod,
+
+    /// Feedback for this question
+    feedback: Option<String>,
+
+    /// Who graded (for manual)
+    graded_by: Option<UserId>,
+
+    /// When graded
+    graded_at: Option<DateTime>
+}
+
+/// How a question was graded
+enum QuestionGradingMethod {
+    /// System auto-graded
+    Auto,
+    /// Manually graded by instructor
+    Manual,
+    /// AI-assisted grading
+    AiAssisted,
+    /// Peer graded
+    Peer
+}
+
+// =============================================================================
+// FEEDBACK
+// =============================================================================
+
+/// Feedback on a grade
+type GradeFeedback {
+    /// Text feedback
+    text: Option<String>,
+
+    /// Text format
+    text_format: TextFormat,
+
+    /// Audio feedback
+    audio: Option<MediaFeedback>,
+
+    /// Video feedback
+    video: Option<MediaFeedback>,
+
+    /// Canned feedback items used
+    canned_feedback_ids: List<String>,
+
+    /// Attachments
+    attachments: List<FeedbackAttachment>
+}
+
+/// Text format
+enum TextFormat {
+    PlainText,
+    Markdown,
+    Html,
+    RichText
+}
+
+/// Media feedback (audio/video)
+type MediaFeedback {
+    /// Media ID
+    media_id: MediaId,
+
+    /// Duration in seconds
+    duration_seconds: i32,
+
+    /// Transcript (if available)
+    transcript: Option<String>,
+
+    /// When recorded
+    recorded_at: DateTime
+}
+
+/// Feedback attachment
+type FeedbackAttachment {
+    id: String,
+    media_id: MediaId,
+    filename: String,
+    description: Option<String>
+}
+
+/// An inline annotation on a document
+type Annotation {
+    /// Unique identifier
+    id: String,
+
+    /// Type of annotation
+    annotation_type: AnnotationType,
+
+    /// Location in document
+    location: AnnotationLocation,
+
+    /// Annotation content
+    content: String,
+
+    /// Color/highlight color
+    color: Option<String>,
+
+    /// Created by
+    created_by: UserId,
+
+    /// Created at
+    created_at: DateTime
+}
+
+/// Type of annotation
+enum AnnotationType {
+    Comment,
+    Highlight,
+    Strikethrough,
+    Suggestion,
+    Correction,
+    Praise,
+    Question
+}
+
+/// Location of an annotation
+type AnnotationLocation {
+    /// Page number (for documents)
+    page: Option<i32>,
+
+    /// Start position
+    start_offset: i32,
+
+    /// End position
+    end_offset: i32,
+
+    /// Selected text
+    selected_text: Option<String>,
+
+    /// Coordinates (for image annotations)
+    coordinates: Option<AnnotationCoords>
+}
+
+/// Coordinates for image/document annotations
+type AnnotationCoords {
+    x: f32,
+    y: f32,
+    width: Option<f32>,
+    height: Option<f32>
+}
+
+// =============================================================================
+// GRADE STATUS
+// =============================================================================
+
+/// Status of a grade
+enum GradeStatus {
+    /// Grading not started
+    Pending,
+    /// Grading in progress
+    InProgress,
+    /// Graded but not published
+    Graded,
+    /// Published to student
+    Published,
+    /// Under review/appeal
+    UnderReview,
+    /// Revised after appeal
+    Revised
+}
+
+/// Role of the grader
+enum GraderRole {
+    Instructor,
+    TeachingAssistant,
+    Grader,
+    Peer,
+    AI,
+    System
+}
+
+// =============================================================================
+// GRADE HISTORY
+// =============================================================================
+
+/// An entry in grade history (audit trail)
+type GradeHistoryEntry {
+    /// Version number
+    version: i32,
+
+    /// When this version was created
+    timestamp: DateTime,
+
+    /// Who made the change
+    changed_by: UserId,
+
+    /// Role of who made the change
+    changer_role: GraderRole,
+
+    /// Type of change
+    change_type: GradeChangeType,
+
+    /// Previous values
+    previous_values: GradeSnapshot,
+
+    /// New values
+    new_values: GradeSnapshot,
+
+    /// Reason for change
+    reason: Option<String>
+}
+
+/// Type of grade change
+enum GradeChangeType {
+    /// Initial grading
+    InitialGrade,
+    /// Score modified
+    ScoreModified,
+    /// Feedback updated
+    FeedbackUpdated,
+    /// Adjustment added
+    AdjustmentAdded,
+    /// Published to student
+    Published,
+    /// Regrade requested
+    RegradeRequested,
+    /// Regraded
+    Regraded,
+    /// Appeal processed
+    AppealProcessed
+}
+
+/// Snapshot of grade values for history
+type GradeSnapshot {
+    points_earned: f32,
+    percentage: f32,
+    letter_grade: Option<String>,
+    adjustments: List<GradeAdjustment>,
+    feedback_text: Option<String>,
+    status: GradeStatus
+}
+
+// =============================================================================
+// GRADEBOOK AGGREGATION
+// =============================================================================
+
+/// Gradebook entry for a student in a course
+type GradebookEntry {
+    /// Student ID
+    student_id: StudentId,
+
+    /// Enrollment ID
+    enrollment_id: EnrollmentId,
+
+    /// Course ID
+    course_id: CourseId,
+
+    /// Assessment grades
+    assessment_grades: Map<AssessmentId, GradeSummary>,
+
+    /// Category totals
+    category_totals: Map<String, CategoryTotal>,
+
+    /// Overall course grade
+    course_grade: CourseGrade,
+
+    /// Last updated
+    updated_at: DateTime
+}
+
+/// Summary of a grade for gradebook
+type GradeSummary {
+    grade_id: GradeId,
+    points_earned: f32,
+    max_points: f32,
+    percentage: f32,
+    letter_grade: Option<String>,
+    status: GradeStatus,
+    is_late: Bool,
+    is_missing: Bool,
+    is_excused: Bool,
+    graded_at: Option<DateTime>
+}
+
+/// Total for a grade category
+type CategoryTotal {
+    /// Category name
+    category: String,
+
+    /// Category weight
+    weight: f32,
+
+    /// Points earned
+    points_earned: f32,
+
+    /// Points possible
+    points_possible: f32,
+
+    /// Percentage
+    percentage: f32,
+
+    /// Weighted contribution
+    weighted_contribution: f32,
+
+    /// Assessments in category
+    assessment_count: i32,
+
+    /// Graded assessments
+    graded_count: i32,
+
+    /// Dropped lowest scores
+    dropped_scores: List<DroppedScore>
+}
+
+/// A score that was dropped
+type DroppedScore {
+    assessment_id: AssessmentId,
+    points_earned: f32,
+    max_points: f32
+}
+
+/// Overall course grade
+type CourseGrade {
+    /// Total points earned
+    total_points: f32,
+
+    /// Total points possible
+    total_possible: f32,
+
+    /// Current percentage
+    current_percentage: f32,
+
+    /// Projected final percentage
+    projected_percentage: Option<f32>,
+
+    /// Current letter grade
+    letter_grade: Option<String>,
+
+    /// GPA points
+    gpa_points: Option<f32>,
+
+    /// Whether passing
+    is_passing: Bool,
+
+    /// Aggregation method used
+    aggregation_type: AggregationType,
+
+    /// Missing assignments affect grade
+    missing_affects_grade: Bool
+}
+
+/// How grades are aggregated
+enum AggregationType {
+    /// Total points
+    TotalPoints,
+    /// Weighted categories
+    WeightedCategories,
+    /// Weighted assignments
+    WeightedAssignments,
+    /// Equal weight
+    EqualWeight,
+    /// Custom formula
+    Custom { formula: String }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating a grade
+type CreateGradeInput {
+    submission_id: SubmissionId,
+    points_earned: f32,
+    feedback: Option<String>,
+    rubric_assessment: Option<RubricAssessment>,
+    question_scores: Option<List<QuestionScore>>,
+    publish_immediately: Bool
+}
+
+/// Input for updating a grade
+type UpdateGradeInput {
+    points_earned: Option<f32>,
+    feedback: Option<GradeFeedback>,
+    rubric_assessment: Option<RubricAssessment>,
+    question_scores: Option<List<QuestionScore>>,
+    adjustments: Option<List<GradeAdjustment>>,
+    reason: Option<String>
+}
+
+/// Input for adding feedback
+type AddFeedbackInput {
+    grade_id: GradeId,
+    text: Option<String>,
+    audio_id: Option<MediaId>,
+    video_id: Option<MediaId>,
+    annotations: Option<List<Annotation>>
+}
+
+/// Input for bulk grade update
+type BulkGradeInput {
+    grades: List<GradeUpdate>
+}
+
+/// Individual grade update in bulk
+type GradeUpdate {
+    submission_id: SubmissionId,
+    points_earned: f32,
+    feedback: Option<String>
+}
+
+// =============================================================================
+// FILTER TYPES
+// =============================================================================
+
+/// Filter options for grade queries
+type GradeFilter {
+    tenant_id: Option<TenantId>,
+    course_id: Option<CourseId>,
+    assessment_id: Option<AssessmentId>,
+    student_id: Option<StudentId>,
+    enrollment_id: Option<EnrollmentId>,
+    status: Option<GradeStatus>,
+    grading_method: Option<GradingMethod>,
+    is_published: Option<Bool>,
+    needs_review: Option<Bool>,
+    graded_date_range: Option<DateRange>,
+    percentage_range: Option<PercentageRange>
+}
+
+/// Percentage range filter
+type PercentageRange {
+    min: Option<f32>,
+    max: Option<f32>
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Grade {
+    /// Create a new grade
+    fn new(
+        bundle: String,
+        submission_id: SubmissionId,
+        assessment_id: AssessmentId,
+        course_id: CourseId,
+        enrollment_id: EnrollmentId,
+        student_id: StudentId,
+        tenant_id: TenantId,
+        max_points: f32
+    ) -> Grade {
+        let now = DateTime::now();
+        Grade {
+            id: generate_grade_id(),
+            uuid: generate_uuid(),
+            bundle,
+            submission_id,
+            assessment_id,
+            course_id,
+            enrollment_id,
+            student_id,
+            tenant_id,
+            points_earned: 0.0,
+            max_points,
+            percentage: 0.0,
+            letter_grade: None,
+            gpa_points: None,
+            passed: None,
+            raw_points: 0.0,
+            late_penalty: None,
+            extra_credit: 0.0,
+            adjustments: vec![],
+            adjusted_points: 0.0,
+            grading_method: GradingMethod::ManualGraded,
+            rubric_assessment: None,
+            ai_grading: None,
+            peer_reviews: vec![],
+            question_scores: vec![],
+            feedback: GradeFeedback::default(),
+            annotations: vec![],
+            status: GradeStatus::Pending,
+            is_published: false,
+            published_at: None,
+            viewed_by_student: false,
+            viewed_at: None,
+            graded_by: None,
+            grader_role: None,
+            graded_at: None,
+            history: vec![],
+            version: 0,
+            metadata: Map::new(),
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Set the score and recalculate percentage
+    fn set_score(&mut self, points: f32) {
+        self.raw_points = points;
+        self.recalculate();
+    }
+
+    /// Recalculate adjusted points and percentage
+    fn recalculate(&mut self) {
+        // Start with raw points
+        let mut adjusted = self.raw_points;
+
+        // Apply late penalty
+        if let Some(penalty) = &self.late_penalty {
+            adjusted = penalty.penalized_points;
+        }
+
+        // Apply adjustments
+        for adj in &self.adjustments {
+            adjusted += adj.points;
+        }
+
+        // Add extra credit
+        adjusted += self.extra_credit;
+
+        // Ensure non-negative
+        self.adjusted_points = adjusted.max(0.0);
+        self.points_earned = self.adjusted_points;
+
+        // Calculate percentage
+        if self.max_points > 0.0 {
+            self.percentage = (self.adjusted_points / self.max_points) * 100.0;
+        } else {
+            self.percentage = 0.0;
+        }
+    }
+
+    /// Apply late penalty
+    fn apply_late_penalty(&mut self, penalty_type: PenaltyType, late_duration: Duration) {
+        let penalty_percentage = match penalty_type {
+            PenaltyType::None => 0.0,
+            PenaltyType::PercentPerDay => {
+                let days = late_duration.as_days() as f32;
+                (days * 10.0).min(100.0) // 10% per day, max 100%
+            },
+            PenaltyType::FlatPercent => 10.0, // Default 10%
+            PenaltyType::ZeroAfterDeadline => 100.0
+        };
+
+        let penalized = self.raw_points * (1.0 - penalty_percentage / 100.0);
+
+        self.late_penalty = Some(LatePenaltyApplied {
+            original_points: self.raw_points,
+            penalized_points: penalized.max(0.0),
+            penalty_percentage,
+            penalty_type,
+            late_duration,
+            within_grace_period: false
+        });
+
+        self.recalculate();
+    }
+
+    /// Add adjustment
+    fn add_adjustment(&mut self, adjustment: GradeAdjustment) {
+        self.adjustments.push(adjustment);
+        self.recalculate();
+        self.version += 1;
+    }
+
+    /// Calculate letter grade from percentage
+    fn calculate_letter_grade(&mut self, scale: &GradingScale) {
+        for level in &scale.levels {
+            if self.percentage >= level.min_percentage && self.percentage <= level.max_percentage {
+                self.letter_grade = Some(level.label.clone());
+                self.gpa_points = level.gpa_points;
+                return;
+            }
+        }
+    }
+
+    /// Publish grade to student
+    fn publish(&mut self) {
+        self.is_published = true;
+        self.published_at = Some(DateTime::now());
+        self.status = GradeStatus::Published;
+    }
+
+    /// Mark as viewed by student
+    fn mark_viewed(&mut self) {
+        if !self.viewed_by_student {
+            self.viewed_by_student = true;
+            self.viewed_at = Some(DateTime::now());
+        }
+    }
+
+    /// Record history entry
+    fn record_history(&mut self, changed_by: UserId, changer_role: GraderRole, change_type: GradeChangeType, reason: Option<String>) {
+        let previous = GradeSnapshot {
+            points_earned: self.points_earned,
+            percentage: self.percentage,
+            letter_grade: self.letter_grade.clone(),
+            adjustments: self.adjustments.clone(),
+            feedback_text: self.feedback.text.clone(),
+            status: self.status.clone()
+        };
+
+        self.history.push(GradeHistoryEntry {
+            version: self.version,
+            timestamp: DateTime::now(),
+            changed_by,
+            changer_role,
+            change_type,
+            previous_values: previous.clone(),
+            new_values: previous, // Will be updated after changes
+            reason
+        });
+
+        self.version += 1;
+    }
+
+    /// Get effective score (considering all factors)
+    fn effective_score(&self) -> f32 {
+        self.adjusted_points
+    }
+
+    /// Check if needs grading review
+    fn needs_review(&self) -> Bool {
+        if let Some(ai) = &self.ai_grading {
+            return ai.requires_review && !ai.was_reviewed
+        }
+        false
+    }
+}
+
+impl GradeFeedback {
+    fn default() -> GradeFeedback {
+        GradeFeedback {
+            text: None,
+            text_format: TextFormat::PlainText,
+            audio: None,
+            video: None,
+            canned_feedback_ids: vec![],
+            attachments: vec![]
+        }
+    }
+
+    /// Check if feedback is empty
+    fn is_empty(&self) -> Bool {
+        self.text.is_none() &&
+        self.audio.is_none() &&
+        self.video.is_none() &&
+        self.attachments.is_empty()
+    }
+}
+
+impl GradebookEntry {
+    /// Create a new gradebook entry
+    fn new(student_id: StudentId, enrollment_id: EnrollmentId, course_id: CourseId) -> GradebookEntry {
+        GradebookEntry {
+            student_id,
+            enrollment_id,
+            course_id,
+            assessment_grades: Map::new(),
+            category_totals: Map::new(),
+            course_grade: CourseGrade::default(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    /// Recalculate all totals
+    fn recalculate(&mut self, weights: &Map<String, f32>, passing_grade: f32) {
+        // Recalculate category totals
+        // ... implementation details
+
+        // Recalculate course grade
+        let total_earned: f32 = self.assessment_grades.values()
+            .map(|g| g.points_earned)
+            .sum();
+        let total_possible: f32 = self.assessment_grades.values()
+            .map(|g| g.max_points)
+            .sum();
+
+        self.course_grade.total_points = total_earned;
+        self.course_grade.total_possible = total_possible;
+
+        if total_possible > 0.0 {
+            self.course_grade.current_percentage = (total_earned / total_possible) * 100.0;
+        }
+
+        self.course_grade.is_passing = self.course_grade.current_percentage >= passing_grade;
+        self.updated_at = DateTime::now();
+    }
+
+    /// Get missing assignment count
+    fn missing_count(&self) -> i32 {
+        self.assessment_grades.values()
+            .filter(|g| g.is_missing)
+            .count() as i32
+    }
+
+    /// Get late submission count
+    fn late_count(&self) -> i32 {
+        self.assessment_grades.values()
+            .filter(|g| g.is_late)
+            .count() as i32
+    }
+}
+
+impl CourseGrade {
+    fn default() -> CourseGrade {
+        CourseGrade {
+            total_points: 0.0,
+            total_possible: 0.0,
+            current_percentage: 0.0,
+            projected_percentage: None,
+            letter_grade: None,
+            gpa_points: None,
+            is_passing: false,
+            aggregation_type: AggregationType::TotalPoints,
+            missing_affects_grade: true
+        }
+    }
+}
+
+impl AiGradingResult {
+    /// Create a new AI grading result
+    fn new(model: String, suggested_score: f32, confidence: f32) -> AiGradingResult {
+        let auto_accepted = confidence >= 0.90;
+        AiGradingResult {
+            model,
+            model_version: "1.0".to_string(),
+            suggested_score,
+            confidence,
+            auto_accepted,
+            requires_review: !auto_accepted,
+            was_reviewed: false,
+            reviewed_by: None,
+            review_decision: None,
+            final_score: if auto_accepted { suggested_score } else { 0.0 },
+            generated_feedback: None,
+            criteria_matches: vec![],
+            explanation: None,
+            graded_at: DateTime::now(),
+            processing_time_ms: 0
+        }
+    }
+
+    /// Accept AI grade
+    fn accept(&mut self) {
+        self.was_reviewed = true;
+        self.review_decision = Some(AiReviewDecision::Accepted);
+        self.final_score = self.suggested_score;
+    }
+
+    /// Modify AI grade
+    fn modify(&mut self, new_score: f32, reviewer: UserId) {
+        let original = self.suggested_score;
+        self.was_reviewed = true;
+        self.reviewed_by = Some(reviewer);
+        self.review_decision = Some(AiReviewDecision::Modified { original_score: original });
+        self.final_score = new_score;
+    }
+
+    /// Reject AI grade
+    fn reject(&mut self, reviewer: UserId) {
+        self.was_reviewed = true;
+        self.reviewed_by = Some(reviewer);
+        self.review_decision = Some(AiReviewDecision::Rejected);
+        self.final_score = 0.0;
+    }
+}
+
+/// Standard grading scale
+type GradingScale {
+    id: String,
+    name: String,
+    levels: List<GradeLevel>
+}
+
+/// Grade level in a scale
+type GradeLevel {
+    label: String,
+    min_percentage: f32,
+    max_percentage: f32,
+    gpa_points: Option<f32>
+}
+
+impl GradingScale {
+    /// Standard US letter grade scale
+    fn standard_letter_scale() -> GradingScale {
+        GradingScale {
+            id: "standard_letter".to_string(),
+            name: "Standard Letter Grade".to_string(),
+            levels: vec![
+                GradeLevel { label: "A".to_string(), min_percentage: 93.0, max_percentage: 100.0, gpa_points: Some(4.0) },
+                GradeLevel { label: "A-".to_string(), min_percentage: 90.0, max_percentage: 92.99, gpa_points: Some(3.7) },
+                GradeLevel { label: "B+".to_string(), min_percentage: 87.0, max_percentage: 89.99, gpa_points: Some(3.3) },
+                GradeLevel { label: "B".to_string(), min_percentage: 83.0, max_percentage: 86.99, gpa_points: Some(3.0) },
+                GradeLevel { label: "B-".to_string(), min_percentage: 80.0, max_percentage: 82.99, gpa_points: Some(2.7) },
+                GradeLevel { label: "C+".to_string(), min_percentage: 77.0, max_percentage: 79.99, gpa_points: Some(2.3) },
+                GradeLevel { label: "C".to_string(), min_percentage: 73.0, max_percentage: 76.99, gpa_points: Some(2.0) },
+                GradeLevel { label: "C-".to_string(), min_percentage: 70.0, max_percentage: 72.99, gpa_points: Some(1.7) },
+                GradeLevel { label: "D+".to_string(), min_percentage: 67.0, max_percentage: 69.99, gpa_points: Some(1.3) },
+                GradeLevel { label: "D".to_string(), min_percentage: 63.0, max_percentage: 66.99, gpa_points: Some(1.0) },
+                GradeLevel { label: "D-".to_string(), min_percentage: 60.0, max_percentage: 62.99, gpa_points: Some(0.7) },
+                GradeLevel { label: "F".to_string(), min_percentage: 0.0, max_percentage: 59.99, gpa_points: Some(0.0) }
+            ]
+        }
+    }
+}

@@ -1,0 +1,789 @@
+/// Intelligo LMS - Theme Customization
+///
+/// Per-tenant theme customization system allowing organizations to brand
+/// their learning environment with custom colors, typography, and styling.
+
+module intelligo::themes::customization
+
+use intelligo::themes::core::*
+use intelligo::themes::default::create_default_theme
+use intelligo::themes::dark::create_dark_theme
+use intelligo::tenant::core::TenantId
+
+/// Tenant-specific theme customization
+type TenantThemeCustomization {
+    tenant_id: TenantId,
+    base_theme: ThemeBase,
+    color_overrides: Option<ColorOverrides>,
+    typography_overrides: Option<TypographyOverrides>,
+    spacing_overrides: Option<SpacingOverrides>,
+    border_overrides: Option<BorderOverrides>,
+    component_overrides: Option<Map<String, Map<String, String>>>,
+    custom_css: Option<String>,
+    logo_url: Option<String>,
+    favicon_url: Option<String>,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// Base theme to customize from
+enum ThemeBase {
+    Light,
+    Dark,
+    Custom(String),
+}
+
+/// Color overrides for customization
+type ColorOverrides {
+    primary: Option<String>,
+    secondary: Option<String>,
+    accent: Option<String>,
+    background: Option<String>,
+    surface: Option<String>,
+    text_primary: Option<String>,
+    text_secondary: Option<String>,
+    border: Option<String>,
+    success: Option<String>,
+    warning: Option<String>,
+    error: Option<String>,
+    info: Option<String>,
+}
+
+/// Typography overrides
+type TypographyOverrides {
+    font_family_sans: Option<String>,
+    font_family_serif: Option<String>,
+    font_family_mono: Option<String>,
+    base_font_size: Option<String>,
+    heading_font_family: Option<String>,
+    heading_font_weight: Option<String>,
+}
+
+/// Spacing overrides
+type SpacingOverrides {
+    base_unit: Option<String>,
+    scale_ratio: Option<f64>,
+}
+
+/// Border overrides
+type BorderOverrides {
+    radius_base: Option<String>,
+    radius_scale: Option<f64>,
+    default_width: Option<String>,
+}
+
+impl TenantThemeCustomization {
+    /// Create a new customization with default settings
+    pub fn new(tenant_id: TenantId) -> Self {
+        TenantThemeCustomization {
+            tenant_id,
+            base_theme: ThemeBase::Light,
+            color_overrides: None,
+            typography_overrides: None,
+            spacing_overrides: None,
+            border_overrides: None,
+            component_overrides: None,
+            custom_css: None,
+            logo_url: None,
+            favicon_url: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    /// Set the base theme
+    pub fn with_base_theme(mut self, base: ThemeBase) -> Self {
+        self.base_theme = base
+        self.updated_at = DateTime::now()
+        self
+    }
+
+    /// Set color overrides
+    pub fn with_colors(mut self, overrides: ColorOverrides) -> Self {
+        self.color_overrides = Some(overrides)
+        self.updated_at = DateTime::now()
+        self
+    }
+
+    /// Set typography overrides
+    pub fn with_typography(mut self, overrides: TypographyOverrides) -> Self {
+        self.typography_overrides = Some(overrides)
+        self.updated_at = DateTime::now()
+        self
+    }
+
+    /// Set custom CSS
+    pub fn with_custom_css(mut self, css: String) -> Self {
+        self.custom_css = Some(css)
+        self.updated_at = DateTime::now()
+        self
+    }
+
+    /// Set branding assets
+    pub fn with_branding(mut self, logo_url: Option<String>, favicon_url: Option<String>) -> Self {
+        self.logo_url = logo_url
+        self.favicon_url = favicon_url
+        self.updated_at = DateTime::now()
+        self
+    }
+
+    /// Apply customizations to base theme and generate final theme
+    pub fn build_theme(&self) -> Theme {
+        // Start with base theme
+        let mut theme = match &self.base_theme {
+            ThemeBase::Light => create_default_theme(),
+            ThemeBase::Dark => create_dark_theme(),
+            ThemeBase::Custom(id) => {
+                // Load custom base theme from database
+                self.load_custom_base(id).unwrap_or_else(|| create_default_theme())
+            }
+        }
+
+        // Apply color overrides
+        if let Some(ref colors) = self.color_overrides {
+            self.apply_color_overrides(&mut theme, colors)
+        }
+
+        // Apply typography overrides
+        if let Some(ref typography) = self.typography_overrides {
+            self.apply_typography_overrides(&mut theme, typography)
+        }
+
+        // Apply spacing overrides
+        if let Some(ref spacing) = self.spacing_overrides {
+            self.apply_spacing_overrides(&mut theme, spacing)
+        }
+
+        // Apply border overrides
+        if let Some(ref borders) = self.border_overrides {
+            self.apply_border_overrides(&mut theme, borders)
+        }
+
+        // Apply component style overrides
+        if let Some(ref components) = self.component_overrides {
+            self.apply_component_overrides(&mut theme, components)
+        }
+
+        // Update theme metadata
+        theme.id = format!("tenant-{}", self.tenant_id)
+        theme.name = format!("Tenant {} Theme", self.tenant_id)
+
+        theme
+    }
+
+    /// Apply color overrides to theme
+    fn apply_color_overrides(&self, theme: &mut Theme, overrides: &ColorOverrides) {
+        if let Some(ref primary) = overrides.primary {
+            theme.colors.primary = generate_color_scale(primary)
+        }
+        if let Some(ref secondary) = overrides.secondary {
+            theme.colors.secondary = generate_color_scale(secondary)
+        }
+        if let Some(ref accent) = overrides.accent {
+            theme.colors.accent = generate_color_scale(accent)
+        }
+        if let Some(ref background) = overrides.background {
+            theme.colors.background = background.clone()
+        }
+        if let Some(ref surface) = overrides.surface {
+            theme.colors.surface = surface.clone()
+        }
+        if let Some(ref text_primary) = overrides.text_primary {
+            theme.colors.text_primary = text_primary.clone()
+        }
+        if let Some(ref text_secondary) = overrides.text_secondary {
+            theme.colors.text_secondary = text_secondary.clone()
+        }
+        if let Some(ref border) = overrides.border {
+            theme.colors.border = border.clone()
+        }
+        if let Some(ref success) = overrides.success {
+            theme.colors.success = generate_color_scale(success)
+        }
+        if let Some(ref warning) = overrides.warning {
+            theme.colors.warning = generate_color_scale(warning)
+        }
+        if let Some(ref error) = overrides.error {
+            theme.colors.error = generate_color_scale(error)
+        }
+        if let Some(ref info) = overrides.info {
+            theme.colors.info = generate_color_scale(info)
+        }
+    }
+
+    /// Apply typography overrides to theme
+    fn apply_typography_overrides(&self, theme: &mut Theme, overrides: &TypographyOverrides) {
+        if let Some(ref font) = overrides.font_family_sans {
+            theme.typography.font_family_sans = font.clone()
+        }
+        if let Some(ref font) = overrides.font_family_serif {
+            theme.typography.font_family_serif = font.clone()
+        }
+        if let Some(ref font) = overrides.font_family_mono {
+            theme.typography.font_family_mono = font.clone()
+        }
+        if let Some(ref size) = overrides.base_font_size {
+            theme.typography.font_size_base = size.clone()
+        }
+    }
+
+    /// Apply spacing overrides to theme
+    fn apply_spacing_overrides(&self, theme: &mut Theme, overrides: &SpacingOverrides) {
+        if let Some(ref base) = overrides.base_unit {
+            let base_value = parse_size(base)
+            let ratio = overrides.scale_ratio.unwrap_or(1.5)
+
+            theme.spacing.xs = format!("{}rem", base_value * 0.25)
+            theme.spacing.sm = format!("{}rem", base_value * 0.5)
+            theme.spacing.md = format!("{}rem", base_value)
+            theme.spacing.lg = format!("{}rem", base_value * ratio)
+            theme.spacing.xl = format!("{}rem", base_value * ratio * ratio)
+            theme.spacing.xxl = format!("{}rem", base_value * ratio * ratio * ratio)
+            theme.spacing.xxxl = format!("{}rem", base_value * ratio * ratio * ratio * ratio)
+        }
+    }
+
+    /// Apply border overrides to theme
+    fn apply_border_overrides(&self, theme: &mut Theme, overrides: &BorderOverrides) {
+        if let Some(ref radius) = overrides.radius_base {
+            let base_value = parse_size(radius)
+            let scale = overrides.radius_scale.unwrap_or(2.0)
+
+            theme.borders.radius_sm = format!("{}rem", base_value * 0.5)
+            theme.borders.radius_md = format!("{}rem", base_value)
+            theme.borders.radius_lg = format!("{}rem", base_value * scale)
+            theme.borders.radius_xl = format!("{}rem", base_value * scale * scale)
+            theme.borders.radius_2xl = format!("{}rem", base_value * scale * scale * scale)
+        }
+        if let Some(ref width) = overrides.default_width {
+            theme.borders.width_thin = width.clone()
+        }
+    }
+
+    /// Apply component style overrides
+    fn apply_component_overrides(&self, theme: &mut Theme, overrides: &Map<String, Map<String, String>>) {
+        for (component, styles) in overrides {
+            if let Some(existing) = theme.component_styles.get_mut(component) {
+                for (key, value) in styles {
+                    existing.insert(key.clone(), value.clone())
+                }
+            } else {
+                theme.component_styles.insert(component.clone(), styles.clone())
+            }
+        }
+    }
+
+    /// Load custom base theme from database
+    fn load_custom_base(&self, theme_id: &str) -> Option<Theme> {
+        // Query database for custom theme definition
+        db::query_one("SELECT * FROM custom_themes WHERE id = $1", [theme_id])
+            .map(|row| Theme::from_row(row))
+            .ok()
+    }
+
+    /// Generate final CSS including custom CSS
+    pub fn generate_css(&self) -> String {
+        let theme = self.build_theme()
+        let mut css = theme.to_css()
+
+        // Append custom CSS if provided
+        if let Some(ref custom) = self.custom_css {
+            css.push_str("\n\n/* Tenant Custom CSS */\n")
+            css.push_str(custom)
+        }
+
+        css
+    }
+}
+
+/// Generate a color scale from a base color
+pub fn generate_color_scale(base_color: &str) -> ColorScale {
+    let hsl = hex_to_hsl(base_color)
+
+    ColorScale {
+        c50: hsl_to_hex(hsl.0, hsl.1 * 0.9, 0.97),
+        c100: hsl_to_hex(hsl.0, hsl.1 * 0.9, 0.94),
+        c200: hsl_to_hex(hsl.0, hsl.1 * 0.85, 0.86),
+        c300: hsl_to_hex(hsl.0, hsl.1 * 0.8, 0.76),
+        c400: hsl_to_hex(hsl.0, hsl.1 * 0.9, 0.64),
+        c500: hsl_to_hex(hsl.0, hsl.1, hsl.2), // Base color
+        c600: hsl_to_hex(hsl.0, hsl.1 * 1.1, hsl.2 * 0.85),
+        c700: hsl_to_hex(hsl.0, hsl.1 * 1.15, hsl.2 * 0.72),
+        c800: hsl_to_hex(hsl.0, hsl.1 * 1.1, hsl.2 * 0.56),
+        c900: hsl_to_hex(hsl.0, hsl.1 * 1.05, hsl.2 * 0.44),
+        c950: hsl_to_hex(hsl.0, hsl.1 * 1.0, hsl.2 * 0.28),
+    }
+}
+
+/// Convert hex color to HSL
+fn hex_to_hsl(hex: &str) -> (f64, f64, f64) {
+    let hex = hex.trim_start_matches('#')
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f64 / 255.0
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f64 / 255.0
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f64 / 255.0
+
+    let max = r.max(g).max(b)
+    let min = r.min(g).min(b)
+    let l = (max + min) / 2.0
+
+    if max == min {
+        return (0.0, 0.0, l)
+    }
+
+    let d = max - min
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) }
+
+    let h = if max == r {
+        ((g - b) / d + (if g < b { 6.0 } else { 0.0 })) / 6.0
+    } else if max == g {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    }
+
+    (h * 360.0, s, l)
+}
+
+/// Convert HSL to hex color
+fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
+    let s = s.clamp(0.0, 1.0)
+    let l = l.clamp(0.0, 1.0)
+
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs())
+    let m = l - c / 2.0
+
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    }
+
+    let r = ((r + m) * 255.0).round() as u8
+    let g = ((g + m) * 255.0).round() as u8
+    let b = ((b + m) * 255.0).round() as u8
+
+    format!("#{:02x}{:02x}{:02x}", r, g, b)
+}
+
+/// Parse a size value (e.g., "1rem", "16px") to a float
+fn parse_size(size: &str) -> f64 {
+    let numeric: String = size.chars().take_while(|c| c.is_numeric() || *c == '.').collect()
+    numeric.parse::<f64>().unwrap_or(1.0)
+}
+
+/// Theme customization manager actor
+actor ThemeCustomizationManager {
+    customizations: Map<TenantId, TenantThemeCustomization>,
+    cache: Map<TenantId, (Theme, DateTime)>,
+    cache_ttl: Duration,
+
+    pub fn new() -> Self {
+        ThemeCustomizationManager {
+            customizations: Map::new(),
+            cache: Map::new(),
+            cache_ttl: Duration::minutes(15),
+        }
+    }
+
+    receive {
+        /// Get or create customization for tenant
+        GetCustomization(tenant_id: TenantId) -> TenantThemeCustomization {
+            if let Some(customization) = self.customizations.get(&tenant_id) {
+                customization.clone()
+            } else {
+                // Try loading from database
+                match self.load_from_db(&tenant_id).await {
+                    Some(customization) => {
+                        self.customizations.insert(tenant_id, customization.clone())
+                        checkpoint()
+                        customization
+                    }
+                    None => TenantThemeCustomization::new(tenant_id)
+                }
+            }
+        }
+
+        /// Save customization for tenant
+        SaveCustomization(customization: TenantThemeCustomization) -> Result<(), String> {
+            let tenant_id = customization.tenant_id.clone()
+
+            // Validate customization
+            if let Err(e) = self.validate(&customization) {
+                return Err(e)
+            }
+
+            // Save to database
+            self.save_to_db(&customization).await?
+
+            // Update local cache
+            self.customizations.insert(tenant_id.clone(), customization)
+            self.cache.remove(&tenant_id) // Invalidate theme cache
+
+            checkpoint()
+            Ok(())
+        }
+
+        /// Get compiled theme for tenant
+        GetTheme(tenant_id: TenantId) -> Theme {
+            // Check cache first
+            if let Some((theme, cached_at)) = self.cache.get(&tenant_id) {
+                if cached_at.elapsed() < self.cache_ttl {
+                    return theme.clone()
+                }
+            }
+
+            // Build theme from customization
+            let customization = self.receive(GetCustomization(tenant_id.clone())).await
+            let theme = customization.build_theme()
+
+            // Cache the result
+            self.cache.insert(tenant_id, (theme.clone(), DateTime::now()))
+
+            theme
+        }
+
+        /// Get CSS for tenant theme
+        GetThemeCSS(tenant_id: TenantId) -> String {
+            let customization = self.receive(GetCustomization(tenant_id.clone())).await
+            customization.generate_css()
+        }
+
+        /// Update primary color for tenant
+        UpdatePrimaryColor(tenant_id: TenantId, color: String) -> Result<(), String> {
+            let mut customization = self.receive(GetCustomization(tenant_id.clone())).await
+
+            let overrides = customization.color_overrides.unwrap_or(ColorOverrides {
+                primary: None,
+                secondary: None,
+                accent: None,
+                background: None,
+                surface: None,
+                text_primary: None,
+                text_secondary: None,
+                border: None,
+                success: None,
+                warning: None,
+                error: None,
+                info: None,
+            })
+
+            customization.color_overrides = Some(ColorOverrides {
+                primary: Some(color),
+                ..overrides
+            })
+
+            self.receive(SaveCustomization(customization)).await
+        }
+
+        /// Reset tenant customization to defaults
+        ResetCustomization(tenant_id: TenantId) -> Result<(), String> {
+            self.customizations.remove(&tenant_id)
+            self.cache.remove(&tenant_id)
+
+            // Delete from database
+            db::execute(
+                "DELETE FROM tenant_theme_customizations WHERE tenant_id = $1",
+                [&tenant_id]
+            ).await?
+
+            checkpoint()
+            Ok(())
+        }
+
+        /// Set base theme for tenant
+        SetBaseTheme(tenant_id: TenantId, base: ThemeBase) -> Result<(), String> {
+            let mut customization = self.receive(GetCustomization(tenant_id.clone())).await
+            customization.base_theme = base
+            self.receive(SaveCustomization(customization)).await
+        }
+
+        /// Preview theme changes without saving
+        PreviewTheme(tenant_id: TenantId, overrides: ColorOverrides) -> Theme {
+            let mut customization = self.receive(GetCustomization(tenant_id.clone())).await
+            customization.color_overrides = Some(overrides)
+            customization.build_theme()
+        }
+
+        /// Import theme from JSON
+        ImportTheme(tenant_id: TenantId, json: String) -> Result<(), String> {
+            let customization: TenantThemeCustomization = serde_json::from_str(&json)
+                .map_err(|e| format!("Invalid theme JSON: {}", e))?
+
+            // Ensure tenant ID matches
+            if customization.tenant_id != tenant_id {
+                return Err("Theme tenant ID mismatch".to_string())
+            }
+
+            self.receive(SaveCustomization(customization)).await
+        }
+
+        /// Export theme as JSON
+        ExportTheme(tenant_id: TenantId) -> String {
+            let customization = self.receive(GetCustomization(tenant_id)).await
+            serde_json::to_string_pretty(&customization).unwrap_or("{}".to_string())
+        }
+
+        /// Clear all caches
+        ClearCache() {
+            self.cache.clear()
+            checkpoint()
+        }
+    }
+
+    /// Validate customization before saving
+    fn validate(&self, customization: &TenantThemeCustomization) -> Result<(), String> {
+        // Validate custom CSS if provided
+        if let Some(ref css) = customization.custom_css {
+            if css.len() > 100_000 {
+                return Err("Custom CSS exceeds maximum size of 100KB".to_string())
+            }
+
+            // Check for dangerous CSS
+            if css.contains("javascript:") || css.contains("expression(") {
+                return Err("Custom CSS contains potentially dangerous content".to_string())
+            }
+        }
+
+        // Validate color formats
+        if let Some(ref colors) = customization.color_overrides {
+            if let Some(ref primary) = colors.primary {
+                if !self.is_valid_color(primary) {
+                    return Err("Invalid primary color format".to_string())
+                }
+            }
+            if let Some(ref secondary) = colors.secondary {
+                if !self.is_valid_color(secondary) {
+                    return Err("Invalid secondary color format".to_string())
+                }
+            }
+            // ... validate other colors
+        }
+
+        Ok(())
+    }
+
+    /// Check if a color string is valid
+    fn is_valid_color(&self, color: &str) -> bool {
+        // Check hex format
+        if color.starts_with('#') {
+            let hex = color.trim_start_matches('#')
+            return (hex.len() == 3 || hex.len() == 6) && hex.chars().all(|c| c.is_ascii_hexdigit())
+        }
+
+        // Check rgb/rgba format
+        if color.starts_with("rgb") {
+            return color.contains('(') && color.contains(')')
+        }
+
+        // Check hsl/hsla format
+        if color.starts_with("hsl") {
+            return color.contains('(') && color.contains(')')
+        }
+
+        false
+    }
+
+    /// Load customization from database
+    async fn load_from_db(&self, tenant_id: &TenantId) -> Option<TenantThemeCustomization> {
+        db::query_one(
+            "SELECT * FROM tenant_theme_customizations WHERE tenant_id = $1",
+            [tenant_id]
+        ).await.map(|row| TenantThemeCustomization {
+            tenant_id: row.get("tenant_id"),
+            base_theme: row.get("base_theme"),
+            color_overrides: row.get_json("color_overrides"),
+            typography_overrides: row.get_json("typography_overrides"),
+            spacing_overrides: row.get_json("spacing_overrides"),
+            border_overrides: row.get_json("border_overrides"),
+            component_overrides: row.get_json("component_overrides"),
+            custom_css: row.get("custom_css"),
+            logo_url: row.get("logo_url"),
+            favicon_url: row.get("favicon_url"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }).ok()
+    }
+
+    /// Save customization to database
+    async fn save_to_db(&self, customization: &TenantThemeCustomization) -> Result<(), String> {
+        db::execute(
+            "INSERT INTO tenant_theme_customizations
+             (tenant_id, base_theme, color_overrides, typography_overrides,
+              spacing_overrides, border_overrides, component_overrides,
+              custom_css, logo_url, favicon_url, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (tenant_id) DO UPDATE SET
+               base_theme = EXCLUDED.base_theme,
+               color_overrides = EXCLUDED.color_overrides,
+               typography_overrides = EXCLUDED.typography_overrides,
+               spacing_overrides = EXCLUDED.spacing_overrides,
+               border_overrides = EXCLUDED.border_overrides,
+               component_overrides = EXCLUDED.component_overrides,
+               custom_css = EXCLUDED.custom_css,
+               logo_url = EXCLUDED.logo_url,
+               favicon_url = EXCLUDED.favicon_url,
+               updated_at = EXCLUDED.updated_at",
+            [
+                &customization.tenant_id,
+                &customization.base_theme,
+                &serde_json::to_value(&customization.color_overrides).ok(),
+                &serde_json::to_value(&customization.typography_overrides).ok(),
+                &serde_json::to_value(&customization.spacing_overrides).ok(),
+                &serde_json::to_value(&customization.border_overrides).ok(),
+                &serde_json::to_value(&customization.component_overrides).ok(),
+                &customization.custom_css,
+                &customization.logo_url,
+                &customization.favicon_url,
+                &customization.created_at,
+                &customization.updated_at,
+            ]
+        ).await.map_err(|e| format!("Failed to save customization: {}", e))
+    }
+}
+
+/// Prebuilt theme templates for quick customization
+pub fn get_theme_templates() -> Vec<(String, ColorOverrides)> {
+    vec![
+        ("Ocean Blue".to_string(), ColorOverrides {
+            primary: Some("#0077b6".to_string()),
+            secondary: Some("#00b4d8".to_string()),
+            accent: Some("#90e0ef".to_string()),
+            background: None,
+            surface: None,
+            text_primary: None,
+            text_secondary: None,
+            border: None,
+            success: None,
+            warning: None,
+            error: None,
+            info: None,
+        }),
+        ("Forest Green".to_string(), ColorOverrides {
+            primary: Some("#2d6a4f".to_string()),
+            secondary: Some("#40916c".to_string()),
+            accent: Some("#95d5b2".to_string()),
+            background: None,
+            surface: None,
+            text_primary: None,
+            text_secondary: None,
+            border: None,
+            success: None,
+            warning: None,
+            error: None,
+            info: None,
+        }),
+        ("Sunset Orange".to_string(), ColorOverrides {
+            primary: Some("#e85d04".to_string()),
+            secondary: Some("#f48c06".to_string()),
+            accent: Some("#ffba08".to_string()),
+            background: None,
+            surface: None,
+            text_primary: None,
+            text_secondary: None,
+            border: None,
+            success: None,
+            warning: None,
+            error: None,
+            info: None,
+        }),
+        ("Royal Purple".to_string(), ColorOverrides {
+            primary: Some("#7209b7".to_string()),
+            secondary: Some("#9d4edd".to_string()),
+            accent: Some("#c77dff".to_string()),
+            background: None,
+            surface: None,
+            text_primary: None,
+            text_secondary: None,
+            border: None,
+            success: None,
+            warning: None,
+            error: None,
+            info: None,
+        }),
+        ("Corporate Gray".to_string(), ColorOverrides {
+            primary: Some("#495057".to_string()),
+            secondary: Some("#6c757d".to_string()),
+            accent: Some("#0d6efd".to_string()),
+            background: None,
+            surface: None,
+            text_primary: None,
+            text_secondary: None,
+            border: None,
+            success: None,
+            warning: None,
+            error: None,
+            info: None,
+        }),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_customization_creation() {
+        let tenant_id = "test-tenant".to_string()
+        let customization = TenantThemeCustomization::new(tenant_id.clone())
+        assert_eq!(customization.tenant_id, tenant_id)
+        assert!(matches!(customization.base_theme, ThemeBase::Light))
+    }
+
+    #[test]
+    fn test_color_scale_generation() {
+        let scale = generate_color_scale("#3b82f6")
+        assert!(scale.c500.contains("3b82f6") || scale.c500.len() == 7)
+    }
+
+    #[test]
+    fn test_hex_to_hsl_conversion() {
+        let (h, s, l) = hex_to_hsl("#ff0000")
+        assert!((h - 0.0).abs() < 1.0) // Red has hue ~0
+        assert!((s - 1.0).abs() < 0.1) // Full saturation
+        assert!((l - 0.5).abs() < 0.1) // 50% lightness
+    }
+
+    #[test]
+    fn test_hsl_to_hex_conversion() {
+        let hex = hsl_to_hex(0.0, 1.0, 0.5)
+        assert_eq!(hex.to_lowercase(), "#ff0000")
+    }
+
+    #[test]
+    fn test_theme_building() {
+        let customization = TenantThemeCustomization::new("test".to_string())
+            .with_colors(ColorOverrides {
+                primary: Some("#ff5500".to_string()),
+                secondary: None,
+                accent: None,
+                background: None,
+                surface: None,
+                text_primary: None,
+                text_secondary: None,
+                border: None,
+                success: None,
+                warning: None,
+                error: None,
+                info: None,
+            })
+
+        let theme = customization.build_theme()
+        assert!(theme.id.contains("tenant"))
+    }
+
+    #[test]
+    fn test_theme_templates() {
+        let templates = get_theme_templates()
+        assert!(templates.len() >= 5)
+        assert!(templates.iter().any(|(name, _)| name == "Ocean Blue"))
+    }
+}

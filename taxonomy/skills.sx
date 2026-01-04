@@ -1,0 +1,593 @@
+/// Intelligo LMS - Skills Taxonomy
+///
+/// Provides skill definition, relationships, and proficiency tracking.
+
+module intelligo::taxonomy::skills
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock}
+use std::time::DateTime
+
+// =============================================================================
+// SKILL
+// =============================================================================
+
+/// A skill in the taxonomy
+pub type Skill {
+    id: String,
+    tenant_id: String,
+    name: String,
+    slug: String,
+    description: Option<String>,
+    category_id: Option<String>,
+    domain: SkillDomain,
+    skill_type: SkillType,
+    proficiency_levels: List<ProficiencyLevel>,
+    related_skills: List<SkillRelation>,
+    prerequisites: List<String>,
+    metadata: Map<String, String>,
+    external_ids: Map<String, String>,  // For mapping to external taxonomies (O*NET, ESCO, etc.)
+    is_verified: bool,
+    is_in_demand: bool,
+    demand_score: Option<f64>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Skill domain classification
+#[derive(Clone, PartialEq)]
+pub enum SkillDomain {
+    Technical,
+    Business,
+    Creative,
+    Interpersonal,
+    Cognitive,
+    Physical,
+    Leadership,
+    Research,
+    Custom(String)
+}
+
+impl SkillDomain {
+    pub fn to_string(&self) -> String {
+        match self {
+            SkillDomain::Technical => "technical".to_string(),
+            SkillDomain::Business => "business".to_string(),
+            SkillDomain::Creative => "creative".to_string(),
+            SkillDomain::Interpersonal => "interpersonal".to_string(),
+            SkillDomain::Cognitive => "cognitive".to_string(),
+            SkillDomain::Physical => "physical".to_string(),
+            SkillDomain::Leadership => "leadership".to_string(),
+            SkillDomain::Research => "research".to_string(),
+            SkillDomain::Custom(name) => name.clone()
+        }
+    }
+}
+
+/// Type of skill
+#[derive(Clone, PartialEq)]
+pub enum SkillType {
+    Hard,       // Technical, measurable skills
+    Soft,       // Interpersonal, behavioral skills
+    Hybrid,     // Combination of both
+    Domain,     // Domain-specific knowledge
+    Tool        // Tool or technology proficiency
+}
+
+/// Proficiency level for a skill
+#[derive(Clone)]
+pub type ProficiencyLevel {
+    level: i32,
+    name: String,
+    description: String,
+    requirements: List<String>,
+    assessment_criteria: List<String>
+}
+
+impl ProficiencyLevel {
+    pub fn beginner() -> ProficiencyLevel {
+        ProficiencyLevel {
+            level: 1,
+            name: "Beginner".to_string(),
+            description: "Basic understanding and limited practical experience".to_string(),
+            requirements: vec![
+                "Understands fundamental concepts".to_string(),
+                "Can perform simple tasks with guidance".to_string()
+            ],
+            assessment_criteria: vec![]
+        }
+    }
+
+    pub fn intermediate() -> ProficiencyLevel {
+        ProficiencyLevel {
+            level: 2,
+            name: "Intermediate".to_string(),
+            description: "Working knowledge and practical application".to_string(),
+            requirements: vec![
+                "Can work independently on standard tasks".to_string(),
+                "Understands common patterns and best practices".to_string()
+            ],
+            assessment_criteria: vec![]
+        }
+    }
+
+    pub fn advanced() -> ProficiencyLevel {
+        ProficiencyLevel {
+            level: 3,
+            name: "Advanced".to_string(),
+            description: "Deep expertise and ability to solve complex problems".to_string(),
+            requirements: vec![
+                "Can handle complex, non-standard situations".to_string(),
+                "Can mentor others and share knowledge".to_string()
+            ],
+            assessment_criteria: vec![]
+        }
+    }
+
+    pub fn expert() -> ProficiencyLevel {
+        ProficiencyLevel {
+            level: 4,
+            name: "Expert".to_string(),
+            description: "Industry-leading expertise and thought leadership".to_string(),
+            requirements: vec![
+                "Recognized authority in the field".to_string(),
+                "Can innovate and advance the state of the art".to_string(),
+                "Drives organizational strategy in this area".to_string()
+            ],
+            assessment_criteria: vec![]
+        }
+    }
+
+    pub fn default_levels() -> List<ProficiencyLevel> {
+        vec![
+            ProficiencyLevel::beginner(),
+            ProficiencyLevel::intermediate(),
+            ProficiencyLevel::advanced(),
+            ProficiencyLevel::expert()
+        ]
+    }
+}
+
+/// Relationship between skills
+#[derive(Clone)]
+pub type SkillRelation {
+    skill_id: String,
+    relation_type: SkillRelationType,
+    strength: f64  // 0.0 to 1.0
+}
+
+#[derive(Clone, PartialEq)]
+pub enum SkillRelationType {
+    Prerequisite,   // Must have this skill first
+    Related,        // Related but not required
+    Complementary,  // Works well together
+    Parent,         // Is a more general skill
+    Child,          // Is a more specific skill
+    Enables,        // Having this skill enables learning the other
+    AlternativeTo   // Can substitute for this skill
+}
+
+impl Skill {
+    pub fn new(tenant_id: &str, name: &str, domain: SkillDomain) -> Skill {
+        Skill {
+            id: generate_id("skill"),
+            tenant_id: tenant_id.to_string(),
+            name: name.to_string(),
+            slug: slugify(name),
+            description: None,
+            category_id: None,
+            domain,
+            skill_type: SkillType::Hard,
+            proficiency_levels: ProficiencyLevel::default_levels(),
+            related_skills: vec![],
+            prerequisites: vec![],
+            metadata: Map::new(),
+            external_ids: Map::new(),
+            is_verified: false,
+            is_in_demand: false,
+            demand_score: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+
+    pub fn with_type(mut self, skill_type: SkillType) -> Self {
+        self.skill_type = skill_type;
+        self
+    }
+
+    pub fn with_external_id(mut self, system: &str, id: &str) -> Self {
+        self.external_ids.insert(system.to_string(), id.to_string());
+        self
+    }
+
+    pub fn add_prerequisite(&mut self, skill_id: &str) {
+        self.prerequisites.push(skill_id.to_string());
+        self.related_skills.push(SkillRelation {
+            skill_id: skill_id.to_string(),
+            relation_type: SkillRelationType::Prerequisite,
+            strength: 1.0
+        });
+    }
+
+    pub fn add_related(&mut self, skill_id: &str, relation: SkillRelationType, strength: f64) {
+        self.related_skills.push(SkillRelation {
+            skill_id: skill_id.to_string(),
+            relation_type: relation,
+            strength
+        });
+    }
+}
+
+// =============================================================================
+// LEARNER SKILL PROFILE
+// =============================================================================
+
+/// A learner's skill profile
+pub type LearnerSkillProfile {
+    learner_id: String,
+    tenant_id: String,
+    skills: Map<String, LearnerSkill>,
+    skill_gaps: List<SkillGap>,
+    last_assessed: Option<DateTime>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// A skill held by a learner
+pub type LearnerSkill {
+    skill_id: String,
+    proficiency_level: i32,
+    confidence: f64,           // 0.0 to 1.0 - how confident we are in this assessment
+    evidence: List<SkillEvidence>,
+    acquired_at: Option<DateTime>,
+    last_demonstrated: Option<DateTime>,
+    decay_factor: f64,         // How much the skill decays over time
+    verified: bool
+}
+
+/// Evidence supporting a skill assessment
+#[derive(Clone)]
+pub type SkillEvidence {
+    evidence_type: EvidenceType,
+    source_id: String,
+    source_type: String,
+    score: Option<f64>,
+    weight: f64,
+    captured_at: DateTime
+}
+
+#[derive(Clone)]
+pub enum EvidenceType {
+    Assessment,
+    CourseCompletion,
+    Certification,
+    SelfAssessment,
+    PeerReview,
+    ManagerEndorsement,
+    ProjectWork,
+    ExternalBadge
+}
+
+/// A gap in skills
+pub type SkillGap {
+    skill_id: String,
+    current_level: i32,
+    target_level: i32,
+    priority: SkillGapPriority,
+    recommended_learning: List<String>,  // Course/activity IDs
+    estimated_time_to_close: Option<i32> // Hours
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SkillGapPriority {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+impl LearnerSkillProfile {
+    pub fn new(tenant_id: &str, learner_id: &str) -> LearnerSkillProfile {
+        LearnerSkillProfile {
+            learner_id: learner_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            skills: Map::new(),
+            skill_gaps: vec![],
+            last_assessed: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    /// Add or update a skill
+    pub fn set_skill(&mut self, skill_id: &str, level: i32, confidence: f64) {
+        let skill = LearnerSkill {
+            skill_id: skill_id.to_string(),
+            proficiency_level: level,
+            confidence,
+            evidence: vec![],
+            acquired_at: Some(DateTime::now()),
+            last_demonstrated: Some(DateTime::now()),
+            decay_factor: 0.1, // 10% decay per year if not used
+            verified: false
+        };
+        self.skills.insert(skill_id.to_string(), skill);
+        self.updated_at = DateTime::now();
+    }
+
+    /// Add evidence for a skill
+    pub fn add_evidence(&mut self, skill_id: &str, evidence: SkillEvidence) {
+        if let Some(skill) = self.skills.get_mut(skill_id) {
+            skill.evidence.push(evidence);
+            skill.last_demonstrated = Some(DateTime::now());
+        }
+    }
+
+    /// Get skill level
+    pub fn get_level(&self, skill_id: &str) -> Option<i32> {
+        self.skills.get(skill_id).map(|s| s.proficiency_level)
+    }
+
+    /// Check if has skill at minimum level
+    pub fn has_skill(&self, skill_id: &str, min_level: i32) -> bool {
+        self.skills.get(skill_id)
+            .map(|s| s.proficiency_level >= min_level)
+            .unwrap_or(false)
+    }
+
+    /// Calculate skill decay
+    pub fn apply_decay(&mut self, now: &DateTime) {
+        for skill in self.skills.values_mut() {
+            if let Some(last_used) = skill.last_demonstrated {
+                let days_since = (*now - last_used).as_secs() / 86400;
+                let years = days_since as f64 / 365.0;
+                let decay = years * skill.decay_factor;
+
+                // Reduce confidence based on decay
+                skill.confidence = (skill.confidence - decay).max(0.0);
+
+                // Potentially reduce level if confidence drops too low
+                if skill.confidence < 0.3 && skill.proficiency_level > 1 {
+                    skill.proficiency_level -= 1;
+                    skill.confidence = 0.6; // Reset confidence at new level
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// SKILL SERVICE
+// =============================================================================
+
+/// Actor for managing skills
+pub actor SkillService {
+    skills: Arc<RwLock<Map<String, Skill>>>,
+    profiles: Arc<RwLock<Map<String, LearnerSkillProfile>>>,
+    tenant_id: String
+}
+
+impl SkillService {
+    pub fn new(tenant_id: &str) -> SkillService {
+        SkillService {
+            skills: Arc::new(RwLock::new(Map::new())),
+            profiles: Arc::new(RwLock::new(Map::new())),
+            tenant_id: tenant_id.to_string()
+        }
+    }
+
+    /// Create a skill
+    pub async fn create_skill(&mut self, skill: Skill) -> Result<Skill, String> {
+        // Check for duplicate
+        if self.skills.read().unwrap().values().any(|s| s.slug == skill.slug) {
+            return Err(format!("Skill with slug '{}' already exists", skill.slug));
+        }
+
+        self.skills.write().unwrap().insert(skill.id.clone(), skill.clone());
+        Ok(skill)
+    }
+
+    /// Get skill by ID
+    pub fn get_skill(&self, id: &str) -> Option<Skill> {
+        self.skills.read().unwrap().get(id).cloned()
+    }
+
+    /// Search skills
+    pub fn search_skills(&self, query: &str) -> List<Skill> {
+        let query_lower = query.to_lowercase();
+        self.skills.read().unwrap()
+            .values()
+            .filter(|s| {
+                s.name.to_lowercase().contains(&query_lower) ||
+                s.description.as_ref().map(|d| d.to_lowercase().contains(&query_lower)).unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Get skills by domain
+    pub fn get_by_domain(&self, domain: &SkillDomain) -> List<Skill> {
+        self.skills.read().unwrap()
+            .values()
+            .filter(|s| &s.domain == domain)
+            .cloned()
+            .collect()
+    }
+
+    /// Get in-demand skills
+    pub fn get_in_demand_skills(&self, limit: usize) -> List<Skill> {
+        let mut skills: Vec<_> = self.skills.read().unwrap()
+            .values()
+            .filter(|s| s.is_in_demand)
+            .cloned()
+            .collect();
+
+        skills.sort_by(|a, b| {
+            b.demand_score.unwrap_or(0.0)
+                .partial_cmp(&a.demand_score.unwrap_or(0.0))
+                .unwrap()
+        });
+
+        skills.into_iter().take(limit).collect()
+    }
+
+    /// Get learner profile
+    pub fn get_profile(&self, learner_id: &str) -> Option<LearnerSkillProfile> {
+        self.profiles.read().unwrap().get(learner_id).cloned()
+    }
+
+    /// Get or create learner profile
+    pub fn get_or_create_profile(&mut self, learner_id: &str) -> LearnerSkillProfile {
+        if let Some(profile) = self.profiles.read().unwrap().get(learner_id).cloned() {
+            return profile;
+        }
+
+        let profile = LearnerSkillProfile::new(&self.tenant_id, learner_id);
+        self.profiles.write().unwrap().insert(learner_id.to_string(), profile.clone());
+        profile
+    }
+
+    /// Update learner skill
+    pub async fn update_learner_skill(
+        &mut self,
+        learner_id: &str,
+        skill_id: &str,
+        level: i32,
+        evidence: Option<SkillEvidence>
+    ) -> Result<LearnerSkillProfile, String> {
+        let mut profiles = self.profiles.write().unwrap();
+        let profile = profiles.entry(learner_id.to_string())
+            .or_insert_with(|| LearnerSkillProfile::new(&self.tenant_id, learner_id));
+
+        // Verify skill exists
+        if !self.skills.read().unwrap().contains_key(skill_id) {
+            return Err("Skill not found".to_string());
+        }
+
+        // Update or add skill
+        if let Some(skill) = profile.skills.get_mut(skill_id) {
+            skill.proficiency_level = level;
+            skill.last_demonstrated = Some(DateTime::now());
+            if let Some(ev) = evidence {
+                skill.evidence.push(ev);
+            }
+        } else {
+            let mut new_skill = LearnerSkill {
+                skill_id: skill_id.to_string(),
+                proficiency_level: level,
+                confidence: 0.7,
+                evidence: vec![],
+                acquired_at: Some(DateTime::now()),
+                last_demonstrated: Some(DateTime::now()),
+                decay_factor: 0.1,
+                verified: false
+            };
+            if let Some(ev) = evidence {
+                new_skill.evidence.push(ev);
+            }
+            profile.skills.insert(skill_id.to_string(), new_skill);
+        }
+
+        profile.updated_at = DateTime::now();
+        Ok(profile.clone())
+    }
+
+    /// Identify skill gaps
+    pub async fn identify_gaps(
+        &self,
+        learner_id: &str,
+        target_skills: List<(String, i32)>  // (skill_id, target_level)
+    ) -> List<SkillGap> {
+        let profiles = self.profiles.read().unwrap();
+        let profile = match profiles.get(learner_id) {
+            Some(p) => p,
+            None => return vec![]
+        };
+
+        let mut gaps = vec![];
+
+        for (skill_id, target_level) in target_skills {
+            let current_level = profile.get_level(&skill_id).unwrap_or(0);
+
+            if current_level < target_level {
+                let priority = if target_level - current_level >= 3 {
+                    SkillGapPriority::Critical
+                } else if target_level - current_level == 2 {
+                    SkillGapPriority::High
+                } else {
+                    SkillGapPriority::Medium
+                };
+
+                gaps.push(SkillGap {
+                    skill_id: skill_id.clone(),
+                    current_level,
+                    target_level,
+                    priority,
+                    recommended_learning: vec![], // Would be populated by learning path AI
+                    estimated_time_to_close: Some((target_level - current_level) * 20) // Rough estimate
+                });
+            }
+        }
+
+        gaps.sort_by(|a, b| b.priority.cmp(&a.priority));
+        gaps
+    }
+
+    /// Get skill prerequisites
+    pub fn get_prerequisites(&self, skill_id: &str) -> List<Skill> {
+        if let Some(skill) = self.skills.read().unwrap().get(skill_id) {
+            let skills = self.skills.read().unwrap();
+            skill.prerequisites.iter()
+                .filter_map(|id| skills.get(id).cloned())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Check if learner meets prerequisites for a skill
+    pub fn meets_prerequisites(&self, learner_id: &str, skill_id: &str, target_level: i32) -> bool {
+        let skill = match self.skills.read().unwrap().get(skill_id).cloned() {
+            Some(s) => s,
+            None => return false
+        };
+
+        let profile = match self.profiles.read().unwrap().get(learner_id).cloned() {
+            Some(p) => p,
+            None => return skill.prerequisites.is_empty()
+        };
+
+        skill.prerequisites.iter().all(|prereq_id| {
+            profile.has_skill(prereq_id, target_level - 1)
+        })
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id(prefix: &str) -> String {
+    use std::time::SystemTime;
+    format!("{}_{:x}", prefix, SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<&str>>()
+        .join("-")
+}

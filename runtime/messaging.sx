@@ -1,0 +1,635 @@
+/// Intelligo LMS - Messaging System
+///
+/// Provides message routing, patterns, and event-driven communication.
+
+module intelligo::runtime::messaging
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock, Mutex}
+use std::time::{Duration, Instant}
+
+// =============================================================================
+// MESSAGE BUS
+// =============================================================================
+
+/// Central message bus for event-driven communication
+pub type MessageBus {
+    handlers: Arc<RwLock<Map<String, List<MessageHandler>>>>,
+    middleware: Arc<RwLock<List<Box<dyn Middleware>>>>,
+    dead_letter_queue: Arc<Mutex<List<DeadLetter>>>
+}
+
+/// Handler for messages
+pub type MessageHandler {
+    id: String,
+    handler_fn: Box<dyn Fn(&BusMessage) -> Result<(), MessageError> + Send + Sync>,
+    filter: Option<Box<dyn Fn(&BusMessage) -> bool + Send + Sync>>
+}
+
+/// A message on the bus
+#[derive(Clone)]
+pub type BusMessage {
+    id: String,
+    topic: String,
+    payload: Arc<dyn std::any::Any + Send + Sync>,
+    headers: Map<String, String>,
+    timestamp: Instant,
+    reply_to: Option<String>,
+    correlation_id: Option<String>
+}
+
+impl BusMessage {
+    pub fn new<T: Send + Sync + 'static>(topic: &str, payload: T) -> BusMessage {
+        BusMessage {
+            id: generate_message_id(),
+            topic: topic.to_string(),
+            payload: Arc::new(payload),
+            headers: Map::new(),
+            timestamp: Instant::now(),
+            reply_to: None,
+            correlation_id: None
+        }
+    }
+
+    pub fn with_header(mut self, key: &str, value: &str) -> Self {
+        self.headers.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    pub fn with_reply_to(mut self, reply_to: &str) -> Self {
+        self.reply_to = Some(reply_to.to_string());
+        self
+    }
+
+    pub fn with_correlation(mut self, correlation_id: &str) -> Self {
+        self.correlation_id = Some(correlation_id.to_string());
+        self
+    }
+
+    pub fn payload<T: 'static>(&self) -> Option<&T> {
+        self.payload.downcast_ref::<T>()
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn header(&self, key: &str) -> Option<&String> {
+        self.headers.get(key)
+    }
+}
+
+/// Dead letter for failed messages
+pub type DeadLetter {
+    message: BusMessage,
+    error: MessageError,
+    timestamp: Instant,
+    retry_count: i32
+}
+
+impl MessageBus {
+    pub fn new() -> MessageBus {
+        MessageBus {
+            handlers: Arc::new(RwLock::new(Map::new())),
+            middleware: Arc::new(RwLock::new(vec![])),
+            dead_letter_queue: Arc::new(Mutex::new(vec![]))
+        }
+    }
+
+    /// Subscribe to a topic
+    pub fn subscribe<F>(&self, topic: &str, handler: F) -> String
+    where
+        F: Fn(&BusMessage) -> Result<(), MessageError> + Send + Sync + 'static
+    {
+        let handler_id = format!("handler-{}", generate_message_id());
+        let msg_handler = MessageHandler {
+            id: handler_id.clone(),
+            handler_fn: Box::new(handler),
+            filter: None
+        };
+
+        self.handlers.write().unwrap()
+            .entry(topic.to_string())
+            .or_insert_with(Vec::new)
+            .push(msg_handler);
+
+        handler_id
+    }
+
+    /// Subscribe with filter
+    pub fn subscribe_filtered<F, P>(&self, topic: &str, filter: P, handler: F) -> String
+    where
+        F: Fn(&BusMessage) -> Result<(), MessageError> + Send + Sync + 'static,
+        P: Fn(&BusMessage) -> bool + Send + Sync + 'static
+    {
+        let handler_id = format!("handler-{}", generate_message_id());
+        let msg_handler = MessageHandler {
+            id: handler_id.clone(),
+            handler_fn: Box::new(handler),
+            filter: Some(Box::new(filter))
+        };
+
+        self.handlers.write().unwrap()
+            .entry(topic.to_string())
+            .or_insert_with(Vec::new)
+            .push(msg_handler);
+
+        handler_id
+    }
+
+    /// Unsubscribe a handler
+    pub fn unsubscribe(&self, topic: &str, handler_id: &str) {
+        if let Some(handlers) = self.handlers.write().unwrap().get_mut(topic) {
+            handlers.retain(|h| h.id != handler_id);
+        }
+    }
+
+    /// Publish a message
+    pub fn publish(&self, message: BusMessage) -> Result<(), MessageError> {
+        // Run through middleware
+        let mut msg = message;
+        for middleware in self.middleware.read().unwrap().iter() {
+            msg = middleware.before_publish(msg)?;
+        }
+
+        // Find handlers
+        let handlers = self.handlers.read().unwrap();
+
+        // Exact match
+        if let Some(topic_handlers) = handlers.get(&msg.topic) {
+            for handler in topic_handlers {
+                // Check filter
+                if let Some(ref filter) = handler.filter {
+                    if !filter(&msg) {
+                        continue;
+                    }
+                }
+
+                if let Err(e) = (handler.handler_fn)(&msg) {
+                    // Handle error
+                    self.dead_letter_queue.lock().unwrap().push(DeadLetter {
+                        message: msg.clone(),
+                        error: e,
+                        timestamp: Instant::now(),
+                        retry_count: 0
+                    });
+                }
+            }
+        }
+
+        // Wildcard matching
+        for (pattern, topic_handlers) in handlers.iter() {
+            if pattern.ends_with(".*") {
+                let prefix = &pattern[..pattern.len() - 2];
+                if msg.topic.starts_with(prefix) {
+                    for handler in topic_handlers {
+                        if let Some(ref filter) = handler.filter {
+                            if !filter(&msg) {
+                                continue;
+                            }
+                        }
+                        let _ = (handler.handler_fn)(&msg);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add middleware
+    pub fn use_middleware<M: Middleware + 'static>(&self, middleware: M) {
+        self.middleware.write().unwrap().push(Box::new(middleware));
+    }
+
+    /// Get dead letters
+    pub fn dead_letters(&self) -> List<DeadLetter> {
+        self.dead_letter_queue.lock().unwrap().clone()
+    }
+
+    /// Retry dead letters
+    pub fn retry_dead_letters(&self) {
+        let mut dlq = self.dead_letter_queue.lock().unwrap();
+        let letters: Vec<_> = dlq.drain(..).collect();
+
+        for mut letter in letters {
+            letter.retry_count += 1;
+            if letter.retry_count <= 3 {
+                if let Err(_) = self.publish(letter.message.clone()) {
+                    dlq.push(letter);
+                }
+            }
+        }
+    }
+}
+
+/// Message error types
+#[derive(Clone, Debug)]
+pub enum MessageError {
+    DeliveryFailed(String),
+    HandlerError(String),
+    Timeout,
+    NoHandler,
+    InvalidMessage(String),
+    Rejected(String)
+}
+
+// =============================================================================
+// MIDDLEWARE
+// =============================================================================
+
+/// Middleware trait for message processing
+pub trait Middleware: Send + Sync {
+    fn before_publish(&self, message: BusMessage) -> Result<BusMessage, MessageError>;
+    fn after_publish(&self, message: &BusMessage, result: &Result<(), MessageError>) {}
+}
+
+/// Logging middleware
+pub struct LoggingMiddleware {
+    log_level: LogLevel
+}
+
+#[derive(Clone)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error
+}
+
+impl LoggingMiddleware {
+    pub fn new(level: LogLevel) -> LoggingMiddleware {
+        LoggingMiddleware { log_level: level }
+    }
+}
+
+impl Middleware for LoggingMiddleware {
+    fn before_publish(&self, message: BusMessage) -> Result<BusMessage, MessageError> {
+        println!("[MESSAGE] Publishing to topic: {}", message.topic);
+        Ok(message)
+    }
+
+    fn after_publish(&self, message: &BusMessage, result: &Result<(), MessageError>) {
+        match result {
+            Ok(_) => println!("[MESSAGE] Published successfully: {}", message.id),
+            Err(e) => println!("[MESSAGE] Publish failed: {:?}", e)
+        }
+    }
+}
+
+/// Validation middleware
+pub struct ValidationMiddleware {
+    validators: Map<String, Box<dyn Fn(&BusMessage) -> Result<(), String> + Send + Sync>>
+}
+
+impl ValidationMiddleware {
+    pub fn new() -> ValidationMiddleware {
+        ValidationMiddleware {
+            validators: Map::new()
+        }
+    }
+
+    pub fn add_validator<F>(&mut self, topic: &str, validator: F)
+    where
+        F: Fn(&BusMessage) -> Result<(), String> + Send + Sync + 'static
+    {
+        self.validators.insert(topic.to_string(), Box::new(validator));
+    }
+}
+
+impl Middleware for ValidationMiddleware {
+    fn before_publish(&self, message: BusMessage) -> Result<BusMessage, MessageError> {
+        if let Some(validator) = self.validators.get(&message.topic) {
+            validator(&message).map_err(|e| MessageError::InvalidMessage(e))?;
+        }
+        Ok(message)
+    }
+}
+
+// =============================================================================
+// REQUEST/RESPONSE PATTERN
+// =============================================================================
+
+/// Request-response handler
+pub type RequestResponse {
+    bus: Arc<MessageBus>,
+    pending: Arc<Mutex<Map<String, PendingRequest>>>
+}
+
+type PendingRequest {
+    tx: std::sync::mpsc::Sender<BusMessage>,
+    timeout: Duration,
+    created: Instant
+}
+
+impl RequestResponse {
+    pub fn new(bus: Arc<MessageBus>) -> RequestResponse {
+        let rr = RequestResponse {
+            bus: bus.clone(),
+            pending: Arc::new(Mutex::new(Map::new()))
+        };
+
+        // Subscribe to response topic
+        let pending = rr.pending.clone();
+        bus.subscribe("responses.*", move |msg| {
+            if let Some(correlation_id) = &msg.correlation_id {
+                if let Some(request) = pending.lock().unwrap().remove(correlation_id) {
+                    let _ = request.tx.send(msg.clone());
+                }
+            }
+            Ok(())
+        });
+
+        rr
+    }
+
+    /// Send a request and wait for response
+    pub fn request<T: Send + Sync + 'static, R: 'static>(
+        &self,
+        topic: &str,
+        payload: T,
+        timeout: Duration
+    ) -> Result<R, MessageError> {
+        let correlation_id = generate_message_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Register pending request
+        self.pending.lock().unwrap().insert(
+            correlation_id.clone(),
+            PendingRequest {
+                tx,
+                timeout,
+                created: Instant::now()
+            }
+        );
+
+        // Send request
+        let message = BusMessage::new(topic, payload)
+            .with_correlation(&correlation_id)
+            .with_reply_to(&format!("responses.{}", correlation_id));
+
+        self.bus.publish(message)?;
+
+        // Wait for response
+        match rx.recv_timeout(timeout) {
+            Ok(response) => {
+                if let Some(value) = response.payload::<R>() {
+                    Ok(value.clone())
+                } else {
+                    Err(MessageError::InvalidMessage("Response type mismatch".to_string()))
+                }
+            }
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&correlation_id);
+                Err(MessageError::Timeout)
+            }
+        }
+    }
+
+    /// Reply to a request
+    pub fn reply<T: Send + Sync + 'static>(&self, request: &BusMessage, payload: T) -> Result<(), MessageError> {
+        if let Some(reply_to) = &request.reply_to {
+            let response = BusMessage::new(reply_to, payload)
+                .with_correlation(request.correlation_id.as_ref().unwrap_or(&"".to_string()));
+            self.bus.publish(response)
+        } else {
+            Err(MessageError::InvalidMessage("No reply_to in request".to_string()))
+        }
+    }
+}
+
+// =============================================================================
+// EVENT SOURCING
+// =============================================================================
+
+/// Event store for event sourcing
+pub type EventStore {
+    events: Arc<RwLock<Map<String, List<StoredEvent>>>>,
+    subscribers: Arc<RwLock<List<Box<dyn Fn(&StoredEvent) + Send + Sync>>>>
+}
+
+/// A stored event
+#[derive(Clone)]
+pub type StoredEvent {
+    id: String,
+    aggregate_id: String,
+    aggregate_type: String,
+    event_type: String,
+    payload: String, // JSON serialized
+    version: i64,
+    timestamp: Instant,
+    metadata: Map<String, String>
+}
+
+impl EventStore {
+    pub fn new() -> EventStore {
+        EventStore {
+            events: Arc::new(RwLock::new(Map::new())),
+            subscribers: Arc::new(RwLock::new(vec![]))
+        }
+    }
+
+    /// Append an event
+    pub fn append(&self, event: StoredEvent) -> Result<(), EventStoreError> {
+        let mut events = self.events.write().unwrap();
+        let stream_id = format!("{}:{}", event.aggregate_type, event.aggregate_id);
+
+        let stream = events.entry(stream_id).or_insert_with(Vec::new);
+
+        // Check version
+        let expected_version = event.version;
+        let current_version = stream.last().map(|e| e.version).unwrap_or(0);
+
+        if expected_version != current_version + 1 {
+            return Err(EventStoreError::ConcurrencyConflict {
+                expected: expected_version,
+                actual: current_version
+            });
+        }
+
+        stream.push(event.clone());
+
+        // Notify subscribers
+        for subscriber in self.subscribers.read().unwrap().iter() {
+            subscriber(&event);
+        }
+
+        Ok(())
+    }
+
+    /// Get events for an aggregate
+    pub fn get_events(&self, aggregate_type: &str, aggregate_id: &str) -> List<StoredEvent> {
+        let stream_id = format!("{}:{}", aggregate_type, aggregate_id);
+        self.events.read().unwrap()
+            .get(&stream_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get events from version
+    pub fn get_events_from(&self, aggregate_type: &str, aggregate_id: &str, from_version: i64) -> List<StoredEvent> {
+        self.get_events(aggregate_type, aggregate_id)
+            .into_iter()
+            .filter(|e| e.version >= from_version)
+            .collect()
+    }
+
+    /// Subscribe to events
+    pub fn subscribe<F>(&self, handler: F)
+    where
+        F: Fn(&StoredEvent) + Send + Sync + 'static
+    {
+        self.subscribers.write().unwrap().push(Box::new(handler));
+    }
+}
+
+/// Event store errors
+#[derive(Clone, Debug)]
+pub enum EventStoreError {
+    ConcurrencyConflict { expected: i64, actual: i64 },
+    NotFound(String),
+    SerializationError(String)
+}
+
+// =============================================================================
+// SAGA PATTERN
+// =============================================================================
+
+/// Saga for managing distributed transactions
+pub type Saga {
+    id: String,
+    steps: List<SagaStep>,
+    current_step: Arc<Mutex<usize>>,
+    state: Arc<RwLock<SagaState>>,
+    data: Arc<RwLock<Map<String, Dynamic>>>
+}
+
+/// A step in a saga
+pub type SagaStep {
+    name: String,
+    execute: Box<dyn Fn(&Map<String, Dynamic>) -> Result<(), SagaError> + Send + Sync>,
+    compensate: Box<dyn Fn(&Map<String, Dynamic>) -> Result<(), SagaError> + Send + Sync>
+}
+
+/// Saga state
+#[derive(Clone, Debug)]
+pub enum SagaState {
+    Pending,
+    Running,
+    Completed,
+    Failed(String),
+    Compensating,
+    Compensated
+}
+
+impl Saga {
+    pub fn new(id: &str) -> Saga {
+        Saga {
+            id: id.to_string(),
+            steps: vec![],
+            current_step: Arc::new(Mutex::new(0)),
+            state: Arc::new(RwLock::new(SagaState::Pending)),
+            data: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    /// Add a step to the saga
+    pub fn step<E, C>(mut self, name: &str, execute: E, compensate: C) -> Self
+    where
+        E: Fn(&Map<String, Dynamic>) -> Result<(), SagaError> + Send + Sync + 'static,
+        C: Fn(&Map<String, Dynamic>) -> Result<(), SagaError> + Send + Sync + 'static
+    {
+        self.steps.push(SagaStep {
+            name: name.to_string(),
+            execute: Box::new(execute),
+            compensate: Box::new(compensate)
+        });
+        self
+    }
+
+    /// Set initial data
+    pub fn with_data(self, key: &str, value: Dynamic) -> Self {
+        self.data.write().unwrap().insert(key.to_string(), value);
+        self
+    }
+
+    /// Execute the saga
+    pub fn execute(&self) -> Result<(), SagaError> {
+        *self.state.write().unwrap() = SagaState::Running;
+        let data = self.data.read().unwrap().clone();
+
+        for (i, step) in self.steps.iter().enumerate() {
+            *self.current_step.lock().unwrap() = i;
+
+            if let Err(e) = (step.execute)(&data) {
+                *self.state.write().unwrap() = SagaState::Failed(e.to_string());
+                self.compensate()?;
+                return Err(e);
+            }
+        }
+
+        *self.state.write().unwrap() = SagaState::Completed;
+        Ok(())
+    }
+
+    /// Compensate (rollback) the saga
+    fn compensate(&self) -> Result<(), SagaError> {
+        *self.state.write().unwrap() = SagaState::Compensating;
+        let data = self.data.read().unwrap().clone();
+        let current = *self.current_step.lock().unwrap();
+
+        // Compensate in reverse order
+        for i in (0..=current).rev() {
+            let step = &self.steps[i];
+            if let Err(e) = (step.compensate)(&data) {
+                // Log but continue compensation
+                eprintln!("Compensation failed for step {}: {:?}", step.name, e);
+            }
+        }
+
+        *self.state.write().unwrap() = SagaState::Compensated;
+        Ok(())
+    }
+
+    /// Get current state
+    pub fn state(&self) -> SagaState {
+        self.state.read().unwrap().clone()
+    }
+}
+
+/// Saga error types
+#[derive(Clone, Debug)]
+pub enum SagaError {
+    StepFailed(String),
+    CompensationFailed(String),
+    Timeout,
+    InvalidState(String)
+}
+
+impl std::fmt::Display for SagaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            SagaError::StepFailed(msg) => write!(f, "Step failed: {}", msg),
+            SagaError::CompensationFailed(msg) => write!(f, "Compensation failed: {}", msg),
+            SagaError::Timeout => write!(f, "Saga timeout"),
+            SagaError::InvalidState(msg) => write!(f, "Invalid state: {}", msg)
+        }
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+/// Generate a unique message ID
+fn generate_message_id() -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:x}", nanos)
+}
+
+/// Dynamic type alias
+type Dynamic = Box<dyn std::any::Any + Send + Sync>;

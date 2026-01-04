@@ -1,0 +1,941 @@
+/// Intelligo LMS - Search System
+///
+/// Full-text search with indexing, facets, and suggestions.
+
+module intelligo::core::search
+
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Search Service
+// ============================================================================
+
+/// Central search service for full-text search across all entities
+pub actor SearchService {
+    tenant_id: String,
+    index: SearchIndex,
+    config: SearchConfig,
+    analyzer: TextAnalyzer,
+
+    pub fn new(tenant_id: &str, config: SearchConfig) -> Self {
+        SearchService {
+            tenant_id: tenant_id.to_string(),
+            index: SearchIndex::new(&config),
+            config,
+            analyzer: TextAnalyzer::new()
+        }
+    }
+
+    // ========================================================================
+    // Search Operations
+    // ========================================================================
+
+    /// Perform a search
+    pub fn search(self, query: SearchQuery) -> Result<SearchResults, SearchError> {
+        // Parse query
+        let parsed = self.parse_query(&query.query)?;
+
+        // Build search request
+        let request = SearchRequest {
+            tenant_id: self.tenant_id.clone(),
+            query: parsed,
+            entity_types: query.entity_types,
+            filters: query.filters,
+            facets: query.facets,
+            sort: query.sort,
+            page: query.page.unwrap_or(1),
+            page_size: query.page_size.unwrap_or(20),
+            highlight: query.highlight.unwrap_or(true)
+        };
+
+        // Execute search
+        let results = self.index.search(&request)?;
+
+        Ok(results)
+    }
+
+    /// Quick search across all entity types
+    pub fn quick_search(self, query: &str, limit: Option<i32>) -> Result<QuickSearchResults, SearchError> {
+        let limit = limit.unwrap_or(10);
+
+        // Search each entity type
+        let mut results = QuickSearchResults::new();
+
+        for entity_type in &["course", "user", "lesson", "assessment"] {
+            let search_query = SearchQuery {
+                query: query.to_string(),
+                entity_types: Some(vec![entity_type.to_string()]),
+                filters: None,
+                facets: None,
+                sort: None,
+                page: Some(1),
+                page_size: Some(limit),
+                highlight: Some(true)
+            };
+
+            if let Ok(search_results) = self.search(search_query) {
+                results.add_category(entity_type, search_results.hits);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search with autocomplete suggestions
+    pub fn autocomplete(self, prefix: &str, entity_type: Option<String>) -> Result<Vec<Suggestion>, SearchError> {
+        let request = AutocompleteRequest {
+            tenant_id: self.tenant_id.clone(),
+            prefix: prefix.to_string(),
+            entity_type,
+            limit: 10
+        };
+
+        self.index.autocomplete(&request)
+    }
+
+    /// Get search suggestions (did you mean)
+    pub fn suggest(self, query: &str) -> Result<Vec<String>, SearchError> {
+        self.index.suggest(&self.tenant_id, query)
+    }
+
+    // ========================================================================
+    // Indexing Operations
+    // ========================================================================
+
+    /// Index a document
+    pub fn index_document(mut self, doc: IndexDocument) -> Result<(), SearchError> {
+        // Validate document
+        self.validate_document(&doc)?;
+
+        // Analyze text fields
+        let analyzed = self.analyze_document(&doc);
+
+        // Add to index
+        self.index.add(&self.tenant_id, &analyzed)?;
+
+        Ok(())
+    }
+
+    /// Index multiple documents
+    pub fn index_documents(mut self, docs: Vec<IndexDocument>) -> Result<IndexingResults, SearchError> {
+        let mut results = IndexingResults::new();
+
+        for doc in docs {
+            match self.index_document(doc.clone()) {
+                Ok(_) => results.add_success(doc.id),
+                Err(e) => results.add_failure(doc.id, e.to_string())
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Update a document
+    pub fn update_document(mut self, doc: IndexDocument) -> Result<(), SearchError> {
+        self.index.update(&self.tenant_id, &self.analyze_document(&doc))?;
+        Ok(())
+    }
+
+    /// Delete a document
+    pub fn delete_document(mut self, entity_type: &str, id: &str) -> Result<(), SearchError> {
+        self.index.delete(&self.tenant_id, entity_type, id)?;
+        Ok(())
+    }
+
+    /// Delete all documents of a type
+    pub fn delete_by_type(mut self, entity_type: &str) -> Result<i64, SearchError> {
+        self.index.delete_by_type(&self.tenant_id, entity_type)
+    }
+
+    /// Reindex all documents of a type
+    pub fn reindex(mut self, entity_type: &str) -> Result<ReindexResults, SearchError> {
+        // Get all documents from database
+        let docs = self.fetch_documents_for_reindex(entity_type)?;
+
+        // Clear existing index
+        self.delete_by_type(entity_type)?;
+
+        // Index all documents
+        let results = self.index_documents(docs)?;
+
+        Ok(ReindexResults {
+            entity_type: entity_type.to_string(),
+            total: results.total,
+            indexed: results.successful,
+            failed: results.failed
+        })
+    }
+
+    // ========================================================================
+    // Faceted Search
+    // ========================================================================
+
+    /// Get available facets for an entity type
+    pub fn get_facets(self, entity_type: &str) -> Vec<FacetDefinition> {
+        match entity_type {
+            "course" => vec![
+                FacetDefinition::new("category", "Category", FacetType::Terms),
+                FacetDefinition::new("status", "Status", FacetType::Terms),
+                FacetDefinition::new("difficulty", "Difficulty", FacetType::Terms),
+                FacetDefinition::new("duration", "Duration", FacetType::Range),
+                FacetDefinition::new("rating", "Rating", FacetType::Range)
+            ],
+            "user" => vec![
+                FacetDefinition::new("role", "Role", FacetType::Terms),
+                FacetDefinition::new("status", "Status", FacetType::Terms),
+                FacetDefinition::new("group", "Group", FacetType::Terms)
+            ],
+            "lesson" => vec![
+                FacetDefinition::new("content_type", "Content Type", FacetType::Terms),
+                FacetDefinition::new("duration", "Duration", FacetType::Range)
+            ],
+            _ => vec![]
+        }
+    }
+
+    // ========================================================================
+    // Saved Searches
+    // ========================================================================
+
+    /// Save a search
+    pub fn save_search(self, user_id: &str, saved: SavedSearch) -> Result<SavedSearch, SearchError> {
+        // Saved searches are stored in the database via a repository
+        // For now, return the saved search as-is (would normally persist)
+        Ok(saved)
+    }
+
+    /// Get user's saved searches
+    pub fn get_saved_searches(self, user_id: &str) -> Result<Vec<SavedSearch>, SearchError> {
+        // Would query database for user's saved searches
+        Ok(vec![])
+    }
+
+    /// Delete a saved search
+    pub fn delete_saved_search(self, user_id: &str, search_id: &str) -> Result<(), SearchError> {
+        // Would delete from database
+        Ok(())
+    }
+
+    // ========================================================================
+    // Search Analytics
+    // ========================================================================
+
+    /// Record search for analytics
+    pub fn record_search(self, query: &str, results_count: i32, user_id: Option<String>) {
+        // Would store in analytics database/event stream
+        // Fire-and-forget operation
+    }
+
+    /// Get popular searches
+    pub fn get_popular_searches(self, limit: Option<i32>) -> Result<Vec<PopularSearch>, SearchError> {
+        // Would query analytics aggregation
+        let limit = limit.unwrap_or(10);
+        Ok(vec![])
+    }
+
+    /// Get search analytics
+    pub fn get_analytics(self, query: AnalyticsQuery) -> Result<SearchAnalytics, SearchError> {
+        // Would query analytics database
+        Ok(SearchAnalytics {
+            total_searches: 0,
+            unique_queries: 0,
+            average_results: 0.0,
+            zero_result_rate: 0.0,
+            top_queries: vec![],
+            search_volume: vec![],
+        })
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn parse_query(self, query: &str) -> Result<ParsedQuery, SearchError> {
+        let mut parsed = ParsedQuery {
+            terms: vec![],
+            phrases: vec![],
+            required: vec![],
+            excluded: vec![],
+            field_queries: vec![]
+        };
+
+        let mut current_term = String::new();
+        let mut in_phrase = false;
+        let mut modifier = TermModifier::Optional;
+
+        for ch in query.chars() {
+            match ch {
+                '"' => {
+                    if in_phrase {
+                        parsed.phrases.push(current_term.clone());
+                        current_term.clear();
+                    }
+                    in_phrase = !in_phrase;
+                }
+                '+' if !in_phrase => {
+                    modifier = TermModifier::Required;
+                }
+                '-' if !in_phrase => {
+                    modifier = TermModifier::Excluded;
+                }
+                ' ' if !in_phrase => {
+                    if !current_term.is_empty() {
+                        match modifier {
+                            TermModifier::Required => parsed.required.push(current_term.clone()),
+                            TermModifier::Excluded => parsed.excluded.push(current_term.clone()),
+                            TermModifier::Optional => parsed.terms.push(current_term.clone())
+                        }
+                        current_term.clear();
+                        modifier = TermModifier::Optional;
+                    }
+                }
+                ':' if !in_phrase => {
+                    // Field query (field:value)
+                    let field = current_term.clone();
+                    current_term.clear();
+                    // Would continue parsing the value
+                }
+                _ => {
+                    current_term.push(ch);
+                }
+            }
+        }
+
+        // Handle remaining term
+        if !current_term.is_empty() {
+            match modifier {
+                TermModifier::Required => parsed.required.push(current_term),
+                TermModifier::Excluded => parsed.excluded.push(current_term),
+                TermModifier::Optional => parsed.terms.push(current_term)
+            }
+        }
+
+        Ok(parsed)
+    }
+
+    fn validate_document(self, doc: &IndexDocument) -> Result<(), SearchError> {
+        if doc.id.is_empty() {
+            return Err(SearchError::ValidationError("Document ID is required".to_string()));
+        }
+
+        if doc.entity_type.is_empty() {
+            return Err(SearchError::ValidationError("Entity type is required".to_string()));
+        }
+
+        Ok(())
+    }
+
+    fn analyze_document(self, doc: &IndexDocument) -> AnalyzedDocument {
+        let mut analyzed_fields = Map::new();
+
+        for (field, value) in &doc.fields {
+            let analyzed_value = self.analyzer.analyze(value);
+            analyzed_fields.insert(field.clone(), analyzed_value);
+        }
+
+        AnalyzedDocument {
+            id: doc.id.clone(),
+            entity_type: doc.entity_type.clone(),
+            fields: doc.fields.clone(),
+            analyzed_fields,
+            metadata: doc.metadata.clone()
+        }
+    }
+
+    fn fetch_documents_for_reindex(self, entity_type: &str) -> Result<Vec<IndexDocument>, SearchError> {
+        // Would fetch from database/repository based on entity type
+        // For now, return empty list
+        Ok(vec![])
+    }
+}
+
+// ============================================================================
+// Search Index
+// ============================================================================
+
+/// Search index abstraction
+pub actor SearchIndex {
+    backend: Box<dyn SearchBackend>,
+    config: SearchConfig,
+
+    pub fn new(config: &SearchConfig) -> Self {
+        let backend: Box<dyn SearchBackend> = match &config.backend {
+            SearchBackend::InMemory => Box::new(InMemorySearchBackend::new()),
+            SearchBackend::Elasticsearch(cfg) => Box::new(ElasticsearchBackend::new(cfg)),
+            SearchBackend::OpenSearch(cfg) => Box::new(OpenSearchBackend::new(cfg)),
+            SearchBackend::Meilisearch(cfg) => Box::new(MeilisearchBackend::new(cfg))
+        };
+
+        SearchIndex {
+            backend,
+            config: config.clone()
+        }
+    }
+
+    pub fn search(self, request: &SearchRequest) -> Result<SearchResults, SearchError> {
+        self.backend.search(request)
+    }
+
+    pub fn autocomplete(self, request: &AutocompleteRequest) -> Result<Vec<Suggestion>, SearchError> {
+        self.backend.autocomplete(request)
+    }
+
+    pub fn suggest(self, tenant_id: &str, query: &str) -> Result<Vec<String>, SearchError> {
+        self.backend.suggest(tenant_id, query)
+    }
+
+    pub fn add(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        self.backend.add(tenant_id, doc)
+    }
+
+    pub fn update(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        self.backend.update(tenant_id, doc)
+    }
+
+    pub fn delete(self, tenant_id: &str, entity_type: &str, id: &str) -> Result<(), SearchError> {
+        self.backend.delete(tenant_id, entity_type, id)
+    }
+
+    pub fn delete_by_type(self, tenant_id: &str, entity_type: &str) -> Result<i64, SearchError> {
+        self.backend.delete_by_type(tenant_id, entity_type)
+    }
+}
+
+/// Search backend trait
+pub trait SearchBackend {
+    fn search(self, request: &SearchRequest) -> Result<SearchResults, SearchError>;
+    fn autocomplete(self, request: &AutocompleteRequest) -> Result<Vec<Suggestion>, SearchError>;
+    fn suggest(self, tenant_id: &str, query: &str) -> Result<Vec<String>, SearchError>;
+    fn add(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError>;
+    fn update(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError>;
+    fn delete(self, tenant_id: &str, entity_type: &str, id: &str) -> Result<(), SearchError>;
+    fn delete_by_type(self, tenant_id: &str, entity_type: &str) -> Result<i64, SearchError>;
+}
+
+/// In-memory search backend (for development/testing)
+pub actor InMemorySearchBackend {
+    documents: Map<String, Vec<AnalyzedDocument>>,
+
+    pub fn new() -> Self {
+        InMemorySearchBackend { documents: Map::new() }
+    }
+}
+
+impl SearchBackend for InMemorySearchBackend {
+    fn search(self, request: &SearchRequest) -> Result<SearchResults, SearchError> {
+        let key = format!("{}:{}", request.tenant_id, request.query.terms.join(" "));
+        let docs = self.documents.get(&request.tenant_id).unwrap_or(&vec![]);
+
+        let mut hits = vec![];
+        for doc in docs {
+            // Simple text matching
+            let matches = request.query.terms.iter().any(|term| {
+                doc.analyzed_fields.values().any(|v| v.contains(term))
+            });
+
+            if matches {
+                // Apply entity type filter
+                if let Some(ref types) = request.entity_types {
+                    if !types.contains(&doc.entity_type) {
+                        continue;
+                    }
+                }
+
+                hits.push(SearchHit {
+                    id: doc.id.clone(),
+                    entity_type: doc.entity_type.clone(),
+                    score: 1.0,
+                    fields: doc.fields.clone(),
+                    highlights: Map::new()
+                });
+            }
+        }
+
+        let total = hits.len() as i64;
+        let start = ((request.page - 1) * request.page_size) as usize;
+        let end = (request.page * request.page_size) as usize;
+        let page_hits = hits.into_iter().skip(start).take(end - start).collect();
+
+        Ok(SearchResults {
+            hits: page_hits,
+            total,
+            page: request.page,
+            page_size: request.page_size,
+            facets: Map::new(),
+            suggestions: vec![]
+        })
+    }
+
+    fn autocomplete(self, request: &AutocompleteRequest) -> Result<Vec<Suggestion>, SearchError> {
+        Ok(vec![])
+    }
+
+    fn suggest(self, tenant_id: &str, query: &str) -> Result<Vec<String>, SearchError> {
+        Ok(vec![])
+    }
+
+    fn add(mut self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        let docs = self.documents.entry(tenant_id.to_string()).or_insert(vec![]);
+        docs.push(doc.clone());
+        Ok(())
+    }
+
+    fn update(mut self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        self.delete(tenant_id, &doc.entity_type, &doc.id)?;
+        self.add(tenant_id, doc)
+    }
+
+    fn delete(mut self, tenant_id: &str, entity_type: &str, id: &str) -> Result<(), SearchError> {
+        if let Some(docs) = self.documents.get_mut(tenant_id) {
+            docs.retain(|d| !(d.entity_type == entity_type && d.id == id));
+        }
+        Ok(())
+    }
+
+    fn delete_by_type(mut self, tenant_id: &str, entity_type: &str) -> Result<i64, SearchError> {
+        let count = if let Some(docs) = self.documents.get_mut(tenant_id) {
+            let before = docs.len();
+            docs.retain(|d| d.entity_type != entity_type);
+            (before - docs.len()) as i64
+        } else {
+            0
+        };
+        Ok(count)
+    }
+}
+
+/// Elasticsearch backend
+pub actor ElasticsearchBackend {
+    config: ElasticsearchConfig,
+    client: ElasticsearchClient,
+
+    pub fn new(config: &ElasticsearchConfig) -> Self {
+        ElasticsearchBackend {
+            config: config.clone(),
+            client: ElasticsearchClient::new(config)
+        }
+    }
+}
+
+impl SearchBackend for ElasticsearchBackend {
+    fn search(self, request: &SearchRequest) -> Result<SearchResults, SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented - requires HTTP client integration".to_string() })
+    }
+
+    fn autocomplete(self, request: &AutocompleteRequest) -> Result<Vec<Suggestion>, SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented".to_string() })
+    }
+
+    fn suggest(self, tenant_id: &str, query: &str) -> Result<Vec<String>, SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented".to_string() })
+    }
+
+    fn add(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented".to_string() })
+    }
+
+    fn update(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented".to_string() })
+    }
+
+    fn delete(self, tenant_id: &str, entity_type: &str, id: &str) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented".to_string() })
+    }
+
+    fn delete_by_type(self, tenant_id: &str, entity_type: &str) -> Result<i64, SearchError> {
+        Err(SearchError::BackendError { message: "Elasticsearch backend not yet implemented".to_string() })
+    }
+}
+
+/// OpenSearch backend
+pub actor OpenSearchBackend {
+    config: OpenSearchConfig,
+
+    pub fn new(config: &OpenSearchConfig) -> Self {
+        OpenSearchBackend { config: config.clone() }
+    }
+}
+
+impl SearchBackend for OpenSearchBackend {
+    fn search(self, request: &SearchRequest) -> Result<SearchResults, SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented - requires HTTP client integration".to_string() })
+    }
+
+    fn autocomplete(self, request: &AutocompleteRequest) -> Result<Vec<Suggestion>, SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented".to_string() })
+    }
+
+    fn suggest(self, tenant_id: &str, query: &str) -> Result<Vec<String>, SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented".to_string() })
+    }
+
+    fn add(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented".to_string() })
+    }
+
+    fn update(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented".to_string() })
+    }
+
+    fn delete(self, tenant_id: &str, entity_type: &str, id: &str) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented".to_string() })
+    }
+
+    fn delete_by_type(self, tenant_id: &str, entity_type: &str) -> Result<i64, SearchError> {
+        Err(SearchError::BackendError { message: "OpenSearch backend not yet implemented".to_string() })
+    }
+}
+
+/// Meilisearch backend
+pub actor MeilisearchBackend {
+    config: MeilisearchConfig,
+
+    pub fn new(config: &MeilisearchConfig) -> Self {
+        MeilisearchBackend { config: config.clone() }
+    }
+}
+
+impl SearchBackend for MeilisearchBackend {
+    fn search(self, request: &SearchRequest) -> Result<SearchResults, SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented - requires HTTP client integration".to_string() })
+    }
+
+    fn autocomplete(self, request: &AutocompleteRequest) -> Result<Vec<Suggestion>, SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented".to_string() })
+    }
+
+    fn suggest(self, tenant_id: &str, query: &str) -> Result<Vec<String>, SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented".to_string() })
+    }
+
+    fn add(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented".to_string() })
+    }
+
+    fn update(self, tenant_id: &str, doc: &AnalyzedDocument) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented".to_string() })
+    }
+
+    fn delete(self, tenant_id: &str, entity_type: &str, id: &str) -> Result<(), SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented".to_string() })
+    }
+
+    fn delete_by_type(self, tenant_id: &str, entity_type: &str) -> Result<i64, SearchError> {
+        Err(SearchError::BackendError { message: "Meilisearch backend not yet implemented".to_string() })
+    }
+}
+
+// ============================================================================
+// Text Analyzer
+// ============================================================================
+
+/// Text analyzer for search indexing
+pub type TextAnalyzer = type {}
+
+impl TextAnalyzer {
+    pub fn new() -> Self { TextAnalyzer {} }
+
+    pub fn analyze(self, text: &str) -> String {
+        text.to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect()
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Search query
+pub type SearchQuery = type {
+    query: String,
+    entity_types: Option<Vec<String>>,
+    filters: Option<Vec<SearchFilter>>,
+    facets: Option<Vec<String>>,
+    sort: Option<Vec<SortField>>,
+    page: Option<i32>,
+    page_size: Option<i32>,
+    highlight: Option<bool>
+}
+
+/// Search filter
+pub type SearchFilter = type {
+    field: String,
+    operator: FilterOperator,
+    value: Value
+}
+
+pub enum FilterOperator {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    LessThan,
+    GreaterThanOrEqual,
+    LessThanOrEqual,
+    In,
+    NotIn,
+    Contains,
+    StartsWith,
+    Range
+}
+
+/// Sort field
+pub type SortField = type {
+    field: String,
+    order: SortOrder
+}
+
+pub enum SortOrder {
+    Ascending,
+    Descending
+}
+
+/// Parsed query
+pub type ParsedQuery = type {
+    terms: Vec<String>,
+    phrases: Vec<String>,
+    required: Vec<String>,
+    excluded: Vec<String>,
+    field_queries: Vec<FieldQuery>
+}
+
+pub type FieldQuery = type {
+    field: String,
+    value: String
+}
+
+pub enum TermModifier {
+    Optional,
+    Required,
+    Excluded
+}
+
+/// Search request
+pub type SearchRequest = type {
+    tenant_id: String,
+    query: ParsedQuery,
+    entity_types: Option<Vec<String>>,
+    filters: Option<Vec<SearchFilter>>,
+    facets: Option<Vec<String>>,
+    sort: Option<Vec<SortField>>,
+    page: i32,
+    page_size: i32,
+    highlight: bool
+}
+
+/// Search results
+pub type SearchResults = type {
+    hits: Vec<SearchHit>,
+    total: i64,
+    page: i32,
+    page_size: i32,
+    facets: Map<String, Vec<FacetValue>>,
+    suggestions: Vec<String>
+}
+
+/// Search hit
+pub type SearchHit = type {
+    id: String,
+    entity_type: String,
+    score: f64,
+    fields: Map<String, String>,
+    highlights: Map<String, String>
+}
+
+/// Quick search results
+pub type QuickSearchResults = type {
+    categories: Map<String, Vec<SearchHit>>
+}
+
+impl QuickSearchResults {
+    pub fn new() -> Self { QuickSearchResults { categories: Map::new() } }
+
+    pub fn add_category(mut self, category: &str, hits: Vec<SearchHit>) {
+        self.categories.insert(category.to_string(), hits);
+    }
+}
+
+/// Autocomplete request
+pub type AutocompleteRequest = type {
+    tenant_id: String,
+    prefix: String,
+    entity_type: Option<String>,
+    limit: i32
+}
+
+/// Suggestion
+pub type Suggestion = type {
+    text: String,
+    entity_type: String,
+    id: Option<String>,
+    score: f64
+}
+
+/// Index document
+pub type IndexDocument = type {
+    id: String,
+    entity_type: String,
+    fields: Map<String, String>,
+    metadata: Map<String, Value>
+}
+
+/// Analyzed document
+pub type AnalyzedDocument = type {
+    id: String,
+    entity_type: String,
+    fields: Map<String, String>,
+    analyzed_fields: Map<String, String>,
+    metadata: Map<String, Value>
+}
+
+/// Indexing results
+pub type IndexingResults = type {
+    total: i32,
+    successful: i32,
+    failed: i32,
+    errors: Vec<IndexingError>
+}
+
+impl IndexingResults {
+    pub fn new() -> Self { IndexingResults { total: 0, successful: 0, failed: 0, errors: vec![] } }
+
+    pub fn add_success(mut self, id: String) {
+        self.total += 1;
+        self.successful += 1;
+    }
+
+    pub fn add_failure(mut self, id: String, error: String) {
+        self.total += 1;
+        self.failed += 1;
+        self.errors.push(IndexingError { id, error });
+    }
+}
+
+pub type IndexingError = type { id: String, error: String }
+
+/// Reindex results
+pub type ReindexResults = type {
+    entity_type: String,
+    total: i32,
+    indexed: i32,
+    failed: i32
+}
+
+/// Facet definition
+pub type FacetDefinition = type {
+    field: String,
+    label: String,
+    facet_type: FacetType
+}
+
+impl FacetDefinition {
+    pub fn new(field: &str, label: &str, facet_type: FacetType) -> Self {
+        FacetDefinition {
+            field: field.to_string(),
+            label: label.to_string(),
+            facet_type
+        }
+    }
+}
+
+pub enum FacetType {
+    Terms,
+    Range,
+    Date
+}
+
+/// Facet value
+pub type FacetValue = type {
+    value: String,
+    count: i64
+}
+
+/// Saved search
+pub type SavedSearch = type {
+    id: String,
+    name: String,
+    query: SearchQuery,
+    created_at: DateTime
+}
+
+/// Popular search
+pub type PopularSearch = type {
+    query: String,
+    count: i64
+}
+
+/// Search analytics
+pub type SearchAnalytics = type {
+    total_searches: i64,
+    unique_queries: i64,
+    avg_results: f64,
+    zero_result_queries: Vec<String>,
+    top_queries: Vec<PopularSearch>
+}
+
+pub type AnalyticsQuery = type {
+    from: Option<DateTime>,
+    to: Option<DateTime>
+}
+
+/// Search configuration
+pub type SearchConfig = type {
+    backend: SearchBackendType,
+    index_prefix: String,
+    default_page_size: i32,
+    max_page_size: i32
+}
+
+pub enum SearchBackendType {
+    InMemory,
+    Elasticsearch(ElasticsearchConfig),
+    OpenSearch(OpenSearchConfig),
+    Meilisearch(MeilisearchConfig)
+}
+
+pub type ElasticsearchConfig = type {
+    hosts: Vec<String>,
+    username: Option<String>,
+    password: Option<String>
+}
+
+pub type OpenSearchConfig = type {
+    hosts: Vec<String>,
+    username: Option<String>,
+    password: Option<String>
+}
+
+pub type MeilisearchConfig = type {
+    host: String,
+    api_key: Option<String>
+}
+
+pub type ElasticsearchClient = type { config: ElasticsearchConfig }
+impl ElasticsearchClient {
+    pub fn new(config: &ElasticsearchConfig) -> Self {
+        ElasticsearchClient { config: config.clone() }
+    }
+}
+
+/// Search error
+pub enum SearchError {
+    ValidationError(String),
+    QueryParseError(String),
+    IndexError(String),
+    BackendError(String),
+    NotFound(String)
+}
+
+impl SearchError {
+    pub fn to_string(self) -> String {
+        match self {
+            SearchError::ValidationError(m) => m,
+            SearchError::QueryParseError(m) => format!("Query parse error: {}", m),
+            SearchError::IndexError(m) => format!("Index error: {}", m),
+            SearchError::BackendError(m) => format!("Backend error: {}", m),
+            SearchError::NotFound(m) => format!("Not found: {}", m)
+        }
+    }
+}

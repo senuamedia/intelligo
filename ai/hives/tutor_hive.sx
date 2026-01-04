@@ -1,0 +1,1912 @@
+// =============================================================================
+// INTELLIGO LMS - Tutor Hive
+// =============================================================================
+// AI-powered tutoring chatbot system following CHAI patterns.
+// Provides question answering with RAG, concept explanation, practice problem
+// generation, study guide creation, and Socratic facilitation for guided
+// discovery learning.
+// =============================================================================
+
+module intelligo::ai::hives::tutor_hive
+
+use intelligo::core::types::*
+use simplex_inference::{Model, Prompt, EmbeddingModel}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::sync::{Arc, RwLock}
+
+// =============================================================================
+// Tutor Hive Types
+// =============================================================================
+
+type ConversationId = String
+type MessageId = String
+type TutorSessionId = String
+type ChunkId = String
+
+/// Tutor Hive Configuration
+pub struct TutorHiveConfig {
+    /// Default model for tutoring
+    default_model: ModelConfig,
+    /// Embedding model for RAG
+    embedding_model: EmbeddingModelConfig,
+    /// Maximum context window tokens
+    max_context_tokens: i32,
+    /// Number of chunks to retrieve for RAG
+    rag_top_k: i32,
+    /// Minimum similarity for chunk retrieval
+    rag_similarity_threshold: f64,
+    /// Session timeout
+    session_timeout: Duration,
+    /// Maximum conversation history to maintain
+    max_history_messages: i32,
+    /// Enable Socratic mode by default
+    default_socratic_mode: bool,
+    /// Maximum hints per problem
+    max_hints_per_problem: i32,
+}
+
+impl Default for TutorHiveConfig {
+    fn default() -> Self {
+        TutorHiveConfig {
+            default_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+                top_p: Some(0.9),
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            embedding_model: EmbeddingModelConfig {
+                provider: ModelProvider::OpenAI,
+                model_id: "text-embedding-3-large".to_string(),
+                dimensions: 1536,
+                input_cost_per_1k: 0.00013,
+            },
+            max_context_tokens: 8000,
+            rag_top_k: 5,
+            rag_similarity_threshold: 0.7,
+            session_timeout: Duration::hours(2),
+            max_history_messages: 20,
+            default_socratic_mode: false,
+            max_hints_per_problem: 3,
+        }
+    }
+}
+
+/// Model configuration
+pub struct ModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    temperature: f64,
+    max_tokens: i32,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    stop_sequences: List<String>,
+    input_cost_per_1k: f64,
+    output_cost_per_1k: f64,
+}
+
+/// Embedding model configuration
+pub struct EmbeddingModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    dimensions: i32,
+    input_cost_per_1k: f64,
+}
+
+/// Model provider
+pub enum ModelProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+    Local { endpoint: String },
+}
+
+// =============================================================================
+// Conversation Types
+// =============================================================================
+
+/// Tutor session containing conversation and context
+pub struct TutorSession {
+    id: TutorSessionId,
+    student_id: StudentId,
+    course_id: CourseId,
+    /// Active conversation
+    conversation: Conversation,
+    /// Current context from course materials
+    active_context: CourseContext,
+    /// Current mode
+    mode: TutorMode,
+    /// Session configuration
+    config: SessionConfig,
+    /// Session metrics
+    metrics: SessionMetrics,
+    /// Created timestamp
+    created_at: DateTime,
+    /// Last activity
+    last_activity: DateTime,
+}
+
+/// Conversation history
+pub struct Conversation {
+    id: ConversationId,
+    messages: List<Message>,
+    /// Current topic/focus
+    current_topic: Option<String>,
+    /// Questions asked in this conversation
+    questions_asked: i32,
+    /// Hints given in this conversation
+    hints_given: i32,
+}
+
+/// Chat message
+pub struct Message {
+    id: MessageId,
+    role: MessageRole,
+    content: String,
+    /// Metadata about the message
+    metadata: MessageMetadata,
+    /// Timestamp
+    timestamp: DateTime,
+}
+
+/// Message role
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+}
+
+/// Message metadata
+pub struct MessageMetadata {
+    /// Message type
+    message_type: MessageType,
+    /// Sources used (for RAG)
+    sources: List<SourceReference>,
+    /// Confidence in response
+    confidence: Option<f64>,
+    /// Was this a hint?
+    is_hint: bool,
+    /// Related learning objectives
+    related_objectives: List<LearningObjectiveId>,
+    /// Tokens used
+    tokens_used: i32,
+}
+
+/// Type of message
+pub enum MessageType {
+    Question,
+    Answer,
+    Explanation,
+    Hint,
+    FollowUp,
+    Clarification,
+    Encouragement,
+    Summary,
+    Practice,
+    Feedback,
+}
+
+/// Source reference for RAG
+pub struct SourceReference {
+    source_type: SourceType,
+    source_id: String,
+    title: String,
+    excerpt: String,
+    relevance_score: f64,
+}
+
+/// Source type
+pub enum SourceType {
+    Lesson,
+    Module,
+    TextContent,
+    Video,
+    Assessment,
+    External,
+}
+
+/// Tutor mode
+pub enum TutorMode {
+    /// Standard Q&A mode
+    Standard,
+    /// Socratic questioning mode
+    Socratic,
+    /// Practice problem mode
+    Practice { current_problem: Option<PracticeContext> },
+    /// Study guide creation mode
+    StudyGuide,
+    /// Concept deep-dive mode
+    DeepDive { concept: String },
+}
+
+/// Practice context
+pub struct PracticeContext {
+    problem: PracticeProblem,
+    hints_given: i32,
+    attempts: i32,
+    started_at: DateTime,
+}
+
+/// Session configuration
+pub struct SessionConfig {
+    /// Tutor persona
+    persona: TutorPersona,
+    /// Response style
+    response_style: ResponseStyle,
+    /// Maximum response length
+    max_response_length: ResponseLength,
+    /// Include sources in responses
+    include_sources: bool,
+    /// Allow direct answers or require discovery
+    allow_direct_answers: bool,
+    /// Difficulty adaptation
+    difficulty_level: SkillLevel,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig {
+            persona: TutorPersona::Friendly,
+            response_style: ResponseStyle::Balanced,
+            max_response_length: ResponseLength::Medium,
+            include_sources: true,
+            allow_direct_answers: true,
+            difficulty_level: SkillLevel::Intermediate,
+        }
+    }
+}
+
+/// Tutor persona
+pub enum TutorPersona {
+    /// Friendly and encouraging
+    Friendly,
+    /// Professional and formal
+    Professional,
+    /// Enthusiastic and energetic
+    Enthusiastic,
+    /// Patient and thorough
+    Patient,
+    /// Challenging and rigorous
+    Challenging,
+    /// Custom persona
+    Custom { description: String },
+}
+
+/// Response style
+pub enum ResponseStyle {
+    /// Brief and to the point
+    Concise,
+    /// Balanced detail
+    Balanced,
+    /// Detailed explanations
+    Detailed,
+    /// Step-by-step with examples
+    Thorough,
+}
+
+/// Response length
+pub enum ResponseLength {
+    Short,   // ~100 words
+    Medium,  // ~300 words
+    Long,    // ~500 words
+    Adaptive,
+}
+
+/// Course context for the tutor
+pub struct CourseContext {
+    course_id: CourseId,
+    course_title: String,
+    /// Current module context
+    current_module: Option<ModuleContext>,
+    /// Current lesson context
+    current_lesson: Option<LessonContext>,
+    /// Available content chunks for RAG
+    content_chunks: List<ContentChunk>,
+    /// Learning objectives
+    learning_objectives: List<LearningObjective>,
+    /// Student's progress
+    student_progress: Option<StudentProgress>,
+}
+
+/// Module context
+pub struct ModuleContext {
+    module_id: ModuleId,
+    title: String,
+    description: String,
+    lessons: List<LessonId>,
+}
+
+/// Lesson context
+pub struct LessonContext {
+    lesson_id: LessonId,
+    title: String,
+    content_summary: String,
+    key_concepts: List<String>,
+    vocabulary: List<VocabularyTerm>,
+}
+
+/// Vocabulary term
+pub struct VocabularyTerm {
+    term: String,
+    definition: String,
+}
+
+/// Content chunk for RAG
+pub struct ContentChunk {
+    id: ChunkId,
+    source_type: SourceType,
+    source_id: String,
+    source_title: String,
+    content: String,
+    embedding: Vec<f64>,
+    metadata: ChunkMetadata,
+}
+
+/// Chunk metadata
+pub struct ChunkMetadata {
+    module_id: Option<ModuleId>,
+    lesson_id: Option<LessonId>,
+    section: Option<String>,
+    page: Option<i32>,
+    timestamp: Option<f64>,
+}
+
+/// Learning objective
+pub struct LearningObjective {
+    id: LearningObjectiveId,
+    description: String,
+    bloom_level: BloomLevel,
+}
+
+/// Student progress
+pub struct StudentProgress {
+    completed_lessons: List<LessonId>,
+    completed_modules: List<ModuleId>,
+    assessment_scores: Map<AssessmentId, f32>,
+    mastery_levels: Map<LearningObjectiveId, f64>,
+    struggling_concepts: List<String>,
+}
+
+/// Session metrics
+pub struct SessionMetrics {
+    messages_exchanged: i32,
+    questions_answered: i32,
+    hints_provided: i32,
+    problems_attempted: i32,
+    problems_solved: i32,
+    concepts_explained: i32,
+    average_response_time_ms: i64,
+    total_tokens_used: i64,
+}
+
+// =============================================================================
+// Request/Response Types
+// =============================================================================
+
+/// Chat request
+pub struct ChatRequest {
+    session_id: TutorSessionId,
+    message: String,
+    /// Optional context override
+    context: Option<ChatContext>,
+}
+
+/// Chat context override
+pub struct ChatContext {
+    /// Focus on specific lesson
+    lesson_id: Option<LessonId>,
+    /// Focus on specific concept
+    concept: Option<String>,
+    /// Reference specific assessment
+    assessment_id: Option<AssessmentId>,
+}
+
+/// Chat response
+pub struct ChatResponse {
+    message: Message,
+    /// Suggested follow-up questions
+    suggested_followups: List<String>,
+    /// Related content suggestions
+    related_content: List<ContentSuggestion>,
+    /// Actions taken
+    actions: List<TutorAction>,
+}
+
+/// Content suggestion
+pub struct ContentSuggestion {
+    content_type: SourceType,
+    content_id: String,
+    title: String,
+    reason: String,
+}
+
+/// Tutor action
+pub enum TutorAction {
+    RetrievedContext { chunks: i32, sources: List<String> },
+    ProvidedHint { hint_number: i32 },
+    GeneratedPractice { problem_id: String },
+    ExplainedConcept { concept: String },
+    CreatedSummary,
+    SuggestedReview { topics: List<String> },
+    EscalatedToInstructor { reason: String },
+}
+
+// =============================================================================
+// Practice Problem Types
+// =============================================================================
+
+/// Practice problem
+pub struct PracticeProblem {
+    id: String,
+    problem_type: ProblemType,
+    question: String,
+    /// Hints available
+    hints: List<String>,
+    /// Solution
+    solution: ProblemSolution,
+    /// Difficulty
+    difficulty: SkillLevel,
+    /// Related objectives
+    objectives: List<LearningObjectiveId>,
+    /// Estimated time (minutes)
+    estimated_time: i32,
+}
+
+/// Problem type
+pub enum ProblemType {
+    /// Conceptual question
+    Conceptual,
+    /// Calculation/computation
+    Calculation,
+    /// Application/scenario
+    Application,
+    /// Analysis
+    Analysis,
+    /// Coding problem
+    Coding { language: String },
+    /// Essay/short answer
+    Essay,
+}
+
+/// Problem solution
+pub struct ProblemSolution {
+    /// The answer
+    answer: String,
+    /// Step-by-step solution
+    steps: List<SolutionStep>,
+    /// Common mistakes
+    common_mistakes: List<String>,
+    /// Key insights
+    key_insights: List<String>,
+}
+
+/// Solution step
+pub struct SolutionStep {
+    step_number: i32,
+    description: String,
+    explanation: String,
+}
+
+/// Practice session result
+pub struct PracticeResult {
+    problem_id: String,
+    solved: bool,
+    attempts: i32,
+    hints_used: i32,
+    time_spent: Duration,
+    student_solution: String,
+    feedback: String,
+}
+
+// =============================================================================
+// Study Guide Types
+// =============================================================================
+
+/// Study guide request
+pub struct StudyGuideRequest {
+    /// Topic or scope
+    topic: StudyGuideScope,
+    /// Focus areas
+    focus_areas: List<String>,
+    /// Time available for study (hours)
+    study_time_available: Option<f32>,
+    /// Include practice problems
+    include_practice: bool,
+    /// Study style preference
+    style: StudyGuideStyle,
+}
+
+/// Study guide scope
+pub enum StudyGuideScope {
+    Lesson { lesson_id: LessonId },
+    Module { module_id: ModuleId },
+    Course { course_id: CourseId },
+    Custom { topics: List<String> },
+    Assessment { assessment_id: AssessmentId },
+}
+
+/// Study guide style
+pub enum StudyGuideStyle {
+    /// Outline format
+    Outline,
+    /// Flashcard format
+    Flashcards,
+    /// Summary format
+    Summary,
+    /// Question-based
+    QuestionBased,
+    /// Mind map format
+    MindMap,
+}
+
+/// Generated study guide
+pub struct StudyGuide {
+    id: String,
+    title: String,
+    scope: StudyGuideScope,
+    sections: List<StudyGuideSection>,
+    key_terms: List<VocabularyTerm>,
+    review_questions: List<ReviewQuestion>,
+    practice_problems: List<PracticeProblem>,
+    estimated_study_time: i32,
+    created_at: DateTime,
+}
+
+/// Study guide section
+pub struct StudyGuideSection {
+    title: String,
+    summary: String,
+    key_points: List<String>,
+    examples: List<String>,
+    common_pitfalls: List<String>,
+    related_objectives: List<LearningObjectiveId>,
+}
+
+/// Review question
+pub struct ReviewQuestion {
+    question: String,
+    answer_guidance: String,
+    difficulty: SkillLevel,
+}
+
+// =============================================================================
+// Tutor Hive Specialists
+// =============================================================================
+
+/// Question Answerer Specialist with RAG
+pub struct QuestionAnswerer {
+    config: ModelConfig,
+    embedding_config: EmbeddingModelConfig,
+    system_prompt: String,
+}
+
+impl QuestionAnswerer {
+    pub fn new(config: ModelConfig, embedding_config: EmbeddingModelConfig) -> Self {
+        QuestionAnswerer {
+            config,
+            embedding_config,
+            system_prompt: r#"You are a knowledgeable and helpful AI tutor for an educational course. Your role is to:
+
+1. Answer student questions accurately based on course materials
+2. Explain concepts clearly at the appropriate level
+3. Guide students toward understanding rather than just providing answers
+4. Reference specific course materials when relevant
+5. Encourage deeper thinking and exploration
+
+Guidelines:
+- Base answers on the provided course context when available
+- Acknowledge when something is outside the course scope
+- Use examples and analogies to clarify concepts
+- Check for understanding with follow-up questions
+- Be patient and supportive
+- Cite sources when using specific course content
+- Adapt explanations to the student's level
+
+Always maintain accuracy and academic integrity."#.to_string(),
+        }
+    }
+
+    pub async fn answer(&self, question: &str, context: &CourseContext, history: &List<Message>, config: &SessionConfig) -> Result<(Message, List<SourceReference>), TutorError> {
+        // Retrieve relevant content chunks
+        let relevant_chunks = self.retrieve_context(question, context).await?;
+
+        // Build the prompt with context
+        let prompt = self.build_answer_prompt(question, &relevant_chunks, history, config);
+
+        // Generate response
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| TutorError::ModelError { message: e.to_string() })?;
+
+        // Extract sources
+        let sources: List<SourceReference> = relevant_chunks.iter().map(|c| SourceReference {
+            source_type: c.source_type.clone(),
+            source_id: c.source_id.clone(),
+            title: c.source_title.clone(),
+            excerpt: self.truncate(&c.content, 200),
+            relevance_score: 0.0, // Would be set from retrieval
+        }).collect();
+
+        let message = Message {
+            id: MessageId(generate_uuid()),
+            role: MessageRole::Assistant,
+            content: response.content,
+            metadata: MessageMetadata {
+                message_type: MessageType::Answer,
+                sources: sources.clone(),
+                confidence: Some(0.9),
+                is_hint: false,
+                related_objectives: vec![],
+                tokens_used: response.usage.total_tokens,
+            },
+            timestamp: DateTime::now(),
+        };
+
+        Ok((message, sources))
+    }
+
+    async fn retrieve_context(&self, query: &str, context: &CourseContext) -> Result<List<ContentChunk>, TutorError> {
+        // Generate query embedding
+        let embedding_model = EmbeddingModel::new(&self.embedding_config.model_id);
+        let query_embedding = embedding_model.embed(query)
+            .await
+            .map_err(|e| TutorError::EmbeddingError { message: e.to_string() })?;
+
+        // Calculate similarities and rank chunks
+        let mut scored_chunks: List<(f64, &ContentChunk)> = context.content_chunks.iter()
+            .map(|chunk| {
+                let similarity = self.cosine_similarity(&query_embedding, &chunk.embedding);
+                (similarity, chunk)
+            })
+            .filter(|(score, _)| *score > 0.7)
+            .collect();
+
+        // Sort by similarity
+        scored_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+        // Take top k
+        Ok(scored_chunks.into_iter()
+            .take(5)
+            .map(|(_, chunk)| chunk.clone())
+            .collect())
+    }
+
+    fn cosine_similarity(&self, a: &Vec<f64>, b: &Vec<f64>) -> f64 {
+        let dot_product: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let magnitude_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let magnitude_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+
+        if magnitude_a == 0.0 || magnitude_b == 0.0 {
+            0.0
+        } else {
+            dot_product / (magnitude_a * magnitude_b)
+        }
+    }
+
+    fn build_answer_prompt(&self, question: &str, chunks: &List<ContentChunk>, history: &List<Message>, config: &SessionConfig) -> String {
+        let mut prompt = String::new();
+
+        // Add relevant context
+        if !chunks.is_empty() {
+            prompt.push_str("## Relevant Course Materials\n");
+            for (i, chunk) in chunks.iter().enumerate() {
+                prompt.push_str(&format!("### Source {}: {}\n{}\n\n",
+                    i + 1, chunk.source_title, chunk.content));
+            }
+        }
+
+        // Add conversation history
+        if !history.is_empty() {
+            prompt.push_str("## Conversation History\n");
+            for msg in history.iter().rev().take(10).rev() {
+                let role = match msg.role {
+                    MessageRole::User => "Student",
+                    MessageRole::Assistant => "Tutor",
+                    MessageRole::System => continue,
+                };
+                prompt.push_str(&format!("{}: {}\n", role, msg.content));
+            }
+            prompt.push_str("\n");
+        }
+
+        // Add the question
+        prompt.push_str(&format!("## Current Question\n{}\n\n", question));
+
+        // Add response guidelines
+        let length_guide = match config.max_response_length {
+            ResponseLength::Short => "Keep your response brief (about 100 words).",
+            ResponseLength::Medium => "Provide a balanced response (about 300 words).",
+            ResponseLength::Long => "Provide a detailed response (about 500 words).",
+            ResponseLength::Adaptive => "Adjust response length to the complexity of the question.",
+        };
+
+        prompt.push_str(&format!("## Guidelines\n{}\n", length_guide));
+
+        if config.include_sources {
+            prompt.push_str("Reference the source materials when applicable.\n");
+        }
+
+        prompt
+    }
+
+    fn truncate(&self, s: &str, max_len: usize) -> String {
+        if s.len() <= max_len {
+            s.to_string()
+        } else {
+            format!("{}...", &s[..max_len])
+        }
+    }
+}
+
+/// Concept Explainer Specialist
+pub struct ConceptExplainer {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl ConceptExplainer {
+    pub fn new(config: ModelConfig) -> Self {
+        ConceptExplainer {
+            config,
+            system_prompt: r#"You are an expert at explaining complex concepts in accessible ways. Your role is to:
+
+1. Break down complex ideas into understandable parts
+2. Use analogies and real-world examples
+3. Build on what the student already knows
+4. Address common misconceptions
+5. Create "aha moments" through progressive revelation
+
+Explanation techniques:
+- Start with the big picture, then details
+- Use concrete examples before abstractions
+- Connect new concepts to familiar ones
+- Visualize with diagrams when helpful (describe them)
+- Check understanding frequently
+- Provide multiple perspectives on the same concept
+
+Adapt your explanations to the student's demonstrated level."#.to_string(),
+        }
+    }
+
+    pub async fn explain(&self, concept: &str, context: &CourseContext, student_level: SkillLevel) -> Result<ConceptExplanation, TutorError> {
+        let prompt = self.build_explanation_prompt(concept, context, student_level);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.7)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| TutorError::ModelError { message: e.to_string() })?;
+
+        self.parse_explanation_response(&response.content)
+    }
+
+    fn build_explanation_prompt(&self, concept: &str, context: &CourseContext, level: SkillLevel) -> String {
+        let level_desc = match level {
+            SkillLevel::Novice => "a complete beginner with no prior knowledge",
+            SkillLevel::Beginner => "a beginner with basic understanding",
+            SkillLevel::Intermediate => "an intermediate student with solid foundations",
+            SkillLevel::Advanced => "an advanced student seeking deeper understanding",
+            SkillLevel::Expert => "an expert looking for nuanced insights",
+        };
+
+        format!(
+            r#"Explain the concept of "{}" for {}.
+
+Course: {}
+
+Provide your explanation in JSON format:
+{{
+  "simple_definition": "<one sentence definition>",
+  "detailed_explanation": "<comprehensive explanation>",
+  "analogies": [
+    {{"analogy": "<the analogy>", "explanation": "<how it maps to the concept>"}}
+  ],
+  "examples": [
+    {{"example": "<concrete example>", "explanation": "<how it demonstrates the concept>"}}
+  ],
+  "common_misconceptions": [
+    {{"misconception": "<what people often get wrong>", "correction": "<the correct understanding>"}}
+  ],
+  "key_points": ["<key point 1>", "<key point 2>"],
+  "prerequisites": ["<concepts they should know first>"],
+  "related_concepts": ["<related topic 1>", "<related topic 2>"],
+  "check_understanding": ["<question to verify understanding>"]
+}}"#,
+            concept,
+            level_desc,
+            context.course_title
+        )
+    }
+
+    fn parse_explanation_response(&self, response: &str) -> Result<ConceptExplanation, TutorError> {
+        let result: ExplanationJson = parse_json(response)
+            .map_err(|e| TutorError::ParseError { message: e.to_string() })?;
+
+        Ok(ConceptExplanation {
+            simple_definition: result.simple_definition,
+            detailed_explanation: result.detailed_explanation,
+            analogies: result.analogies.into_iter().map(|a| Analogy {
+                analogy: a.analogy,
+                explanation: a.explanation,
+            }).collect(),
+            examples: result.examples.into_iter().map(|e| Example {
+                example: e.example,
+                explanation: e.explanation,
+            }).collect(),
+            common_misconceptions: result.common_misconceptions.into_iter().map(|m| Misconception {
+                misconception: m.misconception,
+                correction: m.correction,
+            }).collect(),
+            key_points: result.key_points,
+            prerequisites: result.prerequisites,
+            related_concepts: result.related_concepts,
+            check_understanding: result.check_understanding,
+        })
+    }
+}
+
+/// Concept explanation structure
+pub struct ConceptExplanation {
+    simple_definition: String,
+    detailed_explanation: String,
+    analogies: List<Analogy>,
+    examples: List<Example>,
+    common_misconceptions: List<Misconception>,
+    key_points: List<String>,
+    prerequisites: List<String>,
+    related_concepts: List<String>,
+    check_understanding: List<String>,
+}
+
+/// Analogy
+pub struct Analogy {
+    analogy: String,
+    explanation: String,
+}
+
+/// Example
+pub struct Example {
+    example: String,
+    explanation: String,
+}
+
+/// Misconception
+pub struct Misconception {
+    misconception: String,
+    correction: String,
+}
+
+/// Practice Problem Generator Specialist
+pub struct PracticeProblemGenerator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl PracticeProblemGenerator {
+    pub fn new(config: ModelConfig) -> Self {
+        PracticeProblemGenerator {
+            config,
+            system_prompt: r#"You are an expert at creating educational practice problems. Your role is to:
+
+1. Generate problems that test understanding, not just recall
+2. Create problems at appropriate difficulty levels
+3. Include scaffolded hints
+4. Provide detailed solutions with explanations
+5. Anticipate common mistakes
+
+Problem design principles:
+- Problems should have clear objectives
+- Difficulty should match stated level
+- Hints should guide without giving away answers
+- Solutions should teach, not just show the answer
+- Include real-world context when possible
+
+Create problems that build confidence through appropriate challenge."#.to_string(),
+        }
+    }
+
+    pub async fn generate(&self, topic: &str, difficulty: SkillLevel, problem_type: ProblemType, context: &CourseContext) -> Result<PracticeProblem, TutorError> {
+        let prompt = self.build_problem_prompt(topic, difficulty, &problem_type, context);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.8)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| TutorError::ModelError { message: e.to_string() })?;
+
+        self.parse_problem_response(&response.content, difficulty)
+    }
+
+    fn build_problem_prompt(&self, topic: &str, difficulty: SkillLevel, problem_type: &ProblemType, context: &CourseContext) -> String {
+        let type_desc = match problem_type {
+            ProblemType::Conceptual => "conceptual understanding question",
+            ProblemType::Calculation => "calculation or computation problem",
+            ProblemType::Application => "real-world application scenario",
+            ProblemType::Analysis => "analysis problem requiring critical thinking",
+            ProblemType::Coding { language } => &format!("coding problem in {}", language),
+            ProblemType::Essay => "short answer or essay question",
+        };
+
+        format!(
+            r#"Generate a practice problem on the topic of "{}" for a course on "{}".
+
+Requirements:
+- Problem Type: {}
+- Difficulty: {:?}
+- Include 3 progressive hints
+- Provide step-by-step solution
+
+Output as JSON:
+{{
+  "id": "<uuid>",
+  "question": "<the problem statement>",
+  "hints": [
+    "<hint 1 - gentle nudge>",
+    "<hint 2 - more specific guidance>",
+    "<hint 3 - strong hint without answer>"
+  ],
+  "solution": {{
+    "answer": "<the final answer>",
+    "steps": [
+      {{"step_number": 1, "description": "<what to do>", "explanation": "<why>"}}
+    ],
+    "common_mistakes": ["<mistake students often make>"],
+    "key_insights": ["<important learning from this problem>"]
+  }},
+  "estimated_time": <minutes>,
+  "objectives": ["<learning objective addressed>"]
+}}"#,
+            topic,
+            context.course_title,
+            type_desc,
+            difficulty
+        )
+    }
+
+    fn parse_problem_response(&self, response: &str, difficulty: SkillLevel) -> Result<PracticeProblem, TutorError> {
+        let result: ProblemJson = parse_json(response)
+            .map_err(|e| TutorError::ParseError { message: e.to_string() })?;
+
+        Ok(PracticeProblem {
+            id: result.id,
+            problem_type: ProblemType::Conceptual,
+            question: result.question,
+            hints: result.hints,
+            solution: ProblemSolution {
+                answer: result.solution.answer,
+                steps: result.solution.steps.into_iter().map(|s| SolutionStep {
+                    step_number: s.step_number,
+                    description: s.description,
+                    explanation: s.explanation,
+                }).collect(),
+                common_mistakes: result.solution.common_mistakes,
+                key_insights: result.solution.key_insights,
+            },
+            difficulty,
+            objectives: result.objectives.iter()
+                .map(|id| LearningObjectiveId(id.clone()))
+                .collect(),
+            estimated_time: result.estimated_time,
+        })
+    }
+
+    pub async fn evaluate_attempt(&self, problem: &PracticeProblem, student_answer: &str) -> Result<PracticeResult, TutorError> {
+        let prompt = format!(
+            r#"Evaluate the student's answer to this practice problem.
+
+## Problem
+{}
+
+## Correct Answer
+{}
+
+## Student's Answer
+{}
+
+Provide evaluation as JSON:
+{{
+  "correct": true/false,
+  "feedback": "<detailed feedback on their answer>",
+  "partial_credit": <0.0-1.0 if partially correct>,
+  "specific_issues": ["<specific mistake or misunderstanding>"],
+  "encouragement": "<encouraging message regardless of correctness>",
+  "next_steps": ["<what to study or try next>"]
+}}"#,
+            problem.question,
+            problem.solution.answer,
+            student_answer
+        );
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.3);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| TutorError::ModelError { message: e.to_string() })?;
+
+        let eval: EvaluationJson = parse_json(&response.content)
+            .map_err(|e| TutorError::ParseError { message: e.to_string() })?;
+
+        Ok(PracticeResult {
+            problem_id: problem.id.clone(),
+            solved: eval.correct,
+            attempts: 1,
+            hints_used: 0,
+            time_spent: Duration::seconds(0),
+            student_solution: student_answer.to_string(),
+            feedback: eval.feedback,
+        })
+    }
+}
+
+/// Study Guide Creator Specialist
+pub struct StudyGuideCreator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl StudyGuideCreator {
+    pub fn new(config: ModelConfig) -> Self {
+        StudyGuideCreator {
+            config,
+            system_prompt: r#"You are an expert at creating effective study guides. Your role is to:
+
+1. Organize material for optimal learning and retention
+2. Highlight the most important concepts
+3. Create review questions that test understanding
+4. Include practice problems for application
+5. Anticipate areas where students struggle
+
+Study guide principles:
+- Start with overview, then details
+- Group related concepts together
+- Include visual organization cues
+- Mix recall and application questions
+- Provide time estimates for study
+
+Create study guides that make exam preparation efficient and effective."#.to_string(),
+        }
+    }
+
+    pub async fn create(&self, request: &StudyGuideRequest, context: &CourseContext) -> Result<StudyGuide, TutorError> {
+        let prompt = self.build_study_guide_prompt(request, context);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.5)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| TutorError::ModelError { message: e.to_string() })?;
+
+        self.parse_study_guide_response(&response.content, request)
+    }
+
+    fn build_study_guide_prompt(&self, request: &StudyGuideRequest, context: &CourseContext) -> String {
+        let scope_desc = match &request.topic {
+            StudyGuideScope::Lesson { lesson_id } => format!("Lesson: {}", lesson_id.0),
+            StudyGuideScope::Module { module_id } => format!("Module: {}", module_id.0),
+            StudyGuideScope::Course { course_id } => format!("Full course: {}", course_id.0),
+            StudyGuideScope::Custom { topics } => format!("Topics: {}", topics.join(", ")),
+            StudyGuideScope::Assessment { assessment_id } => format!("Preparation for assessment: {}", assessment_id.0),
+        };
+
+        let style_desc = match &request.style {
+            StudyGuideStyle::Outline => "hierarchical outline",
+            StudyGuideStyle::Flashcards => "flashcard format with Q&A",
+            StudyGuideStyle::Summary => "narrative summary",
+            StudyGuideStyle::QuestionBased => "question-based review",
+            StudyGuideStyle::MindMap => "mind map structure (describe connections)",
+        };
+
+        let time_constraint = request.study_time_available
+            .map(|h| format!("Student has {} hours available for study.", h))
+            .unwrap_or_default();
+
+        format!(
+            r#"Create a study guide for: {}
+
+Course: {}
+Style: {}
+Focus areas: {}
+{}
+Include practice problems: {}
+
+Available content:
+{}
+
+Output as JSON:
+{{
+  "title": "<study guide title>",
+  "sections": [
+    {{
+      "title": "<section title>",
+      "summary": "<key information>",
+      "key_points": ["<point>"],
+      "examples": ["<example>"],
+      "common_pitfalls": ["<what to watch out for>"],
+      "related_objectives": ["<objective_id>"]
+    }}
+  ],
+  "key_terms": [
+    {{"term": "<term>", "definition": "<definition>"}}
+  ],
+  "review_questions": [
+    {{"question": "<question>", "answer_guidance": "<how to answer>", "difficulty": "novice|beginner|intermediate|advanced|expert"}}
+  ],
+  "practice_problems": [],
+  "estimated_study_time": <minutes>
+}}"#,
+            scope_desc,
+            context.course_title,
+            style_desc,
+            request.focus_areas.join(", "),
+            time_constraint,
+            request.include_practice,
+            self.summarize_content(context)
+        )
+    }
+
+    fn summarize_content(&self, context: &CourseContext) -> String {
+        let mut summary = String::new();
+
+        if let Some(module) = &context.current_module {
+            summary.push_str(&format!("Current Module: {}\n{}\n", module.title, module.description));
+        }
+
+        if let Some(lesson) = &context.current_lesson {
+            summary.push_str(&format!("Current Lesson: {}\n{}\n", lesson.title, lesson.content_summary));
+            summary.push_str(&format!("Key Concepts: {}\n", lesson.key_concepts.join(", ")));
+        }
+
+        summary
+    }
+
+    fn parse_study_guide_response(&self, response: &str, request: &StudyGuideRequest) -> Result<StudyGuide, TutorError> {
+        let result: StudyGuideJson = parse_json(response)
+            .map_err(|e| TutorError::ParseError { message: e.to_string() })?;
+
+        Ok(StudyGuide {
+            id: generate_uuid(),
+            title: result.title,
+            scope: request.topic.clone(),
+            sections: result.sections.into_iter().map(|s| StudyGuideSection {
+                title: s.title,
+                summary: s.summary,
+                key_points: s.key_points,
+                examples: s.examples,
+                common_pitfalls: s.common_pitfalls,
+                related_objectives: s.related_objectives.iter()
+                    .map(|id| LearningObjectiveId(id.clone()))
+                    .collect(),
+            }).collect(),
+            key_terms: result.key_terms.into_iter().map(|t| VocabularyTerm {
+                term: t.term,
+                definition: t.definition,
+            }).collect(),
+            review_questions: result.review_questions.into_iter().map(|q| ReviewQuestion {
+                question: q.question,
+                answer_guidance: q.answer_guidance,
+                difficulty: self.parse_difficulty(&q.difficulty),
+            }).collect(),
+            practice_problems: vec![],
+            estimated_study_time: result.estimated_study_time,
+            created_at: DateTime::now(),
+        })
+    }
+
+    fn parse_difficulty(&self, s: &str) -> SkillLevel {
+        match s {
+            "novice" => SkillLevel::Novice,
+            "beginner" => SkillLevel::Beginner,
+            "intermediate" => SkillLevel::Intermediate,
+            "advanced" => SkillLevel::Advanced,
+            "expert" => SkillLevel::Expert,
+            _ => SkillLevel::Intermediate,
+        }
+    }
+}
+
+/// Socratic Facilitator Specialist
+pub struct SocraticFacilitator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl SocraticFacilitator {
+    pub fn new(config: ModelConfig) -> Self {
+        SocraticFacilitator {
+            config,
+            system_prompt: r#"You are a Socratic tutor who guides students to discover knowledge through questioning. Your role is to:
+
+1. Never give direct answers - guide through questions
+2. Ask questions that reveal gaps in understanding
+3. Build on student responses to deepen thinking
+4. Celebrate discoveries and insights
+5. Gently redirect when students go astray
+
+Socratic method principles:
+- Start with what the student knows
+- Ask "why" and "how" questions
+- Use hypotheticals to test understanding
+- Point out contradictions gently
+- Let students make connections themselves
+- Express genuine curiosity about their thinking
+
+Your goal is not to tell them the answer, but to help them find it themselves."#.to_string(),
+        }
+    }
+
+    pub async fn guide(&self, student_question: &str, context: &CourseContext, history: &List<Message>) -> Result<SocraticResponse, TutorError> {
+        let prompt = self.build_socratic_prompt(student_question, context, history);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.8)
+            .with_max_tokens(1024);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| TutorError::ModelError { message: e.to_string() })?;
+
+        self.parse_socratic_response(&response.content)
+    }
+
+    fn build_socratic_prompt(&self, question: &str, context: &CourseContext, history: &List<Message>) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str(&format!("## Course Context\n{}\n\n", context.course_title));
+
+        if !history.is_empty() {
+            prompt.push_str("## Conversation So Far\n");
+            for msg in history.iter().rev().take(6).rev() {
+                let role = match msg.role {
+                    MessageRole::User => "Student",
+                    MessageRole::Assistant => "Tutor",
+                    MessageRole::System => continue,
+                };
+                prompt.push_str(&format!("{}: {}\n", role, msg.content));
+            }
+            prompt.push_str("\n");
+        }
+
+        prompt.push_str(&format!("## Student's Question/Statement\n{}\n\n", question));
+
+        prompt.push_str(r#"## Your Task
+Guide the student to discover the answer using Socratic questioning.
+
+Respond with JSON:
+{
+  "thinking": "<your analysis of what the student understands and doesn't>",
+  "guiding_question": "<a question to lead them toward understanding>",
+  "probing_questions": ["<follow-up question if needed>"],
+  "hint_if_stuck": "<a subtle hint without giving the answer>",
+  "acknowledge": "<acknowledge what they got right>",
+  "tone": "encouraging|curious|challenging"
+}"#);
+
+        prompt
+    }
+
+    fn parse_socratic_response(&self, response: &str) -> Result<SocraticResponse, TutorError> {
+        let result: SocraticJson = parse_json(response)
+            .map_err(|e| TutorError::ParseError { message: e.to_string() })?;
+
+        Ok(SocraticResponse {
+            guiding_question: result.guiding_question,
+            probing_questions: result.probing_questions,
+            hint_if_stuck: result.hint_if_stuck,
+            acknowledgment: result.acknowledge,
+            thinking: result.thinking,
+        })
+    }
+}
+
+/// Socratic response structure
+pub struct SocraticResponse {
+    guiding_question: String,
+    probing_questions: List<String>,
+    hint_if_stuck: String,
+    acknowledgment: String,
+    thinking: String,
+}
+
+// =============================================================================
+// Tutor Hive Actor
+// =============================================================================
+
+/// Main Tutor Hive actor
+pub actor TutorHive {
+    var config: TutorHiveConfig = TutorHiveConfig::default()
+    var question_answerer: QuestionAnswerer
+    var concept_explainer: ConceptExplainer
+    var problem_generator: PracticeProblemGenerator
+    var study_guide_creator: StudyGuideCreator
+    var socratic_facilitator: SocraticFacilitator
+
+    var sessions: Map<TutorSessionId, TutorSession> = Map::new()
+    var content_index: Map<CourseId, List<ContentChunk>> = Map::new()
+
+    var metrics: TutorMetrics = TutorMetrics::default()
+    var is_running: bool = false
+
+    pub fn new() -> Self {
+        let config = TutorHiveConfig::default();
+
+        TutorHive {
+            config: config.clone(),
+            question_answerer: QuestionAnswerer::new(config.default_model.clone(), config.embedding_model.clone()),
+            concept_explainer: ConceptExplainer::new(config.default_model.clone()),
+            problem_generator: PracticeProblemGenerator::new(config.default_model.clone()),
+            study_guide_creator: StudyGuideCreator::new(config.default_model.clone()),
+            socratic_facilitator: SocraticFacilitator::new(config.default_model.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// Start the tutor hive
+    pub receive Start() -> Result<(), TutorError> {
+        if self.is_running {
+            return Err(TutorError::AlreadyRunning);
+        }
+
+        self.is_running = true;
+        println!("[TutorHive] Started");
+
+        // Start session cleanup task
+        spawn self.cleanup_expired_sessions();
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Stop the tutor hive
+    pub receive Stop() {
+        self.is_running = false;
+        println!("[TutorHive] Stopped");
+        checkpoint();
+    }
+
+    /// Create a new tutoring session
+    pub receive CreateSession(
+        student_id: StudentId,
+        course_id: CourseId,
+        config: Option<SessionConfig>
+    ) -> Result<TutorSession, TutorError> {
+        let session_id = TutorSessionId(generate_uuid());
+        let session_config = config.unwrap_or_default();
+
+        // Get course context
+        let context = self.build_course_context(&course_id).await?;
+
+        let session = TutorSession {
+            id: session_id.clone(),
+            student_id,
+            course_id,
+            conversation: Conversation {
+                id: ConversationId(generate_uuid()),
+                messages: vec![],
+                current_topic: None,
+                questions_asked: 0,
+                hints_given: 0,
+            },
+            active_context: context,
+            mode: TutorMode::Standard,
+            config: session_config,
+            metrics: SessionMetrics::default(),
+            created_at: DateTime::now(),
+            last_activity: DateTime::now(),
+        };
+
+        self.sessions.insert(session_id, session.clone());
+        self.metrics.sessions_created += 1;
+
+        checkpoint();
+        Ok(session)
+    }
+
+    /// Chat with the tutor
+    pub receive Chat(request: ChatRequest) -> Result<ChatResponse, TutorError> {
+        let session = self.sessions.get_mut(&request.session_id)
+            .ok_or(TutorError::SessionNotFound { id: request.session_id.clone() })?;
+
+        // Add user message
+        let user_message = Message {
+            id: MessageId(generate_uuid()),
+            role: MessageRole::User,
+            content: request.message.clone(),
+            metadata: MessageMetadata {
+                message_type: MessageType::Question,
+                sources: vec![],
+                confidence: None,
+                is_hint: false,
+                related_objectives: vec![],
+                tokens_used: 0,
+            },
+            timestamp: DateTime::now(),
+        };
+        session.conversation.messages.push(user_message);
+
+        // Generate response based on mode
+        let (response_message, sources) = match &session.mode {
+            TutorMode::Standard => {
+                self.question_answerer.answer(
+                    &request.message,
+                    &session.active_context,
+                    &session.conversation.messages,
+                    &session.config
+                ).await?
+            },
+            TutorMode::Socratic => {
+                let socratic = self.socratic_facilitator.guide(
+                    &request.message,
+                    &session.active_context,
+                    &session.conversation.messages
+                ).await?;
+
+                let message = Message {
+                    id: MessageId(generate_uuid()),
+                    role: MessageRole::Assistant,
+                    content: socratic.guiding_question,
+                    metadata: MessageMetadata {
+                        message_type: MessageType::FollowUp,
+                        sources: vec![],
+                        confidence: Some(0.9),
+                        is_hint: false,
+                        related_objectives: vec![],
+                        tokens_used: 0,
+                    },
+                    timestamp: DateTime::now(),
+                };
+                (message, vec![])
+            },
+            TutorMode::Practice { current_problem } => {
+                // Handle practice mode
+                if let Some(ctx) = current_problem {
+                    let result = self.problem_generator.evaluate_attempt(
+                        &ctx.problem,
+                        &request.message
+                    ).await?;
+
+                    let message = Message {
+                        id: MessageId(generate_uuid()),
+                        role: MessageRole::Assistant,
+                        content: result.feedback,
+                        metadata: MessageMetadata {
+                            message_type: MessageType::Feedback,
+                            sources: vec![],
+                            confidence: Some(0.9),
+                            is_hint: false,
+                            related_objectives: vec![],
+                            tokens_used: 0,
+                        },
+                        timestamp: DateTime::now(),
+                    };
+                    (message, vec![])
+                } else {
+                    // No active problem, use standard answering
+                    self.question_answerer.answer(
+                        &request.message,
+                        &session.active_context,
+                        &session.conversation.messages,
+                        &session.config
+                    ).await?
+                }
+            },
+            _ => {
+                self.question_answerer.answer(
+                    &request.message,
+                    &session.active_context,
+                    &session.conversation.messages,
+                    &session.config
+                ).await?
+            }
+        };
+
+        // Add response to conversation
+        session.conversation.messages.push(response_message.clone());
+        session.conversation.questions_asked += 1;
+        session.metrics.messages_exchanged += 2;
+        session.metrics.questions_answered += 1;
+        session.last_activity = DateTime::now();
+
+        // Generate follow-ups
+        let followups = self.generate_followups(&request.message, &response_message.content);
+
+        self.metrics.messages_processed += 1;
+
+        checkpoint();
+        Ok(ChatResponse {
+            message: response_message,
+            suggested_followups: followups,
+            related_content: vec![],
+            actions: vec![TutorAction::RetrievedContext {
+                chunks: sources.len() as i32,
+                sources: sources.iter().map(|s| s.title.clone()).collect(),
+            }],
+        })
+    }
+
+    /// Explain a concept
+    pub receive ExplainConcept(
+        session_id: TutorSessionId,
+        concept: String
+    ) -> Result<ConceptExplanation, TutorError> {
+        let session = self.sessions.get(&session_id)
+            .ok_or(TutorError::SessionNotFound { id: session_id.clone() })?;
+
+        let explanation = self.concept_explainer.explain(
+            &concept,
+            &session.active_context,
+            session.config.difficulty_level.clone()
+        ).await?;
+
+        self.metrics.concepts_explained += 1;
+
+        checkpoint();
+        Ok(explanation)
+    }
+
+    /// Generate a practice problem
+    pub receive GeneratePractice(
+        session_id: TutorSessionId,
+        topic: String,
+        difficulty: SkillLevel,
+        problem_type: ProblemType
+    ) -> Result<PracticeProblem, TutorError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(TutorError::SessionNotFound { id: session_id.clone() })?;
+
+        let problem = self.problem_generator.generate(
+            &topic,
+            difficulty,
+            problem_type,
+            &session.active_context
+        ).await?;
+
+        // Set practice mode
+        session.mode = TutorMode::Practice {
+            current_problem: Some(PracticeContext {
+                problem: problem.clone(),
+                hints_given: 0,
+                attempts: 0,
+                started_at: DateTime::now(),
+            })
+        };
+
+        self.metrics.problems_generated += 1;
+
+        checkpoint();
+        Ok(problem)
+    }
+
+    /// Get a hint for current practice problem
+    pub receive GetHint(session_id: TutorSessionId) -> Result<String, TutorError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(TutorError::SessionNotFound { id: session_id.clone() })?;
+
+        if let TutorMode::Practice { current_problem: Some(ctx) } = &mut session.mode {
+            if ctx.hints_given < ctx.problem.hints.len() as i32 {
+                let hint = ctx.problem.hints[ctx.hints_given as usize].clone();
+                ctx.hints_given += 1;
+                session.conversation.hints_given += 1;
+                session.metrics.hints_provided += 1;
+
+                checkpoint();
+                return Ok(hint);
+            } else {
+                return Err(TutorError::NoMoreHints);
+            }
+        }
+
+        Err(TutorError::NoPracticeActive)
+    }
+
+    /// Create a study guide
+    pub receive CreateStudyGuide(
+        session_id: TutorSessionId,
+        request: StudyGuideRequest
+    ) -> Result<StudyGuide, TutorError> {
+        let session = self.sessions.get(&session_id)
+            .ok_or(TutorError::SessionNotFound { id: session_id.clone() })?;
+
+        let guide = self.study_guide_creator.create(&request, &session.active_context).await?;
+
+        self.metrics.study_guides_created += 1;
+
+        checkpoint();
+        Ok(guide)
+    }
+
+    /// Switch tutoring mode
+    pub receive SetMode(session_id: TutorSessionId, mode: TutorMode) -> Result<(), TutorError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(TutorError::SessionNotFound { id: session_id.clone() })?;
+
+        session.mode = mode;
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Get session
+    pub receive GetSession(session_id: TutorSessionId) -> Option<TutorSession> {
+        self.sessions.get(&session_id).cloned()
+    }
+
+    /// Index course content for RAG
+    pub receive IndexCourseContent(
+        course_id: CourseId,
+        chunks: List<ContentChunk>
+    ) -> Result<(), TutorError> {
+        self.content_index.insert(course_id, chunks);
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Get metrics
+    pub receive GetMetrics() -> TutorMetrics {
+        self.metrics.clone()
+    }
+
+    // Internal methods
+    async fn build_course_context(&self, course_id: &CourseId) -> Result<CourseContext, TutorError> {
+        let chunks = self.content_index.get(course_id)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(CourseContext {
+            course_id: course_id.clone(),
+            course_title: "Course".to_string(), // Would fetch from storage
+            current_module: None,
+            current_lesson: None,
+            content_chunks: chunks,
+            learning_objectives: vec![],
+            student_progress: None,
+        })
+    }
+
+    fn generate_followups(&self, question: &str, answer: &str) -> List<String> {
+        // Would use AI to generate contextual follow-ups
+        vec![
+            "Can you explain that further?".to_string(),
+            "What's an example of this?".to_string(),
+            "How does this relate to...?".to_string(),
+        ]
+    }
+
+    async fn cleanup_expired_sessions(&mut self) {
+        while self.is_running {
+            let now = DateTime::now();
+            let expired: List<TutorSessionId> = self.sessions.iter()
+                .filter(|(_, s)| now - s.last_activity > self.config.session_timeout)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for id in expired {
+                self.sessions.remove(&id);
+            }
+
+            sleep(Duration::minutes(5)).await;
+        }
+    }
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+#[derive(Clone, Default)]
+pub struct TutorMetrics {
+    pub sessions_created: i64,
+    pub messages_processed: i64,
+    pub concepts_explained: i64,
+    pub problems_generated: i64,
+    pub study_guides_created: i64,
+    pub hints_given: i64,
+    pub average_session_length: i64,
+    pub total_tokens_used: i64,
+}
+
+impl Default for SessionMetrics {
+    fn default() -> Self {
+        SessionMetrics {
+            messages_exchanged: 0,
+            questions_answered: 0,
+            hints_provided: 0,
+            problems_attempted: 0,
+            problems_solved: 0,
+            concepts_explained: 0,
+            average_response_time_ms: 0,
+            total_tokens_used: 0,
+        }
+    }
+}
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+pub enum TutorError {
+    AlreadyRunning,
+    NotRunning,
+    SessionNotFound { id: TutorSessionId },
+    ModelError { message: String },
+    EmbeddingError { message: String },
+    ParseError { message: String },
+    NoPracticeActive,
+    NoMoreHints,
+    ContextNotAvailable,
+}
+
+// =============================================================================
+// JSON Helper Types
+// =============================================================================
+
+struct ExplanationJson {
+    simple_definition: String,
+    detailed_explanation: String,
+    analogies: List<AnalogyJson>,
+    examples: List<ExampleJson>,
+    common_misconceptions: List<MisconceptionJson>,
+    key_points: List<String>,
+    prerequisites: List<String>,
+    related_concepts: List<String>,
+    check_understanding: List<String>,
+}
+
+struct AnalogyJson {
+    analogy: String,
+    explanation: String,
+}
+
+struct ExampleJson {
+    example: String,
+    explanation: String,
+}
+
+struct MisconceptionJson {
+    misconception: String,
+    correction: String,
+}
+
+struct ProblemJson {
+    id: String,
+    question: String,
+    hints: List<String>,
+    solution: SolutionJson,
+    estimated_time: i32,
+    objectives: List<String>,
+}
+
+struct SolutionJson {
+    answer: String,
+    steps: List<StepJson>,
+    common_mistakes: List<String>,
+    key_insights: List<String>,
+}
+
+struct StepJson {
+    step_number: i32,
+    description: String,
+    explanation: String,
+}
+
+struct EvaluationJson {
+    correct: bool,
+    feedback: String,
+    partial_credit: f64,
+    specific_issues: List<String>,
+    encouragement: String,
+    next_steps: List<String>,
+}
+
+struct StudyGuideJson {
+    title: String,
+    sections: List<SectionJson>,
+    key_terms: List<TermJson>,
+    review_questions: List<ReviewQuestionJson>,
+    estimated_study_time: i32,
+}
+
+struct SectionJson {
+    title: String,
+    summary: String,
+    key_points: List<String>,
+    examples: List<String>,
+    common_pitfalls: List<String>,
+    related_objectives: List<String>,
+}
+
+struct TermJson {
+    term: String,
+    definition: String,
+}
+
+struct ReviewQuestionJson {
+    question: String,
+    answer_guidance: String,
+    difficulty: String,
+}
+
+struct SocraticJson {
+    thinking: String,
+    guiding_question: String,
+    probing_questions: List<String>,
+    hint_if_stuck: String,
+    acknowledge: String,
+    tone: String,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn parse_json<T>(json_str: &str) -> Result<T, String> {
+    std::json::parse(json_str)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_tutor_hive_creation() {
+        let hive = TutorHive::new();
+        assert!(!hive.is_running);
+    }
+
+    #[test]
+    fn test_session_config_default() {
+        let config = SessionConfig::default();
+        assert!(config.allow_direct_answers);
+        assert!(config.include_sources);
+    }
+
+    #[test]
+    fn test_cosine_similarity() {
+        let answerer = QuestionAnswerer::new(
+            ModelConfig::default(),
+            EmbeddingModelConfig::default()
+        );
+
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((answerer.cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+    }
+}

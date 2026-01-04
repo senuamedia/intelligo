@@ -1,0 +1,1288 @@
+/// Intelligo LMS - Admin Core
+///
+/// Core admin shell providing navigation, layout, and shared admin infrastructure.
+/// Handles admin authentication, menu building, and widget systems.
+
+module intelligo::admin::core
+
+use intelligo::core::types::*
+use intelligo::core::security::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// ADMIN NAVIGATION
+// =============================================================================
+
+/// A navigation menu item
+type MenuItem {
+    /// Unique identifier
+    id: String,
+
+    /// Display label
+    label: String,
+
+    /// Icon identifier (icon library name)
+    icon: Option<String>,
+
+    /// Route path
+    path: String,
+
+    /// Required permission to see this item
+    permission: Option<PermissionId>,
+
+    /// Child menu items
+    children: List<MenuItem>,
+
+    /// Badge count (notifications, pending items)
+    badge: Option<MenuBadge>,
+
+    /// Sort order within parent
+    weight: i32,
+
+    /// Whether this is the active item
+    active: Bool,
+
+    /// Whether this menu is expanded
+    expanded: Bool
+}
+
+/// Badge displayed on menu item
+type MenuBadge {
+    /// Count to display
+    count: i32,
+
+    /// Badge variant (info, warning, danger)
+    variant: BadgeVariant
+}
+
+/// Badge styling variant
+enum BadgeVariant {
+    Info,
+    Success,
+    Warning,
+    Danger
+}
+
+/// Admin navigation builder
+type AdminNavigation {
+    items: List<MenuItem>
+}
+
+impl AdminNavigation {
+    /// Build the default admin navigation
+    fn build_default(context: &AccessContext, tenant: &TenantId) -> AdminNavigation {
+        let mut items = vec![];
+
+        // Dashboard - always visible to admin
+        items.push(MenuItem {
+            id: "dashboard".to_string(),
+            label: "Dashboard".to_string(),
+            icon: Some("home".to_string()),
+            path: "/admin".to_string(),
+            permission: Some("admin.dashboard.view".to_string()),
+            children: vec![],
+            badge: None,
+            weight: 0,
+            active: false,
+            expanded: false
+        });
+
+        // Courses section
+        if context.has_permission("admin.courses.view") {
+            items.push(MenuItem {
+                id: "courses".to_string(),
+                label: "Courses".to_string(),
+                icon: Some("book".to_string()),
+                path: "/admin/courses".to_string(),
+                permission: Some("admin.courses.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "courses-list".to_string(),
+                        label: "All Courses".to_string(),
+                        icon: None,
+                        path: "/admin/courses".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "courses-create".to_string(),
+                        label: "Create Course".to_string(),
+                        icon: None,
+                        path: "/admin/courses/create".to_string(),
+                        permission: Some("admin.courses.create".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "courses-categories".to_string(),
+                        label: "Categories".to_string(),
+                        icon: None,
+                        path: "/admin/courses/categories".to_string(),
+                        permission: Some("admin.taxonomy.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "question-banks".to_string(),
+                        label: "Question Banks".to_string(),
+                        icon: None,
+                        path: "/admin/questions".to_string(),
+                        permission: Some("admin.questions.view".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 3,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 10,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Users section
+        if context.has_permission("admin.users.view") {
+            items.push(MenuItem {
+                id: "users".to_string(),
+                label: "Users".to_string(),
+                icon: Some("users".to_string()),
+                path: "/admin/users".to_string(),
+                permission: Some("admin.users.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "users-list".to_string(),
+                        label: "All Users".to_string(),
+                        icon: None,
+                        path: "/admin/users".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "users-create".to_string(),
+                        label: "Add User".to_string(),
+                        icon: None,
+                        path: "/admin/users/create".to_string(),
+                        permission: Some("admin.users.create".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "users-import".to_string(),
+                        label: "Bulk Import".to_string(),
+                        icon: None,
+                        path: "/admin/users/import".to_string(),
+                        permission: Some("admin.users.import".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "roles".to_string(),
+                        label: "Roles & Permissions".to_string(),
+                        icon: None,
+                        path: "/admin/roles".to_string(),
+                        permission: Some("admin.roles.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 3,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 20,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Enrollments section
+        if context.has_permission("admin.enrollments.view") {
+            items.push(MenuItem {
+                id: "enrollments".to_string(),
+                label: "Enrollments".to_string(),
+                icon: Some("user-plus".to_string()),
+                path: "/admin/enrollments".to_string(),
+                permission: Some("admin.enrollments.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "enrollments-active".to_string(),
+                        label: "Active Enrollments".to_string(),
+                        icon: None,
+                        path: "/admin/enrollments".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "enrollments-pending".to_string(),
+                        label: "Pending Approval".to_string(),
+                        icon: None,
+                        path: "/admin/enrollments/pending".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "enrollments-bulk".to_string(),
+                        label: "Bulk Enroll".to_string(),
+                        icon: None,
+                        path: "/admin/enrollments/bulk".to_string(),
+                        permission: Some("admin.enrollments.bulk".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 30,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Gradebook section
+        if context.has_permission("admin.grades.view") {
+            items.push(MenuItem {
+                id: "gradebook".to_string(),
+                label: "Gradebook".to_string(),
+                icon: Some("clipboard-check".to_string()),
+                path: "/admin/gradebook".to_string(),
+                permission: Some("admin.grades.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "gradebook-courses".to_string(),
+                        label: "Course Grades".to_string(),
+                        icon: None,
+                        path: "/admin/gradebook".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "gradebook-pending".to_string(),
+                        label: "Pending Grading".to_string(),
+                        icon: None,
+                        path: "/admin/gradebook/pending".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "grade-scales".to_string(),
+                        label: "Grade Scales".to_string(),
+                        icon: None,
+                        path: "/admin/gradebook/scales".to_string(),
+                        permission: Some("admin.grades.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 40,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Reports section
+        if context.has_permission("admin.reports.view") {
+            items.push(MenuItem {
+                id: "reports".to_string(),
+                label: "Reports".to_string(),
+                icon: Some("chart-bar".to_string()),
+                path: "/admin/reports".to_string(),
+                permission: Some("admin.reports.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "reports-overview".to_string(),
+                        label: "Analytics Overview".to_string(),
+                        icon: None,
+                        path: "/admin/reports".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "reports-enrollments".to_string(),
+                        label: "Enrollment Reports".to_string(),
+                        icon: None,
+                        path: "/admin/reports/enrollments".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "reports-completion".to_string(),
+                        label: "Completion Reports".to_string(),
+                        icon: None,
+                        path: "/admin/reports/completion".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "reports-grades".to_string(),
+                        label: "Grade Reports".to_string(),
+                        icon: None,
+                        path: "/admin/reports/grades".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 3,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "reports-activity".to_string(),
+                        label: "Activity Logs".to_string(),
+                        icon: None,
+                        path: "/admin/reports/activity".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 4,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "reports-scorm".to_string(),
+                        label: "SCORM/xAPI Reports".to_string(),
+                        icon: None,
+                        path: "/admin/reports/scorm".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 5,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 50,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Payments section (if e-commerce enabled)
+        if context.has_permission("admin.payments.view") {
+            items.push(MenuItem {
+                id: "payments".to_string(),
+                label: "Payments".to_string(),
+                icon: Some("credit-card".to_string()),
+                path: "/admin/payments".to_string(),
+                permission: Some("admin.payments.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "payments-transactions".to_string(),
+                        label: "Transactions".to_string(),
+                        icon: None,
+                        path: "/admin/payments".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "payments-products".to_string(),
+                        label: "Products & Pricing".to_string(),
+                        icon: None,
+                        path: "/admin/payments/products".to_string(),
+                        permission: Some("admin.payments.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "payments-coupons".to_string(),
+                        label: "Coupons".to_string(),
+                        icon: None,
+                        path: "/admin/payments/coupons".to_string(),
+                        permission: Some("admin.payments.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "payments-subscriptions".to_string(),
+                        label: "Subscriptions".to_string(),
+                        icon: None,
+                        path: "/admin/payments/subscriptions".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 3,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "payments-revenue".to_string(),
+                        label: "Revenue Reports".to_string(),
+                        icon: None,
+                        path: "/admin/payments/revenue".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 4,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 55,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Certificates section
+        if context.has_permission("admin.certificates.view") {
+            items.push(MenuItem {
+                id: "certificates".to_string(),
+                label: "Certificates".to_string(),
+                icon: Some("award".to_string()),
+                path: "/admin/certificates".to_string(),
+                permission: Some("admin.certificates.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "certificates-issued".to_string(),
+                        label: "Issued Certificates".to_string(),
+                        icon: None,
+                        path: "/admin/certificates".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "certificates-templates".to_string(),
+                        label: "Templates".to_string(),
+                        icon: None,
+                        path: "/admin/certificates/templates".to_string(),
+                        permission: Some("admin.certificates.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 60,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Communications section
+        if context.has_permission("admin.communications.view") {
+            items.push(MenuItem {
+                id: "communications".to_string(),
+                label: "Communications".to_string(),
+                icon: Some("mail".to_string()),
+                path: "/admin/communications".to_string(),
+                permission: Some("admin.communications.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "announcements".to_string(),
+                        label: "Announcements".to_string(),
+                        icon: None,
+                        path: "/admin/communications/announcements".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "email-templates".to_string(),
+                        label: "Email Templates".to_string(),
+                        icon: None,
+                        path: "/admin/communications/templates".to_string(),
+                        permission: Some("admin.communications.manage".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "notifications".to_string(),
+                        label: "Notifications".to_string(),
+                        icon: None,
+                        path: "/admin/communications/notifications".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 65,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Settings section
+        if context.has_permission("admin.settings.view") {
+            items.push(MenuItem {
+                id: "settings".to_string(),
+                label: "Settings".to_string(),
+                icon: Some("settings".to_string()),
+                path: "/admin/settings".to_string(),
+                permission: Some("admin.settings.view".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "settings-general".to_string(),
+                        label: "General".to_string(),
+                        icon: None,
+                        path: "/admin/settings".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "settings-branding".to_string(),
+                        label: "Branding".to_string(),
+                        icon: None,
+                        path: "/admin/settings/branding".to_string(),
+                        permission: Some("admin.settings.branding".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "settings-integrations".to_string(),
+                        label: "Integrations".to_string(),
+                        icon: None,
+                        path: "/admin/settings/integrations".to_string(),
+                        permission: Some("admin.settings.integrations".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "settings-ai".to_string(),
+                        label: "AI Configuration".to_string(),
+                        icon: None,
+                        path: "/admin/settings/ai".to_string(),
+                        permission: Some("admin.settings.ai".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 3,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "settings-compliance".to_string(),
+                        label: "Compliance".to_string(),
+                        icon: None,
+                        path: "/admin/settings/compliance".to_string(),
+                        permission: Some("admin.settings.compliance".to_string()),
+                        children: vec![],
+                        badge: None,
+                        weight: 4,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 90,
+                active: false,
+                expanded: false
+            });
+        }
+
+        // Tenant admin (SaaS only)
+        if context.has_permission("admin.tenant.manage") {
+            items.push(MenuItem {
+                id: "tenant".to_string(),
+                label: "Tenant Admin".to_string(),
+                icon: Some("building".to_string()),
+                path: "/admin/tenant".to_string(),
+                permission: Some("admin.tenant.manage".to_string()),
+                children: vec![
+                    MenuItem {
+                        id: "tenant-subscription".to_string(),
+                        label: "Subscription".to_string(),
+                        icon: None,
+                        path: "/admin/tenant/subscription".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 0,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "tenant-usage".to_string(),
+                        label: "Usage & Limits".to_string(),
+                        icon: None,
+                        path: "/admin/tenant/usage".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 1,
+                        active: false,
+                        expanded: false
+                    },
+                    MenuItem {
+                        id: "tenant-domains".to_string(),
+                        label: "Custom Domains".to_string(),
+                        icon: None,
+                        path: "/admin/tenant/domains".to_string(),
+                        permission: None,
+                        children: vec![],
+                        badge: None,
+                        weight: 2,
+                        active: false,
+                        expanded: false
+                    }
+                ],
+                badge: None,
+                weight: 95,
+                active: false,
+                expanded: false
+            });
+        }
+
+        AdminNavigation { items }
+    }
+
+    /// Filter navigation based on permissions
+    fn filter_by_permissions(&self, context: &AccessContext) -> AdminNavigation {
+        let filtered = self.items.iter()
+            .filter(|item| {
+                if let Some(ref perm) = item.permission {
+                    context.has_permission(perm)
+                } else {
+                    true
+                }
+            })
+            .map(|item| {
+                let mut filtered_item = item.clone();
+                filtered_item.children = item.children.iter()
+                    .filter(|child| {
+                        if let Some(ref perm) = child.permission {
+                            context.has_permission(perm)
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                filtered_item
+            })
+            .collect();
+
+        AdminNavigation { items: filtered }
+    }
+
+    /// Mark the active item based on current path
+    fn mark_active(&mut self, current_path: &str) {
+        for item in &mut self.items {
+            if item.path == current_path {
+                item.active = true;
+            }
+            for child in &mut item.children {
+                if child.path == current_path {
+                    child.active = true;
+                    item.expanded = true;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ADMIN WIDGETS
+// =============================================================================
+
+/// A dashboard widget
+type DashboardWidget {
+    /// Widget identifier
+    id: String,
+
+    /// Widget title
+    title: String,
+
+    /// Widget type
+    widget_type: WidgetType,
+
+    /// Grid column span (1-12)
+    col_span: i32,
+
+    /// Grid row span
+    row_span: i32,
+
+    /// Configuration options
+    config: Map<String, Dynamic>,
+
+    /// Required permission
+    permission: Option<PermissionId>,
+
+    /// Refresh interval in seconds (0 = no auto-refresh)
+    refresh_interval: i32
+}
+
+/// Widget type
+enum WidgetType {
+    /// Numeric statistic with optional trend
+    Stat { value: String, label: String, trend: Option<Trend> },
+
+    /// Line/bar/pie chart
+    Chart { chart_type: ChartType, data: ChartData },
+
+    /// Data table
+    Table { columns: List<TableColumn>, rows: List<Map<String, Dynamic>> },
+
+    /// Activity feed
+    ActivityFeed { items: List<ActivityItem> },
+
+    /// Quick action buttons
+    QuickActions { actions: List<QuickAction> },
+
+    /// Progress indicator
+    Progress { current: f32, target: f32, label: String },
+
+    /// Alert/notification list
+    Alerts { alerts: List<Alert> },
+
+    /// Custom widget (rendered by client)
+    Custom { component: String, props: Map<String, Dynamic> }
+}
+
+/// Trend indicator
+type Trend {
+    direction: TrendDirection,
+    value: f32,
+    label: String
+}
+
+/// Trend direction
+enum TrendDirection {
+    Up,
+    Down,
+    Flat
+}
+
+/// Chart type
+enum ChartType {
+    Line,
+    Bar,
+    Pie,
+    Doughnut,
+    Area,
+    Scatter
+}
+
+/// Chart data
+type ChartData {
+    labels: List<String>,
+    datasets: List<ChartDataset>
+}
+
+/// Chart dataset
+type ChartDataset {
+    label: String,
+    data: List<f32>,
+    color: Option<String>
+}
+
+/// Table column definition
+type TableColumn {
+    key: String,
+    label: String,
+    sortable: Bool,
+    width: Option<String>
+}
+
+/// Activity feed item
+type ActivityItem {
+    id: String,
+    actor: String,
+    action: String,
+    target: String,
+    timestamp: DateTime,
+    icon: Option<String>
+}
+
+/// Quick action button
+type QuickAction {
+    id: String,
+    label: String,
+    icon: String,
+    path: String,
+    permission: Option<PermissionId>
+}
+
+/// Alert notification
+type Alert {
+    id: String,
+    level: AlertLevel,
+    title: String,
+    message: String,
+    timestamp: DateTime,
+    action_url: Option<String>,
+    dismissable: Bool
+}
+
+/// Alert level
+enum AlertLevel {
+    Info,
+    Success,
+    Warning,
+    Error
+}
+
+// =============================================================================
+// ADMIN LAYOUT
+// =============================================================================
+
+/// Admin page layout
+type AdminLayout {
+    /// Page title
+    title: String,
+
+    /// Breadcrumb trail
+    breadcrumbs: List<Breadcrumb>,
+
+    /// Page-level actions (buttons in header)
+    actions: List<PageAction>,
+
+    /// Navigation state
+    navigation: AdminNavigation,
+
+    /// Current user info
+    current_user: UserInfo,
+
+    /// Tenant info
+    tenant: TenantInfo,
+
+    /// Global notifications
+    notifications: List<Notification>
+}
+
+/// Breadcrumb item
+type Breadcrumb {
+    label: String,
+    path: Option<String>
+}
+
+/// Page action button
+type PageAction {
+    id: String,
+    label: String,
+    icon: Option<String>,
+    variant: ActionVariant,
+    path: Option<String>,
+    action: Option<String>,
+    permission: Option<PermissionId>
+}
+
+/// Action button variant
+enum ActionVariant {
+    Primary,
+    Secondary,
+    Danger,
+    Ghost
+}
+
+/// User info for display
+type UserInfo {
+    id: UserId,
+    name: String,
+    email: String,
+    avatar: Option<String>,
+    role: String
+}
+
+/// Tenant info for display
+type TenantInfo {
+    id: TenantId,
+    name: String,
+    logo: Option<String>,
+    subdomain: String
+}
+
+/// Notification for user
+type Notification {
+    id: String,
+    title: String,
+    message: String,
+    timestamp: DateTime,
+    read: Bool,
+    action_url: Option<String>
+}
+
+// =============================================================================
+// ADMIN ACTOR
+// =============================================================================
+
+/// Admin core actor handling navigation and layout
+actor AdminCore {
+    state {
+        /// Cached navigation per tenant
+        navigation_cache: Map<TenantId, AdminNavigation>,
+
+        /// Widget definitions
+        widgets: Map<String, DashboardWidget>,
+
+        /// User preferences
+        user_preferences: Map<UserId, AdminPreferences>
+    }
+
+    /// Initialize the admin core
+    fn init() -> AdminCore {
+        AdminCore {
+            state: AdminCoreState {
+                navigation_cache: Map::new(),
+                widgets: Map::new(),
+                user_preferences: Map::new()
+            }
+        }
+    }
+
+    /// Get navigation for a user
+    fn get_navigation(&self, context: &AccessContext, tenant_id: &TenantId) -> AdminNavigation {
+        let base_nav = AdminNavigation::build_default(context, tenant_id);
+        base_nav.filter_by_permissions(context)
+    }
+
+    /// Get layout for a page
+    fn get_layout(
+        &self,
+        context: &AccessContext,
+        tenant: &TenantInfo,
+        page_title: &str,
+        breadcrumbs: List<Breadcrumb>,
+        actions: List<PageAction>
+    ) -> AdminLayout {
+        let mut navigation = self.get_navigation(context, &tenant.id);
+
+        // Get current user info
+        let user_info = UserInfo {
+            id: context.user_id.clone(),
+            name: "User".to_string(), // Would be fetched from user service
+            email: "user@example.com".to_string(),
+            avatar: None,
+            role: "Administrator".to_string()
+        };
+
+        AdminLayout {
+            title: page_title.to_string(),
+            breadcrumbs,
+            actions: actions.into_iter()
+                .filter(|a| {
+                    if let Some(ref perm) = a.permission {
+                        context.has_permission(perm)
+                    } else {
+                        true
+                    }
+                })
+                .collect(),
+            navigation,
+            current_user: user_info,
+            tenant: tenant.clone(),
+            notifications: vec![]
+        }
+    }
+
+    /// Get user preferences
+    fn get_preferences(&self, user_id: &UserId) -> AdminPreferences {
+        self.state.user_preferences
+            .get(user_id)
+            .cloned()
+            .unwrap_or_else(|| AdminPreferences::default())
+    }
+
+    /// Save user preferences
+    fn save_preferences(&mut self, user_id: UserId, preferences: AdminPreferences) {
+        self.state.user_preferences.insert(user_id, preferences);
+    }
+}
+
+/// Admin user preferences
+type AdminPreferences {
+    /// Sidebar collapsed
+    sidebar_collapsed: Bool,
+
+    /// Theme preference
+    theme: ThemePreference,
+
+    /// Dashboard widget layout
+    dashboard_widgets: List<String>,
+
+    /// Items per page in lists
+    items_per_page: i32,
+
+    /// Default date format
+    date_format: String,
+
+    /// Notification preferences
+    notifications: NotificationPreferences
+}
+
+/// Theme preference
+enum ThemePreference {
+    Light,
+    Dark,
+    System
+}
+
+/// Notification preferences
+type NotificationPreferences {
+    email_enabled: Bool,
+    browser_enabled: Bool,
+    digest_frequency: DigestFrequency
+}
+
+/// Digest email frequency
+enum DigestFrequency {
+    Realtime,
+    Daily,
+    Weekly,
+    Never
+}
+
+impl AdminPreferences {
+    fn default() -> AdminPreferences {
+        AdminPreferences {
+            sidebar_collapsed: false,
+            theme: ThemePreference::System,
+            dashboard_widgets: vec![
+                "active_users".to_string(),
+                "enrollments_chart".to_string(),
+                "recent_activity".to_string(),
+                "pending_grading".to_string()
+            ],
+            items_per_page: 25,
+            date_format: "YYYY-MM-DD".to_string(),
+            notifications: NotificationPreferences {
+                email_enabled: true,
+                browser_enabled: true,
+                digest_frequency: DigestFrequency::Daily
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ADMIN SEARCH
+// =============================================================================
+
+/// Global search functionality
+type AdminSearch {
+    query: String,
+    filters: SearchFilters,
+    results: SearchResults
+}
+
+/// Search filters
+type SearchFilters {
+    entity_types: List<String>,
+    date_range: Option<DateRange>,
+    status: Option<String>
+}
+
+/// Search results
+type SearchResults {
+    courses: List<SearchResult>,
+    users: List<SearchResult>,
+    enrollments: List<SearchResult>,
+    assessments: List<SearchResult>,
+    total_count: i32
+}
+
+/// Individual search result
+type SearchResult {
+    id: String,
+    entity_type: String,
+    title: String,
+    subtitle: Option<String>,
+    path: String,
+    icon: String,
+    relevance: f32
+}
+
+// =============================================================================
+// AUDIT LOG
+// =============================================================================
+
+/// Audit log entry
+type AuditLogEntry {
+    id: String,
+    tenant_id: TenantId,
+    user_id: UserId,
+    action: String,
+    entity_type: String,
+    entity_id: String,
+    old_values: Option<Map<String, Dynamic>>,
+    new_values: Option<Map<String, Dynamic>>,
+    ip_address: String,
+    user_agent: String,
+    timestamp: DateTime
+}
+
+/// Audit log query
+type AuditLogQuery {
+    tenant_id: TenantId,
+    user_id: Option<UserId>,
+    action: Option<String>,
+    entity_type: Option<String>,
+    entity_id: Option<String>,
+    date_range: Option<DateRange>,
+    pagination: Pagination
+}
+
+/// Audit log actor
+actor AuditLogger {
+    state {
+        /// Recent entries (in-memory buffer)
+        recent_entries: List<AuditLogEntry>
+    }
+
+    /// Log an action
+    fn log(
+        &mut self,
+        tenant_id: TenantId,
+        user_id: UserId,
+        action: String,
+        entity_type: String,
+        entity_id: String,
+        old_values: Option<Map<String, Dynamic>>,
+        new_values: Option<Map<String, Dynamic>>,
+        ip_address: String,
+        user_agent: String
+    ) -> AuditLogEntry {
+        let entry = AuditLogEntry {
+            id: generate_uuid(),
+            tenant_id,
+            user_id,
+            action,
+            entity_type,
+            entity_id,
+            old_values,
+            new_values,
+            ip_address,
+            user_agent,
+            timestamp: DateTime::now()
+        };
+
+        // Buffer in memory (would also persist to DB)
+        self.state.recent_entries.push(entry.clone());
+
+        // Keep only last 1000 in memory
+        if self.state.recent_entries.len() > 1000 {
+            self.state.recent_entries.remove(0);
+        }
+
+        entry
+    }
+
+    /// Query audit log
+    fn query(&self, query: AuditLogQuery) -> QueryResult<AuditLogEntry> {
+        // In production, this would query the database
+        let filtered: Vec<_> = self.state.recent_entries.iter()
+            .filter(|e| e.tenant_id == query.tenant_id)
+            .filter(|e| {
+                if let Some(ref uid) = query.user_id {
+                    &e.user_id == uid
+                } else {
+                    true
+                }
+            })
+            .filter(|e| {
+                if let Some(ref action) = query.action {
+                    &e.action == action
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        let total = filtered.len() as i64;
+        let start = ((query.pagination.page - 1) * query.pagination.per_page) as usize;
+        let items: Vec<_> = filtered.into_iter()
+            .skip(start)
+            .take(query.pagination.per_page as usize)
+            .collect();
+
+        QueryResult {
+            items,
+            total,
+            page: query.pagination.page,
+            per_page: query.pagination.per_page,
+            total_pages: ((total as f32) / (query.pagination.per_page as f32)).ceil() as i32
+        }
+    }
+}

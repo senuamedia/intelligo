@@ -1,0 +1,378 @@
+/// Intelligo LMS - Taxonomy Unit Tests
+///
+/// Tests for categories, skills, competencies, tags, and learning objectives.
+
+module intelligo::tests::unit::taxonomy
+
+use intelligo::chai::*
+use intelligo::taxonomy::*
+
+pub fn register_tests() {
+    describe("Categories", || {
+        describe("creation", || {
+            it("creates a category with name", || {
+                let category = Category::new("tenant_1", "Programming");
+
+                expect(&category.name).to().equal(&"Programming".to_string());
+                expect(&category.slug).to().equal(&"programming".to_string());
+                expect(&category.depth).to().equal(&0);
+            });
+
+            it("generates path from slug", || {
+                let category = Category::new("tenant_1", "Web Development");
+
+                expect(&category.path).to().equal(&"/web-development".to_string());
+            });
+        });
+
+        describe("hierarchy", || {
+            it("creates child category with parent", || {
+                let parent = Category::new("tenant_1", "Technology");
+                let child = Category::new("tenant_1", "Programming").with_parent(&parent);
+
+                expect(&child.parent_id).to().equal(&Some(parent.id.clone()));
+                expect(&child.depth).to().equal(&1);
+                expect(&child.path).to().contain(&parent.slug);
+            });
+
+            it("detects ancestor relationship", || {
+                let parent = Category::new("tenant_1", "Tech");
+                let child = Category::new("tenant_1", "Programming").with_parent(&parent);
+
+                expect(&parent.is_ancestor_of(&child)).to().be_true();
+                expect(&child.is_descendant_of(&parent)).to().be_true();
+            });
+
+            it("provides breadcrumb", || {
+                let parent = Category::new("tenant_1", "Tech");
+                let child = Category::new("tenant_1", "Programming").with_parent(&parent);
+
+                let breadcrumb = child.breadcrumb();
+                expect(&breadcrumb.len()).to().equal(&2);
+            });
+        });
+
+        describe("CategoryTree", || {
+            it("loads categories", || {
+                let tree = CategoryTree::new();
+                let categories = vec![
+                    Category::new("tenant_1", "Tech"),
+                    Category::new("tenant_1", "Business"),
+                ];
+
+                tree.load(categories);
+
+                let roots = tree.roots();
+                expect(&roots.len()).to().equal(&2);
+            });
+
+            it("finds category by path", || {
+                let tree = CategoryTree::new();
+                let cat = Category::new("tenant_1", "Programming");
+                tree.load(vec![cat.clone()]);
+
+                let found = tree.get_by_path("/programming");
+                expect(&found.is_some()).to().be_true();
+            });
+        });
+    });
+
+    describe("Skills", || {
+        describe("creation", || {
+            it("creates a skill with domain", || {
+                let skill = Skill::new("tenant_1", "Python", SkillDomain::Technical);
+
+                expect(&skill.name).to().equal(&"Python".to_string());
+                expect(&skill.domain).to().equal(&SkillDomain::Technical);
+            });
+
+            it("has default proficiency levels", || {
+                let skill = Skill::new("tenant_1", "JavaScript", SkillDomain::Technical);
+
+                expect(&skill.proficiency_levels.len()).to().equal(&4);
+            });
+        });
+
+        describe("relationships", || {
+            it("can add prerequisites", || {
+                let mut advanced = Skill::new("tenant_1", "Advanced Python", SkillDomain::Technical);
+                let basic = Skill::new("tenant_1", "Basic Python", SkillDomain::Technical);
+
+                advanced.add_prerequisite(&basic.id);
+
+                expect(&advanced.prerequisites.len()).to().equal(&1);
+            });
+
+            it("can add related skills", || {
+                let mut python = Skill::new("tenant_1", "Python", SkillDomain::Technical);
+                let django = Skill::new("tenant_1", "Django", SkillDomain::Technical);
+
+                python.add_related(&django.id, SkillRelationType::Complementary, 0.8);
+
+                expect(&python.related_skills.len()).to().equal(&1);
+            });
+        });
+
+        describe("LearnerSkillProfile", || {
+            it("tracks learner skills", || {
+                let mut profile = LearnerSkillProfile::new("tenant_1", "learner_1");
+
+                profile.set_skill("skill_1", 2, 0.8);
+
+                expect(&profile.get_level("skill_1")).to().equal(&Some(2));
+            });
+
+            it("checks skill requirements", || {
+                let mut profile = LearnerSkillProfile::new("tenant_1", "learner_1");
+                profile.set_skill("python", 3, 0.9);
+
+                expect(&profile.has_skill("python", 2)).to().be_true();
+                expect(&profile.has_skill("python", 4)).to().be_false();
+            });
+
+            it("adds evidence for skills", || {
+                let mut profile = LearnerSkillProfile::new("tenant_1", "learner_1");
+                profile.set_skill("python", 2, 0.7);
+
+                profile.add_evidence("python", SkillEvidence {
+                    evidence_type: EvidenceType::Assessment,
+                    source_id: "assessment_1".to_string(),
+                    source_type: "quiz".to_string(),
+                    score: Some(85.0),
+                    weight: 1.0,
+                    captured_at: DateTime::now()
+                });
+
+                let skill = profile.skills.get("python").unwrap();
+                expect(&skill.evidence.len()).to().equal(&1);
+            });
+        });
+    });
+
+    describe("Competencies", || {
+        describe("creation", || {
+            it("creates a competency with code", || {
+                let competency = Competency::new("tenant_1", "framework_1", "COMM-001", "Communication");
+
+                expect(&competency.code).to().equal(&"COMM-001".to_string());
+                expect(&competency.name).to().equal(&"Communication".to_string());
+            });
+
+            it("can set category", || {
+                let competency = Competency::new("tenant_1", "framework_1", "LEAD-001", "Leadership")
+                    .with_category(CompetencyCategory::Leadership);
+
+                expect(&competency.category).to().equal(&CompetencyCategory::Leadership);
+            });
+        });
+
+        describe("CompetencyFramework", || {
+            it("creates a framework", || {
+                let framework = CompetencyFramework::new("tenant_1", "Core Competencies");
+
+                expect(&framework.name).to().equal(&"Core Competencies".to_string());
+                expect(&framework.is_active).to().be_false();
+            });
+
+            it("can add competencies", || {
+                let mut framework = CompetencyFramework::new("tenant_1", "Core Competencies");
+
+                framework.add_competency("comp_1");
+                framework.add_competency("comp_2");
+
+                expect(&framework.competencies.len()).to().equal(&2);
+            });
+
+            it("can be activated", || {
+                let mut framework = CompetencyFramework::new("tenant_1", "Core Competencies");
+
+                framework.activate();
+
+                expect(&framework.is_active).to().be_true();
+            });
+        });
+
+        describe("RoleCompetencyProfile", || {
+            it("defines role requirements", || {
+                let mut profile = RoleCompetencyProfile::new(
+                    "tenant_1", "role_1", "Software Engineer", "framework_1"
+                );
+
+                profile.require("tech_1", 2, 3);
+                profile.prefer("comm_1", 2);
+
+                expect(&profile.required_competencies.len()).to().equal(&1);
+                expect(&profile.nice_to_have.len()).to().equal(&1);
+            });
+        });
+    });
+
+    describe("Tags", || {
+        describe("creation", || {
+            it("creates a tag", || {
+                let tag = Tag::new("tenant_1", "Python", TagType::Technology);
+
+                expect(&tag.name).to().equal(&"Python".to_string());
+                expect(&tag.tag_type).to().equal(&TagType::Technology);
+            });
+
+            it("generates slug", || {
+                let tag = Tag::new("tenant_1", "Machine Learning", TagType::Topic);
+
+                expect(&tag.slug).to().equal(&"machine-learning".to_string());
+            });
+
+            it("can add synonyms", || {
+                let tag = Tag::new("tenant_1", "ML", TagType::Topic)
+                    .with_synonyms(vec!["Machine Learning", "AI/ML"]);
+
+                expect(&tag.synonyms.len()).to().equal(&2);
+            });
+        });
+
+        describe("TaggedEntity", || {
+            it("tags an entity", || {
+                let mut entity = TaggedEntity::new("course_1", EntityType::Course);
+
+                entity.add_tag("tag_1");
+                entity.add_tag("tag_2");
+
+                expect(&entity.tags.len()).to().equal(&2);
+            });
+
+            it("removes tags", || {
+                let mut entity = TaggedEntity::new("course_1", EntityType::Course);
+                entity.add_tag("tag_1");
+                entity.add_tag("tag_2");
+
+                entity.remove_tag("tag_1");
+
+                expect(&entity.tags.len()).to().equal(&1);
+            });
+
+            it("combines manual and auto tags", || {
+                let mut entity = TaggedEntity::new("course_1", EntityType::Course);
+                entity.add_tag("tag_1");
+                entity.add_auto_tag("tag_2");
+
+                let all = entity.all_tags();
+                expect(&all.len()).to().equal(&2);
+            });
+        });
+
+        describe("TagCloud", || {
+            it("generates weighted tag cloud", || {
+                let tags = vec![
+                    {
+                        let mut t = Tag::new("tenant_1", "Python", TagType::Technology);
+                        t.usage_count = 100;
+                        t
+                    },
+                    {
+                        let mut t = Tag::new("tenant_1", "JavaScript", TagType::Technology);
+                        t.usage_count = 50;
+                        t
+                    },
+                ];
+
+                let cloud = generate_tag_cloud(&tags, 2.0, 1.0);
+
+                expect(&cloud.len()).to().equal(&2);
+                expect(&cloud[0].size).to().be_greater_than(&cloud[1].size);
+            });
+        });
+    });
+
+    describe("Learning Objectives", || {
+        describe("creation", || {
+            it("creates an objective with statement", || {
+                let objective = LearningObjective::new(
+                    "tenant_1",
+                    "LO-001",
+                    "Explain the principles of object-oriented programming"
+                );
+
+                expect(&objective.statement).to().contain(&"Explain".to_string());
+                expect(&objective.bloom_level).to().equal(&BloomLevel::Understand);
+            });
+
+            it("infers Bloom level from verb", || {
+                let create_obj = LearningObjective::new("tenant_1", "LO-001", "Create a web application");
+                let analyze_obj = LearningObjective::new("tenant_1", "LO-002", "Analyze user requirements");
+
+                expect(&create_obj.bloom_level).to().equal(&BloomLevel::Create);
+                expect(&analyze_obj.bloom_level).to().equal(&BloomLevel::Analyze);
+            });
+        });
+
+        describe("Bloom's Taxonomy", || {
+            it("orders levels correctly", || {
+                expect(&(BloomLevel::Create > BloomLevel::Remember)).to().be_true();
+                expect(&(BloomLevel::Apply > BloomLevel::Understand)).to().be_true();
+            });
+
+            it("provides action verbs per level", || {
+                let verbs = BloomLevel::Apply.action_verbs();
+
+                expect(&verbs.len()).to().be_greater_than(&0);
+                expect(&verbs).to().contain(&"implement");
+            });
+
+            it("identifies level from verb", || {
+                expect(&BloomLevel::from_verb("define")).to().equal(&Some(BloomLevel::Remember));
+                expect(&BloomLevel::from_verb("design")).to().equal(&Some(BloomLevel::Create));
+            });
+        });
+
+        describe("ABCD compliance", || {
+            it("validates ABCD format", || {
+                let mut objective = LearningObjective::new(
+                    "tenant_1",
+                    "LO-001",
+                    "Implement a REST API"
+                );
+                objective.conditions = Some("Given a specification document".to_string());
+                objective.criteria = Some("that passes all integration tests".to_string());
+
+                expect(&objective.is_abcd_compliant()).to().be_true();
+            });
+
+            it("generates SMART statement", || {
+                let mut objective = LearningObjective::new(
+                    "tenant_1",
+                    "LO-001",
+                    "Configure a database"
+                );
+                objective.conditions = Some("a development environment".to_string());
+                objective.criteria = Some("successfully connecting to the application".to_string());
+                objective.time_frame = Some("2 hours".to_string());
+
+                let smart = objective.to_smart_statement();
+
+                expect(&smart).to().contain(&"2 hours".to_string());
+            });
+        });
+
+        describe("Alignment", || {
+            it("tracks objective alignment to content", || {
+                let mut alignment = ObjectiveAlignment {
+                    objective_id: "lo_1".to_string(),
+                    aligned_items: vec![],
+                    coverage: 0.0,
+                    alignment_score: 0.0,
+                    gaps: vec![]
+                };
+
+                alignment.aligned_items.push(AlignedItem {
+                    item_id: "activity_1".to_string(),
+                    item_type: AlignedItemType::Activity,
+                    alignment_strength: 0.9,
+                    bloom_level_match: true,
+                    notes: None
+                });
+
+                expect(&alignment.aligned_items.len()).to().equal(&1);
+            });
+        });
+    });
+}

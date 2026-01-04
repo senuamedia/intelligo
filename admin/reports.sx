@@ -1,0 +1,1069 @@
+/// Intelligo LMS - Reports & Analytics
+///
+/// Comprehensive reporting and analytics for learning data,
+/// including enrollment, completion, grades, activity, and SCORM/xAPI reports.
+
+module intelligo::admin::reports
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// REPORT DEFINITIONS
+// =============================================================================
+
+/// A report definition
+type ReportDefinition {
+    /// Report ID
+    id: String,
+
+    /// Report name
+    name: String,
+
+    /// Description
+    description: String,
+
+    /// Report category
+    category: ReportCategory,
+
+    /// Available columns
+    columns: List<ReportColumn>,
+
+    /// Default columns
+    default_columns: List<String>,
+
+    /// Available filters
+    filters: List<ReportFilter>,
+
+    /// Supported export formats
+    export_formats: List<ExportFormat>,
+
+    /// Required permission
+    permission: PermissionId,
+
+    /// Whether scheduled reports are supported
+    schedulable: Bool
+}
+
+/// Report category
+enum ReportCategory {
+    Enrollment,
+    Completion,
+    Grades,
+    Activity,
+    Compliance,
+    Revenue,
+    User,
+    System
+}
+
+/// Report column definition
+type ReportColumn {
+    /// Column ID
+    id: String,
+
+    /// Display label
+    label: String,
+
+    /// Data type
+    data_type: ColumnDataType,
+
+    /// Sortable
+    sortable: Bool,
+
+    /// Aggregatable (for summaries)
+    aggregatable: Bool,
+
+    /// Format string
+    format: Option<String>
+}
+
+/// Column data type
+enum ColumnDataType {
+    Text,
+    Number,
+    Percentage,
+    Currency,
+    Date,
+    DateTime,
+    Duration,
+    Boolean,
+    Status
+}
+
+/// Report filter
+type ReportFilter {
+    /// Filter ID
+    id: String,
+
+    /// Display label
+    label: String,
+
+    /// Filter type
+    filter_type: FilterType,
+
+    /// Options (for select types)
+    options: Option<List<FilterOption>>,
+
+    /// Default value
+    default_value: Option<Dynamic>
+}
+
+/// Filter type
+enum FilterType {
+    Text,
+    Select,
+    MultiSelect,
+    DateRange,
+    NumberRange,
+    Boolean,
+    Course,
+    User,
+    Assessment
+}
+
+/// Filter option
+type FilterOption {
+    value: String,
+    label: String
+}
+
+/// Export format
+enum ExportFormat {
+    Csv,
+    Excel,
+    Pdf,
+    Json
+}
+
+// =============================================================================
+// REPORT EXECUTION
+// =============================================================================
+
+/// Report execution request
+type ReportRequest {
+    /// Report ID
+    report_id: String,
+
+    /// Tenant
+    tenant_id: TenantId,
+
+    /// Selected columns
+    columns: List<String>,
+
+    /// Filter values
+    filters: Map<String, Dynamic>,
+
+    /// Sort configuration
+    sort: Option<ReportSort>,
+
+    /// Pagination
+    pagination: Pagination,
+
+    /// Date range
+    date_range: Option<DateRange>,
+
+    /// Group by columns
+    group_by: Option<List<String>>
+}
+
+/// Report sort configuration
+type ReportSort {
+    column: String,
+    direction: SortOrder
+}
+
+/// Report execution result
+type ReportResult {
+    /// Report metadata
+    report: ReportDefinition,
+
+    /// Executed at
+    executed_at: DateTime,
+
+    /// Data rows
+    rows: List<Map<String, Dynamic>>,
+
+    /// Summary row (if grouped/aggregated)
+    summary: Option<Map<String, Dynamic>>,
+
+    /// Total row count (before pagination)
+    total_count: i64,
+
+    /// Execution time in ms
+    execution_time_ms: i64,
+
+    /// Pagination info
+    pagination: PaginationInfo
+}
+
+/// Pagination info
+type PaginationInfo {
+    page: i32,
+    per_page: i32,
+    total_pages: i32,
+    has_more: Bool
+}
+
+// =============================================================================
+// ENROLLMENT REPORTS
+// =============================================================================
+
+/// Enrollment report row
+type EnrollmentReportRow {
+    enrollment_id: EnrollmentId,
+    user_id: UserId,
+    user_name: String,
+    user_email: String,
+    course_id: CourseId,
+    course_title: String,
+    course_code: String,
+    enrolled_at: DateTime,
+    status: EnrollmentStatus,
+    source: EnrollmentSource,
+    progress_percent: f32,
+    completed_at: Option<DateTime>,
+    grade: Option<String>,
+    time_spent_minutes: i64,
+    last_access: Option<DateTime>
+}
+
+/// Enrollment summary
+type EnrollmentSummary {
+    total_enrollments: i64,
+    active_enrollments: i64,
+    completed_enrollments: i64,
+    withdrawn_enrollments: i64,
+    average_progress: f32,
+    average_completion_time_days: f32
+}
+
+// =============================================================================
+// COMPLETION REPORTS
+// =============================================================================
+
+/// Course completion report row
+type CompletionReportRow {
+    course_id: CourseId,
+    course_title: String,
+    total_enrollments: i32,
+    not_started: i32,
+    in_progress: i32,
+    completed: i32,
+    completion_rate: f32,
+    avg_completion_days: f32,
+    avg_score: Option<f32>
+}
+
+/// Module completion report row
+type ModuleCompletionRow {
+    module_id: ModuleId,
+    module_title: String,
+    course_title: String,
+    total_learners: i32,
+    completed: i32,
+    completion_rate: f32,
+    avg_time_minutes: i64,
+    avg_score: Option<f32>
+}
+
+/// Lesson completion report row
+type LessonCompletionRow {
+    lesson_id: LessonId,
+    lesson_title: String,
+    lesson_type: ContentType,
+    module_title: String,
+    course_title: String,
+    views: i32,
+    completions: i32,
+    completion_rate: f32,
+    avg_time_seconds: i64,
+    drop_off_rate: f32
+}
+
+// =============================================================================
+// GRADE REPORTS
+// =============================================================================
+
+/// Grade report row
+type GradeReportRow {
+    grade_id: GradeId,
+    user_id: UserId,
+    user_name: String,
+    course_id: CourseId,
+    course_title: String,
+    assessment_id: AssessmentId,
+    assessment_title: String,
+    assessment_type: AssessmentType,
+    score: f32,
+    max_score: f32,
+    percentage: f32,
+    letter_grade: Option<String>,
+    attempts: i32,
+    graded_at: DateTime,
+    graded_by: Option<String>,
+    grading_method: GradingMethod
+}
+
+/// Grade distribution
+type GradeDistribution {
+    assessment_id: AssessmentId,
+    assessment_title: String,
+    total_submissions: i32,
+    graded_count: i32,
+    average_score: f32,
+    median_score: f32,
+    std_deviation: f32,
+    min_score: f32,
+    max_score: f32,
+    distribution: List<GradeBucket>
+}
+
+/// Grade bucket for distribution
+type GradeBucket {
+    range_start: f32,
+    range_end: f32,
+    label: String,
+    count: i32,
+    percentage: f32
+}
+
+/// Gradebook report row (student-centric)
+type GradebookRow {
+    user_id: UserId,
+    user_name: String,
+    course_id: CourseId,
+    assessments: Map<AssessmentId, GradebookCell>,
+    total_points: f32,
+    max_points: f32,
+    percentage: f32,
+    letter_grade: Option<String>,
+    pass_status: PassStatus
+}
+
+/// Gradebook cell
+type GradebookCell {
+    score: Option<f32>,
+    max_score: f32,
+    status: GradebookCellStatus,
+    graded_at: Option<DateTime>
+}
+
+/// Gradebook cell status
+enum GradebookCellStatus {
+    NotSubmitted,
+    Submitted,
+    Grading,
+    Graded,
+    Late,
+    Excused
+}
+
+/// Pass status
+enum PassStatus {
+    Passing,
+    Failing,
+    Incomplete
+}
+
+// =============================================================================
+// ACTIVITY REPORTS
+// =============================================================================
+
+/// Activity log entry
+type ActivityLogEntry {
+    id: String,
+    timestamp: DateTime,
+    user_id: UserId,
+    user_name: String,
+    user_email: String,
+    action: String,
+    action_category: ActionCategory,
+    entity_type: String,
+    entity_id: String,
+    entity_title: Option<String>,
+    course_id: Option<CourseId>,
+    course_title: Option<String>,
+    ip_address: String,
+    user_agent: String,
+    session_id: Option<SessionId>,
+    details: Map<String, Dynamic>
+}
+
+/// Action category
+enum ActionCategory {
+    Authentication,
+    Course,
+    Content,
+    Assessment,
+    Submission,
+    Grading,
+    Enrollment,
+    Communication,
+    Administration,
+    System
+}
+
+/// User activity summary
+type UserActivitySummary {
+    user_id: UserId,
+    user_name: String,
+    first_access: DateTime,
+    last_access: DateTime,
+    total_sessions: i32,
+    total_time_minutes: i64,
+    pages_viewed: i32,
+    resources_accessed: i32,
+    assessments_taken: i32,
+    discussions_participated: i32,
+    avg_session_duration_minutes: f32
+}
+
+/// Course activity summary
+type CourseActivitySummary {
+    course_id: CourseId,
+    course_title: String,
+    date: DateTime,
+    unique_visitors: i32,
+    total_views: i32,
+    lesson_views: i32,
+    assessment_attempts: i32,
+    submissions: i32,
+    forum_posts: i32,
+    avg_time_minutes: f32
+}
+
+// =============================================================================
+// SCORM/XAPI REPORTS
+// =============================================================================
+
+/// SCORM report row
+type ScormReportRow {
+    user_id: UserId,
+    user_name: String,
+    course_id: CourseId,
+    course_title: String,
+    sco_id: String,
+    sco_title: String,
+    completion_status: ScormCompletionStatus,
+    success_status: ScormSuccessStatus,
+    score_raw: Option<f32>,
+    score_scaled: Option<f32>,
+    total_time: Option<Duration>,
+    session_time: Option<Duration>,
+    attempts: i32,
+    last_access: DateTime,
+    suspend_data_size: i32
+}
+
+/// xAPI statement report row
+type XapiReportRow {
+    statement_id: String,
+    timestamp: DateTime,
+    actor_id: UserId,
+    actor_name: String,
+    verb_id: String,
+    verb_display: String,
+    object_id: String,
+    object_type: String,
+    object_name: String,
+    result_score: Option<f32>,
+    result_success: Option<Bool>,
+    result_completion: Option<Bool>,
+    result_duration: Option<Duration>,
+    context_course: Option<String>,
+    context_instructor: Option<String>
+}
+
+/// Learning path analytics
+type LearningPathAnalytics {
+    course_id: CourseId,
+    course_title: String,
+    total_learners: i32,
+    path_distribution: List<LearningPath>,
+    common_struggles: List<ContentStruggle>,
+    avg_path_length: f32,
+    most_revisited_content: List<RevisitedContent>
+}
+
+/// Learning path variant
+type LearningPath {
+    path_id: String,
+    steps: List<String>,
+    learner_count: i32,
+    completion_rate: f32,
+    avg_time_minutes: i64
+}
+
+/// Content struggle indicator
+type ContentStruggle {
+    content_id: String,
+    content_title: String,
+    content_type: ContentType,
+    attempt_count: i32,
+    failure_rate: f32,
+    avg_time_to_complete: i64
+}
+
+/// Revisited content
+type RevisitedContent {
+    content_id: String,
+    content_title: String,
+    revisit_count: i32,
+    unique_revisitors: i32
+}
+
+// =============================================================================
+// REVENUE REPORTS
+// =============================================================================
+
+/// Revenue report row
+type RevenueReportRow {
+    transaction_id: String,
+    date: DateTime,
+    user_id: UserId,
+    user_name: String,
+    user_email: String,
+    course_id: Option<CourseId>,
+    course_title: Option<String>,
+    product_type: ProductType,
+    amount: f32,
+    currency: String,
+    payment_method: String,
+    payment_provider: String,
+    status: TransactionStatus,
+    coupon_code: Option<String>,
+    discount_amount: f32
+}
+
+/// Product type
+enum ProductType {
+    Course,
+    Subscription,
+    Certificate,
+    Bundle
+}
+
+/// Transaction status
+enum TransactionStatus {
+    Pending,
+    Completed,
+    Refunded,
+    Failed,
+    Disputed
+}
+
+/// Revenue summary
+type RevenueSummary {
+    period_start: DateTime,
+    period_end: DateTime,
+    total_revenue: f32,
+    total_transactions: i32,
+    avg_transaction: f32,
+    refund_amount: f32,
+    refund_count: i32,
+    net_revenue: f32,
+    by_product_type: Map<ProductType, f32>,
+    by_payment_method: Map<String, f32>,
+    by_course: List<CourseRevenue>
+}
+
+/// Revenue by course
+type CourseRevenue {
+    course_id: CourseId,
+    course_title: String,
+    revenue: f32,
+    enrollments: i32,
+    avg_price: f32
+}
+
+// =============================================================================
+// SCHEDULED REPORTS
+// =============================================================================
+
+/// Scheduled report configuration
+type ScheduledReport {
+    id: String,
+    tenant_id: TenantId,
+    report_id: String,
+    name: String,
+    description: Option<String>,
+    schedule: ReportSchedule,
+    filters: Map<String, Dynamic>,
+    columns: List<String>,
+    export_format: ExportFormat,
+    recipients: List<ReportRecipient>,
+    enabled: Bool,
+    last_run: Option<DateTime>,
+    next_run: DateTime,
+    created_by: UserId,
+    created_at: DateTime
+}
+
+/// Report schedule
+type ReportSchedule {
+    frequency: ScheduleFrequency,
+    day_of_week: Option<i32>,
+    day_of_month: Option<i32>,
+    time: String,
+    timezone: String
+}
+
+/// Schedule frequency
+enum ScheduleFrequency {
+    Daily,
+    Weekly,
+    BiWeekly,
+    Monthly,
+    Quarterly
+}
+
+/// Report recipient
+type ReportRecipient {
+    email: String,
+    name: String,
+    delivery_method: DeliveryMethod
+}
+
+/// Delivery method
+enum DeliveryMethod {
+    Email,
+    Download,
+    Webhook
+}
+
+// =============================================================================
+// REPORTS ACTOR
+// =============================================================================
+
+/// Reports actor for generating and managing reports
+actor ReportsActor {
+    state {
+        /// Report definitions
+        definitions: Map<String, ReportDefinition>,
+
+        /// Scheduled reports
+        scheduled: Map<String, ScheduledReport>,
+
+        /// Report cache
+        cache: Map<String, CachedReport>,
+
+        /// Running report jobs
+        running_jobs: Map<String, ReportJob>
+    }
+
+    /// Initialize reports actor
+    fn init() -> ReportsActor {
+        let definitions = Self::build_report_definitions();
+
+        ReportsActor {
+            state: ReportsActorState {
+                definitions,
+                scheduled: Map::new(),
+                cache: Map::new(),
+                running_jobs: Map::new()
+            }
+        }
+    }
+
+    /// Get all report definitions
+    fn get_definitions(&self, context: &AccessContext) -> List<ReportDefinition> {
+        self.state.definitions.values()
+            .filter(|d| context.has_permission(&d.permission))
+            .cloned()
+            .collect()
+    }
+
+    /// Get report definition by ID
+    fn get_definition(&self, report_id: &str) -> Option<ReportDefinition> {
+        self.state.definitions.get(report_id).cloned()
+    }
+
+    /// Execute a report
+    fn execute(&self, request: ReportRequest) -> Result<ReportResult, LmsError> {
+        let start_time = std::time::Instant::now();
+
+        // Get report definition
+        let report = self.get_definition(&request.report_id)
+            .ok_or_else(|| LmsError::NotFound {
+                entity_type: "Report".to_string(),
+                id: request.report_id.clone()
+            })?;
+
+        // Execute based on report type
+        let (rows, total_count, summary) = match request.report_id.as_str() {
+            "enrollment_report" => self.execute_enrollment_report(&request),
+            "completion_report" => self.execute_completion_report(&request),
+            "grade_report" => self.execute_grade_report(&request),
+            "activity_log" => self.execute_activity_report(&request),
+            "scorm_report" => self.execute_scorm_report(&request),
+            "xapi_report" => self.execute_xapi_report(&request),
+            "revenue_report" => self.execute_revenue_report(&request),
+            _ => (vec![], 0, None)
+        };
+
+        let execution_time = start_time.elapsed().as_millis() as i64;
+        let total_pages = ((total_count as f32) / (request.pagination.per_page as f32)).ceil() as i32;
+
+        Ok(ReportResult {
+            report,
+            executed_at: DateTime::now(),
+            rows,
+            summary,
+            total_count,
+            execution_time_ms: execution_time,
+            pagination: PaginationInfo {
+                page: request.pagination.page,
+                per_page: request.pagination.per_page,
+                total_pages,
+                has_more: request.pagination.page < total_pages
+            }
+        })
+    }
+
+    /// Execute enrollment report
+    fn execute_enrollment_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        // Would query enrollment data from database
+        (vec![], 0, None)
+    }
+
+    /// Execute completion report
+    fn execute_completion_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        (vec![], 0, None)
+    }
+
+    /// Execute grade report
+    fn execute_grade_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        (vec![], 0, None)
+    }
+
+    /// Execute activity report
+    fn execute_activity_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        (vec![], 0, None)
+    }
+
+    /// Execute SCORM report
+    fn execute_scorm_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        (vec![], 0, None)
+    }
+
+    /// Execute xAPI report
+    fn execute_xapi_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        (vec![], 0, None)
+    }
+
+    /// Execute revenue report
+    fn execute_revenue_report(&self, request: &ReportRequest) -> (List<Map<String, Dynamic>>, i64, Option<Map<String, Dynamic>>) {
+        (vec![], 0, None)
+    }
+
+    /// Export report
+    fn export(&self, request: ReportRequest, format: ExportFormat) -> Result<ExportedReport, LmsError> {
+        let result = self.execute(request)?;
+
+        match format {
+            ExportFormat::Csv => self.export_csv(&result),
+            ExportFormat::Excel => self.export_excel(&result),
+            ExportFormat::Pdf => self.export_pdf(&result),
+            ExportFormat::Json => self.export_json(&result)
+        }
+    }
+
+    /// Export to CSV
+    fn export_csv(&self, result: &ReportResult) -> Result<ExportedReport, LmsError> {
+        // Generate CSV content
+        Ok(ExportedReport {
+            filename: format!("{}-{}.csv", result.report.id, DateTime::now().format("%Y%m%d")),
+            content_type: "text/csv".to_string(),
+            data: vec![]
+        })
+    }
+
+    /// Export to Excel
+    fn export_excel(&self, result: &ReportResult) -> Result<ExportedReport, LmsError> {
+        Ok(ExportedReport {
+            filename: format!("{}-{}.xlsx", result.report.id, DateTime::now().format("%Y%m%d")),
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+            data: vec![]
+        })
+    }
+
+    /// Export to PDF
+    fn export_pdf(&self, result: &ReportResult) -> Result<ExportedReport, LmsError> {
+        Ok(ExportedReport {
+            filename: format!("{}-{}.pdf", result.report.id, DateTime::now().format("%Y%m%d")),
+            content_type: "application/pdf".to_string(),
+            data: vec![]
+        })
+    }
+
+    /// Export to JSON
+    fn export_json(&self, result: &ReportResult) -> Result<ExportedReport, LmsError> {
+        Ok(ExportedReport {
+            filename: format!("{}-{}.json", result.report.id, DateTime::now().format("%Y%m%d")),
+            content_type: "application/json".to_string(),
+            data: vec![]
+        })
+    }
+
+    /// Schedule a report
+    fn schedule(&mut self, config: ScheduledReport) -> Result<ScheduledReport, LmsError> {
+        let id = config.id.clone();
+        self.state.scheduled.insert(id.clone(), config.clone());
+        Ok(config)
+    }
+
+    /// Update scheduled report
+    fn update_schedule(&mut self, id: &str, config: ScheduledReport) -> Result<ScheduledReport, LmsError> {
+        if !self.state.scheduled.contains_key(id) {
+            return Err(LmsError::NotFound {
+                entity_type: "ScheduledReport".to_string(),
+                id: id.to_string()
+            })
+        }
+
+        self.state.scheduled.insert(id.to_string(), config.clone());
+        Ok(config)
+    }
+
+    /// Delete scheduled report
+    fn delete_schedule(&mut self, id: &str) -> Result<(), LmsError> {
+        self.state.scheduled.remove(id);
+        Ok(())
+    }
+
+    /// Get scheduled reports for tenant
+    fn get_scheduled(&self, tenant_id: &TenantId) -> List<ScheduledReport> {
+        self.state.scheduled.values()
+            .filter(|s| &s.tenant_id == tenant_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Build report definitions
+    fn build_report_definitions() -> Map<String, ReportDefinition> {
+        let mut definitions = Map::new();
+
+        // Enrollment Report
+        definitions.insert("enrollment_report".to_string(), ReportDefinition {
+            id: "enrollment_report".to_string(),
+            name: "Enrollment Report".to_string(),
+            description: "Detailed enrollment data with progress and completion status".to_string(),
+            category: ReportCategory::Enrollment,
+            columns: vec![
+                ReportColumn { id: "user_name".to_string(), label: "Student Name".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "user_email".to_string(), label: "Email".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "course_title".to_string(), label: "Course".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "enrolled_at".to_string(), label: "Enrolled".to_string(), data_type: ColumnDataType::DateTime, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "status".to_string(), label: "Status".to_string(), data_type: ColumnDataType::Status, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "progress_percent".to_string(), label: "Progress".to_string(), data_type: ColumnDataType::Percentage, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "completed_at".to_string(), label: "Completed".to_string(), data_type: ColumnDataType::DateTime, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "grade".to_string(), label: "Grade".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "time_spent_minutes".to_string(), label: "Time Spent".to_string(), data_type: ColumnDataType::Duration, sortable: true, aggregatable: true, format: None }
+            ],
+            default_columns: vec!["user_name".to_string(), "course_title".to_string(), "enrolled_at".to_string(), "status".to_string(), "progress_percent".to_string()],
+            filters: vec![
+                ReportFilter { id: "course".to_string(), label: "Course".to_string(), filter_type: FilterType::Course, options: None, default_value: None },
+                ReportFilter { id: "status".to_string(), label: "Status".to_string(), filter_type: FilterType::MultiSelect, options: Some(vec![
+                    FilterOption { value: "active".to_string(), label: "Active".to_string() },
+                    FilterOption { value: "completed".to_string(), label: "Completed".to_string() },
+                    FilterOption { value: "withdrawn".to_string(), label: "Withdrawn".to_string() }
+                ]), default_value: None },
+                ReportFilter { id: "date_range".to_string(), label: "Enrolled Between".to_string(), filter_type: FilterType::DateRange, options: None, default_value: None }
+            ],
+            export_formats: vec![ExportFormat::Csv, ExportFormat::Excel, ExportFormat::Pdf],
+            permission: "admin.reports.enrollment".to_string(),
+            schedulable: true
+        });
+
+        // Completion Report
+        definitions.insert("completion_report".to_string(), ReportDefinition {
+            id: "completion_report".to_string(),
+            name: "Completion Report".to_string(),
+            description: "Course and module completion rates and statistics".to_string(),
+            category: ReportCategory::Completion,
+            columns: vec![
+                ReportColumn { id: "course_title".to_string(), label: "Course".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "total_enrollments".to_string(), label: "Total Enrolled".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "not_started".to_string(), label: "Not Started".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "in_progress".to_string(), label: "In Progress".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "completed".to_string(), label: "Completed".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "completion_rate".to_string(), label: "Completion Rate".to_string(), data_type: ColumnDataType::Percentage, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "avg_completion_days".to_string(), label: "Avg Days to Complete".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "avg_score".to_string(), label: "Avg Score".to_string(), data_type: ColumnDataType::Percentage, sortable: true, aggregatable: true, format: None }
+            ],
+            default_columns: vec!["course_title".to_string(), "total_enrollments".to_string(), "completed".to_string(), "completion_rate".to_string()],
+            filters: vec![
+                ReportFilter { id: "course".to_string(), label: "Course".to_string(), filter_type: FilterType::Course, options: None, default_value: None },
+                ReportFilter { id: "date_range".to_string(), label: "Completion Period".to_string(), filter_type: FilterType::DateRange, options: None, default_value: None }
+            ],
+            export_formats: vec![ExportFormat::Csv, ExportFormat::Excel, ExportFormat::Pdf],
+            permission: "admin.reports.completion".to_string(),
+            schedulable: true
+        });
+
+        // Grade Report
+        definitions.insert("grade_report".to_string(), ReportDefinition {
+            id: "grade_report".to_string(),
+            name: "Grade Report".to_string(),
+            description: "Assessment grades and score distributions".to_string(),
+            category: ReportCategory::Grades,
+            columns: vec![
+                ReportColumn { id: "user_name".to_string(), label: "Student".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "course_title".to_string(), label: "Course".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "assessment_title".to_string(), label: "Assessment".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "assessment_type".to_string(), label: "Type".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "score".to_string(), label: "Score".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "percentage".to_string(), label: "Percentage".to_string(), data_type: ColumnDataType::Percentage, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "letter_grade".to_string(), label: "Grade".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "attempts".to_string(), label: "Attempts".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "graded_at".to_string(), label: "Graded".to_string(), data_type: ColumnDataType::DateTime, sortable: true, aggregatable: false, format: None }
+            ],
+            default_columns: vec!["user_name".to_string(), "assessment_title".to_string(), "percentage".to_string(), "letter_grade".to_string()],
+            filters: vec![
+                ReportFilter { id: "course".to_string(), label: "Course".to_string(), filter_type: FilterType::Course, options: None, default_value: None },
+                ReportFilter { id: "assessment".to_string(), label: "Assessment".to_string(), filter_type: FilterType::Assessment, options: None, default_value: None },
+                ReportFilter { id: "date_range".to_string(), label: "Graded Between".to_string(), filter_type: FilterType::DateRange, options: None, default_value: None }
+            ],
+            export_formats: vec![ExportFormat::Csv, ExportFormat::Excel, ExportFormat::Pdf],
+            permission: "admin.reports.grades".to_string(),
+            schedulable: true
+        });
+
+        // Activity Log
+        definitions.insert("activity_log".to_string(), ReportDefinition {
+            id: "activity_log".to_string(),
+            name: "Activity Log".to_string(),
+            description: "Detailed user activity and audit trail".to_string(),
+            category: ReportCategory::Activity,
+            columns: vec![
+                ReportColumn { id: "timestamp".to_string(), label: "Time".to_string(), data_type: ColumnDataType::DateTime, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "user_name".to_string(), label: "User".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "action".to_string(), label: "Action".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "action_category".to_string(), label: "Category".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "entity_type".to_string(), label: "Entity Type".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "entity_title".to_string(), label: "Entity".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "ip_address".to_string(), label: "IP Address".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None }
+            ],
+            default_columns: vec!["timestamp".to_string(), "user_name".to_string(), "action".to_string(), "entity_title".to_string()],
+            filters: vec![
+                ReportFilter { id: "user".to_string(), label: "User".to_string(), filter_type: FilterType::User, options: None, default_value: None },
+                ReportFilter { id: "action_category".to_string(), label: "Category".to_string(), filter_type: FilterType::MultiSelect, options: Some(vec![
+                    FilterOption { value: "authentication".to_string(), label: "Authentication".to_string() },
+                    FilterOption { value: "course".to_string(), label: "Course".to_string() },
+                    FilterOption { value: "content".to_string(), label: "Content".to_string() },
+                    FilterOption { value: "assessment".to_string(), label: "Assessment".to_string() },
+                    FilterOption { value: "grading".to_string(), label: "Grading".to_string() },
+                    FilterOption { value: "enrollment".to_string(), label: "Enrollment".to_string() },
+                    FilterOption { value: "administration".to_string(), label: "Administration".to_string() }
+                ]), default_value: None },
+                ReportFilter { id: "date_range".to_string(), label: "Date Range".to_string(), filter_type: FilterType::DateRange, options: None, default_value: None }
+            ],
+            export_formats: vec![ExportFormat::Csv, ExportFormat::Excel, ExportFormat::Json],
+            permission: "admin.reports.activity".to_string(),
+            schedulable: false
+        });
+
+        // SCORM Report
+        definitions.insert("scorm_report".to_string(), ReportDefinition {
+            id: "scorm_report".to_string(),
+            name: "SCORM Tracking Report".to_string(),
+            description: "SCORM package completion and score tracking".to_string(),
+            category: ReportCategory::Compliance,
+            columns: vec![
+                ReportColumn { id: "user_name".to_string(), label: "Learner".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "course_title".to_string(), label: "Course".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "sco_title".to_string(), label: "SCO".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "completion_status".to_string(), label: "Completion".to_string(), data_type: ColumnDataType::Status, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "success_status".to_string(), label: "Success".to_string(), data_type: ColumnDataType::Status, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "score_scaled".to_string(), label: "Score".to_string(), data_type: ColumnDataType::Percentage, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "total_time".to_string(), label: "Total Time".to_string(), data_type: ColumnDataType::Duration, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "attempts".to_string(), label: "Attempts".to_string(), data_type: ColumnDataType::Number, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "last_access".to_string(), label: "Last Access".to_string(), data_type: ColumnDataType::DateTime, sortable: true, aggregatable: false, format: None }
+            ],
+            default_columns: vec!["user_name".to_string(), "sco_title".to_string(), "completion_status".to_string(), "score_scaled".to_string(), "total_time".to_string()],
+            filters: vec![
+                ReportFilter { id: "course".to_string(), label: "Course".to_string(), filter_type: FilterType::Course, options: None, default_value: None },
+                ReportFilter { id: "completion_status".to_string(), label: "Completion Status".to_string(), filter_type: FilterType::MultiSelect, options: Some(vec![
+                    FilterOption { value: "not_attempted".to_string(), label: "Not Attempted".to_string() },
+                    FilterOption { value: "incomplete".to_string(), label: "Incomplete".to_string() },
+                    FilterOption { value: "completed".to_string(), label: "Completed".to_string() }
+                ]), default_value: None },
+                ReportFilter { id: "date_range".to_string(), label: "Date Range".to_string(), filter_type: FilterType::DateRange, options: None, default_value: None }
+            ],
+            export_formats: vec![ExportFormat::Csv, ExportFormat::Excel, ExportFormat::Pdf],
+            permission: "admin.reports.scorm".to_string(),
+            schedulable: true
+        });
+
+        // Revenue Report
+        definitions.insert("revenue_report".to_string(), ReportDefinition {
+            id: "revenue_report".to_string(),
+            name: "Revenue Report".to_string(),
+            description: "Payment transactions and revenue analytics".to_string(),
+            category: ReportCategory::Revenue,
+            columns: vec![
+                ReportColumn { id: "date".to_string(), label: "Date".to_string(), data_type: ColumnDataType::DateTime, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "user_name".to_string(), label: "Customer".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "course_title".to_string(), label: "Product".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "product_type".to_string(), label: "Type".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "amount".to_string(), label: "Amount".to_string(), data_type: ColumnDataType::Currency, sortable: true, aggregatable: true, format: None },
+                ReportColumn { id: "payment_method".to_string(), label: "Payment Method".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "status".to_string(), label: "Status".to_string(), data_type: ColumnDataType::Status, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "coupon_code".to_string(), label: "Coupon".to_string(), data_type: ColumnDataType::Text, sortable: true, aggregatable: false, format: None },
+                ReportColumn { id: "discount_amount".to_string(), label: "Discount".to_string(), data_type: ColumnDataType::Currency, sortable: true, aggregatable: true, format: None }
+            ],
+            default_columns: vec!["date".to_string(), "user_name".to_string(), "course_title".to_string(), "amount".to_string(), "status".to_string()],
+            filters: vec![
+                ReportFilter { id: "product_type".to_string(), label: "Product Type".to_string(), filter_type: FilterType::MultiSelect, options: Some(vec![
+                    FilterOption { value: "course".to_string(), label: "Course".to_string() },
+                    FilterOption { value: "subscription".to_string(), label: "Subscription".to_string() },
+                    FilterOption { value: "bundle".to_string(), label: "Bundle".to_string() }
+                ]), default_value: None },
+                ReportFilter { id: "status".to_string(), label: "Status".to_string(), filter_type: FilterType::MultiSelect, options: Some(vec![
+                    FilterOption { value: "completed".to_string(), label: "Completed".to_string() },
+                    FilterOption { value: "refunded".to_string(), label: "Refunded".to_string() },
+                    FilterOption { value: "pending".to_string(), label: "Pending".to_string() }
+                ]), default_value: None },
+                ReportFilter { id: "date_range".to_string(), label: "Date Range".to_string(), filter_type: FilterType::DateRange, options: None, default_value: None }
+            ],
+            export_formats: vec![ExportFormat::Csv, ExportFormat::Excel, ExportFormat::Pdf],
+            permission: "admin.reports.revenue".to_string(),
+            schedulable: true
+        });
+
+        definitions
+    }
+}
+
+/// Cached report
+type CachedReport {
+    result: ReportResult,
+    expires_at: DateTime
+}
+
+/// Report job
+type ReportJob {
+    id: String,
+    request: ReportRequest,
+    status: JobStatus,
+    started_at: DateTime,
+    completed_at: Option<DateTime>,
+    error: Option<String>
+}
+
+/// Job status
+enum JobStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed
+}
+
+/// Exported report
+type ExportedReport {
+    filename: String,
+    content_type: String,
+    data: List<u8>
+}

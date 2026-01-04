@@ -1,0 +1,265 @@
+// Enrollment Notification Email Template for Intelligo LMS
+// Sent when a user is enrolled in a course
+
+module intelligo::templates::email::enrollment
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Enrollment email template ID
+pub const TEMPLATE_ID: &str = "email.enrollment";
+
+/// Create the enrollment email template configuration
+pub fn get_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Course Enrollment".to_string(),
+        description: Some("Sent when a user is enrolled in a course".to_string()),
+        category: "learning".to_string(),
+
+        subject: Some("You've been enrolled in {{course_name}}".to_string()),
+        body_html: ENROLLMENT_HTML.to_string(),
+        body_text: Some(ENROLLMENT_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "course_name".to_string(),
+            "organization_name".to_string(),
+            "course_url".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "course_description".to_string(),
+            "course_image_url".to_string(),
+            "instructor_name".to_string(),
+            "start_date".to_string(),
+            "end_date".to_string(),
+            "duration".to_string(),
+            "enrolled_by".to_string(),
+            "learning_path_name".to_string(),
+            "prerequisites".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Build context for enrollment email
+pub fn build_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    course_name: String,
+    course_description: Option<String>,
+    course_image_url: Option<String>,
+    course_url: String,
+    organization_name: String,
+    instructor_name: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    duration: Option<String>,
+    enrolled_by: Option<String>,
+    learning_path_name: Option<String>,
+    prerequisites: Option<Vec<String>>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name)
+        .set_string("course_name", course_name)
+        .set_string("organization_name", organization_name)
+        .set_string("course_url", course_url)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(first_name) = user_first_name {
+        ctx = ctx.set_string("user_first_name", first_name);
+    }
+
+    if let Some(description) = course_description {
+        ctx = ctx.set_string("course_description", description);
+    }
+
+    if let Some(image_url) = course_image_url {
+        ctx = ctx.set_string("course_image_url", image_url);
+    }
+
+    if let Some(instructor) = instructor_name {
+        ctx = ctx.set_string("instructor_name", instructor);
+    }
+
+    if let Some(start) = start_date {
+        ctx = ctx.set_string("start_date", start);
+        ctx = ctx.set_bool("has_dates", true);
+    }
+
+    if let Some(end) = end_date {
+        ctx = ctx.set_string("end_date", end);
+    }
+
+    if let Some(dur) = duration {
+        ctx = ctx.set_string("duration", dur);
+    }
+
+    if let Some(enrollee) = enrolled_by {
+        ctx = ctx.set_string("enrolled_by", enrollee);
+        ctx = ctx.set_bool("was_enrolled_by_someone", true);
+    }
+
+    if let Some(path) = learning_path_name {
+        ctx = ctx.set_string("learning_path_name", path);
+        ctx = ctx.set_bool("is_part_of_path", true);
+    }
+
+    if let Some(prereqs) = prerequisites {
+        if !prereqs.is_empty() {
+            let prereq_values: Vec<ContextValue> = prereqs.into_iter()
+                .map(|p| ContextValue::String(p))
+                .collect();
+            ctx = ctx.set_list("prerequisites", prereq_values);
+            ctx = ctx.set_bool("has_prerequisites", true);
+        }
+    }
+
+    ctx
+}
+
+const ENROLLMENT_HTML: &str = r#"
+<h1>New Course Enrollment</h1>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+{{#if was_enrolled_by_someone}}
+<p><strong>{{enrolled_by}}</strong> has enrolled you in a new course!</p>
+{{else}}
+<p>You've been successfully enrolled in a new course!</p>
+{{/if}}
+
+{{#if is_part_of_path}}
+<p style="color: #666;">This course is part of the <strong>{{learning_path_name}}</strong> learning path.</p>
+{{/if}}
+
+<div style="background-color: #f8f9fa; border-radius: 8px; overflow: hidden; margin: 20px 0;">
+    {{#if course_image_url}}
+    <img src="{{course_image_url}}" alt="{{course_name}}" style="width: 100%; max-height: 200px; object-fit: cover;">
+    {{/if}}
+    <div style="padding: 20px;">
+        <h2 style="margin-top: 0;">{{course_name}}</h2>
+        {{#if course_description}}
+        <p style="color: #666;">{{course_description}}</p>
+        {{/if}}
+
+        <table style="width: 100%; margin: 15px 0;">
+            {{#if instructor_name}}
+            <tr>
+                <td style="padding: 5px 0;"><strong>Instructor:</strong></td>
+                <td style="padding: 5px 0;">{{instructor_name}}</td>
+            </tr>
+            {{/if}}
+            {{#if duration}}
+            <tr>
+                <td style="padding: 5px 0;"><strong>Duration:</strong></td>
+                <td style="padding: 5px 0;">{{duration}}</td>
+            </tr>
+            {{/if}}
+            {{#if has_dates}}
+            <tr>
+                <td style="padding: 5px 0;"><strong>Start Date:</strong></td>
+                <td style="padding: 5px 0;">{{start_date}}</td>
+            </tr>
+            {{#if end_date}}
+            <tr>
+                <td style="padding: 5px 0;"><strong>End Date:</strong></td>
+                <td style="padding: 5px 0;">{{end_date}}</td>
+            </tr>
+            {{/if}}
+            {{/if}}
+        </table>
+    </div>
+</div>
+
+{{#if has_prerequisites}}
+<div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 10px 0;"><strong>Prerequisites:</strong></p>
+    <p style="margin: 0;">Before starting this course, please complete the following:</p>
+    <ul style="margin: 10px 0 0 0;">
+        {{#each prerequisites}}
+        <li>{{this}}</li>
+        {{/each}}
+    </ul>
+</div>
+{{/if}}
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{course_url}}" class="button">Start Learning</a>
+</p>
+
+<h2>What to Expect</h2>
+<ul>
+    <li>Access to all course materials and resources</li>
+    <li>Interactive lessons and assessments</li>
+    <li>Track your progress as you complete modules</li>
+    <li>Earn a certificate upon completion</li>
+</ul>
+
+<p>We're excited for you to start this learning journey!</p>
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+"#;
+
+const ENROLLMENT_TEXT: &str = r#"
+NEW COURSE ENROLLMENT
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+{{#if was_enrolled_by_someone}}
+{{enrolled_by}} has enrolled you in a new course!
+{{else}}
+You've been successfully enrolled in a new course!
+{{/if}}
+
+{{#if is_part_of_path}}
+This course is part of the {{learning_path_name}} learning path.
+{{/if}}
+
+COURSE: {{course_name}}
+{{#if course_description}}
+{{course_description}}
+{{/if}}
+
+{{#if instructor_name}}Instructor: {{instructor_name}}{{/if}}
+{{#if duration}}Duration: {{duration}}{{/if}}
+{{#if has_dates}}
+Start Date: {{start_date}}
+{{#if end_date}}End Date: {{end_date}}{{/if}}
+{{/if}}
+
+{{#if has_prerequisites}}
+PREREQUISITES
+Before starting this course, please complete the following:
+{{#each prerequisites}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+Start learning now: {{course_url}}
+
+WHAT TO EXPECT
+- Access to all course materials and resources
+- Interactive lessons and assessments
+- Track your progress as you complete modules
+- Earn a certificate upon completion
+
+We're excited for you to start this learning journey!
+
+Best regards,
+The {{organization_name}} Team
+"#;

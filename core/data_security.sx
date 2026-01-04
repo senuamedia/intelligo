@@ -1,0 +1,1598 @@
+/// Intelligo LMS - Data Security Layer
+///
+/// Enterprise-grade data security including encryption at rest, key management,
+/// rate limiting, input validation, integrity verification, and secure connections.
+
+module intelligo::core::data_security
+
+use std::time::{DateTime, Duration, Instant}
+use std::collections::{Map, Set, List}
+use intelligo::core::types::*
+
+// ============================================================================
+// Encryption at Rest
+// ============================================================================
+
+/// Encryption configuration for data at rest
+pub type EncryptionConfig = type {
+    // Master key identifier (from key vault)
+    master_key_id: String,
+
+    // Encryption algorithm
+    algorithm: EncryptionAlgorithm,
+
+    // Fields to encrypt by entity type
+    encrypted_fields: Map<String, Set<String>>,
+
+    // Enable envelope encryption
+    envelope_encryption: bool,
+
+    // Key derivation function
+    kdf: KeyDerivationFunction,
+
+    // Auto-rotate keys after this duration
+    key_rotation_period: Duration,
+}
+
+impl EncryptionConfig {
+    pub fn default() -> Self {
+        let mut encrypted_fields = Map::new();
+
+        // User sensitive fields
+        encrypted_fields.insert("User".to_string(), Set::from([
+            "email".to_string(),
+            "phone".to_string(),
+            "ssn".to_string(),
+            "date_of_birth".to_string(),
+            "address".to_string(),
+            "emergency_contact".to_string(),
+        ]));
+
+        // Payment/billing fields
+        encrypted_fields.insert("Payment".to_string(), Set::from([
+            "card_number".to_string(),
+            "card_expiry".to_string(),
+            "billing_address".to_string(),
+        ]));
+
+        // Assessment answer keys
+        encrypted_fields.insert("Assessment".to_string(), Set::from([
+            "answer_key".to_string(),
+            "grading_rubric".to_string(),
+        ]));
+
+        // API keys and tokens
+        encrypted_fields.insert("Integration".to_string(), Set::from([
+            "api_key".to_string(),
+            "api_secret".to_string(),
+            "access_token".to_string(),
+            "refresh_token".to_string(),
+        ]));
+
+        EncryptionConfig {
+            master_key_id: "".to_string(),
+            algorithm: EncryptionAlgorithm::Aes256Gcm,
+            encrypted_fields,
+            envelope_encryption: true,
+            kdf: KeyDerivationFunction::Argon2id,
+            key_rotation_period: Duration::from_days(90),
+        }
+    }
+
+    pub fn production(master_key_id: &str) -> Self {
+        let mut config = Self::default();
+        config.master_key_id = master_key_id.to_string();
+        config
+    }
+}
+
+/// Supported encryption algorithms
+pub enum EncryptionAlgorithm {
+    Aes256Gcm,
+    Aes256Cbc,
+    ChaCha20Poly1305,
+}
+
+impl EncryptionAlgorithm {
+    pub fn key_size(self) -> i32 {
+        match self {
+            EncryptionAlgorithm::Aes256Gcm => 32,
+            EncryptionAlgorithm::Aes256Cbc => 32,
+            EncryptionAlgorithm::ChaCha20Poly1305 => 32,
+        }
+    }
+
+    pub fn nonce_size(self) -> i32 {
+        match self {
+            EncryptionAlgorithm::Aes256Gcm => 12,
+            EncryptionAlgorithm::Aes256Cbc => 16,
+            EncryptionAlgorithm::ChaCha20Poly1305 => 12,
+        }
+    }
+}
+
+/// Key derivation functions
+pub enum KeyDerivationFunction {
+    Argon2id,
+    Pbkdf2,
+    Scrypt,
+}
+
+/// Data encryption service
+pub actor DataEncryption {
+    config: EncryptionConfig,
+    key_cache: Map<String, CachedKey>,
+    key_vault: Box<dyn KeyVault>,
+}
+
+impl DataEncryption {
+    pub fn new(config: EncryptionConfig, key_vault: Box<dyn KeyVault>) -> Self {
+        DataEncryption {
+            config,
+            key_cache: Map::new(),
+            key_vault,
+        }
+    }
+
+    /// Encrypt a field value
+    pub async fn encrypt_field(
+        mut self,
+        entity_type: &str,
+        field_name: &str,
+        plaintext: &[u8]
+    ) -> Result<EncryptedValue, SecurityError> {
+        // Check if field should be encrypted
+        if !self.should_encrypt(entity_type, field_name) {
+            return Err(SecurityError::Internal {
+                message: format!("Field {} not configured for encryption", field_name)
+            });
+        }
+
+        // Get or generate data encryption key (DEK)
+        let dek = if self.config.envelope_encryption {
+            self.get_or_create_dek(entity_type).await?
+        } else {
+            self.get_master_key().await?
+        };
+
+        // Generate nonce
+        let nonce = crypto::random_bytes(self.config.algorithm.nonce_size() as usize);
+
+        // Encrypt
+        let ciphertext = match self.config.algorithm {
+            EncryptionAlgorithm::Aes256Gcm => {
+                crypto::aes_256_gcm_encrypt(&dek.key, &nonce, plaintext, None)?
+            }
+            EncryptionAlgorithm::Aes256Cbc => {
+                crypto::aes_256_cbc_encrypt(&dek.key, &nonce, plaintext)?
+            }
+            EncryptionAlgorithm::ChaCha20Poly1305 => {
+                crypto::chacha20_poly1305_encrypt(&dek.key, &nonce, plaintext, None)?
+            }
+        };
+
+        Ok(EncryptedValue {
+            ciphertext,
+            nonce,
+            key_id: dek.id.clone(),
+            algorithm: self.config.algorithm.clone(),
+            encrypted_at: DateTime::now(),
+        })
+    }
+
+    /// Decrypt a field value
+    pub async fn decrypt_field(
+        mut self,
+        encrypted: &EncryptedValue
+    ) -> Result<Vec<u8>, SecurityError> {
+        // Get decryption key
+        let key = self.get_key(&encrypted.key_id).await?;
+
+        // Decrypt
+        let plaintext = match encrypted.algorithm {
+            EncryptionAlgorithm::Aes256Gcm => {
+                crypto::aes_256_gcm_decrypt(&key.key, &encrypted.nonce, &encrypted.ciphertext, None)?
+            }
+            EncryptionAlgorithm::Aes256Cbc => {
+                crypto::aes_256_cbc_decrypt(&key.key, &encrypted.nonce, &encrypted.ciphertext)?
+            }
+            EncryptionAlgorithm::ChaCha20Poly1305 => {
+                crypto::chacha20_poly1305_decrypt(&key.key, &encrypted.nonce, &encrypted.ciphertext, None)?
+            }
+        };
+
+        Ok(plaintext)
+    }
+
+    /// Check if a field should be encrypted
+    fn should_encrypt(self, entity_type: &str, field_name: &str) -> bool {
+        self.config.encrypted_fields
+            .get(entity_type)
+            .map(|fields| fields.contains(field_name))
+            .unwrap_or(false)
+    }
+
+    /// Get or create a data encryption key for envelope encryption
+    async fn get_or_create_dek(mut self, entity_type: &str) -> Result<CachedKey, SecurityError> {
+        let dek_id = format!("dek_{}", entity_type);
+
+        // Check cache
+        if let Some(cached) = self.key_cache.get(&dek_id) {
+            if !cached.is_expired() {
+                return Ok(cached.clone());
+            }
+        }
+
+        // Try to load from vault
+        match self.key_vault.get_key(&dek_id).await {
+            Ok(key_material) => {
+                let cached = CachedKey {
+                    id: dek_id.clone(),
+                    key: key_material,
+                    created_at: DateTime::now(),
+                    expires_at: DateTime::now() + Duration::from_hours(24),
+                };
+                self.key_cache.insert(dek_id, cached.clone());
+                Ok(cached)
+            }
+            Err(_) => {
+                // Generate new DEK and wrap with master key
+                let dek = crypto::random_bytes(32);
+                let master_key = self.get_master_key().await?;
+
+                // Wrap DEK with master key
+                let wrapped_dek = crypto::aes_256_gcm_encrypt(
+                    &master_key.key,
+                    &crypto::random_bytes(12),
+                    &dek,
+                    Some(dek_id.as_bytes())
+                )?;
+
+                // Store wrapped DEK
+                self.key_vault.store_key(&dek_id, &wrapped_dek).await?;
+
+                let cached = CachedKey {
+                    id: dek_id.clone(),
+                    key: dek,
+                    created_at: DateTime::now(),
+                    expires_at: DateTime::now() + Duration::from_hours(24),
+                };
+                self.key_cache.insert(dek_id, cached.clone());
+                Ok(cached)
+            }
+        }
+    }
+
+    /// Get master key from vault
+    async fn get_master_key(mut self) -> Result<CachedKey, SecurityError> {
+        let key_id = &self.config.master_key_id;
+
+        if let Some(cached) = self.key_cache.get(key_id) {
+            if !cached.is_expired() {
+                return Ok(cached.clone());
+            }
+        }
+
+        let key_material = self.key_vault.get_key(key_id).await?;
+
+        let cached = CachedKey {
+            id: key_id.clone(),
+            key: key_material,
+            created_at: DateTime::now(),
+            expires_at: DateTime::now() + Duration::from_hours(1),
+        };
+        self.key_cache.insert(key_id.clone(), cached.clone());
+        Ok(cached)
+    }
+
+    /// Get a specific key
+    async fn get_key(mut self, key_id: &str) -> Result<CachedKey, SecurityError> {
+        if let Some(cached) = self.key_cache.get(key_id) {
+            if !cached.is_expired() {
+                return Ok(cached.clone());
+            }
+        }
+
+        // If it's a DEK, we need to unwrap it
+        if key_id.starts_with("dek_") {
+            let wrapped = self.key_vault.get_key(key_id).await?;
+            let master_key = self.get_master_key().await?;
+
+            // Unwrap DEK
+            let dek = crypto::aes_256_gcm_decrypt(
+                &master_key.key,
+                &wrapped[0..12],
+                &wrapped[12..],
+                Some(key_id.as_bytes())
+            )?;
+
+            let cached = CachedKey {
+                id: key_id.to_string(),
+                key: dek,
+                created_at: DateTime::now(),
+                expires_at: DateTime::now() + Duration::from_hours(24),
+            };
+            self.key_cache.insert(key_id.to_string(), cached.clone());
+            Ok(cached)
+        } else {
+            let key_material = self.key_vault.get_key(key_id).await?;
+            let cached = CachedKey {
+                id: key_id.to_string(),
+                key: key_material,
+                created_at: DateTime::now(),
+                expires_at: DateTime::now() + Duration::from_hours(1),
+            };
+            self.key_cache.insert(key_id.to_string(), cached.clone());
+            Ok(cached)
+        }
+    }
+
+    /// Rotate data encryption keys
+    pub async fn rotate_keys(mut self) -> Result<KeyRotationResult, SecurityError> {
+        let mut rotated = 0;
+        let mut errors = vec![];
+
+        for entity_type in self.config.encrypted_fields.keys() {
+            let dek_id = format!("dek_{}", entity_type);
+
+            match self.rotate_dek(&dek_id).await {
+                Ok(_) => rotated += 1,
+                Err(e) => errors.push(format!("{}: {}", dek_id, e.to_string())),
+            }
+        }
+
+        Ok(KeyRotationResult {
+            keys_rotated: rotated,
+            errors,
+            rotated_at: DateTime::now(),
+        })
+    }
+
+    /// Rotate a single DEK
+    async fn rotate_dek(mut self, dek_id: &str) -> Result<(), SecurityError> {
+        // Generate new DEK
+        let new_dek = crypto::random_bytes(32);
+        let master_key = self.get_master_key().await?;
+
+        // Wrap new DEK
+        let wrapped = crypto::aes_256_gcm_encrypt(
+            &master_key.key,
+            &crypto::random_bytes(12),
+            &new_dek,
+            Some(dek_id.as_bytes())
+        )?;
+
+        // Store with version
+        let versioned_id = format!("{}_{}", dek_id, DateTime::now().timestamp());
+        self.key_vault.store_key(&versioned_id, &wrapped).await?;
+
+        // Update current key reference
+        self.key_vault.store_key(dek_id, &wrapped).await?;
+
+        // Invalidate cache
+        self.key_cache.remove(dek_id);
+
+        Ok(())
+    }
+}
+
+/// Encrypted value container
+pub type EncryptedValue = type {
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    key_id: String,
+    algorithm: EncryptionAlgorithm,
+    encrypted_at: DateTime,
+}
+
+impl EncryptedValue {
+    /// Serialize to storage format
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut result = Vec::new();
+
+        // Version byte
+        result.push(1);
+
+        // Algorithm byte
+        result.push(match self.algorithm {
+            EncryptionAlgorithm::Aes256Gcm => 1,
+            EncryptionAlgorithm::Aes256Cbc => 2,
+            EncryptionAlgorithm::ChaCha20Poly1305 => 3,
+        });
+
+        // Key ID length and bytes
+        let key_bytes = self.key_id.as_bytes();
+        result.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+        result.extend_from_slice(key_bytes);
+
+        // Nonce
+        result.extend_from_slice(&self.nonce);
+
+        // Ciphertext
+        result.extend_from_slice(&self.ciphertext);
+
+        result
+    }
+
+    /// Deserialize from storage format
+    pub fn from_bytes(data: &[u8]) -> Result<Self, SecurityError> {
+        if data.len() < 4 {
+            return Err(SecurityError::Internal {
+                message: "Invalid encrypted value format".to_string()
+            });
+        }
+
+        let version = data[0];
+        if version != 1 {
+            return Err(SecurityError::Internal {
+                message: format!("Unsupported encryption version: {}", version)
+            });
+        }
+
+        let algorithm = match data[1] {
+            1 => EncryptionAlgorithm::Aes256Gcm,
+            2 => EncryptionAlgorithm::Aes256Cbc,
+            3 => EncryptionAlgorithm::ChaCha20Poly1305,
+            _ => return Err(SecurityError::Internal {
+                message: "Unknown encryption algorithm".to_string()
+            }),
+        };
+
+        let key_id_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+        let key_id = String::from_utf8(data[4..4 + key_id_len].to_vec())
+            .map_err(|e| SecurityError::Internal {
+                message: format!("Invalid key ID: {}", e)
+            })?;
+
+        let nonce_size = algorithm.nonce_size() as usize;
+        let nonce_start = 4 + key_id_len;
+        let nonce = data[nonce_start..nonce_start + nonce_size].to_vec();
+
+        let ciphertext = data[nonce_start + nonce_size..].to_vec();
+
+        Ok(EncryptedValue {
+            ciphertext,
+            nonce,
+            key_id,
+            algorithm,
+            encrypted_at: DateTime::now(),
+        })
+    }
+}
+
+/// Cached encryption key
+pub type CachedKey = type {
+    id: String,
+    key: Vec<u8>,
+    created_at: DateTime,
+    expires_at: DateTime,
+}
+
+impl CachedKey {
+    pub fn is_expired(self) -> bool {
+        DateTime::now() > self.expires_at
+    }
+}
+
+/// Key rotation result
+pub type KeyRotationResult = type {
+    keys_rotated: i32,
+    errors: Vec<String>,
+    rotated_at: DateTime,
+}
+
+// ============================================================================
+// Key Vault Interface
+// ============================================================================
+
+/// Key vault interface for secure key storage
+pub trait KeyVault {
+    /// Get key material by ID
+    async fn get_key(self, key_id: &str) -> Result<Vec<u8>, SecurityError>;
+
+    /// Store key material
+    async fn store_key(self, key_id: &str, key_material: &[u8]) -> Result<(), SecurityError>;
+
+    /// Delete key
+    async fn delete_key(self, key_id: &str) -> Result<(), SecurityError>;
+
+    /// List all key IDs
+    async fn list_keys(self) -> Result<Vec<String>, SecurityError>;
+}
+
+/// Environment-based key vault (for development)
+pub actor EnvKeyVault {
+    prefix: String,
+}
+
+impl EnvKeyVault {
+    pub fn new(prefix: &str) -> Self {
+        EnvKeyVault {
+            prefix: prefix.to_string(),
+        }
+    }
+}
+
+impl KeyVault for EnvKeyVault {
+    async fn get_key(self, key_id: &str) -> Result<Vec<u8>, SecurityError> {
+        let env_key = format!("{}_{}", self.prefix, key_id.to_uppercase());
+        let value = std::env::var(&env_key).map_err(|_| SecurityError::Internal {
+            message: format!("Key not found: {}", key_id)
+        })?;
+
+        base64::decode(&value).map_err(|e| SecurityError::Internal {
+            message: format!("Invalid key format: {}", e)
+        })
+    }
+
+    async fn store_key(self, _key_id: &str, _key_material: &[u8]) -> Result<(), SecurityError> {
+        Err(SecurityError::Internal {
+            message: "EnvKeyVault does not support key storage".to_string()
+        })
+    }
+
+    async fn delete_key(self, _key_id: &str) -> Result<(), SecurityError> {
+        Err(SecurityError::Internal {
+            message: "EnvKeyVault does not support key deletion".to_string()
+        })
+    }
+
+    async fn list_keys(self) -> Result<Vec<String>, SecurityError> {
+        Ok(vec![])
+    }
+}
+
+/// AWS KMS key vault
+pub actor AwsKmsVault {
+    region: String,
+    kms_key_arn: String,
+}
+
+impl AwsKmsVault {
+    pub fn new(region: &str, kms_key_arn: &str) -> Self {
+        AwsKmsVault {
+            region: region.to_string(),
+            kms_key_arn: kms_key_arn.to_string(),
+        }
+    }
+}
+
+impl KeyVault for AwsKmsVault {
+    async fn get_key(self, key_id: &str) -> Result<Vec<u8>, SecurityError> {
+        // Use AWS SDK to decrypt
+        let client = aws::kms::Client::new(&self.region).await?;
+
+        client.decrypt()
+            .key_id(&self.kms_key_arn)
+            .ciphertext_blob(key_id.as_bytes())
+            .send()
+            .await
+            .map(|r| r.plaintext.unwrap_or_default())
+            .map_err(|e| SecurityError::Internal {
+                message: format!("KMS decrypt failed: {}", e)
+            })
+    }
+
+    async fn store_key(self, key_id: &str, key_material: &[u8]) -> Result<(), SecurityError> {
+        let client = aws::kms::Client::new(&self.region).await?;
+
+        client.encrypt()
+            .key_id(&self.kms_key_arn)
+            .plaintext(key_material)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| SecurityError::Internal {
+                message: format!("KMS encrypt failed: {}", e)
+            })
+    }
+
+    async fn delete_key(self, _key_id: &str) -> Result<(), SecurityError> {
+        // KMS keys are managed separately
+        Ok(())
+    }
+
+    async fn list_keys(self) -> Result<Vec<String>, SecurityError> {
+        Ok(vec![])
+    }
+}
+
+/// HashiCorp Vault integration
+pub actor HashiCorpVault {
+    address: String,
+    token: String,
+    mount_path: String,
+}
+
+impl HashiCorpVault {
+    pub fn new(address: &str, token: &str, mount_path: &str) -> Self {
+        HashiCorpVault {
+            address: address.to_string(),
+            token: token.to_string(),
+            mount_path: mount_path.to_string(),
+        }
+    }
+}
+
+impl KeyVault for HashiCorpVault {
+    async fn get_key(self, key_id: &str) -> Result<Vec<u8>, SecurityError> {
+        let url = format!("{}/v1/{}/data/{}", self.address, self.mount_path, key_id);
+
+        let response = http::get(&url)
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .map_err(|e| SecurityError::Internal {
+                message: format!("Vault request failed: {}", e)
+            })?;
+
+        let body: serde_json::Value = response.json().await?;
+        let key_b64 = body["data"]["data"]["key"].as_str().ok_or_else(|| SecurityError::Internal {
+            message: "Key not found in vault response".to_string()
+        })?;
+
+        base64::decode(key_b64).map_err(|e| SecurityError::Internal {
+            message: format!("Invalid key format: {}", e)
+        })
+    }
+
+    async fn store_key(self, key_id: &str, key_material: &[u8]) -> Result<(), SecurityError> {
+        let url = format!("{}/v1/{}/data/{}", self.address, self.mount_path, key_id);
+        let key_b64 = base64::encode(key_material);
+
+        let body = serde_json::json!({
+            "data": {
+                "key": key_b64
+            }
+        });
+
+        http::post(&url)
+            .header("X-Vault-Token", &self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SecurityError::Internal {
+                message: format!("Vault store failed: {}", e)
+            })?;
+
+        Ok(())
+    }
+
+    async fn delete_key(self, key_id: &str) -> Result<(), SecurityError> {
+        let url = format!("{}/v1/{}/data/{}", self.address, self.mount_path, key_id);
+
+        http::delete(&url)
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .map_err(|e| SecurityError::Internal {
+                message: format!("Vault delete failed: {}", e)
+            })?;
+
+        Ok(())
+    }
+
+    async fn list_keys(self) -> Result<Vec<String>, SecurityError> {
+        let url = format!("{}/v1/{}/metadata", self.address, self.mount_path);
+
+        let response = http::request("LIST", &url)
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .map_err(|e| SecurityError::Internal {
+                message: format!("Vault list failed: {}", e)
+            })?;
+
+        let body: serde_json::Value = response.json().await?;
+        let keys = body["data"]["keys"].as_array()
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_default();
+
+        Ok(keys)
+    }
+}
+
+// ============================================================================
+// Rate Limiting
+// ============================================================================
+
+/// Rate limiter configuration
+pub type RateLimitConfig = type {
+    // Default rate limit (requests per window)
+    default_limit: i32,
+
+    // Window duration
+    window_duration: Duration,
+
+    // Per-endpoint overrides
+    endpoint_limits: Map<String, EndpointLimit>,
+
+    // Per-role overrides (higher privilege = higher limits)
+    role_multipliers: Map<String, f64>,
+
+    // Burst allowance (temporary spike above limit)
+    burst_multiplier: f64,
+
+    // Enable distributed rate limiting
+    distributed: bool,
+}
+
+impl RateLimitConfig {
+    pub fn default() -> Self {
+        let mut endpoint_limits = Map::new();
+
+        // Auth endpoints - stricter limits
+        endpoint_limits.insert("/api/v1/auth/login".to_string(), EndpointLimit {
+            limit: 5,
+            window: Duration::from_minutes(15),
+            block_duration: Duration::from_hours(1),
+        });
+        endpoint_limits.insert("/api/v1/auth/password-reset".to_string(), EndpointLimit {
+            limit: 3,
+            window: Duration::from_hours(1),
+            block_duration: Duration::from_hours(24),
+        });
+
+        // API endpoints
+        endpoint_limits.insert("/api/v1/courses".to_string(), EndpointLimit {
+            limit: 100,
+            window: Duration::from_minutes(1),
+            block_duration: Duration::from_minutes(5),
+        });
+
+        let mut role_multipliers = Map::new();
+        role_multipliers.insert("student".to_string(), 1.0);
+        role_multipliers.insert("teacher".to_string(), 2.0);
+        role_multipliers.insert("admin".to_string(), 5.0);
+        role_multipliers.insert("tenant_admin".to_string(), 10.0);
+
+        RateLimitConfig {
+            default_limit: 60,
+            window_duration: Duration::from_minutes(1),
+            endpoint_limits,
+            role_multipliers,
+            burst_multiplier: 1.5,
+            distributed: false,
+        }
+    }
+
+    pub fn strict() -> Self {
+        let mut config = Self::default();
+        config.default_limit = 30;
+        config.burst_multiplier = 1.0;
+        config
+    }
+}
+
+/// Per-endpoint rate limit
+pub type EndpointLimit = type {
+    limit: i32,
+    window: Duration,
+    block_duration: Duration,
+}
+
+/// Rate limiter service
+pub actor RateLimiter {
+    config: RateLimitConfig,
+    buckets: Map<String, TokenBucket>,
+    blocked: Map<String, DateTime>,
+}
+
+impl RateLimiter {
+    pub fn new(config: RateLimitConfig) -> Self {
+        RateLimiter {
+            config,
+            buckets: Map::new(),
+            blocked: Map::new(),
+        }
+    }
+
+    /// Check if request is allowed
+    pub fn check(mut self, key: &str, endpoint: &str, role: Option<&str>) -> RateLimitResult {
+        let now = Instant::now();
+
+        // Check if blocked
+        if let Some(blocked_until) = self.blocked.get(key) {
+            if DateTime::now() < *blocked_until {
+                return RateLimitResult::Blocked {
+                    retry_after: blocked_until.duration_since(DateTime::now()),
+                    reason: "Rate limit exceeded, temporarily blocked".to_string(),
+                };
+            } else {
+                self.blocked.remove(key);
+            }
+        }
+
+        // Get limit for this endpoint
+        let (limit, window) = if let Some(ep_limit) = self.config.endpoint_limits.get(endpoint) {
+            (ep_limit.limit, ep_limit.window)
+        } else {
+            (self.config.default_limit, self.config.window_duration)
+        };
+
+        // Apply role multiplier
+        let effective_limit = if let Some(r) = role {
+            let multiplier = self.config.role_multipliers.get(r).unwrap_or(&1.0);
+            (limit as f64 * multiplier) as i32
+        } else {
+            limit
+        };
+
+        // Get or create bucket
+        let bucket_key = format!("{}:{}", key, endpoint);
+        let bucket = self.buckets.entry(bucket_key.clone())
+            .or_insert_with(|| TokenBucket::new(effective_limit, window));
+
+        // Try to consume a token
+        if bucket.try_consume(now) {
+            let remaining = bucket.remaining();
+            let reset_at = bucket.reset_at();
+
+            RateLimitResult::Allowed {
+                remaining,
+                limit: effective_limit,
+                reset_at,
+            }
+        } else {
+            // Check if we should block
+            let ep_limit = self.config.endpoint_limits.get(endpoint);
+            if let Some(el) = ep_limit {
+                let blocked_until = DateTime::now() + el.block_duration;
+                self.blocked.insert(key.to_string(), blocked_until);
+            }
+
+            RateLimitResult::Limited {
+                retry_after: bucket.time_until_reset(now),
+                limit: effective_limit,
+            }
+        }
+    }
+
+    /// Reset rate limit for a key
+    pub fn reset(mut self, key: &str) {
+        let keys_to_remove: Vec<String> = self.buckets.keys()
+            .filter(|k| k.starts_with(&format!("{}:", key)))
+            .cloned()
+            .collect();
+
+        for k in keys_to_remove {
+            self.buckets.remove(&k);
+        }
+
+        self.blocked.remove(key);
+    }
+
+    /// Clean up expired buckets
+    pub fn cleanup(mut self) {
+        let now = Instant::now();
+        self.buckets.retain(|_, bucket| !bucket.is_expired(now));
+
+        let expired_blocks: Vec<String> = self.blocked.iter()
+            .filter(|(_, blocked_until)| DateTime::now() >= **blocked_until)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for k in expired_blocks {
+            self.blocked.remove(&k);
+        }
+    }
+}
+
+/// Token bucket for rate limiting
+pub type TokenBucket = type {
+    tokens: i32,
+    max_tokens: i32,
+    window_duration: Duration,
+    window_start: Instant,
+    last_access: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(max_tokens: i32, window_duration: Duration) -> Self {
+        let now = Instant::now();
+        TokenBucket {
+            tokens: max_tokens,
+            max_tokens,
+            window_duration,
+            window_start: now,
+            last_access: now,
+        }
+    }
+
+    pub fn try_consume(mut self, now: Instant) -> bool {
+        // Check if window has reset
+        if now.duration_since(self.window_start) >= self.window_duration {
+            self.tokens = self.max_tokens;
+            self.window_start = now;
+        }
+
+        self.last_access = now;
+
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remaining(self) -> i32 {
+        self.tokens
+    }
+
+    pub fn reset_at(self) -> DateTime {
+        DateTime::now() + self.time_until_reset(Instant::now())
+    }
+
+    pub fn time_until_reset(self, now: Instant) -> Duration {
+        let elapsed = now.duration_since(self.window_start);
+        if elapsed >= self.window_duration {
+            Duration::from_secs(0)
+        } else {
+            self.window_duration - elapsed
+        }
+    }
+
+    pub fn is_expired(self, now: Instant) -> bool {
+        now.duration_since(self.last_access) > self.window_duration * 10
+    }
+}
+
+/// Rate limit check result
+pub enum RateLimitResult {
+    Allowed {
+        remaining: i32,
+        limit: i32,
+        reset_at: DateTime,
+    },
+    Limited {
+        retry_after: Duration,
+        limit: i32,
+    },
+    Blocked {
+        retry_after: Duration,
+        reason: String,
+    },
+}
+
+impl RateLimitResult {
+    pub fn is_allowed(self) -> bool {
+        match self {
+            RateLimitResult::Allowed { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Get HTTP headers for rate limit response
+    pub fn to_headers(self) -> Map<String, String> {
+        let mut headers = Map::new();
+
+        match self {
+            RateLimitResult::Allowed { remaining, limit, reset_at } => {
+                headers.insert("X-RateLimit-Limit".to_string(), limit.to_string());
+                headers.insert("X-RateLimit-Remaining".to_string(), remaining.to_string());
+                headers.insert("X-RateLimit-Reset".to_string(), reset_at.timestamp().to_string());
+            }
+            RateLimitResult::Limited { retry_after, limit } => {
+                headers.insert("X-RateLimit-Limit".to_string(), limit.to_string());
+                headers.insert("X-RateLimit-Remaining".to_string(), "0".to_string());
+                headers.insert("Retry-After".to_string(), retry_after.as_secs().to_string());
+            }
+            RateLimitResult::Blocked { retry_after, .. } => {
+                headers.insert("Retry-After".to_string(), retry_after.as_secs().to_string());
+            }
+        }
+
+        headers
+    }
+}
+
+// ============================================================================
+// Input Validation
+// ============================================================================
+
+/// Input validator for sanitizing and validating user input
+pub actor InputValidator {
+    rules: Map<String, Vec<ValidationRule>>,
+    sanitizers: Map<String, SanitizeRule>,
+}
+
+impl InputValidator {
+    pub fn new() -> Self {
+        let mut validator = InputValidator {
+            rules: Map::new(),
+            sanitizers: Map::new(),
+        };
+
+        validator.register_default_rules();
+        validator
+    }
+
+    fn register_default_rules(mut self) {
+        // Email validation
+        self.rules.insert("email".to_string(), vec![
+            ValidationRule::MaxLength(254),
+            ValidationRule::Pattern(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$".to_string()),
+            ValidationRule::NoSqlInjection,
+        ]);
+
+        // Username validation
+        self.rules.insert("username".to_string(), vec![
+            ValidationRule::MinLength(3),
+            ValidationRule::MaxLength(50),
+            ValidationRule::Pattern(r"^[a-zA-Z0-9_-]+$".to_string()),
+            ValidationRule::NoSqlInjection,
+        ]);
+
+        // Password validation
+        self.rules.insert("password".to_string(), vec![
+            ValidationRule::MinLength(8),
+            ValidationRule::MaxLength(128),
+            ValidationRule::RequireUppercase,
+            ValidationRule::RequireLowercase,
+            ValidationRule::RequireDigit,
+            ValidationRule::RequireSpecial,
+            ValidationRule::NoCommonPasswords,
+        ]);
+
+        // Course title
+        self.rules.insert("course_title".to_string(), vec![
+            ValidationRule::MinLength(3),
+            ValidationRule::MaxLength(200),
+            ValidationRule::NoHtml,
+            ValidationRule::NoSqlInjection,
+        ]);
+
+        // Rich text content
+        self.rules.insert("rich_text".to_string(), vec![
+            ValidationRule::MaxLength(100000),
+            ValidationRule::SanitizeHtml,
+        ]);
+
+        // URL validation
+        self.rules.insert("url".to_string(), vec![
+            ValidationRule::MaxLength(2048),
+            ValidationRule::Pattern(r"^https?://[^\s<>\"{}|\\^`\[\]]+$".to_string()),
+            ValidationRule::NoJavascriptUrl,
+        ]);
+
+        // File path validation
+        self.rules.insert("file_path".to_string(), vec![
+            ValidationRule::MaxLength(1024),
+            ValidationRule::NoPathTraversal,
+            ValidationRule::AllowedExtensions(vec![
+                "pdf".to_string(), "doc".to_string(), "docx".to_string(),
+                "ppt".to_string(), "pptx".to_string(), "xls".to_string(),
+                "xlsx".to_string(), "jpg".to_string(), "jpeg".to_string(),
+                "png".to_string(), "gif".to_string(), "mp4".to_string(),
+                "mp3".to_string(), "zip".to_string(),
+            ]),
+        ]);
+
+        // Set up sanitizers
+        self.sanitizers.insert("html".to_string(), SanitizeRule::Html {
+            allowed_tags: vec![
+                "p".to_string(), "br".to_string(), "b".to_string(), "i".to_string(),
+                "u".to_string(), "strong".to_string(), "em".to_string(),
+                "h1".to_string(), "h2".to_string(), "h3".to_string(),
+                "ul".to_string(), "ol".to_string(), "li".to_string(),
+                "a".to_string(), "img".to_string(), "table".to_string(),
+                "tr".to_string(), "td".to_string(), "th".to_string(),
+                "code".to_string(), "pre".to_string(), "blockquote".to_string(),
+            ],
+            allowed_attrs: vec![
+                "href".to_string(), "src".to_string(), "alt".to_string(),
+                "class".to_string(), "id".to_string(),
+            ],
+        });
+
+        self.sanitizers.insert("plain_text".to_string(), SanitizeRule::StripHtml);
+    }
+
+    /// Validate input against rules
+    pub fn validate(self, field_type: &str, value: &str) -> ValidationResult {
+        let rules = match self.rules.get(field_type) {
+            Some(r) => r,
+            None => return ValidationResult::Valid,
+        };
+
+        let mut errors = vec![];
+
+        for rule in rules {
+            if let Some(error) = self.check_rule(rule, value) {
+                errors.push(error);
+            }
+        }
+
+        if errors.is_empty() {
+            ValidationResult::Valid
+        } else {
+            ValidationResult::Invalid { errors }
+        }
+    }
+
+    /// Sanitize input
+    pub fn sanitize(self, sanitizer_name: &str, value: &str) -> String {
+        let rule = match self.sanitizers.get(sanitizer_name) {
+            Some(r) => r,
+            None => return value.to_string(),
+        };
+
+        match rule {
+            SanitizeRule::Html { allowed_tags, allowed_attrs } => {
+                self.sanitize_html(value, allowed_tags, allowed_attrs)
+            }
+            SanitizeRule::StripHtml => {
+                self.strip_html(value)
+            }
+            SanitizeRule::EscapeHtml => {
+                self.escape_html(value)
+            }
+            SanitizeRule::Trim => {
+                value.trim().to_string()
+            }
+            SanitizeRule::Lowercase => {
+                value.to_lowercase()
+            }
+            SanitizeRule::Custom { callback } => {
+                callback(value)
+            }
+        }
+    }
+
+    fn check_rule(self, rule: &ValidationRule, value: &str) -> Option<String> {
+        match rule {
+            ValidationRule::Required => {
+                if value.trim().is_empty() {
+                    Some("Field is required".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::MinLength(min) => {
+                if value.len() < *min as usize {
+                    Some(format!("Must be at least {} characters", min))
+                } else {
+                    None
+                }
+            }
+            ValidationRule::MaxLength(max) => {
+                if value.len() > *max as usize {
+                    Some(format!("Must be at most {} characters", max))
+                } else {
+                    None
+                }
+            }
+            ValidationRule::Pattern(pattern) => {
+                let re = regex::Regex::new(pattern).ok()?;
+                if !re.is_match(value) {
+                    Some("Invalid format".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::NoSqlInjection => {
+                let sql_patterns = [
+                    r"(\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|ALTER|CREATE|TRUNCATE)\b)",
+                    r"(--|;|/\*|\*/|@@|@)",
+                    r"(\bOR\b\s+\d+\s*=\s*\d+)",
+                    r"(\bAND\b\s+\d+\s*=\s*\d+)",
+                    r"('.*--)",
+                ];
+
+                for pattern in &sql_patterns {
+                    let re = regex::Regex::new(&format!("(?i){}", pattern)).ok()?;
+                    if re.is_match(value) {
+                        return Some("Invalid input detected".to_string());
+                    }
+                }
+                None
+            }
+            ValidationRule::NoXss => {
+                let xss_patterns = [
+                    r"<script[^>]*>",
+                    r"javascript:",
+                    r"on\w+\s*=",
+                    r"<iframe",
+                    r"<object",
+                    r"<embed",
+                ];
+
+                for pattern in &xss_patterns {
+                    let re = regex::Regex::new(&format!("(?i){}", pattern)).ok()?;
+                    if re.is_match(value) {
+                        return Some("Invalid content detected".to_string());
+                    }
+                }
+                None
+            }
+            ValidationRule::NoHtml => {
+                if value.contains('<') || value.contains('>') {
+                    Some("HTML not allowed".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::NoPathTraversal => {
+                if value.contains("..") || value.contains("//") || value.starts_with("/") {
+                    Some("Invalid path".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::NoJavascriptUrl => {
+                let lower = value.to_lowercase();
+                if lower.starts_with("javascript:") || lower.starts_with("data:text/html") {
+                    Some("Invalid URL".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::RequireUppercase => {
+                if !value.chars().any(|c| c.is_uppercase()) {
+                    Some("Must contain uppercase letter".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::RequireLowercase => {
+                if !value.chars().any(|c| c.is_lowercase()) {
+                    Some("Must contain lowercase letter".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::RequireDigit => {
+                if !value.chars().any(|c| c.is_digit(10)) {
+                    Some("Must contain a digit".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::RequireSpecial => {
+                let special_chars = "!@#$%^&*()_+-=[]{}|;':\",./<>?";
+                if !value.chars().any(|c| special_chars.contains(c)) {
+                    Some("Must contain a special character".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::NoCommonPasswords => {
+                let common = [
+                    "password", "123456", "12345678", "qwerty", "abc123",
+                    "monkey", "1234567", "letmein", "trustno1", "dragon",
+                    "baseball", "iloveyou", "master", "sunshine", "ashley",
+                ];
+                let lower = value.to_lowercase();
+                if common.iter().any(|p| lower.contains(p)) {
+                    Some("Password too common".to_string())
+                } else {
+                    None
+                }
+            }
+            ValidationRule::AllowedExtensions(exts) => {
+                let ext = value.rsplit('.').next().unwrap_or("").to_lowercase();
+                if !exts.iter().any(|e| e.to_lowercase() == ext) {
+                    Some(format!("File type not allowed. Allowed: {}", exts.join(", ")))
+                } else {
+                    None
+                }
+            }
+            ValidationRule::SanitizeHtml => {
+                // This is handled in sanitize, not validate
+                None
+            }
+        }
+    }
+
+    fn sanitize_html(self, value: &str, allowed_tags: &[String], allowed_attrs: &[String]) -> String {
+        // Simplified HTML sanitizer - in production use a proper library
+        let mut result = value.to_string();
+
+        // Remove script tags completely
+        let script_re = regex::Regex::new(r"(?i)<script[^>]*>[\s\S]*?</script>").unwrap();
+        result = script_re.replace_all(&result, "").to_string();
+
+        // Remove event handlers
+        let event_re = regex::Regex::new(r"(?i)\s*on\w+\s*=\s*[\"'][^\"']*[\"']").unwrap();
+        result = event_re.replace_all(&result, "").to_string();
+
+        // Remove javascript: URLs
+        let js_re = regex::Regex::new(r"(?i)javascript:\s*").unwrap();
+        result = js_re.replace_all(&result, "").to_string();
+
+        result
+    }
+
+    fn strip_html(self, value: &str) -> String {
+        let re = regex::Regex::new(r"<[^>]+>").unwrap();
+        re.replace_all(value, "").to_string()
+    }
+
+    fn escape_html(self, value: &str) -> String {
+        value
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;")
+    }
+}
+
+/// Validation rule types
+pub enum ValidationRule {
+    Required,
+    MinLength(i32),
+    MaxLength(i32),
+    Pattern(String),
+    NoSqlInjection,
+    NoXss,
+    NoHtml,
+    NoPathTraversal,
+    NoJavascriptUrl,
+    RequireUppercase,
+    RequireLowercase,
+    RequireDigit,
+    RequireSpecial,
+    NoCommonPasswords,
+    AllowedExtensions(Vec<String>),
+    SanitizeHtml,
+}
+
+/// Sanitization rules
+pub enum SanitizeRule {
+    Html { allowed_tags: Vec<String>, allowed_attrs: Vec<String> },
+    StripHtml,
+    EscapeHtml,
+    Trim,
+    Lowercase,
+    Custom { callback: fn(&str) -> String },
+}
+
+/// Validation result
+pub enum ValidationResult {
+    Valid,
+    Invalid { errors: Vec<String> },
+}
+
+impl ValidationResult {
+    pub fn is_valid(self) -> bool {
+        match self {
+            ValidationResult::Valid => true,
+            _ => false,
+        }
+    }
+}
+
+// ============================================================================
+// Data Integrity
+// ============================================================================
+
+/// Data integrity verification service
+pub actor DataIntegrity {
+    algorithm: HashAlgorithm,
+}
+
+impl DataIntegrity {
+    pub fn new(algorithm: HashAlgorithm) -> Self {
+        DataIntegrity { algorithm }
+    }
+
+    /// Compute checksum for data
+    pub fn compute_checksum(self, data: &[u8]) -> String {
+        match self.algorithm {
+            HashAlgorithm::Sha256 => crypto::sha256_hex(data),
+            HashAlgorithm::Sha512 => crypto::sha512_hex(data),
+            HashAlgorithm::Blake3 => crypto::blake3_hex(data),
+        }
+    }
+
+    /// Verify data against checksum
+    pub fn verify_checksum(self, data: &[u8], expected: &str) -> bool {
+        let computed = self.compute_checksum(data);
+        // Constant-time comparison to prevent timing attacks
+        crypto::constant_time_eq(&computed, expected)
+    }
+
+    /// Sign data with HMAC
+    pub fn sign(self, data: &[u8], key: &[u8]) -> String {
+        match self.algorithm {
+            HashAlgorithm::Sha256 => crypto::hmac_sha256_hex(key, data),
+            HashAlgorithm::Sha512 => crypto::hmac_sha512_hex(key, data),
+            HashAlgorithm::Blake3 => crypto::blake3_keyed_hex(key, data),
+        }
+    }
+
+    /// Verify HMAC signature
+    pub fn verify_signature(self, data: &[u8], key: &[u8], signature: &str) -> bool {
+        let computed = self.sign(data, key);
+        crypto::constant_time_eq(&computed, signature)
+    }
+
+    /// Generate integrity record for entity
+    pub fn create_integrity_record(self, entity_id: &str, data: &[u8], signing_key: &[u8]) -> IntegrityRecord {
+        let checksum = self.compute_checksum(data);
+        let signature = self.sign(data, signing_key);
+
+        IntegrityRecord {
+            entity_id: entity_id.to_string(),
+            checksum,
+            signature,
+            algorithm: self.algorithm.clone(),
+            created_at: DateTime::now(),
+        }
+    }
+
+    /// Verify entity integrity
+    pub fn verify_integrity(self, data: &[u8], record: &IntegrityRecord, signing_key: &[u8]) -> IntegrityVerification {
+        let checksum_valid = self.verify_checksum(data, &record.checksum);
+        let signature_valid = self.verify_signature(data, signing_key, &record.signature);
+
+        IntegrityVerification {
+            checksum_valid,
+            signature_valid,
+            verified_at: DateTime::now(),
+        }
+    }
+}
+
+/// Hash algorithms
+pub enum HashAlgorithm {
+    Sha256,
+    Sha512,
+    Blake3,
+}
+
+/// Integrity record for an entity
+pub type IntegrityRecord = type {
+    entity_id: String,
+    checksum: String,
+    signature: String,
+    algorithm: HashAlgorithm,
+    created_at: DateTime,
+}
+
+/// Integrity verification result
+pub type IntegrityVerification = type {
+    checksum_valid: bool,
+    signature_valid: bool,
+    verified_at: DateTime,
+}
+
+impl IntegrityVerification {
+    pub fn is_valid(self) -> bool {
+        self.checksum_valid && self.signature_valid
+    }
+}
+
+// ============================================================================
+// Secure Connection Configuration
+// ============================================================================
+
+/// Database connection security configuration
+pub type SecureConnectionConfig = type {
+    // Require SSL/TLS
+    require_ssl: bool,
+
+    // SSL mode (disable, allow, prefer, require, verify-ca, verify-full)
+    ssl_mode: SslMode,
+
+    // CA certificate path
+    ssl_ca_cert: Option<String>,
+
+    // Client certificate path
+    ssl_client_cert: Option<String>,
+
+    // Client key path
+    ssl_client_key: Option<String>,
+
+    // Connection timeout
+    connect_timeout: Duration,
+
+    // Idle connection timeout
+    idle_timeout: Duration,
+
+    // Maximum connections
+    max_connections: i32,
+
+    // Minimum connections
+    min_connections: i32,
+
+    // Connection lifetime
+    max_lifetime: Duration,
+}
+
+impl SecureConnectionConfig {
+    pub fn development() -> Self {
+        SecureConnectionConfig {
+            require_ssl: false,
+            ssl_mode: SslMode::Prefer,
+            ssl_ca_cert: None,
+            ssl_client_cert: None,
+            ssl_client_key: None,
+            connect_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_minutes(10),
+            max_connections: 10,
+            min_connections: 1,
+            max_lifetime: Duration::from_hours(1),
+        }
+    }
+
+    pub fn production() -> Self {
+        SecureConnectionConfig {
+            require_ssl: true,
+            ssl_mode: SslMode::VerifyFull,
+            ssl_ca_cert: None, // Set from environment
+            ssl_client_cert: None,
+            ssl_client_key: None,
+            connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_minutes(5),
+            max_connections: 100,
+            min_connections: 10,
+            max_lifetime: Duration::from_minutes(30),
+        }
+    }
+}
+
+/// SSL mode for database connections
+pub enum SslMode {
+    Disable,
+    Allow,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl SslMode {
+    pub fn to_string(self) -> String {
+        match self {
+            SslMode::Disable => "disable".to_string(),
+            SslMode::Allow => "allow".to_string(),
+            SslMode::Prefer => "prefer".to_string(),
+            SslMode::Require => "require".to_string(),
+            SslMode::VerifyCa => "verify-ca".to_string(),
+            SslMode::VerifyFull => "verify-full".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// Security Error Types
+// ============================================================================
+
+pub enum SecurityError {
+    EncryptionError { message: String },
+    DecryptionError { message: String },
+    KeyNotFound { key_id: String },
+    RateLimitExceeded { retry_after: Duration },
+    ValidationFailed { errors: Vec<String> },
+    IntegrityViolation { entity_id: String },
+    ConnectionError { message: String },
+    Internal { message: String },
+}
+
+impl SecurityError {
+    pub fn to_string(self) -> String {
+        match self {
+            SecurityError::EncryptionError { message } =>
+                format!("Encryption error: {}", message),
+            SecurityError::DecryptionError { message } =>
+                format!("Decryption error: {}", message),
+            SecurityError::KeyNotFound { key_id } =>
+                format!("Key not found: {}", key_id),
+            SecurityError::RateLimitExceeded { retry_after } =>
+                format!("Rate limit exceeded, retry after {} seconds", retry_after.as_secs()),
+            SecurityError::ValidationFailed { errors } =>
+                format!("Validation failed: {}", errors.join(", ")),
+            SecurityError::IntegrityViolation { entity_id } =>
+                format!("Data integrity violation for entity: {}", entity_id),
+            SecurityError::ConnectionError { message } =>
+                format!("Connection error: {}", message),
+            SecurityError::Internal { message } =>
+                format!("Internal security error: {}", message),
+        }
+    }
+}

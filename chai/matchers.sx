@@ -1,0 +1,726 @@
+/// Intelligo LMS - Custom Matchers
+///
+/// Provides extensible custom matchers for domain-specific testing.
+
+module intelligo::chai::matchers
+
+use std::collections::{Map, List}
+use std::time::{DateTime, Duration}
+
+// =============================================================================
+// MATCHER TRAIT
+// =============================================================================
+
+/// Base trait for all matchers
+pub trait Matcher<T> {
+    fn matches(&self, actual: &T) -> bool;
+    fn failure_message(&self, actual: &T) -> String;
+    fn negated_failure_message(&self, actual: &T) -> String;
+}
+
+/// Result of a matcher
+pub type MatchResult {
+    success: bool,
+    message: String
+}
+
+impl MatchResult {
+    pub fn ok() -> MatchResult {
+        MatchResult {
+            success: true,
+            message: "".to_string()
+        }
+    }
+
+    pub fn fail(message: &str) -> MatchResult {
+        MatchResult {
+            success: false,
+            message: message.to_string()
+        }
+    }
+}
+
+// =============================================================================
+// NUMERIC MATCHERS
+// =============================================================================
+
+/// Matches if value is within a range
+pub struct BeWithin<T> {
+    min: T,
+    max: T
+}
+
+impl<T: PartialOrd + std::fmt::Display> Matcher<T> for BeWithin<T> {
+    fn matches(&self, actual: &T) -> bool {
+        actual >= &self.min && actual <= &self.max
+    }
+
+    fn failure_message(&self, actual: &T) -> String {
+        format!("expected {} to be within {} and {}", actual, self.min, self.max)
+    }
+
+    fn negated_failure_message(&self, actual: &T) -> String {
+        format!("expected {} not to be within {} and {}", actual, self.min, self.max)
+    }
+}
+
+pub fn be_within<T>(min: T, max: T) -> BeWithin<T> {
+    BeWithin { min, max }
+}
+
+/// Matches if value is close to expected (within delta)
+pub struct BeCloseTo {
+    expected: f64,
+    delta: f64
+}
+
+impl Matcher<f64> for BeCloseTo {
+    fn matches(&self, actual: &f64) -> bool {
+        (actual - self.expected).abs() <= self.delta
+    }
+
+    fn failure_message(&self, actual: &f64) -> String {
+        format!(
+            "expected {} to be close to {} (within {})",
+            actual, self.expected, self.delta
+        )
+    }
+
+    fn negated_failure_message(&self, actual: &f64) -> String {
+        format!(
+            "expected {} not to be close to {} (within {})",
+            actual, self.expected, self.delta
+        )
+    }
+}
+
+pub fn be_close_to(expected: f64, delta: f64) -> BeCloseTo {
+    BeCloseTo { expected, delta }
+}
+
+/// Matches if value is positive
+pub struct BePositive;
+
+impl Matcher<f64> for BePositive {
+    fn matches(&self, actual: &f64) -> bool {
+        *actual > 0.0
+    }
+
+    fn failure_message(&self, actual: &f64) -> String {
+        format!("expected {} to be positive", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &f64) -> String {
+        format!("expected {} not to be positive", actual)
+    }
+}
+
+pub fn be_positive() -> BePositive {
+    BePositive
+}
+
+/// Matches if value is negative
+pub struct BeNegative;
+
+impl Matcher<f64> for BeNegative {
+    fn matches(&self, actual: &f64) -> bool {
+        *actual < 0.0
+    }
+
+    fn failure_message(&self, actual: &f64) -> String {
+        format!("expected {} to be negative", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &f64) -> String {
+        format!("expected {} not to be negative", actual)
+    }
+}
+
+pub fn be_negative() -> BeNegative {
+    BeNegative
+}
+
+/// Matches percentage (0-100)
+pub struct BeValidPercentage;
+
+impl Matcher<f64> for BeValidPercentage {
+    fn matches(&self, actual: &f64) -> bool {
+        *actual >= 0.0 && *actual <= 100.0
+    }
+
+    fn failure_message(&self, actual: &f64) -> String {
+        format!("expected {} to be a valid percentage (0-100)", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &f64) -> String {
+        format!("expected {} not to be a valid percentage", actual)
+    }
+}
+
+pub fn be_valid_percentage() -> BeValidPercentage {
+    BeValidPercentage
+}
+
+// =============================================================================
+// STRING MATCHERS
+// =============================================================================
+
+/// Matches if string matches regex pattern
+pub struct MatchPattern {
+    pattern: String
+}
+
+impl Matcher<String> for MatchPattern {
+    fn matches(&self, actual: &String) -> bool {
+        std::regex::Regex::new(&self.pattern)
+            .map(|re| re.is_match(actual))
+            .unwrap_or(false)
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to match pattern '{}'", actual, self.pattern)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to match pattern '{}'", actual, self.pattern)
+    }
+}
+
+pub fn match_pattern(pattern: &str) -> MatchPattern {
+    MatchPattern { pattern: pattern.to_string() }
+}
+
+/// Matches if string is valid email
+pub struct BeValidEmail;
+
+impl Matcher<String> for BeValidEmail {
+    fn matches(&self, actual: &String) -> bool {
+        // Simple email validation
+        let parts: Vec<&str> = actual.split('@').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        let domain_parts: Vec<&str> = parts[1].split('.').collect();
+        !parts[0].is_empty() && domain_parts.len() >= 2 && domain_parts.iter().all(|p| !p.is_empty())
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid email", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid email", actual)
+    }
+}
+
+pub fn be_valid_email() -> BeValidEmail {
+    BeValidEmail
+}
+
+/// Matches if string is valid URL
+pub struct BeValidUrl;
+
+impl Matcher<String> for BeValidUrl {
+    fn matches(&self, actual: &String) -> bool {
+        actual.starts_with("http://") || actual.starts_with("https://")
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid URL", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid URL", actual)
+    }
+}
+
+pub fn be_valid_url() -> BeValidUrl {
+    BeValidUrl
+}
+
+/// Matches if string is valid UUID
+pub struct BeValidUuid;
+
+impl Matcher<String> for BeValidUuid {
+    fn matches(&self, actual: &String) -> bool {
+        if actual.len() != 36 {
+            return false;
+        }
+        let parts: Vec<&str> = actual.split('-').collect();
+        if parts.len() != 5 {
+            return false;
+        }
+        parts[0].len() == 8 && parts[1].len() == 4 && parts[2].len() == 4
+            && parts[3].len() == 4 && parts[4].len() == 12
+            && actual.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid UUID", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid UUID", actual)
+    }
+}
+
+pub fn be_valid_uuid() -> BeValidUuid {
+    BeValidUuid
+}
+
+/// Matches if string is valid JSON
+pub struct BeValidJson;
+
+impl Matcher<String> for BeValidJson {
+    fn matches(&self, actual: &String) -> bool {
+        std::json::parse(actual).is_ok()
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be valid JSON", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be valid JSON", actual)
+    }
+}
+
+pub fn be_valid_json() -> BeValidJson {
+    BeValidJson
+}
+
+// =============================================================================
+// COLLECTION MATCHERS
+// =============================================================================
+
+/// Matches if collection has specific length
+pub struct HaveLength {
+    expected: usize
+}
+
+impl<T> Matcher<Vec<T>> for HaveLength {
+    fn matches(&self, actual: &Vec<T>) -> bool {
+        actual.len() == self.expected
+    }
+
+    fn failure_message(&self, actual: &Vec<T>) -> String {
+        format!("expected collection of length {} to have length {}", actual.len(), self.expected)
+    }
+
+    fn negated_failure_message(&self, actual: &Vec<T>) -> String {
+        format!("expected collection not to have length {}", self.expected)
+    }
+}
+
+pub fn have_length(expected: usize) -> HaveLength {
+    HaveLength { expected }
+}
+
+/// Matches if collection contains all elements
+pub struct ContainAll<T> {
+    expected: Vec<T>
+}
+
+impl<T: PartialEq + std::fmt::Debug> Matcher<Vec<T>> for ContainAll<T> {
+    fn matches(&self, actual: &Vec<T>) -> bool {
+        self.expected.iter().all(|e| actual.contains(e))
+    }
+
+    fn failure_message(&self, actual: &Vec<T>) -> String {
+        format!("expected {:?} to contain all of {:?}", actual, self.expected)
+    }
+
+    fn negated_failure_message(&self, actual: &Vec<T>) -> String {
+        format!("expected {:?} not to contain all of {:?}", actual, self.expected)
+    }
+}
+
+pub fn contain_all<T>(expected: Vec<T>) -> ContainAll<T> {
+    ContainAll { expected }
+}
+
+/// Matches if collection contains any of the elements
+pub struct ContainAny<T> {
+    expected: Vec<T>
+}
+
+impl<T: PartialEq + std::fmt::Debug> Matcher<Vec<T>> for ContainAny<T> {
+    fn matches(&self, actual: &Vec<T>) -> bool {
+        self.expected.iter().any(|e| actual.contains(e))
+    }
+
+    fn failure_message(&self, actual: &Vec<T>) -> String {
+        format!("expected {:?} to contain any of {:?}", actual, self.expected)
+    }
+
+    fn negated_failure_message(&self, actual: &Vec<T>) -> String {
+        format!("expected {:?} not to contain any of {:?}", actual, self.expected)
+    }
+}
+
+pub fn contain_any<T>(expected: Vec<T>) -> ContainAny<T> {
+    ContainAny { expected }
+}
+
+/// Matches if all elements satisfy predicate
+pub struct AllSatisfy<T, F> {
+    predicate: F,
+    description: String,
+    _marker: std::marker::PhantomData<T>
+}
+
+impl<T, F: Fn(&T) -> bool> Matcher<Vec<T>> for AllSatisfy<T, F> {
+    fn matches(&self, actual: &Vec<T>) -> bool {
+        actual.iter().all(&self.predicate)
+    }
+
+    fn failure_message(&self, _actual: &Vec<T>) -> String {
+        format!("expected all elements to {}", self.description)
+    }
+
+    fn negated_failure_message(&self, _actual: &Vec<T>) -> String {
+        format!("expected not all elements to {}", self.description)
+    }
+}
+
+pub fn all_satisfy<T, F: Fn(&T) -> bool>(description: &str, predicate: F) -> AllSatisfy<T, F> {
+    AllSatisfy {
+        predicate,
+        description: description.to_string(),
+        _marker: std::marker::PhantomData
+    }
+}
+
+/// Matches if collection is sorted
+pub struct BeSorted;
+
+impl<T: PartialOrd> Matcher<Vec<T>> for BeSorted {
+    fn matches(&self, actual: &Vec<T>) -> bool {
+        actual.windows(2).all(|w| w[0] <= w[1])
+    }
+
+    fn failure_message(&self, _actual: &Vec<T>) -> String {
+        "expected collection to be sorted".to_string()
+    }
+
+    fn negated_failure_message(&self, _actual: &Vec<T>) -> String {
+        "expected collection not to be sorted".to_string()
+    }
+}
+
+pub fn be_sorted() -> BeSorted {
+    BeSorted
+}
+
+// =============================================================================
+// LMS-SPECIFIC MATCHERS
+// =============================================================================
+
+/// Matches if score is passing (>= threshold)
+pub struct BePassingScore {
+    threshold: f64
+}
+
+impl Matcher<f64> for BePassingScore {
+    fn matches(&self, actual: &f64) -> bool {
+        *actual >= self.threshold
+    }
+
+    fn failure_message(&self, actual: &f64) -> String {
+        format!("expected score {} to be passing (>= {})", actual, self.threshold)
+    }
+
+    fn negated_failure_message(&self, actual: &f64) -> String {
+        format!("expected score {} not to be passing", actual)
+    }
+}
+
+pub fn be_passing_score(threshold: f64) -> BePassingScore {
+    BePassingScore { threshold }
+}
+
+/// Matches if completion status is complete
+pub struct BeCompleted;
+
+impl Matcher<String> for BeCompleted {
+    fn matches(&self, actual: &String) -> bool {
+        actual == "completed" || actual == "complete" || actual == "passed"
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected status '{}' to be completed", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected status '{}' not to be completed", actual)
+    }
+}
+
+pub fn be_completed() -> BeCompleted {
+    BeCompleted
+}
+
+/// Matches if string is valid SCORM status
+pub struct BeValidScormStatus;
+
+impl Matcher<String> for BeValidScormStatus {
+    fn matches(&self, actual: &String) -> bool {
+        matches!(
+            actual.as_str(),
+            "not attempted" | "incomplete" | "completed" | "passed" | "failed" | "browsed"
+        )
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid SCORM status", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid SCORM status", actual)
+    }
+}
+
+pub fn be_valid_scorm_status() -> BeValidScormStatus {
+    BeValidScormStatus
+}
+
+/// Matches if string is valid xAPI verb
+pub struct BeValidXapiVerb;
+
+impl Matcher<String> for BeValidXapiVerb {
+    fn matches(&self, actual: &String) -> bool {
+        actual.starts_with("http://") || actual.starts_with("https://")
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid xAPI verb IRI", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid xAPI verb IRI", actual)
+    }
+}
+
+pub fn be_valid_xapi_verb() -> BeValidXapiVerb {
+    BeValidXapiVerb
+}
+
+/// Matches if duration is within expected range
+pub struct BeValidDuration {
+    min: Duration,
+    max: Duration
+}
+
+impl Matcher<Duration> for BeValidDuration {
+    fn matches(&self, actual: &Duration) -> bool {
+        *actual >= self.min && *actual <= self.max
+    }
+
+    fn failure_message(&self, actual: &Duration) -> String {
+        format!(
+            "expected duration {:?} to be between {:?} and {:?}",
+            actual, self.min, self.max
+        )
+    }
+
+    fn negated_failure_message(&self, actual: &Duration) -> String {
+        format!("expected duration {:?} not to be in the valid range", actual)
+    }
+}
+
+pub fn be_valid_duration(min: Duration, max: Duration) -> BeValidDuration {
+    BeValidDuration { min, max }
+}
+
+/// Matches if progress is valid (0-100%)
+pub struct BeValidProgress;
+
+impl Matcher<f64> for BeValidProgress {
+    fn matches(&self, actual: &f64) -> bool {
+        *actual >= 0.0 && *actual <= 100.0
+    }
+
+    fn failure_message(&self, actual: &f64) -> String {
+        format!("expected progress {} to be valid (0-100)", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &f64) -> String {
+        format!("expected progress {} not to be valid", actual)
+    }
+}
+
+pub fn be_valid_progress() -> BeValidProgress {
+    BeValidProgress
+}
+
+/// Matches if course status is valid
+pub struct BeValidCourseStatus;
+
+impl Matcher<String> for BeValidCourseStatus {
+    fn matches(&self, actual: &String) -> bool {
+        matches!(
+            actual.as_str(),
+            "draft" | "pending_review" | "published" | "archived" | "suspended"
+        )
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid course status", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid course status", actual)
+    }
+}
+
+pub fn be_valid_course_status() -> BeValidCourseStatus {
+    BeValidCourseStatus
+}
+
+/// Matches if enrollment status is valid
+pub struct BeValidEnrollmentStatus;
+
+impl Matcher<String> for BeValidEnrollmentStatus {
+    fn matches(&self, actual: &String) -> bool {
+        matches!(
+            actual.as_str(),
+            "pending" | "active" | "completed" | "failed" | "withdrawn" | "expired"
+        )
+    }
+
+    fn failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' to be a valid enrollment status", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &String) -> String {
+        format!("expected '{}' not to be a valid enrollment status", actual)
+    }
+}
+
+pub fn be_valid_enrollment_status() -> BeValidEnrollmentStatus {
+    BeValidEnrollmentStatus
+}
+
+// =============================================================================
+// DATE/TIME MATCHERS
+// =============================================================================
+
+/// Matches if date is in the past
+pub struct BeInPast;
+
+impl Matcher<DateTime> for BeInPast {
+    fn matches(&self, actual: &DateTime) -> bool {
+        *actual < DateTime::now()
+    }
+
+    fn failure_message(&self, actual: &DateTime) -> String {
+        format!("expected {:?} to be in the past", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &DateTime) -> String {
+        format!("expected {:?} not to be in the past", actual)
+    }
+}
+
+pub fn be_in_past() -> BeInPast {
+    BeInPast
+}
+
+/// Matches if date is in the future
+pub struct BeInFuture;
+
+impl Matcher<DateTime> for BeInFuture {
+    fn matches(&self, actual: &DateTime) -> bool {
+        *actual > DateTime::now()
+    }
+
+    fn failure_message(&self, actual: &DateTime) -> String {
+        format!("expected {:?} to be in the future", actual)
+    }
+
+    fn negated_failure_message(&self, actual: &DateTime) -> String {
+        format!("expected {:?} not to be in the future", actual)
+    }
+}
+
+pub fn be_in_future() -> BeInFuture {
+    BeInFuture
+}
+
+/// Matches if date is within last N days
+pub struct BeWithinLastDays {
+    days: i64
+}
+
+impl Matcher<DateTime> for BeWithinLastDays {
+    fn matches(&self, actual: &DateTime) -> bool {
+        let cutoff = DateTime::now() - Duration::days(self.days);
+        *actual >= cutoff && *actual <= DateTime::now()
+    }
+
+    fn failure_message(&self, actual: &DateTime) -> String {
+        format!("expected {:?} to be within the last {} days", actual, self.days)
+    }
+
+    fn negated_failure_message(&self, actual: &DateTime) -> String {
+        format!("expected {:?} not to be within the last {} days", actual, self.days)
+    }
+}
+
+pub fn be_within_last_days(days: i64) -> BeWithinLastDays {
+    BeWithinLastDays { days }
+}
+
+// =============================================================================
+// CUSTOM MATCHER BUILDER
+// =============================================================================
+
+/// Builder for creating custom matchers
+pub struct CustomMatcher<T> {
+    check_fn: Box<dyn Fn(&T) -> bool>,
+    message_fn: Box<dyn Fn(&T) -> String>,
+    negated_message_fn: Box<dyn Fn(&T) -> String>
+}
+
+impl<T> CustomMatcher<T> {
+    pub fn new<F, M, N>(check: F, message: M, negated_message: N) -> CustomMatcher<T>
+    where
+        F: Fn(&T) -> bool + 'static,
+        M: Fn(&T) -> String + 'static,
+        N: Fn(&T) -> String + 'static
+    {
+        CustomMatcher {
+            check_fn: Box::new(check),
+            message_fn: Box::new(message),
+            negated_message_fn: Box::new(negated_message)
+        }
+    }
+}
+
+impl<T> Matcher<T> for CustomMatcher<T> {
+    fn matches(&self, actual: &T) -> bool {
+        (self.check_fn)(actual)
+    }
+
+    fn failure_message(&self, actual: &T) -> String {
+        (self.message_fn)(actual)
+    }
+
+    fn negated_failure_message(&self, actual: &T) -> String {
+        (self.negated_message_fn)(actual)
+    }
+}
+
+/// Create a simple custom matcher
+pub fn custom_matcher<T, F: Fn(&T) -> bool + 'static>(
+    description: &str,
+    check: F
+) -> CustomMatcher<T> {
+    let desc = description.to_string();
+    let desc2 = description.to_string();
+    CustomMatcher::new(
+        check,
+        move |_| format!("expected to {}", desc),
+        move |_| format!("expected not to {}", desc2)
+    )
+}

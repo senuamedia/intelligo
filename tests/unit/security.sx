@@ -1,0 +1,592 @@
+/// Intelligo LMS - Security Unit Tests
+///
+/// Unit tests for security features including encryption, rate limiting,
+/// input validation, and data integrity.
+
+module intelligo::tests::unit::security
+
+use intelligo::chai::*
+use intelligo::core::data_security::*
+use intelligo::core::security::*
+
+pub fn register_tests() {
+    describe("Data Security", || {
+        describe("encryption", || {
+            it("encrypts and decrypts field data", async || {
+                let config = EncryptionConfig::default();
+                let vault = TestKeyVault::new();
+                let encryption = DataEncryption::new(config, Box::new(vault));
+
+                let plaintext = b"sensitive user data";
+
+                // Encrypt
+                let encrypted = encryption.encrypt_field("User", "email", plaintext).await;
+                expect(&encrypted.is_ok()).to().be_true();
+
+                let encrypted_value = encrypted.unwrap();
+                expect(&encrypted_value.ciphertext.len()).to().be_greater_than(&0);
+                expect(&encrypted_value.ciphertext).to().not_equal(&plaintext.to_vec());
+
+                // Decrypt
+                let decrypted = encryption.decrypt_field(&encrypted_value).await;
+                expect(&decrypted.is_ok()).to().be_true();
+                expect(&decrypted.unwrap()).to().equal(&plaintext.to_vec());
+            });
+
+            it("uses envelope encryption with DEK", async || {
+                let mut config = EncryptionConfig::default();
+                config.envelope_encryption = true;
+                config.master_key_id = "test_master_key".to_string();
+
+                let vault = TestKeyVault::with_master_key();
+                let encryption = DataEncryption::new(config, Box::new(vault));
+
+                let data = b"test data for envelope encryption";
+                let encrypted = encryption.encrypt_field("User", "ssn", data).await;
+
+                expect(&encrypted.is_ok()).to().be_true();
+                let value = encrypted.unwrap();
+
+                // Key ID should be a DEK, not master key
+                expect(&value.key_id.starts_with("dek_")).to().be_true();
+            });
+
+            it("handles multiple encryption algorithms", async || {
+                let algorithms = vec![
+                    EncryptionAlgorithm::Aes256Gcm,
+                    EncryptionAlgorithm::ChaCha20Poly1305,
+                ];
+
+                for algorithm in algorithms {
+                    let mut config = EncryptionConfig::default();
+                    config.algorithm = algorithm;
+                    let vault = TestKeyVault::new();
+                    let encryption = DataEncryption::new(config, Box::new(vault));
+
+                    let plaintext = b"test data";
+                    let encrypted = encryption.encrypt_field("User", "email", plaintext).await;
+                    expect(&encrypted.is_ok()).to().be_true();
+
+                    let decrypted = encryption.decrypt_field(&encrypted.unwrap()).await;
+                    expect(&decrypted.is_ok()).to().be_true();
+                    expect(&decrypted.unwrap()).to().equal(&plaintext.to_vec());
+                }
+            });
+
+            it("serializes and deserializes encrypted values", || {
+                let encrypted = EncryptedValue {
+                    ciphertext: vec![1, 2, 3, 4, 5],
+                    nonce: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                    key_id: "test_key".to_string(),
+                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    encrypted_at: DateTime::now(),
+                };
+
+                let bytes = encrypted.to_bytes();
+                let restored = EncryptedValue::from_bytes(&bytes);
+
+                expect(&restored.is_ok()).to().be_true();
+                let restored = restored.unwrap();
+                expect(&restored.ciphertext).to().equal(&encrypted.ciphertext);
+                expect(&restored.nonce).to().equal(&encrypted.nonce);
+                expect(&restored.key_id).to().equal(&encrypted.key_id);
+            });
+        });
+
+        describe("rate limiting", || {
+            it("allows requests within limit", || {
+                let config = RateLimitConfig::default();
+                let mut limiter = RateLimiter::new(config);
+
+                let key = "user_123";
+                let endpoint = "/api/v1/courses";
+
+                // First request should be allowed
+                let result = limiter.check(key, endpoint, None);
+                expect(&result.is_allowed()).to().be_true();
+
+                // Next 59 requests should also be allowed (default is 60/min)
+                for _ in 0..58 {
+                    let result = limiter.check(key, endpoint, None);
+                    expect(&result.is_allowed()).to().be_true();
+                }
+            });
+
+            it("blocks requests exceeding limit", || {
+                let mut config = RateLimitConfig::default();
+                config.default_limit = 5;
+                let mut limiter = RateLimiter::new(config);
+
+                let key = "user_123";
+                let endpoint = "/api/v1/test";
+
+                // Exhaust the limit
+                for _ in 0..5 {
+                    limiter.check(key, endpoint, None);
+                }
+
+                // Next request should be limited
+                let result = limiter.check(key, endpoint, None);
+                expect(&result.is_allowed()).to().be_false();
+
+                match result {
+                    RateLimitResult::Limited { retry_after, .. } => {
+                        expect(&retry_after.as_secs()).to().be_greater_than(&0);
+                    }
+                    _ => panic!("Expected Limited result")
+                }
+            });
+
+            it("applies stricter limits for auth endpoints", || {
+                let config = RateLimitConfig::default();
+                let mut limiter = RateLimiter::new(config);
+
+                let key = "user_123";
+                let endpoint = "/api/v1/auth/login";
+
+                // Auth endpoint has limit of 5 per 15 minutes
+                for _ in 0..5 {
+                    let result = limiter.check(key, endpoint, None);
+                    expect(&result.is_allowed()).to().be_true();
+                }
+
+                // 6th request should be limited
+                let result = limiter.check(key, endpoint, None);
+                expect(&result.is_allowed()).to().be_false();
+            });
+
+            it("applies role multipliers", || {
+                let config = RateLimitConfig::default();
+                let mut limiter = RateLimiter::new(config);
+
+                let key = "admin_user";
+                let endpoint = "/api/v1/courses";
+
+                // Admin gets 5x multiplier (60 * 5 = 300 requests)
+                for _ in 0..100 {
+                    let result = limiter.check(key, endpoint, Some("admin"));
+                    expect(&result.is_allowed()).to().be_true();
+                }
+            });
+
+            it("resets rate limit for key", || {
+                let mut config = RateLimitConfig::default();
+                config.default_limit = 5;
+                let mut limiter = RateLimiter::new(config);
+
+                let key = "user_123";
+                let endpoint = "/api/v1/test";
+
+                // Exhaust limit
+                for _ in 0..6 {
+                    limiter.check(key, endpoint, None);
+                }
+
+                // Reset
+                limiter.reset(key);
+
+                // Should be allowed again
+                let result = limiter.check(key, endpoint, None);
+                expect(&result.is_allowed()).to().be_true();
+            });
+
+            it("generates correct rate limit headers", || {
+                let config = RateLimitConfig::default();
+                let mut limiter = RateLimiter::new(config);
+
+                let result = limiter.check("user", "/api/v1/test", None);
+                let headers = result.to_headers();
+
+                expect(&headers.contains_key("X-RateLimit-Limit")).to().be_true();
+                expect(&headers.contains_key("X-RateLimit-Remaining")).to().be_true();
+                expect(&headers.contains_key("X-RateLimit-Reset")).to().be_true();
+            });
+        });
+
+        describe("input validation", || {
+            it("validates email format", || {
+                let validator = InputValidator::new();
+
+                // Valid emails
+                let valid = validator.validate("email", "user@example.com");
+                expect(&valid.is_valid()).to().be_true();
+
+                let valid = validator.validate("email", "user.name+tag@subdomain.example.co.uk");
+                expect(&valid.is_valid()).to().be_true();
+
+                // Invalid emails
+                let invalid = validator.validate("email", "not-an-email");
+                expect(&invalid.is_valid()).to().be_false();
+
+                let invalid = validator.validate("email", "user@");
+                expect(&invalid.is_valid()).to().be_false();
+            });
+
+            it("validates password strength", || {
+                let validator = InputValidator::new();
+
+                // Strong password
+                let valid = validator.validate("password", "SecureP@ss123!");
+                expect(&valid.is_valid()).to().be_true();
+
+                // Too short
+                let invalid = validator.validate("password", "Short1!");
+                expect(&invalid.is_valid()).to().be_false();
+
+                // No uppercase
+                let invalid = validator.validate("password", "lowercase123!");
+                expect(&invalid.is_valid()).to().be_false();
+
+                // No special character
+                let invalid = validator.validate("password", "NoSpecial123");
+                expect(&invalid.is_valid()).to().be_false();
+
+                // Common password
+                let invalid = validator.validate("password", "Password123!");
+                expect(&invalid.is_valid()).to().be_false();
+            });
+
+            it("detects SQL injection attempts", || {
+                let validator = InputValidator::new();
+
+                let sql_attacks = vec![
+                    "'; DROP TABLE users; --",
+                    "1 OR 1=1",
+                    "1; SELECT * FROM users",
+                    "admin'--",
+                    "1 UNION SELECT * FROM users",
+                ];
+
+                for attack in sql_attacks {
+                    let result = validator.validate("username", attack);
+                    expect(&result.is_valid()).to().be_false();
+                }
+            });
+
+            it("detects XSS attempts", || {
+                let validator = InputValidator::new();
+
+                let xss_attacks = vec![
+                    "<script>alert('xss')</script>",
+                    "<img src=x onerror=alert('xss')>",
+                    "<a href=\"javascript:alert('xss')\">click</a>",
+                    "<iframe src=\"evil.com\">",
+                ];
+
+                // These should be caught when NoXss rule is applied
+                for attack in xss_attacks {
+                    // Course title should not allow HTML
+                    let result = validator.validate("course_title", attack);
+                    expect(&result.is_valid()).to().be_false();
+                }
+            });
+
+            it("prevents path traversal", || {
+                let validator = InputValidator::new();
+
+                let traversal_attempts = vec![
+                    "../../../etc/passwd",
+                    "..\\..\\windows\\system32",
+                    "/etc/passwd",
+                    "//network/share",
+                ];
+
+                for attempt in traversal_attempts {
+                    let result = validator.validate("file_path", attempt);
+                    expect(&result.is_valid()).to().be_false();
+                }
+            });
+
+            it("validates file extensions", || {
+                let validator = InputValidator::new();
+
+                // Allowed extensions
+                let valid = validator.validate("file_path", "document.pdf");
+                expect(&valid.is_valid()).to().be_true();
+
+                let valid = validator.validate("file_path", "image.jpg");
+                expect(&valid.is_valid()).to().be_true();
+
+                // Dangerous extensions
+                let invalid = validator.validate("file_path", "script.exe");
+                expect(&invalid.is_valid()).to().be_false();
+
+                let invalid = validator.validate("file_path", "shell.sh");
+                expect(&invalid.is_valid()).to().be_false();
+            });
+
+            it("sanitizes HTML content", || {
+                let validator = InputValidator::new();
+
+                let malicious = "<script>alert('xss')</script><p>Safe content</p>";
+                let sanitized = validator.sanitize("html", malicious);
+
+                expect(&sanitized.contains("<script>")).to().be_false();
+                expect(&sanitized.contains("<p>Safe content</p>")).to().be_true();
+            });
+
+            it("strips HTML when required", || {
+                let validator = InputValidator::new();
+
+                let html = "<h1>Title</h1><p>Content with <b>bold</b></p>";
+                let stripped = validator.sanitize("plain_text", html);
+
+                expect(&stripped.contains("<")).to().be_false();
+                expect(&stripped.contains(">")).to().be_false();
+                expect(&stripped.contains("Title")).to().be_true();
+                expect(&stripped.contains("Content")).to().be_true();
+            });
+        });
+
+        describe("data integrity", || {
+            it("computes checksums correctly", || {
+                let integrity = DataIntegrity::new(HashAlgorithm::Sha256);
+                let data = b"test data for checksum";
+
+                let checksum = integrity.compute_checksum(data);
+                expect(&checksum.len()).to().equal(&64); // SHA-256 hex is 64 chars
+
+                // Same data should produce same checksum
+                let checksum2 = integrity.compute_checksum(data);
+                expect(&checksum).to().equal(&checksum2);
+
+                // Different data should produce different checksum
+                let checksum3 = integrity.compute_checksum(b"different data");
+                expect(&checksum).to().not_equal(&checksum3);
+            });
+
+            it("verifies checksums correctly", || {
+                let integrity = DataIntegrity::new(HashAlgorithm::Sha256);
+                let data = b"test data";
+
+                let checksum = integrity.compute_checksum(data);
+
+                // Valid verification
+                let valid = integrity.verify_checksum(data, &checksum);
+                expect(&valid).to().be_true();
+
+                // Invalid verification
+                let invalid = integrity.verify_checksum(b"modified data", &checksum);
+                expect(&invalid).to().be_false();
+            });
+
+            it("signs and verifies data with HMAC", || {
+                let integrity = DataIntegrity::new(HashAlgorithm::Sha256);
+                let data = b"data to sign";
+                let key = b"secret signing key";
+
+                let signature = integrity.sign(data, key);
+                expect(&signature.len()).to().be_greater_than(&0);
+
+                // Valid verification
+                let valid = integrity.verify_signature(data, key, &signature);
+                expect(&valid).to().be_true();
+
+                // Invalid with different data
+                let invalid = integrity.verify_signature(b"different data", key, &signature);
+                expect(&invalid).to().be_false();
+
+                // Invalid with different key
+                let invalid = integrity.verify_signature(data, b"wrong key", &signature);
+                expect(&invalid).to().be_false();
+            });
+
+            it("creates integrity records", || {
+                let integrity = DataIntegrity::new(HashAlgorithm::Sha256);
+                let data = b"entity data";
+                let key = b"signing key";
+
+                let record = integrity.create_integrity_record("entity_123", data, key);
+
+                expect(&record.entity_id).to().equal(&"entity_123".to_string());
+                expect(&record.checksum.len()).to().be_greater_than(&0);
+                expect(&record.signature.len()).to().be_greater_than(&0);
+            });
+
+            it("verifies entity integrity", || {
+                let integrity = DataIntegrity::new(HashAlgorithm::Sha256);
+                let data = b"entity data";
+                let key = b"signing key";
+
+                let record = integrity.create_integrity_record("entity_123", data, key);
+
+                // Valid verification
+                let verification = integrity.verify_integrity(data, &record, key);
+                expect(&verification.is_valid()).to().be_true();
+                expect(&verification.checksum_valid).to().be_true();
+                expect(&verification.signature_valid).to().be_true();
+
+                // Invalid with modified data
+                let verification = integrity.verify_integrity(b"modified", &record, key);
+                expect(&verification.is_valid()).to().be_false();
+            });
+        });
+    });
+
+    describe("RBAC Security", || {
+        it("enforces role hierarchy", || {
+            let manager = SecurityManager::new(TenantId("tenant_1".to_string()));
+
+            // Get inherited roles
+            let teacher_inherits = SystemRole::Teacher.inherits_from();
+            expect(&teacher_inherits.contains(&SystemRole::Student)).to().be_true();
+            expect(&teacher_inherits.contains(&SystemRole::TeachingAssistant)).to().be_true();
+            expect(&teacher_inherits.contains(&SystemRole::Anonymous)).to().be_true();
+
+            // Admin inherits all
+            let admin_inherits = SystemRole::Administrator.inherits_from();
+            expect(&admin_inherits.contains(&SystemRole::Teacher)).to().be_true();
+            expect(&admin_inherits.contains(&SystemRole::CourseCoordinator)).to().be_true();
+        });
+
+        it("checks course-scoped access", async || {
+            let mut manager = SecurityManager::new(TenantId("tenant_1".to_string()));
+
+            let context = SecurityContext {
+                user_id: UserId("user_1".to_string()),
+                tenant_id: TenantId("tenant_1".to_string()),
+                session_id: Some(SessionId("session_1".to_string())),
+                roles: Set::from([RoleId("student".to_string())]),
+                course_roles: Map::from([
+                    (CourseId("course_1".to_string()), CourseRole::Student)
+                ]),
+                current_course: Some(CourseId("course_1".to_string())),
+                ip_address: Some("127.0.0.1".to_string()),
+                authenticated: true,
+                mfa_verified: false,
+                session_start: Some(DateTime::now()),
+                metadata: Map::new(),
+            };
+
+            // Student can view enrolled course
+            let result = manager <- CheckCourseAccess(
+                context.clone(),
+                CourseId("course_1".to_string()),
+                LmsAction::ViewCourse
+            );
+            expect(&result.is_allowed()).to().be_true();
+
+            // Student can take assessments
+            let result = manager <- CheckCourseAccess(
+                context.clone(),
+                CourseId("course_1".to_string()),
+                LmsAction::TakeAssessment
+            );
+            expect(&result.is_allowed()).to().be_true();
+
+            // Student cannot edit course
+            let result = manager <- CheckCourseAccess(
+                context.clone(),
+                CourseId("course_1".to_string()),
+                LmsAction::EditCourse
+            );
+            expect(&result.is_denied()).to().be_true();
+        });
+
+        it("denies access to different tenant", async || {
+            let manager = SecurityManager::new(TenantId("tenant_1".to_string()));
+
+            let context = SecurityContext {
+                user_id: UserId("user_1".to_string()),
+                tenant_id: TenantId("tenant_2".to_string()), // Different tenant
+                session_id: None,
+                roles: Set::from([RoleId("admin".to_string())]),
+                course_roles: Map::new(),
+                current_course: None,
+                ip_address: None,
+                authenticated: true,
+                mfa_verified: false,
+                session_start: None,
+                metadata: Map::new(),
+            };
+
+            let result = manager <- CheckAccess(
+                context,
+                LmsAction::ViewCourse,
+                LmsResourceType::Course { course_id: Some(CourseId("course_1".to_string())) }
+            );
+            expect(&result.is_denied()).to().be_true();
+        });
+
+        it("grants admin full access", async || {
+            let mut manager = SecurityManager::new(TenantId("tenant_1".to_string()));
+
+            let context = SecurityContext {
+                user_id: UserId("admin_1".to_string()),
+                tenant_id: TenantId("tenant_1".to_string()),
+                session_id: None,
+                roles: Set::from([RoleId("administrator".to_string())]),
+                course_roles: Map::new(),
+                current_course: None,
+                ip_address: None,
+                authenticated: true,
+                mfa_verified: false,
+                session_start: None,
+                metadata: Map::new(),
+            };
+
+            // Admin can do anything
+            let actions = vec![
+                LmsAction::DeleteCourse,
+                LmsAction::ManageUsers,
+                LmsAction::ConfigureSystem,
+                LmsAction::ManageTenant,
+            ];
+
+            for action in actions {
+                let result = manager <- CheckAccess(
+                    context.clone(),
+                    action,
+                    LmsResourceType::Any
+                );
+                expect(&result.is_allowed()).to().be_true();
+            }
+        });
+    });
+}
+
+// Test helpers
+actor TestKeyVault {
+    keys: Map<String, Vec<u8>>,
+}
+
+impl TestKeyVault {
+    pub fn new() -> Self {
+        TestKeyVault {
+            keys: Map::new(),
+        }
+    }
+
+    pub fn with_master_key() -> Self {
+        let mut vault = TestKeyVault::new();
+        vault.keys.insert("test_master_key".to_string(), crypto::random_bytes(32));
+        vault
+    }
+}
+
+impl KeyVault for TestKeyVault {
+    async fn get_key(self, key_id: &str) -> Result<Vec<u8>, SecurityError> {
+        self.keys.get(key_id).cloned().ok_or_else(|| {
+            // For DEKs, generate a new one
+            if key_id.starts_with("dek_") {
+                Ok(crypto::random_bytes(32))
+            } else {
+                Err(SecurityError::KeyNotFound { key_id: key_id.to_string() })
+            }
+        }).unwrap_or_else(|e| Err(e))
+    }
+
+    async fn store_key(mut self, key_id: &str, key_material: &[u8]) -> Result<(), SecurityError> {
+        self.keys.insert(key_id.to_string(), key_material.to_vec());
+        Ok(())
+    }
+
+    async fn delete_key(mut self, key_id: &str) -> Result<(), SecurityError> {
+        self.keys.remove(key_id);
+        Ok(())
+    }
+
+    async fn list_keys(self) -> Result<Vec<String>, SecurityError> {
+        Ok(self.keys.keys().cloned().collect())
+    }
+}

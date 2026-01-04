@@ -1,0 +1,15 @@
+/// Intelligo LMS - Communication Module
+///
+/// Exports communication platform integrations.
+
+module intelligo::integrations::communication
+
+pub use intelligo::integrations::communication::email::*
+pub use intelligo::integrations::communication::slack::*
+pub use intelligo::integrations::communication::teams::*
+
+// Re-export commonly used types
+pub use EmailProvider
+pub use EmailMessage
+pub use SlackIntegration
+pub use TeamsIntegration

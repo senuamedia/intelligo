@@ -1,0 +1,638 @@
+/// Intelligo LMS - Test Fixtures
+///
+/// Provides fixture management and test data factories for testing.
+
+module intelligo::chai::fixtures
+
+use std::collections::{Map, List}
+use std::sync::{Arc, Mutex}
+
+// =============================================================================
+// FIXTURE REGISTRY
+// =============================================================================
+
+/// Global fixture registry
+static mut FIXTURE_REGISTRY: Option<FixtureRegistry> = None;
+
+/// Registry for test fixtures
+pub type FixtureRegistry {
+    fixtures: Map<String, Box<dyn Fn() -> Dynamic + Send + Sync>>,
+    instances: Arc<Mutex<Map<String, Dynamic>>>,
+    sequences: Arc<Mutex<Map<String, i64>>>
+}
+
+impl FixtureRegistry {
+    pub fn new() -> FixtureRegistry {
+        FixtureRegistry {
+            fixtures: Map::new(),
+            instances: Arc::new(Mutex::new(Map::new())),
+            sequences: Arc::new(Mutex::new(Map::new()))
+        }
+    }
+
+    pub fn global() -> &'static mut FixtureRegistry {
+        unsafe {
+            if FIXTURE_REGISTRY.is_none() {
+                FIXTURE_REGISTRY = Some(FixtureRegistry::new());
+            }
+            FIXTURE_REGISTRY.as_mut().unwrap()
+        }
+    }
+
+    pub fn reset() {
+        unsafe {
+            FIXTURE_REGISTRY = Some(FixtureRegistry::new());
+        }
+    }
+
+    /// Register a fixture factory
+    pub fn define<T: 'static>(
+        &mut self,
+        name: &str,
+        factory: impl Fn() -> T + Send + Sync + 'static
+    ) {
+        self.fixtures.insert(
+            name.to_string(),
+            Box::new(move || Box::new(factory()) as Dynamic)
+        );
+    }
+
+    /// Get next sequence number
+    pub fn next_sequence(&self, name: &str) -> i64 {
+        let mut sequences = self.sequences.lock().unwrap();
+        let seq = sequences.entry(name.to_string()).or_insert(0);
+        *seq += 1;
+        *seq
+    }
+
+    /// Reset sequences
+    pub fn reset_sequences(&self) {
+        self.sequences.lock().unwrap().clear();
+    }
+}
+
+// =============================================================================
+// FIXTURE DSL
+// =============================================================================
+
+/// Define a fixture
+pub fn define_fixture<T: 'static>(
+    name: &str,
+    factory: impl Fn() -> T + Send + Sync + 'static
+) {
+    FixtureRegistry::global().define(name, factory);
+}
+
+/// Create a fixture instance
+pub fn fixture<T: Clone + 'static>(name: &str) -> T {
+    let registry = FixtureRegistry::global();
+    if let Some(factory) = registry.fixtures.get(name) {
+        let value = factory();
+        *value.downcast::<T>().unwrap()
+    } else {
+        panic!("Fixture '{}' not found", name);
+    }
+}
+
+/// Get next sequence number for a named sequence
+pub fn sequence(name: &str) -> i64 {
+    FixtureRegistry::global().next_sequence(name)
+}
+
+// =============================================================================
+// FACTORY BUILDER
+// =============================================================================
+
+/// Builder for creating test factories
+pub struct Factory<T> {
+    base: Box<dyn Fn() -> T + Send + Sync>,
+    traits: Map<String, Box<dyn Fn(&mut T) + Send + Sync>>,
+    sequences: Map<String, Box<dyn Fn(i64) -> Dynamic + Send + Sync>>
+}
+
+impl<T: Clone + 'static> Factory<T> {
+    /// Create a new factory
+    pub fn new(base: impl Fn() -> T + Send + Sync + 'static) -> Factory<T> {
+        Factory {
+            base: Box::new(base),
+            traits: Map::new(),
+            sequences: Map::new()
+        }
+    }
+
+    /// Add a trait to the factory
+    pub fn with_trait(
+        mut self,
+        name: &str,
+        modifier: impl Fn(&mut T) + Send + Sync + 'static
+    ) -> Self {
+        self.traits.insert(name.to_string(), Box::new(modifier));
+        self
+    }
+
+    /// Add a sequence to the factory
+    pub fn with_sequence<V: 'static>(
+        mut self,
+        name: &str,
+        generator: impl Fn(i64) -> V + Send + Sync + 'static
+    ) -> Self {
+        self.sequences.insert(
+            name.to_string(),
+            Box::new(move |n| Box::new(generator(n)) as Dynamic)
+        );
+        self
+    }
+
+    /// Build an instance
+    pub fn build(&self) -> T {
+        (self.base)()
+    }
+
+    /// Build an instance with traits
+    pub fn build_with(&self, traits: &[&str]) -> T {
+        let mut instance = (self.base)();
+        for trait_name in traits {
+            if let Some(modifier) = self.traits.get(*trait_name) {
+                modifier(&mut instance);
+            }
+        }
+        instance
+    }
+
+    /// Build multiple instances
+    pub fn build_list(&self, count: usize) -> List<T> {
+        (0..count).map(|_| self.build()).collect()
+    }
+}
+
+// =============================================================================
+// LMS-SPECIFIC FIXTURES
+// =============================================================================
+
+/// Common test user data
+pub type TestUser {
+    id: String,
+    email: String,
+    first_name: String,
+    last_name: String,
+    role: String
+}
+
+impl TestUser {
+    pub fn learner() -> TestUser {
+        let n = sequence("user");
+        TestUser {
+            id: format!("user_{}", n),
+            email: format!("learner{}@test.com", n),
+            first_name: format!("Test{}", n),
+            last_name: "Learner",
+            role: "learner".to_string()
+        }
+    }
+
+    pub fn instructor() -> TestUser {
+        let n = sequence("user");
+        TestUser {
+            id: format!("user_{}", n),
+            email: format!("instructor{}@test.com", n),
+            first_name: format!("Prof{}", n),
+            last_name: "Teacher",
+            role: "instructor".to_string()
+        }
+    }
+
+    pub fn admin() -> TestUser {
+        let n = sequence("user");
+        TestUser {
+            id: format!("user_{}", n),
+            email: format!("admin{}@test.com", n),
+            first_name: format!("Admin{}", n),
+            last_name: "User",
+            role: "admin".to_string()
+        }
+    }
+}
+
+/// Common test course data
+pub type TestCourse {
+    id: String,
+    title: String,
+    description: String,
+    instructor_id: String,
+    status: String
+}
+
+impl TestCourse {
+    pub fn draft() -> TestCourse {
+        let n = sequence("course");
+        TestCourse {
+            id: format!("course_{}", n),
+            title: format!("Test Course {}", n),
+            description: "A test course for unit testing".to_string(),
+            instructor_id: "instructor_1".to_string(),
+            status: "draft".to_string()
+        }
+    }
+
+    pub fn published() -> TestCourse {
+        let mut course = TestCourse::draft();
+        course.status = "published".to_string();
+        course
+    }
+
+    pub fn archived() -> TestCourse {
+        let mut course = TestCourse::draft();
+        course.status = "archived".to_string();
+        course
+    }
+}
+
+/// Common test activity data
+pub type TestActivity {
+    id: String,
+    title: String,
+    activity_type: String,
+    course_id: String,
+    order: i32
+}
+
+impl TestActivity {
+    pub fn scorm() -> TestActivity {
+        let n = sequence("activity");
+        TestActivity {
+            id: format!("activity_{}", n),
+            title: format!("SCORM Module {}", n),
+            activity_type: "scorm".to_string(),
+            course_id: "course_1".to_string(),
+            order: n as i32
+        }
+    }
+
+    pub fn video() -> TestActivity {
+        let n = sequence("activity");
+        TestActivity {
+            id: format!("activity_{}", n),
+            title: format!("Video Lesson {}", n),
+            activity_type: "video".to_string(),
+            course_id: "course_1".to_string(),
+            order: n as i32
+        }
+    }
+
+    pub fn quiz() -> TestActivity {
+        let n = sequence("activity");
+        TestActivity {
+            id: format!("activity_{}", n),
+            title: format!("Quiz {}", n),
+            activity_type: "quiz".to_string(),
+            course_id: "course_1".to_string(),
+            order: n as i32
+        }
+    }
+
+    pub fn assignment() -> TestActivity {
+        let n = sequence("activity");
+        TestActivity {
+            id: format!("activity_{}", n),
+            title: format!("Assignment {}", n),
+            activity_type: "assignment".to_string(),
+            course_id: "course_1".to_string(),
+            order: n as i32
+        }
+    }
+}
+
+/// Test enrollment data
+pub type TestEnrollment {
+    id: String,
+    user_id: String,
+    course_id: String,
+    status: String,
+    progress: f64
+}
+
+impl TestEnrollment {
+    pub fn active() -> TestEnrollment {
+        let n = sequence("enrollment");
+        TestEnrollment {
+            id: format!("enrollment_{}", n),
+            user_id: format!("user_{}", n),
+            course_id: "course_1".to_string(),
+            status: "active".to_string(),
+            progress: 0.0
+        }
+    }
+
+    pub fn completed() -> TestEnrollment {
+        let mut enrollment = TestEnrollment::active();
+        enrollment.status = "completed".to_string();
+        enrollment.progress = 100.0;
+        enrollment
+    }
+
+    pub fn in_progress(progress: f64) -> TestEnrollment {
+        let mut enrollment = TestEnrollment::active();
+        enrollment.progress = progress;
+        enrollment
+    }
+}
+
+// =============================================================================
+// SCORM TEST DATA
+// =============================================================================
+
+/// Test SCORM package data
+pub type TestScormPackage {
+    id: String,
+    title: String,
+    version: String,
+    manifest_xml: String
+}
+
+impl TestScormPackage {
+    pub fn scorm_12() -> TestScormPackage {
+        let n = sequence("scorm");
+        TestScormPackage {
+            id: format!("scorm_{}", n),
+            title: format!("SCORM 1.2 Package {}", n),
+            version: "1.2".to_string(),
+            manifest_xml: r#"<?xml version="1.0"?>
+<manifest identifier="test_manifest">
+  <organizations default="org1">
+    <organization identifier="org1">
+      <title>Test Organization</title>
+      <item identifier="item1" identifierref="res1">
+        <title>Lesson 1</title>
+      </item>
+    </organization>
+  </organizations>
+  <resources>
+    <resource identifier="res1" type="webcontent" href="index.html">
+      <file href="index.html"/>
+    </resource>
+  </resources>
+</manifest>"#.to_string()
+        }
+    }
+
+    pub fn scorm_2004() -> TestScormPackage {
+        let n = sequence("scorm");
+        TestScormPackage {
+            id: format!("scorm_{}", n),
+            title: format!("SCORM 2004 Package {}", n),
+            version: "2004".to_string(),
+            manifest_xml: r#"<?xml version="1.0"?>
+<manifest identifier="test_manifest" xmlns:imsss="http://www.imsglobal.org/xsd/imsss">
+  <organizations default="org1">
+    <organization identifier="org1">
+      <title>Test Organization</title>
+      <item identifier="item1" identifierref="res1">
+        <title>Lesson 1</title>
+        <imsss:sequencing>
+          <imsss:controlMode choice="true" flow="true"/>
+        </imsss:sequencing>
+      </item>
+    </organization>
+  </organizations>
+  <resources>
+    <resource identifier="res1" type="webcontent" adlcp:scormType="sco" href="index.html">
+      <file href="index.html"/>
+    </resource>
+  </resources>
+</manifest>"#.to_string()
+        }
+    }
+}
+
+/// Test SCORM runtime data
+pub type TestScormRuntime {
+    learner_id: String,
+    learner_name: String,
+    location: String,
+    completion_status: String,
+    success_status: String,
+    score_raw: Option<f64>,
+    score_min: Option<f64>,
+    score_max: Option<f64>
+}
+
+impl TestScormRuntime {
+    pub fn initial() -> TestScormRuntime {
+        TestScormRuntime {
+            learner_id: "learner_1".to_string(),
+            learner_name: "Test, Learner".to_string(),
+            location: "".to_string(),
+            completion_status: "not attempted".to_string(),
+            success_status: "unknown".to_string(),
+            score_raw: None,
+            score_min: None,
+            score_max: None
+        }
+    }
+
+    pub fn in_progress() -> TestScormRuntime {
+        TestScormRuntime {
+            learner_id: "learner_1".to_string(),
+            learner_name: "Test, Learner".to_string(),
+            location: "page_3".to_string(),
+            completion_status: "incomplete".to_string(),
+            success_status: "unknown".to_string(),
+            score_raw: Some(50.0),
+            score_min: Some(0.0),
+            score_max: Some(100.0)
+        }
+    }
+
+    pub fn completed() -> TestScormRuntime {
+        TestScormRuntime {
+            learner_id: "learner_1".to_string(),
+            learner_name: "Test, Learner".to_string(),
+            location: "".to_string(),
+            completion_status: "completed".to_string(),
+            success_status: "passed".to_string(),
+            score_raw: Some(85.0),
+            score_min: Some(0.0),
+            score_max: Some(100.0)
+        }
+    }
+}
+
+// =============================================================================
+// XAPI TEST DATA
+// =============================================================================
+
+/// Test xAPI statement data
+pub type TestXapiStatement {
+    id: String,
+    actor_mbox: String,
+    verb_id: String,
+    object_id: String,
+    result_score: Option<f64>,
+    result_success: Option<bool>,
+    result_completion: Option<bool>
+}
+
+impl TestXapiStatement {
+    pub fn attempted() -> TestXapiStatement {
+        let n = sequence("xapi");
+        TestXapiStatement {
+            id: format!("statement_{}", n),
+            actor_mbox: "mailto:learner@test.com".to_string(),
+            verb_id: "http://adlnet.gov/expapi/verbs/attempted".to_string(),
+            object_id: format!("http://example.com/activities/lesson_{}", n),
+            result_score: None,
+            result_success: None,
+            result_completion: None
+        }
+    }
+
+    pub fn completed() -> TestXapiStatement {
+        let mut stmt = TestXapiStatement::attempted();
+        stmt.verb_id = "http://adlnet.gov/expapi/verbs/completed".to_string();
+        stmt.result_completion = Some(true);
+        stmt
+    }
+
+    pub fn passed() -> TestXapiStatement {
+        let mut stmt = TestXapiStatement::completed();
+        stmt.verb_id = "http://adlnet.gov/expapi/verbs/passed".to_string();
+        stmt.result_success = Some(true);
+        stmt.result_score = Some(0.85);
+        stmt
+    }
+
+    pub fn failed() -> TestXapiStatement {
+        let mut stmt = TestXapiStatement::completed();
+        stmt.verb_id = "http://adlnet.gov/expapi/verbs/failed".to_string();
+        stmt.result_success = Some(false);
+        stmt.result_score = Some(0.45);
+        stmt
+    }
+}
+
+// =============================================================================
+// DATABASE FIXTURE HELPERS
+// =============================================================================
+
+/// Transactional test context
+pub type TestContext {
+    transaction_id: String,
+    fixtures_loaded: List<String>,
+    cleanup_fns: List<Box<dyn Fn()>>
+}
+
+impl TestContext {
+    pub fn new() -> TestContext {
+        TestContext {
+            transaction_id: format!("tx_{}", sequence("transaction")),
+            fixtures_loaded: vec![],
+            cleanup_fns: vec![]
+        }
+    }
+
+    /// Register a cleanup function
+    pub fn on_cleanup(&mut self, f: impl Fn() + 'static) {
+        self.cleanup_fns.push(Box::new(f));
+    }
+
+    /// Run all cleanup functions
+    pub fn cleanup(&self) {
+        for f in self.cleanup_fns.iter().rev() {
+            f();
+        }
+    }
+}
+
+/// Test database seeder
+pub type TestSeeder {
+    data: Map<String, List<Map<String, Dynamic>>>
+}
+
+impl TestSeeder {
+    pub fn new() -> TestSeeder {
+        TestSeeder {
+            data: Map::new()
+        }
+    }
+
+    /// Add seed data for a table
+    pub fn seed(&mut self, table: &str, rows: List<Map<String, Dynamic>>) -> &mut Self {
+        self.data.insert(table.to_string(), rows);
+        self
+    }
+
+    /// Get seed data for a table
+    pub fn get(&self, table: &str) -> Option<&List<Map<String, Dynamic>>> {
+        self.data.get(table)
+    }
+
+    /// Apply seeds (returns SQL for debugging)
+    pub fn to_sql(&self) -> List<String> {
+        let mut statements = vec![];
+        for (table, rows) in &self.data {
+            for row in rows {
+                let columns: Vec<String> = row.keys().cloned().collect();
+                let values: Vec<String> = row.values()
+                    .map(|v| format!("'{}'", v))
+                    .collect();
+                statements.push(format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    table,
+                    columns.join(", "),
+                    values.join(", ")
+                ));
+            }
+        }
+        statements
+    }
+}
+
+// =============================================================================
+// FIXTURE MACROS
+// =============================================================================
+
+/// Create a map from key-value pairs
+#[macro]
+pub fn test_map(pairs: List<(String, Dynamic)>) -> Map<String, Dynamic> {
+    let mut map = Map::new();
+    for (key, value) in pairs {
+        map.insert(key, value);
+    }
+    map
+}
+
+/// Create a test user map
+pub fn user_data(overrides: Map<String, Dynamic>) -> Map<String, Dynamic> {
+    let n = sequence("user");
+    let mut data = Map::new();
+    data.insert("id".to_string(), Box::new(format!("user_{}", n)));
+    data.insert("email".to_string(), Box::new(format!("user{}@test.com", n)));
+    data.insert("first_name".to_string(), Box::new(format!("User{}", n)));
+    data.insert("last_name".to_string(), Box::new("Test".to_string()));
+    data.insert("role".to_string(), Box::new("learner".to_string()));
+
+    for (key, value) in overrides {
+        data.insert(key, value);
+    }
+    data
+}
+
+/// Create a test course map
+pub fn course_data(overrides: Map<String, Dynamic>) -> Map<String, Dynamic> {
+    let n = sequence("course");
+    let mut data = Map::new();
+    data.insert("id".to_string(), Box::new(format!("course_{}", n)));
+    data.insert("title".to_string(), Box::new(format!("Course {}", n)));
+    data.insert("description".to_string(), Box::new("Test course".to_string()));
+    data.insert("status".to_string(), Box::new("draft".to_string()));
+
+    for (key, value) in overrides {
+        data.insert(key, value);
+    }
+    data
+}
+
+/// Reset all fixtures and sequences
+pub fn reset_fixtures() {
+    FixtureRegistry::reset();
+}

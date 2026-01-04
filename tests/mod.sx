@@ -1,0 +1,89 @@
+/// Intelligo LMS - Test Suite
+///
+/// Main test module that imports and runs all tests.
+
+module intelligo::tests
+
+use intelligo::chai::*
+
+// Import test modules
+mod unit {
+    pub mod entities;
+    pub mod compliance;
+    pub mod taxonomy;
+    pub mod ai;
+    pub mod security;
+    pub mod frontend;
+}
+
+mod integration {
+    pub mod enrollment_flow;
+    pub mod scorm_player;
+    pub mod learning_path;
+    pub mod api;
+}
+
+mod e2e {
+    pub mod learner_journey;
+    pub mod admin_workflow;
+}
+
+/// Run all tests
+pub fn run_all_tests() -> TestRunResults {
+    TestRegistry::reset();
+
+    // Register all test suites
+    unit::entities::register_tests();
+    unit::compliance::register_tests();
+    unit::taxonomy::register_tests();
+    unit::ai::register_tests();
+    unit::security::register_tests();
+    unit::frontend::register_tests();
+
+    integration::enrollment_flow::register_tests();
+    integration::scorm_player::register_tests();
+    integration::learning_path::register_tests();
+    integration::api::register_tests();
+
+    e2e::learner_journey::register_tests();
+    e2e::admin_workflow::register_tests();
+
+    // Run tests
+    run_tests()
+}
+
+/// Run unit tests only
+pub fn run_unit_tests() -> TestRunResults {
+    TestRegistry::reset();
+
+    unit::entities::register_tests();
+    unit::compliance::register_tests();
+    unit::taxonomy::register_tests();
+    unit::ai::register_tests();
+    unit::security::register_tests();
+    unit::frontend::register_tests();
+
+    run_tests()
+}
+
+/// Run integration tests only
+pub fn run_integration_tests() -> TestRunResults {
+    TestRegistry::reset();
+
+    integration::enrollment_flow::register_tests();
+    integration::scorm_player::register_tests();
+    integration::learning_path::register_tests();
+    integration::api::register_tests();
+
+    run_tests()
+}
+
+/// Run e2e tests only
+pub fn run_e2e_tests() -> TestRunResults {
+    TestRegistry::reset();
+
+    e2e::learner_journey::register_tests();
+    e2e::admin_workflow::register_tests();
+
+    run_tests()
+}

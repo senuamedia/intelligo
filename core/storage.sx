@@ -1,0 +1,2279 @@
+// =============================================================================
+// Intelligo LMS - Entity Storage System
+// =============================================================================
+// Generic entity storage with tenant isolation, revision tracking, caching,
+// and query builder pattern for the LMS
+// =============================================================================
+
+module intelligo::core::storage
+
+use std::time::{DateTime, Duration, Instant}
+use std::collections::{Map, Set, List}
+use intelligo::core::types::*
+
+// =============================================================================
+// Type Aliases
+// =============================================================================
+
+type EntityId = String
+type EntityTypeId = String
+type CacheKey = String
+
+// =============================================================================
+// Entity Base Types
+// =============================================================================
+
+/// Base entity with common fields for all stored objects
+type Entity {
+    id: EntityId,
+    entity_type: EntityTypeId,
+    tenant_id: TenantId,
+    /// Current revision number
+    revision: i64,
+    /// Entity status
+    status: EntityStatus,
+    /// Created by user
+    created_by: UserId,
+    created_at: DateTime,
+    /// Last updated by user
+    updated_by: Option<UserId>,
+    updated_at: DateTime,
+    /// Soft delete
+    deleted: Bool,
+    deleted_at: Option<DateTime>,
+    deleted_by: Option<UserId>,
+    /// Field values
+    fields: Map<String, FieldValue>,
+    /// Entity metadata
+    metadata: Map<String, Dynamic>
+}
+
+/// Revision record for audit trail
+type EntityRevision {
+    id: RevisionId,
+    entity_id: EntityId,
+    entity_type: EntityTypeId,
+    tenant_id: TenantId,
+    revision_number: i64,
+    /// Snapshot of entity at this revision
+    data: Map<String, FieldValue>,
+    /// What changed
+    changes: List<FieldChange>,
+    /// Who made the change
+    changed_by: UserId,
+    changed_at: DateTime,
+    /// Revision message
+    message: Option<String>,
+    /// Change type
+    change_type: RevisionChangeType
+}
+
+enum RevisionChangeType {
+    Create,
+    Update,
+    Delete,
+    Restore,
+    Publish,
+    Unpublish,
+    Archive
+}
+
+type FieldChange {
+    field_name: String,
+    old_value: Option<FieldValue>,
+    new_value: Option<FieldValue>
+}
+
+/// Field value with type information
+enum FieldValue {
+    String(String),
+    Int(i64),
+    Float(f64),
+    Bool(Bool),
+    DateTime(DateTime),
+    Duration(Duration),
+    Reference { entity_type: EntityTypeId, entity_id: EntityId },
+    ReferenceList { entity_type: EntityTypeId, entity_ids: List<EntityId> },
+    Json(Dynamic),
+    Binary { data: Vec<u8>, mime_type: String },
+    Null
+}
+
+impl FieldValue {
+    fn as_string(&self) -> Option<String> {
+        match self {
+            FieldValue::String(s) => Some(s.clone()),
+            _ => None
+        }
+    }
+
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            FieldValue::Int(i) => Some(*i),
+            _ => None
+        }
+    }
+
+    fn as_float(&self) -> Option<f64> {
+        match self {
+            FieldValue::Float(f) => Some(*f),
+            _ => None
+        }
+    }
+
+    fn as_bool(&self) -> Option<Bool> {
+        match self {
+            FieldValue::Bool(b) => Some(*b),
+            _ => None
+        }
+    }
+
+    fn as_datetime(&self) -> Option<DateTime> {
+        match self {
+            FieldValue::DateTime(dt) => Some(*dt),
+            _ => None
+        }
+    }
+
+    fn as_dynamic(&self) -> Dynamic {
+        match self {
+            FieldValue::String(s) => Dynamic::String(s.clone()),
+            FieldValue::Int(i) => Dynamic::Int(*i),
+            FieldValue::Float(f) => Dynamic::Float(*f),
+            FieldValue::Bool(b) => Dynamic::Bool(*b),
+            FieldValue::DateTime(dt) => Dynamic::String(dt.to_rfc3339()),
+            FieldValue::Json(j) => j.clone(),
+            FieldValue::Null => Dynamic::Null,
+            _ => Dynamic::Null
+        }
+    }
+
+    fn is_null(&self) -> Bool {
+        match self {
+            FieldValue::Null => true,
+            _ => false
+        }
+    }
+}
+
+// =============================================================================
+// Query Builder
+// =============================================================================
+
+/// Fluent query builder for entity queries
+type QueryBuilder {
+    entity_type: EntityTypeId,
+    tenant_id: TenantId,
+    filters: List<QueryFilter>,
+    sort: List<QuerySort>,
+    pagination: Option<QueryPagination>,
+    include_deleted: Bool,
+    include_fields: Option<Set<String>>,
+    exclude_fields: Option<Set<String>>,
+    joins: List<QueryJoin>,
+    group_by: List<String>,
+    aggregations: List<QueryAggregation>
+}
+
+impl QueryBuilder {
+    fn new(entity_type: EntityTypeId, tenant_id: TenantId) -> Self {
+        QueryBuilder {
+            entity_type,
+            tenant_id,
+            filters: vec![],
+            sort: vec![],
+            pagination: None,
+            include_deleted: false,
+            include_fields: None,
+            exclude_fields: None,
+            joins: vec![],
+            group_by: vec![],
+            aggregations: vec![]
+        }
+    }
+
+    /// Add a filter condition
+    fn filter(mut self, field: &str, op: FilterOperator, value: FieldValue) -> Self {
+        self.filters.push(QueryFilter {
+            field: field.to_string(),
+            operator: op,
+            value
+        });
+        self
+    }
+
+    /// Add equality filter
+    fn where_eq(self, field: &str, value: FieldValue) -> Self {
+        self.filter(field, FilterOperator::Equals, value)
+    }
+
+    /// Add not-equals filter
+    fn where_ne(self, field: &str, value: FieldValue) -> Self {
+        self.filter(field, FilterOperator::NotEquals, value)
+    }
+
+    /// Add greater-than filter
+    fn where_gt(self, field: &str, value: FieldValue) -> Self {
+        self.filter(field, FilterOperator::GreaterThan, value)
+    }
+
+    /// Add less-than filter
+    fn where_lt(self, field: &str, value: FieldValue) -> Self {
+        self.filter(field, FilterOperator::LessThan, value)
+    }
+
+    /// Add greater-or-equal filter
+    fn where_gte(self, field: &str, value: FieldValue) -> Self {
+        self.filter(field, FilterOperator::GreaterOrEqual, value)
+    }
+
+    /// Add less-or-equal filter
+    fn where_lte(self, field: &str, value: FieldValue) -> Self {
+        self.filter(field, FilterOperator::LessOrEqual, value)
+    }
+
+    /// Add contains filter (for strings)
+    fn where_contains(self, field: &str, value: &str) -> Self {
+        self.filter(field, FilterOperator::Contains, FieldValue::String(value.to_string()))
+    }
+
+    /// Add starts-with filter
+    fn where_starts_with(self, field: &str, value: &str) -> Self {
+        self.filter(field, FilterOperator::StartsWith, FieldValue::String(value.to_string()))
+    }
+
+    /// Add ends-with filter
+    fn where_ends_with(self, field: &str, value: &str) -> Self {
+        self.filter(field, FilterOperator::EndsWith, FieldValue::String(value.to_string()))
+    }
+
+    /// Add in-list filter
+    fn where_in(mut self, field: &str, values: List<FieldValue>) -> Self {
+        self.filters.push(QueryFilter {
+            field: field.to_string(),
+            operator: FilterOperator::In,
+            value: FieldValue::Json(Dynamic::from(values))
+        });
+        self
+    }
+
+    /// Add not-in-list filter
+    fn where_not_in(mut self, field: &str, values: List<FieldValue>) -> Self {
+        self.filters.push(QueryFilter {
+            field: field.to_string(),
+            operator: FilterOperator::NotIn,
+            value: FieldValue::Json(Dynamic::from(values))
+        });
+        self
+    }
+
+    /// Add is-null filter
+    fn where_null(self, field: &str) -> Self {
+        self.filter(field, FilterOperator::IsNull, FieldValue::Null)
+    }
+
+    /// Add is-not-null filter
+    fn where_not_null(self, field: &str) -> Self {
+        self.filter(field, FilterOperator::IsNotNull, FieldValue::Null)
+    }
+
+    /// Filter by status
+    fn with_status(self, status: EntityStatus) -> Self {
+        self.filter("status", FilterOperator::Equals, FieldValue::String(format!("{:?}", status)))
+    }
+
+    /// Filter by created date range
+    fn created_between(self, start: DateTime, end: DateTime) -> Self {
+        self.where_gte("created_at", FieldValue::DateTime(start))
+            .where_lte("created_at", FieldValue::DateTime(end))
+    }
+
+    /// Filter by updated date range
+    fn updated_between(self, start: DateTime, end: DateTime) -> Self {
+        self.where_gte("updated_at", FieldValue::DateTime(start))
+            .where_lte("updated_at", FieldValue::DateTime(end))
+    }
+
+    /// Filter by creator
+    fn created_by(self, user_id: &UserId) -> Self {
+        self.where_eq("created_by", FieldValue::String(user_id.0.clone()))
+    }
+
+    /// Add sort order
+    fn order_by(mut self, field: &str, direction: SortDirection) -> Self {
+        self.sort.push(QuerySort {
+            field: field.to_string(),
+            direction
+        });
+        self
+    }
+
+    /// Sort ascending
+    fn order_by_asc(self, field: &str) -> Self {
+        self.order_by(field, SortDirection::Ascending)
+    }
+
+    /// Sort descending
+    fn order_by_desc(self, field: &str) -> Self {
+        self.order_by(field, SortDirection::Descending)
+    }
+
+    /// Set pagination
+    fn paginate(mut self, page: i32, per_page: i32) -> Self {
+        self.pagination = Some(QueryPagination { page, per_page });
+        self
+    }
+
+    /// Limit results
+    fn limit(mut self, limit: i32) -> Self {
+        self.pagination = Some(QueryPagination { page: 1, per_page: limit });
+        self
+    }
+
+    /// Skip results
+    fn skip(mut self, offset: i32) -> Self {
+        if let Some(p) = &mut self.pagination {
+            p.page = (offset / p.per_page) + 1;
+        } else {
+            self.pagination = Some(QueryPagination { page: 1, per_page: 100 });
+        }
+        self
+    }
+
+    /// Include deleted entities
+    fn with_deleted(mut self) -> Self {
+        self.include_deleted = true;
+        self
+    }
+
+    /// Only return specific fields
+    fn select(mut self, fields: List<&str>) -> Self {
+        self.include_fields = Some(fields.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// Exclude specific fields
+    fn exclude(mut self, fields: List<&str>) -> Self {
+        self.exclude_fields = Some(fields.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// Add a join
+    fn join(mut self, join: QueryJoin) -> Self {
+        self.joins.push(join);
+        self
+    }
+
+    /// Join related entity
+    fn with(self, relation_field: &str, entity_type: &str) -> Self {
+        self.join(QueryJoin {
+            join_type: JoinType::Left,
+            entity_type: entity_type.to_string(),
+            local_field: relation_field.to_string(),
+            foreign_field: "id".to_string(),
+            alias: None
+        })
+    }
+
+    /// Group by fields
+    fn group(mut self, fields: List<&str>) -> Self {
+        self.group_by = fields.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Add aggregation
+    fn aggregate(mut self, agg: QueryAggregation) -> Self {
+        self.aggregations.push(agg);
+        self
+    }
+
+    /// Count aggregation
+    fn count(self) -> Self {
+        self.aggregate(QueryAggregation {
+            function: AggregateFunction::Count,
+            field: "*".to_string(),
+            alias: "count".to_string()
+        })
+    }
+
+    /// Sum aggregation
+    fn sum(self, field: &str) -> Self {
+        self.aggregate(QueryAggregation {
+            function: AggregateFunction::Sum,
+            field: field.to_string(),
+            alias: format!("sum_{}", field)
+        })
+    }
+
+    /// Average aggregation
+    fn avg(self, field: &str) -> Self {
+        self.aggregate(QueryAggregation {
+            function: AggregateFunction::Avg,
+            field: field.to_string(),
+            alias: format!("avg_{}", field)
+        })
+    }
+
+    /// Min aggregation
+    fn min(self, field: &str) -> Self {
+        self.aggregate(QueryAggregation {
+            function: AggregateFunction::Min,
+            field: field.to_string(),
+            alias: format!("min_{}", field)
+        })
+    }
+
+    /// Max aggregation
+    fn max(self, field: &str) -> Self {
+        self.aggregate(QueryAggregation {
+            function: AggregateFunction::Max,
+            field: field.to_string(),
+            alias: format!("max_{}", field)
+        })
+    }
+
+    /// Build the query
+    fn build(self) -> Query {
+        Query {
+            entity_type: self.entity_type,
+            tenant_id: self.tenant_id,
+            filters: self.filters,
+            sort: self.sort,
+            pagination: self.pagination,
+            include_deleted: self.include_deleted,
+            include_fields: self.include_fields,
+            exclude_fields: self.exclude_fields,
+            joins: self.joins,
+            group_by: self.group_by,
+            aggregations: self.aggregations
+        }
+    }
+}
+
+/// Compiled query
+type Query {
+    entity_type: EntityTypeId,
+    tenant_id: TenantId,
+    filters: List<QueryFilter>,
+    sort: List<QuerySort>,
+    pagination: Option<QueryPagination>,
+    include_deleted: Bool,
+    include_fields: Option<Set<String>>,
+    exclude_fields: Option<Set<String>>,
+    joins: List<QueryJoin>,
+    group_by: List<String>,
+    aggregations: List<QueryAggregation>
+}
+
+type QueryFilter {
+    field: String,
+    operator: FilterOperator,
+    value: FieldValue
+}
+
+enum FilterOperator {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    LessThan,
+    GreaterOrEqual,
+    LessOrEqual,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
+    Matches,
+    Between
+}
+
+type QuerySort {
+    field: String,
+    direction: SortDirection
+}
+
+enum SortDirection {
+    Ascending,
+    Descending
+}
+
+type QueryPagination {
+    page: i32,
+    per_page: i32
+}
+
+type QueryJoin {
+    join_type: JoinType,
+    entity_type: String,
+    local_field: String,
+    foreign_field: String,
+    alias: Option<String>
+}
+
+enum JoinType {
+    Inner,
+    Left,
+    Right
+}
+
+type QueryAggregation {
+    function: AggregateFunction,
+    field: String,
+    alias: String
+}
+
+enum AggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max
+}
+
+// =============================================================================
+// Query Result Types
+// =============================================================================
+
+/// Paginated query result
+type PagedResult<T> {
+    items: List<T>,
+    total: i64,
+    page: i32,
+    per_page: i32,
+    total_pages: i32,
+    has_next: Bool,
+    has_prev: Bool
+}
+
+impl<T> PagedResult<T> {
+    fn empty() -> Self {
+        PagedResult {
+            items: vec![],
+            total: 0,
+            page: 1,
+            per_page: 0,
+            total_pages: 0,
+            has_next: false,
+            has_prev: false
+        }
+    }
+}
+
+/// Aggregation result
+type AggregationResult {
+    results: Map<String, Dynamic>,
+    groups: Option<List<GroupResult>>
+}
+
+type GroupResult {
+    keys: Map<String, FieldValue>,
+    values: Map<String, Dynamic>
+}
+
+// =============================================================================
+// Bulk Operation Types
+// =============================================================================
+
+/// Bulk operation request
+type BulkOperation {
+    operation_type: BulkOperationType,
+    entity_type: EntityTypeId,
+    entities: List<Entity>,
+    options: BulkOptions
+}
+
+enum BulkOperationType {
+    Create,
+    Update,
+    Upsert,
+    Delete,
+    Restore
+}
+
+type BulkOptions {
+    /// Stop on first error
+    stop_on_error: Bool,
+    /// Skip validation
+    skip_validation: Bool,
+    /// Create revisions
+    create_revisions: Bool,
+    /// Update user
+    updated_by: Option<UserId>,
+    /// Batch size for processing
+    batch_size: i32
+}
+
+impl BulkOptions {
+    fn default() -> Self {
+        BulkOptions {
+            stop_on_error: false,
+            skip_validation: false,
+            create_revisions: true,
+            updated_by: None,
+            batch_size: 100
+        }
+    }
+}
+
+/// Bulk operation result
+type BulkOperationResult {
+    succeeded: List<EntityId>,
+    failed: List<BulkOperationError>,
+    total_processed: i32,
+    duration_ms: i64
+}
+
+type BulkOperationError {
+    entity_id: Option<EntityId>,
+    index: i32,
+    error: String,
+    error_code: String
+}
+
+// =============================================================================
+// Cache Types
+// =============================================================================
+
+type CacheEntry {
+    key: CacheKey,
+    value: Entity,
+    created_at: Instant,
+    expires_at: Instant,
+    access_count: i64,
+    last_accessed: Instant
+}
+
+type CacheStats {
+    total_entries: i64,
+    hits: i64,
+    misses: i64,
+    hit_rate: f64,
+    memory_used_bytes: i64,
+    evictions: i64
+}
+
+type CacheConfig {
+    enabled: Bool,
+    max_entries: i64,
+    default_ttl: Duration,
+    entity_type_ttls: Map<EntityTypeId, Duration>,
+    eviction_policy: EvictionPolicy
+}
+
+enum EvictionPolicy {
+    LRU,    // Least Recently Used
+    LFU,    // Least Frequently Used
+    FIFO,   // First In First Out
+    TTL     // Time To Live only
+}
+
+impl CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            enabled: true,
+            max_entries: 10000,
+            default_ttl: Duration::from_minutes(15),
+            entity_type_ttls: Map::new(),
+            eviction_policy: EvictionPolicy::LRU
+        }
+    }
+}
+
+// =============================================================================
+// Storage Error Types
+// =============================================================================
+
+enum StorageError {
+    NotFound { entity_type: EntityTypeId, entity_id: EntityId },
+    AlreadyExists { entity_type: EntityTypeId, entity_id: EntityId },
+    TenantMismatch { expected: TenantId, actual: TenantId },
+    ValidationFailed { errors: List<ValidationError> },
+    RevisionConflict { current: i64, expected: i64 },
+    ConcurrencyError { message: String },
+    QueryError { message: String },
+    ConnectionError { message: String },
+    TimeoutError,
+    Internal { message: String }
+}
+
+impl StorageError {
+    fn to_string(&self) -> String {
+        match self {
+            StorageError::NotFound { entity_type, entity_id } =>
+                format!("{} with id {} not found", entity_type, entity_id),
+            StorageError::AlreadyExists { entity_type, entity_id } =>
+                format!("{} with id {} already exists", entity_type, entity_id),
+            StorageError::TenantMismatch { expected, actual } =>
+                format!("Tenant mismatch: expected {}, got {}", expected, actual),
+            StorageError::ValidationFailed { errors } =>
+                format!("Validation failed: {}", errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(", ")),
+            StorageError::RevisionConflict { current, expected } =>
+                format!("Revision conflict: current is {}, expected {}", current, expected),
+            StorageError::ConcurrencyError { message } =>
+                format!("Concurrency error: {}", message),
+            StorageError::QueryError { message } =>
+                format!("Query error: {}", message),
+            StorageError::ConnectionError { message } =>
+                format!("Connection error: {}", message),
+            StorageError::TimeoutError =>
+                "Operation timed out".to_string(),
+            StorageError::Internal { message } =>
+                format!("Internal error: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// Database Backend Trait
+// =============================================================================
+
+/// Database backend trait for persistent storage
+trait DatabaseBackend {
+    /// Initialize the database connection
+    async fn initialize(self) -> Result<(), StorageError>
+
+    /// Insert an entity into the database
+    async fn insert(self, entity: &Entity) -> Result<(), StorageError>
+
+    /// Update an entity in the database
+    async fn update(self, entity: &Entity) -> Result<(), StorageError>
+
+    /// Delete an entity from the database (hard delete)
+    async fn delete(self, entity_type: &EntityTypeId, entity_id: &EntityId, tenant_id: &TenantId) -> Result<(), StorageError>
+
+    /// Load an entity by ID
+    async fn load(self, entity_type: &EntityTypeId, entity_id: &EntityId, tenant_id: &TenantId) -> Result<Option<Entity>, StorageError>
+
+    /// Execute a query
+    async fn query(self, query: &Query) -> Result<(List<Entity>, i64), StorageError>
+
+    /// Insert a revision record
+    async fn insert_revision(self, revision: &EntityRevision) -> Result<(), StorageError>
+
+    /// Get revisions for an entity
+    async fn get_revisions(self, entity_id: &EntityId) -> Result<List<EntityRevision>, StorageError>
+
+    /// Check connection health
+    async fn health_check(self) -> Result<(), StorageError>
+}
+
+/// PostgreSQL database backend implementation
+pub actor PostgresBackend {
+    var connection_string: String
+    var pool_size: i32
+    var connected: Bool
+
+    pub fn new(connection_string: String) -> Self {
+        PostgresBackend {
+            connection_string,
+            pool_size: 10,
+            connected: false
+        }
+    }
+
+    pub fn with_pool_size(mut self, size: i32) -> Self {
+        self.pool_size = size;
+        self
+    }
+}
+
+impl DatabaseBackend for PostgresBackend {
+    async fn initialize(self) -> Result<(), StorageError> {
+        // Initialize PostgreSQL connection pool
+        let result = db::connect(&self.connection_string, self.pool_size).await;
+        match result {
+            Ok(_) => {
+                self.connected = true;
+                // Ensure tables exist
+                self.ensure_schema().await?;
+                Ok(())
+            },
+            Err(e) => Err(StorageError::ConnectionError {
+                message: format!("Failed to connect to PostgreSQL: {}", e)
+            })
+        }
+    }
+
+    async fn insert(self, entity: &Entity) -> Result<(), StorageError> {
+        let query = r#"
+            INSERT INTO entities (
+                id, entity_type, tenant_id, revision, status,
+                created_by, created_at, updated_by, updated_at,
+                deleted, deleted_at, deleted_by, fields, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        "#;
+
+        db::execute(query, [
+            &entity.id,
+            &entity.entity_type,
+            &entity.tenant_id,
+            &entity.revision,
+            &format!("{:?}", entity.status),
+            &entity.created_by.0,
+            &entity.created_at,
+            &entity.updated_by.as_ref().map(|u| u.0.clone()),
+            &entity.updated_at,
+            &entity.deleted,
+            &entity.deleted_at,
+            &entity.deleted_by.as_ref().map(|u| u.0.clone()),
+            &serde_json::to_value(&entity.fields).unwrap_or_default(),
+            &serde_json::to_value(&entity.metadata).unwrap_or_default()
+        ]).await.map_err(|e| StorageError::QueryError {
+            message: format!("Insert failed: {}", e)
+        })?;
+
+        Ok(())
+    }
+
+    async fn update(self, entity: &Entity) -> Result<(), StorageError> {
+        let query = r#"
+            UPDATE entities SET
+                revision = $1, status = $2, updated_by = $3, updated_at = $4,
+                deleted = $5, deleted_at = $6, deleted_by = $7,
+                fields = $8, metadata = $9
+            WHERE id = $10 AND entity_type = $11 AND tenant_id = $12
+        "#;
+
+        let result = db::execute(query, [
+            &entity.revision,
+            &format!("{:?}", entity.status),
+            &entity.updated_by.as_ref().map(|u| u.0.clone()),
+            &entity.updated_at,
+            &entity.deleted,
+            &entity.deleted_at,
+            &entity.deleted_by.as_ref().map(|u| u.0.clone()),
+            &serde_json::to_value(&entity.fields).unwrap_or_default(),
+            &serde_json::to_value(&entity.metadata).unwrap_or_default(),
+            &entity.id,
+            &entity.entity_type,
+            &entity.tenant_id
+        ]).await.map_err(|e| StorageError::QueryError {
+            message: format!("Update failed: {}", e)
+        })?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotFound {
+                entity_type: entity.entity_type.clone(),
+                entity_id: entity.id.clone()
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn delete(self, entity_type: &EntityTypeId, entity_id: &EntityId, tenant_id: &TenantId) -> Result<(), StorageError> {
+        let query = "DELETE FROM entities WHERE id = $1 AND entity_type = $2 AND tenant_id = $3";
+
+        db::execute(query, [entity_id, entity_type, tenant_id])
+            .await
+            .map_err(|e| StorageError::QueryError {
+                message: format!("Delete failed: {}", e)
+            })?;
+
+        Ok(())
+    }
+
+    async fn load(self, entity_type: &EntityTypeId, entity_id: &EntityId, tenant_id: &TenantId) -> Result<Option<Entity>, StorageError> {
+        let query = r#"
+            SELECT id, entity_type, tenant_id, revision, status,
+                   created_by, created_at, updated_by, updated_at,
+                   deleted, deleted_at, deleted_by, fields, metadata
+            FROM entities
+            WHERE id = $1 AND entity_type = $2 AND tenant_id = $3
+        "#;
+
+        let row = db::query_one(query, [entity_id, entity_type, tenant_id])
+            .await
+            .map_err(|e| StorageError::QueryError {
+                message: format!("Load failed: {}", e)
+            })?;
+
+        match row {
+            Some(r) => Ok(Some(self.row_to_entity(&r)?)),
+            None => Ok(None)
+        }
+    }
+
+    async fn query(self, query: &Query) -> Result<(List<Entity>, i64), StorageError> {
+        let (sql, params) = self.build_query_sql(query);
+        let count_sql = self.build_count_sql(query);
+
+        // Execute count query
+        let count_row = db::query_one(&count_sql.0, &count_sql.1)
+            .await
+            .map_err(|e| StorageError::QueryError {
+                message: format!("Count query failed: {}", e)
+            })?;
+
+        let total: i64 = count_row.map(|r| r.get("count")).unwrap_or(0);
+
+        // Execute main query
+        let rows = db::query(&sql, &params)
+            .await
+            .map_err(|e| StorageError::QueryError {
+                message: format!("Query failed: {}", e)
+            })?;
+
+        let entities: List<Entity> = rows.iter()
+            .filter_map(|r| self.row_to_entity(r).ok())
+            .collect();
+
+        Ok((entities, total))
+    }
+
+    async fn insert_revision(self, revision: &EntityRevision) -> Result<(), StorageError> {
+        let query = r#"
+            INSERT INTO entity_revisions (
+                id, entity_id, entity_type, tenant_id, revision_number,
+                data, changes, changed_by, changed_at, message, change_type
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "#;
+
+        db::execute(query, [
+            &revision.id.0,
+            &revision.entity_id,
+            &revision.entity_type,
+            &revision.tenant_id,
+            &revision.revision_number,
+            &serde_json::to_value(&revision.data).unwrap_or_default(),
+            &serde_json::to_value(&revision.changes).unwrap_or_default(),
+            &revision.changed_by.0,
+            &revision.changed_at,
+            &revision.message,
+            &format!("{:?}", revision.change_type)
+        ]).await.map_err(|e| StorageError::QueryError {
+            message: format!("Insert revision failed: {}", e)
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_revisions(self, entity_id: &EntityId) -> Result<List<EntityRevision>, StorageError> {
+        let query = r#"
+            SELECT id, entity_id, entity_type, tenant_id, revision_number,
+                   data, changes, changed_by, changed_at, message, change_type
+            FROM entity_revisions
+            WHERE entity_id = $1
+            ORDER BY revision_number ASC
+        "#;
+
+        let rows = db::query(query, [entity_id])
+            .await
+            .map_err(|e| StorageError::QueryError {
+                message: format!("Get revisions failed: {}", e)
+            })?;
+
+        let revisions: List<EntityRevision> = rows.iter()
+            .filter_map(|r| self.row_to_revision(r).ok())
+            .collect();
+
+        Ok(revisions)
+    }
+
+    async fn health_check(self) -> Result<(), StorageError> {
+        db::query_one("SELECT 1", [])
+            .await
+            .map_err(|e| StorageError::ConnectionError {
+                message: format!("Health check failed: {}", e)
+            })?;
+        Ok(())
+    }
+}
+
+impl PostgresBackend {
+    async fn ensure_schema(self) -> Result<(), StorageError> {
+        let create_entities = r#"
+            CREATE TABLE IF NOT EXISTS entities (
+                id VARCHAR(255) NOT NULL,
+                entity_type VARCHAR(255) NOT NULL,
+                tenant_id VARCHAR(255) NOT NULL,
+                revision BIGINT NOT NULL DEFAULT 1,
+                status VARCHAR(50) NOT NULL DEFAULT 'Draft',
+                created_by VARCHAR(255) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by VARCHAR(255),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                deleted_at TIMESTAMPTZ,
+                deleted_by VARCHAR(255),
+                fields JSONB NOT NULL DEFAULT '{}',
+                metadata JSONB NOT NULL DEFAULT '{}',
+                PRIMARY KEY (id, entity_type, tenant_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_entities_tenant ON entities(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_entities_type_tenant ON entities(entity_type, tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(status) WHERE NOT deleted;
+            CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at);
+            CREATE INDEX IF NOT EXISTS idx_entities_fields ON entities USING GIN (fields);
+        "#;
+
+        let create_revisions = r#"
+            CREATE TABLE IF NOT EXISTS entity_revisions (
+                id VARCHAR(255) PRIMARY KEY,
+                entity_id VARCHAR(255) NOT NULL,
+                entity_type VARCHAR(255) NOT NULL,
+                tenant_id VARCHAR(255) NOT NULL,
+                revision_number BIGINT NOT NULL,
+                data JSONB NOT NULL DEFAULT '{}',
+                changes JSONB NOT NULL DEFAULT '[]',
+                changed_by VARCHAR(255) NOT NULL,
+                changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                message TEXT,
+                change_type VARCHAR(50) NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_revisions_entity ON entity_revisions(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_revisions_tenant ON entity_revisions(tenant_id);
+        "#;
+
+        db::execute(create_entities, []).await.map_err(|e| StorageError::QueryError {
+            message: format!("Failed to create entities table: {}", e)
+        })?;
+
+        db::execute(create_revisions, []).await.map_err(|e| StorageError::QueryError {
+            message: format!("Failed to create revisions table: {}", e)
+        })?;
+
+        Ok(())
+    }
+
+    fn row_to_entity(&self, row: &db::Row) -> Result<Entity, StorageError> {
+        Ok(Entity {
+            id: row.get("id"),
+            entity_type: row.get("entity_type"),
+            tenant_id: row.get("tenant_id"),
+            revision: row.get("revision"),
+            status: EntityStatus::from_string(&row.get::<String>("status")),
+            created_by: UserId(row.get("created_by")),
+            created_at: row.get("created_at"),
+            updated_by: row.get::<Option<String>>("updated_by").map(|s| UserId(s)),
+            updated_at: row.get("updated_at"),
+            deleted: row.get("deleted"),
+            deleted_at: row.get("deleted_at"),
+            deleted_by: row.get::<Option<String>>("deleted_by").map(|s| UserId(s)),
+            fields: serde_json::from_value(row.get("fields")).unwrap_or_default(),
+            metadata: serde_json::from_value(row.get("metadata")).unwrap_or_default()
+        })
+    }
+
+    fn row_to_revision(&self, row: &db::Row) -> Result<EntityRevision, StorageError> {
+        Ok(EntityRevision {
+            id: RevisionId(row.get("id")),
+            entity_id: row.get("entity_id"),
+            entity_type: row.get("entity_type"),
+            tenant_id: row.get("tenant_id"),
+            revision_number: row.get("revision_number"),
+            data: serde_json::from_value(row.get("data")).unwrap_or_default(),
+            changes: serde_json::from_value(row.get("changes")).unwrap_or_default(),
+            changed_by: UserId(row.get("changed_by")),
+            changed_at: row.get("changed_at"),
+            message: row.get("message"),
+            change_type: RevisionChangeType::from_string(&row.get::<String>("change_type"))
+        })
+    }
+
+    fn build_query_sql(&self, query: &Query) -> (String, Vec<Dynamic>) {
+        let mut sql = String::from("SELECT * FROM entities WHERE tenant_id = $1 AND entity_type = $2");
+        let mut params: Vec<Dynamic> = vec![
+            Dynamic::String(query.tenant_id.clone()),
+            Dynamic::String(query.entity_type.clone())
+        ];
+        let mut param_index = 3;
+
+        // Add deleted filter
+        if !query.include_deleted {
+            sql.push_str(" AND deleted = false");
+        }
+
+        // Add filters
+        for filter in &query.filters {
+            let (filter_sql, filter_params) = self.build_filter_sql(filter, &mut param_index);
+            sql.push_str(&format!(" AND {}", filter_sql));
+            params.extend(filter_params);
+        }
+
+        // Add sorting
+        if !query.sort.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let sort_clauses: Vec<String> = query.sort.iter()
+                .map(|s| format!("{} {}", self.escape_field(&s.field), match s.direction {
+                    SortDirection::Ascending => "ASC",
+                    SortDirection::Descending => "DESC"
+                }))
+                .collect();
+            sql.push_str(&sort_clauses.join(", "));
+        }
+
+        // Add pagination
+        if let Some(p) = &query.pagination {
+            let offset = (p.page - 1) * p.per_page;
+            sql.push_str(&format!(" LIMIT {} OFFSET {}", p.per_page, offset));
+        }
+
+        (sql, params)
+    }
+
+    fn build_count_sql(&self, query: &Query) -> (String, Vec<Dynamic>) {
+        let mut sql = String::from("SELECT COUNT(*) as count FROM entities WHERE tenant_id = $1 AND entity_type = $2");
+        let mut params: Vec<Dynamic> = vec![
+            Dynamic::String(query.tenant_id.clone()),
+            Dynamic::String(query.entity_type.clone())
+        ];
+        let mut param_index = 3;
+
+        if !query.include_deleted {
+            sql.push_str(" AND deleted = false");
+        }
+
+        for filter in &query.filters {
+            let (filter_sql, filter_params) = self.build_filter_sql(filter, &mut param_index);
+            sql.push_str(&format!(" AND {}", filter_sql));
+            params.extend(filter_params);
+        }
+
+        (sql, params)
+    }
+
+    fn build_filter_sql(&self, filter: &QueryFilter, param_index: &mut i32) -> (String, Vec<Dynamic>) {
+        let field = self.escape_field(&filter.field);
+        let is_json_field = !["id", "entity_type", "tenant_id", "revision", "status",
+                             "created_by", "created_at", "updated_by", "updated_at",
+                             "deleted", "deleted_at", "deleted_by"].contains(&filter.field.as_str());
+
+        let field_ref = if is_json_field {
+            format!("fields->>'{}' ", filter.field)
+        } else {
+            field
+        };
+
+        let idx = *param_index;
+        *param_index += 1;
+
+        match filter.operator {
+            FilterOperator::Equals => (format!("{} = ${}", field_ref, idx), vec![filter.value.as_dynamic()]),
+            FilterOperator::NotEquals => (format!("{} != ${}", field_ref, idx), vec![filter.value.as_dynamic()]),
+            FilterOperator::GreaterThan => (format!("{} > ${}", field_ref, idx), vec![filter.value.as_dynamic()]),
+            FilterOperator::LessThan => (format!("{} < ${}", field_ref, idx), vec![filter.value.as_dynamic()]),
+            FilterOperator::GreaterOrEqual => (format!("{} >= ${}", field_ref, idx), vec![filter.value.as_dynamic()]),
+            FilterOperator::LessOrEqual => (format!("{} <= ${}", field_ref, idx), vec![filter.value.as_dynamic()]),
+            FilterOperator::Contains => (format!("{} ILIKE ${}", field_ref, idx), vec![Dynamic::String(format!("%{}%", filter.value.as_string().unwrap_or_default()))]),
+            FilterOperator::StartsWith => (format!("{} ILIKE ${}", field_ref, idx), vec![Dynamic::String(format!("{}%", filter.value.as_string().unwrap_or_default()))]),
+            FilterOperator::EndsWith => (format!("{} ILIKE ${}", field_ref, idx), vec![Dynamic::String(format!("%{}", filter.value.as_string().unwrap_or_default()))]),
+            FilterOperator::IsNull => (format!("{} IS NULL", field_ref), vec![]),
+            FilterOperator::IsNotNull => (format!("{} IS NOT NULL", field_ref), vec![]),
+            _ => (format!("{} = ${}", field_ref, idx), vec![filter.value.as_dynamic()])
+        }
+    }
+
+    fn escape_field(&self, field: &str) -> String {
+        // Simple SQL injection prevention
+        field.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect()
+    }
+}
+
+impl RevisionChangeType {
+    fn from_string(s: &str) -> Self {
+        match s {
+            "Create" => RevisionChangeType::Create,
+            "Update" => RevisionChangeType::Update,
+            "Delete" => RevisionChangeType::Delete,
+            "Restore" => RevisionChangeType::Restore,
+            "Publish" => RevisionChangeType::Publish,
+            "Unpublish" => RevisionChangeType::Unpublish,
+            "Archive" => RevisionChangeType::Archive,
+            _ => RevisionChangeType::Update
+        }
+    }
+}
+
+/// Storage mode configuration
+pub enum StorageMode {
+    /// In-memory only (for testing)
+    Memory,
+    /// Database with in-memory cache
+    Database { backend: Box<dyn DatabaseBackend> },
+    /// Hybrid: memory with async persistence
+    Hybrid { backend: Box<dyn DatabaseBackend> }
+}
+
+// =============================================================================
+// Entity Storage Actor
+// =============================================================================
+
+/// Main entity storage actor with CRUD operations, caching, and revision tracking
+actor EntityStorage {
+    var tenant_id: TenantId
+    var storage_mode: StorageMode
+
+    // In-memory storage (used as cache when database backend is present)
+    var entities: Map<EntityTypeId, Map<EntityId, Entity>> = {}
+    var revisions: Map<EntityId, List<EntityRevision>> = {}
+
+    // Cache
+    var cache: Map<CacheKey, CacheEntry> = {}
+    var cache_config: CacheConfig = CacheConfig::default()
+    var cache_stats: CacheStats = CacheStats {
+        total_entries: 0,
+        hits: 0,
+        misses: 0,
+        hit_rate: 0.0,
+        memory_used_bytes: 0,
+        evictions: 0
+    }
+
+    // Indexes for fast lookups
+    var indexes: Map<String, Map<String, Set<EntityId>>> = {}
+
+    // Hooks
+    var before_save_hooks: List<fn(&Entity) -> Result<(), StorageError>> = []
+    var after_save_hooks: List<fn(&Entity)> = []
+    var before_delete_hooks: List<fn(&Entity) -> Result<(), StorageError>> = []
+    var after_delete_hooks: List<fn(&Entity)> = []
+
+    fn new(tenant_id: TenantId) -> Self {
+        EntityStorage {
+            tenant_id,
+            storage_mode: StorageMode::Memory,
+            entities: {},
+            revisions: {},
+            cache: {},
+            cache_config: CacheConfig::default(),
+            cache_stats: CacheStats::default(),
+            indexes: {},
+            before_save_hooks: vec![],
+            after_save_hooks: vec![],
+            before_delete_hooks: vec![],
+            after_delete_hooks: vec![]
+        }
+    }
+
+    /// Create with a database backend
+    pub fn with_database(tenant_id: TenantId, backend: Box<dyn DatabaseBackend>) -> Self {
+        EntityStorage {
+            tenant_id,
+            storage_mode: StorageMode::Database { backend },
+            entities: {},
+            revisions: {},
+            cache: {},
+            cache_config: CacheConfig::default(),
+            cache_stats: CacheStats::default(),
+            indexes: {},
+            before_save_hooks: vec![],
+            after_save_hooks: vec![],
+            before_delete_hooks: vec![],
+            after_delete_hooks: vec![]
+        }
+    }
+
+    /// Create with PostgreSQL backend
+    pub async fn with_postgres(tenant_id: TenantId, connection_string: String) -> Result<Self, StorageError> {
+        let backend = PostgresBackend::new(connection_string);
+        backend.initialize().await?;
+
+        Ok(EntityStorage {
+            tenant_id,
+            storage_mode: StorageMode::Database { backend: Box::new(backend) },
+            entities: {},
+            revisions: {},
+            cache: {},
+            cache_config: CacheConfig::default(),
+            cache_stats: CacheStats::default(),
+            indexes: {},
+            before_save_hooks: vec![],
+            after_save_hooks: vec![],
+            before_delete_hooks: vec![],
+            after_delete_hooks: vec![]
+        })
+    }
+
+    // =========================================================================
+    // CRUD Operations
+    // =========================================================================
+
+    /// Create a new entity
+    receive Create(entity: Entity) -> Result<Entity, StorageError> {
+        // Verify tenant
+        if entity.tenant_id != self.tenant_id {
+            return Err(StorageError::TenantMismatch {
+                expected: self.tenant_id.clone(),
+                actual: entity.tenant_id.clone()
+            });
+        }
+
+        // Check if exists
+        if let Some(type_storage) = self.entities.get(&entity.entity_type) {
+            if type_storage.contains_key(&entity.id) {
+                return Err(StorageError::AlreadyExists {
+                    entity_type: entity.entity_type.clone(),
+                    entity_id: entity.id.clone()
+                });
+            }
+        }
+
+        // Run before save hooks
+        for hook in &self.before_save_hooks {
+            hook(&entity)?;
+        }
+
+        // Set initial revision
+        let mut entity = entity;
+        entity.revision = 1;
+        entity.created_at = DateTime::now();
+        entity.updated_at = DateTime::now();
+
+        // Store entity
+        self.entities.entry(entity.entity_type.clone())
+            .or_default()
+            .insert(entity.id.clone(), entity.clone());
+
+        // Create initial revision
+        let revision = EntityRevision {
+            id: generate_revision_id(),
+            entity_id: entity.id.clone(),
+            entity_type: entity.entity_type.clone(),
+            tenant_id: entity.tenant_id.clone(),
+            revision_number: 1,
+            data: entity.fields.clone(),
+            changes: vec![],
+            changed_by: entity.created_by.clone(),
+            changed_at: DateTime::now(),
+            message: Some("Created".to_string()),
+            change_type: RevisionChangeType::Create
+        };
+
+        self.revisions.entry(entity.id.clone())
+            .or_default()
+            .push(revision);
+
+        // Update indexes
+        self.update_indexes(&entity);
+
+        // Update cache
+        self.cache_put(&entity);
+
+        // Run after save hooks
+        for hook in &self.after_save_hooks {
+            hook(&entity);
+        }
+
+        checkpoint();
+        Ok(entity)
+    }
+
+    /// Load an entity by ID
+    receive Load(entity_type: EntityTypeId, entity_id: EntityId) -> Result<Entity, StorageError> {
+        // Check cache first
+        let cache_key = self.make_cache_key(&entity_type, &entity_id);
+        if let Some(cached) = self.cache_get(&cache_key) {
+            return Ok(cached);
+        }
+
+        // Load from storage
+        let entity = self.entities.get(&entity_type)
+            .and_then(|type_storage| type_storage.get(&entity_id))
+            .cloned()
+            .ok_or(StorageError::NotFound {
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone()
+            })?;
+
+        // Verify tenant
+        if entity.tenant_id != self.tenant_id {
+            return Err(StorageError::TenantMismatch {
+                expected: self.tenant_id.clone(),
+                actual: entity.tenant_id.clone()
+            });
+        }
+
+        // Check if deleted
+        if entity.deleted {
+            return Err(StorageError::NotFound {
+                entity_type,
+                entity_id
+            });
+        }
+
+        // Update cache
+        self.cache_put(&entity);
+
+        Ok(entity)
+    }
+
+    /// Update an entity
+    receive Update(entity: Entity, expected_revision: Option<i64>) -> Result<Entity, StorageError> {
+        // Verify tenant
+        if entity.tenant_id != self.tenant_id {
+            return Err(StorageError::TenantMismatch {
+                expected: self.tenant_id.clone(),
+                actual: entity.tenant_id.clone()
+            });
+        }
+
+        // Load existing
+        let existing = self.entities.get(&entity.entity_type)
+            .and_then(|type_storage| type_storage.get(&entity.id))
+            .ok_or(StorageError::NotFound {
+                entity_type: entity.entity_type.clone(),
+                entity_id: entity.id.clone()
+            })?;
+
+        // Check revision for optimistic locking
+        if let Some(expected) = expected_revision {
+            if existing.revision != expected {
+                return Err(StorageError::RevisionConflict {
+                    current: existing.revision,
+                    expected
+                });
+            }
+        }
+
+        // Run before save hooks
+        for hook in &self.before_save_hooks {
+            hook(&entity)?;
+        }
+
+        // Calculate changes
+        let changes = self.calculate_changes(&existing.fields, &entity.fields);
+
+        // Update entity
+        let mut updated = entity.clone();
+        updated.revision = existing.revision + 1;
+        updated.updated_at = DateTime::now();
+
+        // Store updated entity
+        self.entities.get_mut(&updated.entity_type)
+            .unwrap()
+            .insert(updated.id.clone(), updated.clone());
+
+        // Create revision
+        let revision = EntityRevision {
+            id: generate_revision_id(),
+            entity_id: updated.id.clone(),
+            entity_type: updated.entity_type.clone(),
+            tenant_id: updated.tenant_id.clone(),
+            revision_number: updated.revision,
+            data: updated.fields.clone(),
+            changes,
+            changed_by: updated.updated_by.clone().unwrap_or(updated.created_by.clone()),
+            changed_at: DateTime::now(),
+            message: None,
+            change_type: RevisionChangeType::Update
+        };
+
+        self.revisions.entry(updated.id.clone())
+            .or_default()
+            .push(revision);
+
+        // Update indexes
+        self.remove_from_indexes(existing);
+        self.update_indexes(&updated);
+
+        // Update cache
+        self.cache_put(&updated);
+
+        // Run after save hooks
+        for hook in &self.after_save_hooks {
+            hook(&updated);
+        }
+
+        checkpoint();
+        Ok(updated)
+    }
+
+    /// Delete an entity (soft delete by default)
+    receive Delete(entity_type: EntityTypeId, entity_id: EntityId, deleted_by: UserId, hard_delete: Bool) -> Result<(), StorageError> {
+        // Load existing
+        let existing = self.entities.get(&entity_type)
+            .and_then(|type_storage| type_storage.get(&entity_id))
+            .cloned()
+            .ok_or(StorageError::NotFound {
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone()
+            })?;
+
+        // Verify tenant
+        if existing.tenant_id != self.tenant_id {
+            return Err(StorageError::TenantMismatch {
+                expected: self.tenant_id.clone(),
+                actual: existing.tenant_id.clone()
+            });
+        }
+
+        // Run before delete hooks
+        for hook in &self.before_delete_hooks {
+            hook(&existing)?;
+        }
+
+        if hard_delete {
+            // Hard delete - remove completely
+            self.entities.get_mut(&entity_type)
+                .unwrap()
+                .remove(&entity_id);
+            self.revisions.remove(&entity_id);
+        } else {
+            // Soft delete
+            let mut deleted = existing.clone();
+            deleted.deleted = true;
+            deleted.deleted_at = Some(DateTime::now());
+            deleted.deleted_by = Some(deleted_by.clone());
+            deleted.revision += 1;
+            deleted.updated_at = DateTime::now();
+
+            self.entities.get_mut(&entity_type)
+                .unwrap()
+                .insert(entity_id.clone(), deleted.clone());
+
+            // Create revision
+            let revision = EntityRevision {
+                id: generate_revision_id(),
+                entity_id: entity_id.clone(),
+                entity_type: entity_type.clone(),
+                tenant_id: existing.tenant_id.clone(),
+                revision_number: deleted.revision,
+                data: deleted.fields.clone(),
+                changes: vec![],
+                changed_by: deleted_by,
+                changed_at: DateTime::now(),
+                message: Some("Deleted".to_string()),
+                change_type: RevisionChangeType::Delete
+            };
+
+            self.revisions.entry(entity_id.clone())
+                .or_default()
+                .push(revision);
+        }
+
+        // Remove from indexes
+        self.remove_from_indexes(&existing);
+
+        // Remove from cache
+        self.cache_remove(&entity_type, &entity_id);
+
+        // Run after delete hooks
+        for hook in &self.after_delete_hooks {
+            hook(&existing);
+        }
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Restore a soft-deleted entity
+    receive Restore(entity_type: EntityTypeId, entity_id: EntityId, restored_by: UserId) -> Result<Entity, StorageError> {
+        // Load existing (including deleted)
+        let existing = self.entities.get(&entity_type)
+            .and_then(|type_storage| type_storage.get(&entity_id))
+            .cloned()
+            .ok_or(StorageError::NotFound {
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone()
+            })?;
+
+        if !existing.deleted {
+            return Ok(existing);
+        }
+
+        // Restore
+        let mut restored = existing;
+        restored.deleted = false;
+        restored.deleted_at = None;
+        restored.deleted_by = None;
+        restored.revision += 1;
+        restored.updated_at = DateTime::now();
+        restored.updated_by = Some(restored_by.clone());
+
+        self.entities.get_mut(&entity_type)
+            .unwrap()
+            .insert(entity_id.clone(), restored.clone());
+
+        // Create revision
+        let revision = EntityRevision {
+            id: generate_revision_id(),
+            entity_id: entity_id.clone(),
+            entity_type: entity_type.clone(),
+            tenant_id: restored.tenant_id.clone(),
+            revision_number: restored.revision,
+            data: restored.fields.clone(),
+            changes: vec![],
+            changed_by: restored_by,
+            changed_at: DateTime::now(),
+            message: Some("Restored".to_string()),
+            change_type: RevisionChangeType::Restore
+        };
+
+        self.revisions.entry(entity_id.clone())
+            .or_default()
+            .push(revision);
+
+        // Update indexes
+        self.update_indexes(&restored);
+
+        // Update cache
+        self.cache_put(&restored);
+
+        checkpoint();
+        Ok(restored)
+    }
+
+    // =========================================================================
+    // Query Operations
+    // =========================================================================
+
+    /// Execute a query
+    receive Query(query: Query) -> Result<PagedResult<Entity>, StorageError> {
+        // Verify tenant
+        if query.tenant_id != self.tenant_id {
+            return Err(StorageError::TenantMismatch {
+                expected: self.tenant_id.clone(),
+                actual: query.tenant_id.clone()
+            });
+        }
+
+        // Get all entities of type
+        let type_storage = self.entities.get(&query.entity_type)
+            .map(|s| s.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Apply filters
+        let mut filtered: Vec<Entity> = type_storage.into_iter()
+            .filter(|e| e.tenant_id == query.tenant_id)
+            .filter(|e| query.include_deleted || !e.deleted)
+            .filter(|e| self.matches_filters(e, &query.filters))
+            .collect();
+
+        // Get total count before pagination
+        let total = filtered.len() as i64;
+
+        // Apply sorting
+        for sort in query.sort.iter().rev() {
+            self.sort_entities(&mut filtered, &sort.field, &sort.direction);
+        }
+
+        // Apply pagination
+        let (page, per_page) = if let Some(p) = &query.pagination {
+            (p.page, p.per_page)
+        } else {
+            (1, 100)
+        };
+
+        let start = ((page - 1) * per_page) as usize;
+        let end = (start + per_page as usize).min(filtered.len());
+        let items: List<Entity> = if start < filtered.len() {
+            filtered[start..end].to_vec()
+        } else {
+            vec![]
+        };
+
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as i32;
+
+        Ok(PagedResult {
+            items,
+            total,
+            page,
+            per_page,
+            total_pages,
+            has_next: page < total_pages,
+            has_prev: page > 1
+        })
+    }
+
+    /// Find one entity matching query
+    receive FindOne(query: Query) -> Result<Option<Entity>, StorageError> {
+        let mut query = query;
+        query.pagination = Some(QueryPagination { page: 1, per_page: 1 });
+
+        let result = send self <- Query(query)?;
+        Ok(result.items.into_iter().next())
+    }
+
+    /// Count entities matching query
+    receive Count(query: Query) -> Result<i64, StorageError> {
+        let result = send self <- Query(query)?;
+        Ok(result.total)
+    }
+
+    /// Check if entity exists
+    receive Exists(entity_type: EntityTypeId, entity_id: EntityId) -> Bool {
+        self.entities.get(&entity_type)
+            .map(|s| s.contains_key(&entity_id))
+            .unwrap_or(false)
+    }
+
+    fn matches_filters(&self, entity: &Entity, filters: &List<QueryFilter>) -> Bool {
+        for filter in filters {
+            let field_value = if filter.field == "id" {
+                Some(FieldValue::String(entity.id.clone()))
+            } else if filter.field == "status" {
+                Some(FieldValue::String(format!("{:?}", entity.status)))
+            } else if filter.field == "created_at" {
+                Some(FieldValue::DateTime(entity.created_at))
+            } else if filter.field == "updated_at" {
+                Some(FieldValue::DateTime(entity.updated_at))
+            } else if filter.field == "created_by" {
+                Some(FieldValue::String(entity.created_by.0.clone()))
+            } else {
+                entity.fields.get(&filter.field).cloned()
+            };
+
+            if !self.matches_filter(&field_value, &filter.operator, &filter.value) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn matches_filter(&self, field_value: &Option<FieldValue>, operator: &FilterOperator, expected: &FieldValue) -> Bool {
+        match operator {
+            FilterOperator::Equals => {
+                field_value.as_ref().map(|v| self.values_equal(v, expected)).unwrap_or(false)
+            },
+            FilterOperator::NotEquals => {
+                field_value.as_ref().map(|v| !self.values_equal(v, expected)).unwrap_or(true)
+            },
+            FilterOperator::GreaterThan => {
+                self.compare_values(field_value, expected) == Some(Ordering::Greater)
+            },
+            FilterOperator::LessThan => {
+                self.compare_values(field_value, expected) == Some(Ordering::Less)
+            },
+            FilterOperator::GreaterOrEqual => {
+                match self.compare_values(field_value, expected) {
+                    Some(Ordering::Greater) | Some(Ordering::Equal) => true,
+                    _ => false
+                }
+            },
+            FilterOperator::LessOrEqual => {
+                match self.compare_values(field_value, expected) {
+                    Some(Ordering::Less) | Some(Ordering::Equal) => true,
+                    _ => false
+                }
+            },
+            FilterOperator::Contains => {
+                if let (Some(FieldValue::String(v)), FieldValue::String(e)) = (field_value, expected) {
+                    v.contains(e)
+                } else {
+                    false
+                }
+            },
+            FilterOperator::StartsWith => {
+                if let (Some(FieldValue::String(v)), FieldValue::String(e)) = (field_value, expected) {
+                    v.starts_with(e)
+                } else {
+                    false
+                }
+            },
+            FilterOperator::EndsWith => {
+                if let (Some(FieldValue::String(v)), FieldValue::String(e)) = (field_value, expected) {
+                    v.ends_with(e)
+                } else {
+                    false
+                }
+            },
+            FilterOperator::IsNull => field_value.is_none() || field_value.as_ref().map(|v| v.is_null()).unwrap_or(true),
+            FilterOperator::IsNotNull => field_value.as_ref().map(|v| !v.is_null()).unwrap_or(false),
+            _ => false
+        }
+    }
+
+    fn values_equal(&self, a: &FieldValue, b: &FieldValue) -> Bool {
+        match (a, b) {
+            (FieldValue::String(s1), FieldValue::String(s2)) => s1 == s2,
+            (FieldValue::Int(i1), FieldValue::Int(i2)) => i1 == i2,
+            (FieldValue::Float(f1), FieldValue::Float(f2)) => (f1 - f2).abs() < f64::EPSILON,
+            (FieldValue::Bool(b1), FieldValue::Bool(b2)) => b1 == b2,
+            (FieldValue::DateTime(d1), FieldValue::DateTime(d2)) => d1 == d2,
+            (FieldValue::Null, FieldValue::Null) => true,
+            _ => false
+        }
+    }
+
+    fn compare_values(&self, a: &Option<FieldValue>, b: &FieldValue) -> Option<Ordering> {
+        let a = a.as_ref()?;
+        match (a, b) {
+            (FieldValue::Int(i1), FieldValue::Int(i2)) => Some(i1.cmp(i2)),
+            (FieldValue::Float(f1), FieldValue::Float(f2)) => f1.partial_cmp(f2),
+            (FieldValue::String(s1), FieldValue::String(s2)) => Some(s1.cmp(s2)),
+            (FieldValue::DateTime(d1), FieldValue::DateTime(d2)) => Some(d1.cmp(d2)),
+            _ => None
+        }
+    }
+
+    fn sort_entities(&self, entities: &mut Vec<Entity>, field: &str, direction: &SortDirection) {
+        entities.sort_by(|a, b| {
+            let va = a.fields.get(field);
+            let vb = b.fields.get(field);
+
+            let ordering = match (va, vb) {
+                (Some(FieldValue::Int(i1)), Some(FieldValue::Int(i2))) => i1.cmp(i2),
+                (Some(FieldValue::String(s1)), Some(FieldValue::String(s2))) => s1.cmp(s2),
+                (Some(FieldValue::DateTime(d1)), Some(FieldValue::DateTime(d2))) => d1.cmp(d2),
+                _ => Ordering::Equal
+            };
+
+            match direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse()
+            }
+        });
+    }
+
+    // =========================================================================
+    // Bulk Operations
+    // =========================================================================
+
+    /// Execute bulk operation
+    receive BulkExecute(operation: BulkOperation) -> BulkOperationResult {
+        let start = Instant::now();
+        let mut succeeded = vec![];
+        let mut failed = vec![];
+
+        for (index, entity) in operation.entities.iter().enumerate() {
+            let result = match operation.operation_type {
+                BulkOperationType::Create => send self <- Create(entity.clone()),
+                BulkOperationType::Update => send self <- Update(entity.clone(), None),
+                BulkOperationType::Upsert => {
+                    match send self <- Update(entity.clone(), None) {
+                        Ok(e) => Ok(e),
+                        Err(StorageError::NotFound { .. }) => send self <- Create(entity.clone()),
+                        Err(e) => Err(e)
+                    }
+                },
+                BulkOperationType::Delete => {
+                    let user_id = operation.options.updated_by.clone()
+                        .unwrap_or(entity.created_by.clone());
+                    send self <- Delete(entity.entity_type.clone(), entity.id.clone(), user_id, false)
+                        .map(|_| entity.clone())
+                },
+                BulkOperationType::Restore => {
+                    let user_id = operation.options.updated_by.clone()
+                        .unwrap_or(entity.created_by.clone());
+                    send self <- Restore(entity.entity_type.clone(), entity.id.clone(), user_id)
+                }
+            };
+
+            match result {
+                Ok(e) => succeeded.push(e.id),
+                Err(e) => {
+                    failed.push(BulkOperationError {
+                        entity_id: Some(entity.id.clone()),
+                        index: index as i32,
+                        error: e.to_string(),
+                        error_code: "OPERATION_FAILED".to_string()
+                    });
+
+                    if operation.options.stop_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        BulkOperationResult {
+            succeeded,
+            failed,
+            total_processed: operation.entities.len() as i32,
+            duration_ms: start.elapsed().as_millis() as i64
+        }
+    }
+
+    /// Bulk create entities
+    receive BulkCreate(entities: List<Entity>) -> BulkOperationResult {
+        send self <- BulkExecute(BulkOperation {
+            operation_type: BulkOperationType::Create,
+            entity_type: entities.first().map(|e| e.entity_type.clone()).unwrap_or_default(),
+            entities,
+            options: BulkOptions::default()
+        })
+    }
+
+    /// Bulk update entities
+    receive BulkUpdate(entities: List<Entity>) -> BulkOperationResult {
+        send self <- BulkExecute(BulkOperation {
+            operation_type: BulkOperationType::Update,
+            entity_type: entities.first().map(|e| e.entity_type.clone()).unwrap_or_default(),
+            entities,
+            options: BulkOptions::default()
+        })
+    }
+
+    /// Bulk delete entities
+    receive BulkDelete(entity_type: EntityTypeId, entity_ids: List<EntityId>, deleted_by: UserId) -> BulkOperationResult {
+        let mut succeeded = vec![];
+        let mut failed = vec![];
+
+        for (index, entity_id) in entity_ids.iter().enumerate() {
+            match send self <- Delete(entity_type.clone(), entity_id.clone(), deleted_by.clone(), false) {
+                Ok(_) => succeeded.push(entity_id.clone()),
+                Err(e) => failed.push(BulkOperationError {
+                    entity_id: Some(entity_id.clone()),
+                    index: index as i32,
+                    error: e.to_string(),
+                    error_code: "DELETE_FAILED".to_string()
+                })
+            }
+        }
+
+        BulkOperationResult {
+            succeeded,
+            failed,
+            total_processed: entity_ids.len() as i32,
+            duration_ms: 0
+        }
+    }
+
+    // =========================================================================
+    // Revision Operations
+    // =========================================================================
+
+    /// Get all revisions for an entity
+    receive GetRevisions(entity_id: EntityId) -> List<EntityRevision> {
+        self.revisions.get(&entity_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get a specific revision
+    receive GetRevision(entity_id: EntityId, revision_number: i64) -> Option<EntityRevision> {
+        self.revisions.get(&entity_id)
+            .and_then(|revs| revs.iter().find(|r| r.revision_number == revision_number).cloned())
+    }
+
+    /// Revert to a specific revision
+    receive RevertToRevision(entity_id: EntityId, revision_number: i64, reverted_by: UserId) -> Result<Entity, StorageError> {
+        let revision = self.revisions.get(&entity_id)
+            .and_then(|revs| revs.iter().find(|r| r.revision_number == revision_number).cloned())
+            .ok_or(StorageError::NotFound {
+                entity_type: "revision".to_string(),
+                entity_id: format!("{}:{}", entity_id, revision_number)
+            })?;
+
+        // Load current entity
+        let current = self.entities.get(&revision.entity_type)
+            .and_then(|s| s.get(&entity_id))
+            .cloned()
+            .ok_or(StorageError::NotFound {
+                entity_type: revision.entity_type.clone(),
+                entity_id: entity_id.clone()
+            })?;
+
+        // Create reverted entity
+        let mut reverted = current;
+        reverted.fields = revision.data.clone();
+        reverted.revision += 1;
+        reverted.updated_at = DateTime::now();
+        reverted.updated_by = Some(reverted_by.clone());
+
+        // Update storage
+        self.entities.get_mut(&reverted.entity_type)
+            .unwrap()
+            .insert(entity_id.clone(), reverted.clone());
+
+        // Create revert revision
+        let new_revision = EntityRevision {
+            id: generate_revision_id(),
+            entity_id: entity_id.clone(),
+            entity_type: reverted.entity_type.clone(),
+            tenant_id: reverted.tenant_id.clone(),
+            revision_number: reverted.revision,
+            data: reverted.fields.clone(),
+            changes: vec![],
+            changed_by: reverted_by,
+            changed_at: DateTime::now(),
+            message: Some(format!("Reverted to revision {}", revision_number)),
+            change_type: RevisionChangeType::Update
+        };
+
+        self.revisions.entry(entity_id)
+            .or_default()
+            .push(new_revision);
+
+        // Update cache
+        self.cache_put(&reverted);
+
+        checkpoint();
+        Ok(reverted)
+    }
+
+    fn calculate_changes(&self, old: &Map<String, FieldValue>, new: &Map<String, FieldValue>) -> List<FieldChange> {
+        let mut changes = vec![];
+
+        // Check for modified and removed fields
+        for (field, old_value) in old {
+            let new_value = new.get(field);
+            if new_value.map(|v| !self.values_equal(v, old_value)).unwrap_or(true) {
+                changes.push(FieldChange {
+                    field_name: field.clone(),
+                    old_value: Some(old_value.clone()),
+                    new_value: new_value.cloned()
+                });
+            }
+        }
+
+        // Check for new fields
+        for (field, new_value) in new {
+            if !old.contains_key(field) {
+                changes.push(FieldChange {
+                    field_name: field.clone(),
+                    old_value: None,
+                    new_value: Some(new_value.clone())
+                });
+            }
+        }
+
+        changes
+    }
+
+    // =========================================================================
+    // Cache Operations
+    // =========================================================================
+
+    fn make_cache_key(&self, entity_type: &EntityTypeId, entity_id: &EntityId) -> CacheKey {
+        format!("{}:{}:{}", self.tenant_id, entity_type, entity_id)
+    }
+
+    fn cache_get(&mut self, key: &CacheKey) -> Option<Entity> {
+        if !self.cache_config.enabled {
+            return None;
+        }
+
+        if let Some(entry) = self.cache.get_mut(key) {
+            if entry.expires_at > Instant::now() {
+                entry.access_count += 1;
+                entry.last_accessed = Instant::now();
+                self.cache_stats.hits += 1;
+                self.update_hit_rate();
+                return Some(entry.value.clone());
+            } else {
+                self.cache.remove(key);
+            }
+        }
+
+        self.cache_stats.misses += 1;
+        self.update_hit_rate();
+        None
+    }
+
+    fn cache_put(&mut self, entity: &Entity) {
+        if !self.cache_config.enabled {
+            return;
+        }
+
+        let key = self.make_cache_key(&entity.entity_type, &entity.id);
+        let ttl = self.cache_config.entity_type_ttls
+            .get(&entity.entity_type)
+            .cloned()
+            .unwrap_or(self.cache_config.default_ttl);
+
+        let now = Instant::now();
+        let entry = CacheEntry {
+            key: key.clone(),
+            value: entity.clone(),
+            created_at: now,
+            expires_at: now + ttl,
+            access_count: 0,
+            last_accessed: now
+        };
+
+        // Check if we need to evict
+        if self.cache.len() as i64 >= self.cache_config.max_entries {
+            self.evict_cache();
+        }
+
+        self.cache.insert(key, entry);
+        self.cache_stats.total_entries = self.cache.len() as i64;
+    }
+
+    fn cache_remove(&mut self, entity_type: &EntityTypeId, entity_id: &EntityId) {
+        let key = self.make_cache_key(entity_type, entity_id);
+        self.cache.remove(&key);
+        self.cache_stats.total_entries = self.cache.len() as i64;
+    }
+
+    fn evict_cache(&mut self) {
+        match self.cache_config.eviction_policy {
+            EvictionPolicy::LRU => {
+                // Remove least recently used
+                if let Some(key) = self.cache.iter()
+                    .min_by_key(|(_, e)| e.last_accessed)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.cache.remove(&key);
+                    self.cache_stats.evictions += 1;
+                }
+            },
+            EvictionPolicy::LFU => {
+                // Remove least frequently used
+                if let Some(key) = self.cache.iter()
+                    .min_by_key(|(_, e)| e.access_count)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.cache.remove(&key);
+                    self.cache_stats.evictions += 1;
+                }
+            },
+            EvictionPolicy::FIFO => {
+                // Remove oldest
+                if let Some(key) = self.cache.iter()
+                    .min_by_key(|(_, e)| e.created_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.cache.remove(&key);
+                    self.cache_stats.evictions += 1;
+                }
+            },
+            EvictionPolicy::TTL => {
+                // Remove expired entries
+                let now = Instant::now();
+                let expired: Vec<CacheKey> = self.cache.iter()
+                    .filter(|(_, e)| e.expires_at <= now)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+
+                for key in expired {
+                    self.cache.remove(&key);
+                    self.cache_stats.evictions += 1;
+                }
+            }
+        }
+    }
+
+    fn update_hit_rate(&mut self) {
+        let total = self.cache_stats.hits + self.cache_stats.misses;
+        if total > 0 {
+            self.cache_stats.hit_rate = (self.cache_stats.hits as f64) / (total as f64);
+        }
+    }
+
+    /// Clear entire cache
+    receive ClearCache() {
+        self.cache.clear();
+        self.cache_stats.total_entries = 0;
+    }
+
+    /// Get cache statistics
+    receive GetCacheStats() -> CacheStats {
+        self.cache_stats.clone()
+    }
+
+    /// Configure cache
+    receive ConfigureCache(config: CacheConfig) {
+        self.cache_config = config;
+        if !self.cache_config.enabled {
+            self.cache.clear();
+        }
+    }
+
+    // =========================================================================
+    // Index Operations
+    // =========================================================================
+
+    fn update_indexes(&mut self, entity: &Entity) {
+        // Index by common fields
+        self.index_field(entity, "status", &FieldValue::String(format!("{:?}", entity.status)));
+        self.index_field(entity, "created_by", &FieldValue::String(entity.created_by.0.clone()));
+
+        // Index custom fields marked for indexing
+        for (field, value) in &entity.fields {
+            if entity.metadata.get(&format!("index_{}", field)).and_then(|v| v.as_bool()).unwrap_or(false) {
+                self.index_field(entity, field, value);
+            }
+        }
+    }
+
+    fn index_field(&mut self, entity: &Entity, field: &str, value: &FieldValue) {
+        let index_key = format!("{}:{}:{}", entity.entity_type, entity.tenant_id, field);
+        let value_key = match value {
+            FieldValue::String(s) => s.clone(),
+            FieldValue::Int(i) => i.to_string(),
+            _ => return
+        };
+
+        self.indexes.entry(index_key)
+            .or_default()
+            .entry(value_key)
+            .or_default()
+            .insert(entity.id.clone());
+    }
+
+    fn remove_from_indexes(&mut self, entity: &Entity) {
+        // Remove from all indexes
+        for (_, value_map) in self.indexes.iter_mut() {
+            for (_, entity_ids) in value_map.iter_mut() {
+                entity_ids.remove(&entity.id);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Hook Management
+    // =========================================================================
+
+    /// Register a before-save hook
+    receive RegisterBeforeSaveHook(hook: fn(&Entity) -> Result<(), StorageError>) {
+        self.before_save_hooks.push(hook);
+    }
+
+    /// Register an after-save hook
+    receive RegisterAfterSaveHook(hook: fn(&Entity)) {
+        self.after_save_hooks.push(hook);
+    }
+
+    /// Register a before-delete hook
+    receive RegisterBeforeDeleteHook(hook: fn(&Entity) -> Result<(), StorageError>) {
+        self.before_delete_hooks.push(hook);
+    }
+
+    /// Register an after-delete hook
+    receive RegisterAfterDeleteHook(hook: fn(&Entity)) {
+        self.after_delete_hooks.push(hook);
+    }
+
+    // =========================================================================
+    // Tenant Scoping
+    // =========================================================================
+
+    /// Create a query builder scoped to current tenant
+    receive CreateQuery(entity_type: EntityTypeId) -> QueryBuilder {
+        QueryBuilder::new(entity_type, self.tenant_id.clone())
+    }
+
+    /// Get current tenant ID
+    receive GetTenantId() -> TenantId {
+        self.tenant_id.clone()
+    }
+
+    /// Set tenant ID (for multi-tenant switching)
+    receive SetTenantId(tenant_id: TenantId) {
+        // Clear cache when switching tenants
+        self.cache.clear();
+        self.tenant_id = tenant_id;
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+fn generate_revision_id() -> RevisionId {
+    RevisionId(format!("rev_{}", std::uuid::v4()))
+}
+
+enum Ordering {
+    Less,
+    Equal,
+    Greater
+}
+
+impl Ordering {
+    fn reverse(&self) -> Ordering {
+        match self {
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+            Ordering::Equal => Ordering::Equal
+        }
+    }
+}

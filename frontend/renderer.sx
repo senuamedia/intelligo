@@ -1,0 +1,912 @@
+/// Intelligo LMS - Frontend Renderer
+///
+/// Server-side page rendering for students, teachers, and admins.
+/// Generates static HTML with hydration markers for interactive components.
+
+module intelligo::frontend::renderer
+
+use intelligo::frontend::*
+use intelligo::core::*
+use intelligo::themes::*
+
+// ============================================================================
+// Page Renderer
+// ============================================================================
+
+/// Central page renderer for generating HTML output
+pub actor PageRenderer {
+    config: FrontendConfig,
+    theme_engine: ThemeEngine,
+    component_registry: ComponentRegistry,
+    layout_cache: Map<String, String>,
+
+    pub fn new(config: FrontendConfig) -> Self {
+        PageRenderer {
+            config,
+            theme_engine: ThemeEngine::new(),
+            component_registry: ComponentRegistry::new(),
+            layout_cache: Map::new(),
+        }
+    }
+
+    // ========================================================================
+    // Page Rendering
+    // ========================================================================
+
+    /// Render a complete page
+    pub fn render_page(self, ctx: &PageContext, template: &str, data: &Map<String, Value>) -> Result<RenderedPage, FrontendError> {
+        // Build the page structure
+        let html = self.build_html(ctx, template, data)?;
+
+        // Generate hydration state
+        let hydration_state = self.build_hydration_state(ctx, data);
+
+        // Build the complete page
+        let full_html = self.wrap_with_layout(ctx, &html, &hydration_state)?;
+
+        Ok(RenderedPage {
+            html: full_html,
+            hydration_state,
+            meta: PageMeta {
+                title: ctx.title.clone(),
+                description: ctx.description.clone(),
+                canonical_url: ctx.canonical_url.clone(),
+            },
+            cache_control: self.determine_cache_control(ctx),
+            etag: self.generate_etag(&full_html),
+        })
+    }
+
+    /// Render a student dashboard page
+    pub fn render_student_dashboard(self, ctx: &PageContext, student_data: &StudentDashboardData) -> Result<RenderedPage, FrontendError> {
+        let mut data = Map::new();
+        data.insert("enrollments".to_string(), Value::from(&student_data.enrollments));
+        data.insert("progress".to_string(), Value::from(&student_data.progress));
+        data.insert("upcoming".to_string(), Value::from(&student_data.upcoming_deadlines));
+        data.insert("achievements".to_string(), Value::from(&student_data.achievements));
+        data.insert("recommendations".to_string(), Value::from(&student_data.recommendations));
+
+        self.render_page(ctx, "student/dashboard", &data)
+    }
+
+    /// Render a teacher dashboard page
+    pub fn render_teacher_dashboard(self, ctx: &PageContext, teacher_data: &TeacherDashboardData) -> Result<RenderedPage, FrontendError> {
+        let mut data = Map::new();
+        data.insert("courses".to_string(), Value::from(&teacher_data.courses));
+        data.insert("pending_submissions".to_string(), Value::from(&teacher_data.pending_submissions));
+        data.insert("student_stats".to_string(), Value::from(&teacher_data.student_stats));
+        data.insert("announcements".to_string(), Value::from(&teacher_data.announcements));
+
+        self.render_page(ctx, "teacher/dashboard", &data)
+    }
+
+    /// Render an admin dashboard page
+    pub fn render_admin_dashboard(self, ctx: &PageContext, admin_data: &AdminDashboardData) -> Result<RenderedPage, FrontendError> {
+        let mut data = Map::new();
+        data.insert("stats".to_string(), Value::from(&admin_data.stats));
+        data.insert("recent_users".to_string(), Value::from(&admin_data.recent_users));
+        data.insert("system_health".to_string(), Value::from(&admin_data.system_health));
+        data.insert("pending_actions".to_string(), Value::from(&admin_data.pending_actions));
+
+        self.render_page(ctx, "admin/dashboard", &data)
+    }
+
+    /// Render a course page
+    pub fn render_course(self, ctx: &PageContext, course: &CourseData) -> Result<RenderedPage, FrontendError> {
+        let mut data = Map::new();
+        data.insert("course".to_string(), Value::from(course));
+
+        self.render_page(ctx, "course/view", &data)
+    }
+
+    /// Render a lesson page
+    pub fn render_lesson(self, ctx: &PageContext, lesson: &LessonData, course: &CourseData) -> Result<RenderedPage, FrontendError> {
+        let mut data = Map::new();
+        data.insert("lesson".to_string(), Value::from(lesson));
+        data.insert("course".to_string(), Value::from(course));
+
+        self.render_page(ctx, "lesson/view", &data)
+    }
+
+    // ========================================================================
+    // HTML Building
+    // ========================================================================
+
+    fn build_html(self, ctx: &PageContext, template: &str, data: &Map<String, Value>) -> Result<String, FrontendError> {
+        // Get the template
+        let template_content = self.get_template(template)?;
+
+        // Render the template with data
+        let rendered = self.render_template(&template_content, data, ctx)?;
+
+        Ok(rendered)
+    }
+
+    fn wrap_with_layout(self, ctx: &PageContext, content: &str, hydration_state: &HydrationState) -> Result<String, FrontendError> {
+        let layout = self.get_layout(&ctx.user.role)?;
+
+        let head = self.build_head(ctx)?;
+        let scripts = self.build_scripts(ctx, hydration_state)?;
+
+        let html = format!(r#"<!DOCTYPE html>
+<html lang="{lang}" data-theme="{theme}">
+<head>
+{head}
+</head>
+<body class="{body_class}">
+{layout_start}
+{content}
+{layout_end}
+{scripts}
+</body>
+</html>"#,
+            lang = ctx.user.preferences.language,
+            theme = ctx.user.preferences.theme,
+            head = head,
+            body_class = self.get_body_class(ctx),
+            layout_start = layout.0,
+            content = content,
+            layout_end = layout.1,
+            scripts = scripts
+        );
+
+        Ok(html)
+    }
+
+    fn build_head(self, ctx: &PageContext) -> Result<String, FrontendError> {
+        let mut head = String::new();
+
+        // Charset and viewport
+        head.push_str(r#"<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+"#);
+
+        // Title
+        head.push_str(&format!("<title>{}</title>\n", escape_html(&ctx.title)));
+
+        // Description
+        head.push_str(&format!(r#"<meta name="description" content="{}">
+"#, escape_html(&ctx.description)));
+
+        // Canonical URL
+        if !ctx.canonical_url.is_empty() {
+            head.push_str(&format!(r#"<link rel="canonical" href="{}">
+"#, ctx.canonical_url));
+        }
+
+        // Open Graph tags
+        head.push_str(&format!(r#"<meta property="og:title" content="{}">
+<meta property="og:description" content="{}">
+<meta property="og:type" content="website">
+"#, escape_html(&ctx.title), escape_html(&ctx.description)));
+
+        // Custom meta tags
+        for meta in &ctx.meta_tags {
+            if let Some(ref name) = meta.name {
+                head.push_str(&format!(r#"<meta name="{}" content="{}">
+"#, name, escape_html(&meta.content)));
+            }
+            if let Some(ref property) = meta.property {
+                head.push_str(&format!(r#"<meta property="{}" content="{}">
+"#, property, escape_html(&meta.content)));
+            }
+        }
+
+        // Styles
+        for style in &ctx.styles {
+            if let Some(ref href) = style.href {
+                let media = style.media.as_ref().map(|m| format!(r#" media="{}""#, m)).unwrap_or_default();
+                let integrity = style.integrity.as_ref().map(|i| format!(r#" integrity="{}" crossorigin="anonymous""#, i)).unwrap_or_default();
+                head.push_str(&format!(r#"<link rel="stylesheet" href="{}"{}{}>
+"#, self.asset_url(href), media, integrity));
+            }
+            if let Some(ref content) = style.content {
+                head.push_str(&format!(r#"<style nonce="{}">{}</style>
+"#, ctx.csp_nonce, content));
+            }
+        }
+
+        // Theme CSS variables
+        let theme_vars = self.theme_engine.generate_css_variables(&ctx.user.preferences.theme);
+        head.push_str(&format!(r#"<style nonce="{}">:root {{ {} }}</style>
+"#, ctx.csp_nonce, theme_vars));
+
+        // Preload critical assets
+        if self.config.assets.preload_critical {
+            head.push_str(&self.generate_preloads(ctx));
+        }
+
+        // Structured data (JSON-LD)
+        if let Some(ref structured_data) = ctx.structured_data {
+            head.push_str(&format!(r#"<script type="application/ld+json" nonce="{}">
+{}
+</script>
+"#, ctx.csp_nonce, serde_json::to_string(structured_data).unwrap_or_default()));
+        }
+
+        Ok(head)
+    }
+
+    fn build_scripts(self, ctx: &PageContext, hydration_state: &HydrationState) -> Result<String, FrontendError> {
+        let mut scripts = String::new();
+
+        // Hydration data
+        scripts.push_str(&hydration_state.to_script_tag());
+
+        // Hydration bootstrap
+        let bootstrap = HydrationScriptGenerator::new(self.config.hydration.clone())
+            .generate_bootstrap();
+        scripts.push_str(&format!(r#"<script nonce="{}">{}</script>
+"#, ctx.csp_nonce, bootstrap));
+
+        // Custom scripts
+        for script in &ctx.scripts {
+            if let Some(ref src) = script.src {
+                let async_attr = if script.async_load { " async" } else { "" };
+                let defer_attr = if script.defer { " defer" } else { "" };
+                let module_attr = if script.module { r#" type="module""# } else { "" };
+                let integrity = script.integrity.as_ref().map(|i| format!(r#" integrity="{}""#, i)).unwrap_or_default();
+                let crossorigin = script.crossorigin.as_ref().map(|c| format!(r#" crossorigin="{}""#, c)).unwrap_or_default();
+
+                scripts.push_str(&format!(r#"<script src="{}"{}{}{}{}{} nonce="{}"></script>
+"#,
+                    self.asset_url(src),
+                    async_attr,
+                    defer_attr,
+                    module_attr,
+                    integrity,
+                    crossorigin,
+                    ctx.csp_nonce
+                ));
+            }
+            if let Some(ref content) = script.content {
+                let module_attr = if script.module { r#" type="module""# } else { "" };
+                scripts.push_str(&format!(r#"<script{} nonce="{}">{}</script>
+"#, module_attr, ctx.csp_nonce, content));
+            }
+        }
+
+        Ok(scripts)
+    }
+
+    // ========================================================================
+    // Component Rendering
+    // ========================================================================
+
+    /// Render a component with hydration marker
+    pub fn render_component(self, name: &str, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let component = self.component_registry.get(name);
+        let id = generate_component_id(name);
+
+        let data_attrs = format!(
+            r#"data-hydrate="{}" data-component="{}" data-props='{}'"#,
+            id,
+            name,
+            escape_json(&serde_json::to_string(props).unwrap_or_default())
+        );
+
+        let inner_html = match component {
+            Some(c) => c.render(props, content),
+            None => content.unwrap_or_default().to_string(),
+        };
+
+        format!(r#"<div {} class="component component--{}">{}</div>"#,
+            data_attrs,
+            name,
+            inner_html
+        )
+    }
+
+    // ========================================================================
+    // Helpers
+    // ========================================================================
+
+    fn get_template(self, name: &str) -> Result<String, FrontendError> {
+        // Load template from filesystem or cache
+        // For now, return a placeholder
+        Ok(format!("<!-- Template: {} -->", name))
+    }
+
+    fn render_template(self, template: &str, data: &Map<String, Value>, ctx: &PageContext) -> Result<String, FrontendError> {
+        // Simple template rendering with variable substitution
+        let mut result = template.to_string();
+
+        for (key, value) in data {
+            let placeholder = format!("{{{{{}}}}}", key);
+            result = result.replace(&placeholder, &value.to_string());
+        }
+
+        Ok(result)
+    }
+
+    fn get_layout(self, role: &UserRole) -> Result<(String, String), FrontendError> {
+        let layout = match role {
+            UserRole::Admin | UserRole::TenantAdmin => {
+                (ADMIN_LAYOUT_START.to_string(), ADMIN_LAYOUT_END.to_string())
+            },
+            UserRole::Teacher => {
+                (TEACHER_LAYOUT_START.to_string(), TEACHER_LAYOUT_END.to_string())
+            },
+            UserRole::Student => {
+                (STUDENT_LAYOUT_START.to_string(), STUDENT_LAYOUT_END.to_string())
+            },
+            UserRole::Anonymous => {
+                (PUBLIC_LAYOUT_START.to_string(), PUBLIC_LAYOUT_END.to_string())
+            },
+        };
+
+        Ok(layout)
+    }
+
+    fn get_body_class(self, ctx: &PageContext) -> String {
+        let mut classes = vec!["lms"];
+
+        match ctx.user.role {
+            UserRole::Admin | UserRole::TenantAdmin => classes.push("is-admin"),
+            UserRole::Teacher => classes.push("is-teacher"),
+            UserRole::Student => classes.push("is-student"),
+            UserRole::Anonymous => classes.push("is-anonymous"),
+        }
+
+        if ctx.user.authenticated {
+            classes.push("is-authenticated");
+        }
+
+        classes.join(" ")
+    }
+
+    fn build_hydration_state(self, ctx: &PageContext, data: &Map<String, Value>) -> HydrationState {
+        let mut state = HydrationState::new();
+
+        // Add user context if authenticated
+        if ctx.user.authenticated {
+            state.user = Some(UserContextState {
+                id: ctx.user.user_id.clone().unwrap_or_default(),
+                role: format!("{:?}", ctx.user.role),
+                permissions: ctx.user.permissions.clone(),
+                tenant_id: ctx.user.tenant_id.clone(),
+            });
+        }
+
+        // Add feature flags
+        state.features = ctx.user.feature_flags.clone();
+
+        // Set CSP nonce
+        state.nonce = ctx.csp_nonce.clone();
+
+        state
+    }
+
+    fn determine_cache_control(self, ctx: &PageContext) -> CacheControl {
+        if ctx.user.authenticated {
+            // Private, short cache for authenticated users
+            CacheControl {
+                public: false,
+                max_age: 60,
+                s_max_age: None,
+                must_revalidate: true,
+                no_store: false,
+            }
+        } else {
+            // Public, longer cache for anonymous users
+            CacheControl {
+                public: true,
+                max_age: 300,
+                s_max_age: Some(600),
+                must_revalidate: false,
+                no_store: false,
+            }
+        }
+    }
+
+    fn generate_etag(self, content: &str) -> String {
+        // Generate ETag from content hash
+        let hash = std::crypto::sha256(content.as_bytes());
+        format!("\"{}\"", hex_encode(&hash[0..8]))
+    }
+
+    fn asset_url(self, path: &str) -> String {
+        if path.starts_with("http") || path.starts_with("//") {
+            path.to_string()
+        } else if !self.config.cdn_base_url.is_empty() {
+            format!("{}{}", self.config.cdn_base_url, path)
+        } else {
+            path.to_string()
+        }
+    }
+
+    fn generate_preloads(self, ctx: &PageContext) -> String {
+        let mut preloads = String::new();
+
+        // Preload critical CSS
+        preloads.push_str(&format!(r#"<link rel="preload" href="{}/css/critical.css" as="style">
+"#, self.config.static_base_url));
+
+        // Preload main font
+        preloads.push_str(&format!(r#"<link rel="preload" href="{}/fonts/inter-var.woff2" as="font" type="font/woff2" crossorigin>
+"#, self.config.cdn_base_url));
+
+        preloads
+    }
+}
+
+// ============================================================================
+// Component Registry
+// ============================================================================
+
+/// Registry of renderable components
+pub actor ComponentRegistry {
+    components: Map<String, Box<dyn RenderableComponent>>,
+
+    pub fn new() -> Self {
+        let mut registry = ComponentRegistry {
+            components: Map::new(),
+        };
+
+        // Register built-in components
+        registry.register_builtin();
+
+        registry
+    }
+
+    fn register_builtin(mut self) {
+        // Register core components
+        self.register("button", Box::new(ButtonComponent::new()));
+        self.register("card", Box::new(CardComponent::new()));
+        self.register("modal", Box::new(ModalComponent::new()));
+        self.register("dropdown", Box::new(DropdownComponent::new()));
+        self.register("tabs", Box::new(TabsComponent::new()));
+        self.register("progress-bar", Box::new(ProgressBarComponent::new()));
+        self.register("video-player", Box::new(VideoPlayerComponent::new()));
+        self.register("quiz-widget", Box::new(QuizWidgetComponent::new()));
+        self.register("notification-bell", Box::new(NotificationBellComponent::new()));
+        self.register("search-bar", Box::new(SearchBarComponent::new()));
+        self.register("auth-widget", Box::new(AuthWidgetComponent::new()));
+    }
+
+    pub fn register(mut self, name: &str, component: Box<dyn RenderableComponent>) {
+        self.components.insert(name.to_string(), component);
+    }
+
+    pub fn get(self, name: &str) -> Option<&Box<dyn RenderableComponent>> {
+        self.components.get(name)
+    }
+}
+
+/// Trait for server-renderable components
+pub trait RenderableComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String;
+}
+
+// ============================================================================
+// Built-in Components
+// ============================================================================
+
+pub struct ButtonComponent {}
+impl ButtonComponent { pub fn new() -> Self { ButtonComponent {} } }
+impl RenderableComponent for ButtonComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let variant = props.get("variant").and_then(|v| v.as_str()).unwrap_or("primary");
+        let size = props.get("size").and_then(|v| v.as_str()).unwrap_or("md");
+        let disabled = props.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        format!(r#"<button class="btn btn--{} btn--{}" {}>{}</button>"#,
+            variant,
+            size,
+            if disabled { "disabled" } else { "" },
+            content.unwrap_or("Button")
+        )
+    }
+}
+
+pub struct CardComponent {}
+impl CardComponent { pub fn new() -> Self { CardComponent {} } }
+impl RenderableComponent for CardComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let title = props.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let image = props.get("image").and_then(|v| v.as_str());
+
+        let mut html = String::from(r#"<div class="card">"#);
+
+        if let Some(img) = image {
+            html.push_str(&format!(r#"<img class="card__image" src="{}" alt="" loading="lazy">"#, img));
+        }
+
+        html.push_str(r#"<div class="card__body">"#);
+
+        if !title.is_empty() {
+            html.push_str(&format!(r#"<h3 class="card__title">{}</h3>"#, escape_html(title)));
+        }
+
+        html.push_str(&format!(r#"<div class="card__content">{}</div>"#, content.unwrap_or("")));
+        html.push_str("</div></div>");
+
+        html
+    }
+}
+
+pub struct ModalComponent {}
+impl ModalComponent { pub fn new() -> Self { ModalComponent {} } }
+impl RenderableComponent for ModalComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let title = props.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let open = props.get("open").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        format!(r#"<div class="modal {}" role="dialog" aria-labelledby="modal-title">
+  <div class="modal__backdrop"></div>
+  <div class="modal__content">
+    <header class="modal__header">
+      <h2 id="modal-title" class="modal__title">{}</h2>
+      <button class="modal__close" aria-label="Close">&times;</button>
+    </header>
+    <div class="modal__body">{}</div>
+  </div>
+</div>"#,
+            if open { "is-open" } else { "" },
+            escape_html(title),
+            content.unwrap_or("")
+        )
+    }
+}
+
+pub struct DropdownComponent {}
+impl DropdownComponent { pub fn new() -> Self { DropdownComponent {} } }
+impl RenderableComponent for DropdownComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let label = props.get("label").and_then(|v| v.as_str()).unwrap_or("Select");
+
+        format!(r#"<div class="dropdown">
+  <button class="dropdown__trigger" aria-haspopup="true">{}</button>
+  <div class="dropdown__menu" role="menu">{}</div>
+</div>"#, escape_html(label), content.unwrap_or(""))
+    }
+}
+
+pub struct TabsComponent {}
+impl TabsComponent { pub fn new() -> Self { TabsComponent {} } }
+impl RenderableComponent for TabsComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        format!(r#"<div class="tabs" role="tablist">{}</div>"#, content.unwrap_or(""))
+    }
+}
+
+pub struct ProgressBarComponent {}
+impl ProgressBarComponent { pub fn new() -> Self { ProgressBarComponent {} } }
+impl RenderableComponent for ProgressBarComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let value = props.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let max = props.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
+        let percentage = (value / max * 100.0).min(100.0);
+
+        format!(r#"<div class="progress" role="progressbar" aria-valuenow="{}" aria-valuemin="0" aria-valuemax="{}">
+  <div class="progress__bar" style="width: {}%"></div>
+  <span class="progress__label">{}%</span>
+</div>"#, value, max, percentage, percentage as i32)
+    }
+}
+
+pub struct VideoPlayerComponent {}
+impl VideoPlayerComponent { pub fn new() -> Self { VideoPlayerComponent {} } }
+impl RenderableComponent for VideoPlayerComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let src = props.get("src").and_then(|v| v.as_str()).unwrap_or("");
+        let poster = props.get("poster").and_then(|v| v.as_str()).unwrap_or("");
+        let title = props.get("title").and_then(|v| v.as_str()).unwrap_or("Video");
+
+        format!(r#"<div class="video-player">
+  <video controls preload="metadata" poster="{}" title="{}">
+    <source src="{}" type="video/mp4">
+    Your browser does not support video playback.
+  </video>
+</div>"#, poster, escape_html(title), src)
+    }
+}
+
+pub struct QuizWidgetComponent {}
+impl QuizWidgetComponent { pub fn new() -> Self { QuizWidgetComponent {} } }
+impl RenderableComponent for QuizWidgetComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let quiz_id = props.get("quiz_id").and_then(|v| v.as_str()).unwrap_or("");
+        let title = props.get("title").and_then(|v| v.as_str()).unwrap_or("Quiz");
+
+        format!(r#"<div class="quiz-widget" data-quiz-id="{}">
+  <h3 class="quiz-widget__title">{}</h3>
+  <div class="quiz-widget__content">{}</div>
+  <div class="quiz-widget__actions">
+    <button class="btn btn--primary quiz-widget__start">Start Quiz</button>
+  </div>
+</div>"#, quiz_id, escape_html(title), content.unwrap_or(""))
+    }
+}
+
+pub struct NotificationBellComponent {}
+impl NotificationBellComponent { pub fn new() -> Self { NotificationBellComponent {} } }
+impl RenderableComponent for NotificationBellComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let count = props.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        format!(r#"<button class="notification-bell" aria-label="Notifications">
+  <svg class="notification-bell__icon" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/>
+  </svg>
+  {}</button>"#,
+            if count > 0 {
+                format!(r#"<span class="notification-bell__badge">{}</span>"#,
+                    if count > 99 { "99+".to_string() } else { count.to_string() })
+            } else { String::new() }
+        )
+    }
+}
+
+pub struct SearchBarComponent {}
+impl SearchBarComponent { pub fn new() -> Self { SearchBarComponent {} } }
+impl RenderableComponent for SearchBarComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let placeholder = props.get("placeholder").and_then(|v| v.as_str()).unwrap_or("Search...");
+
+        format!(r#"<div class="search-bar">
+  <input type="search" class="search-bar__input" placeholder="{}" aria-label="Search">
+  <button class="search-bar__submit" aria-label="Submit search">
+    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+  </button>
+</div>"#, escape_html(placeholder))
+    }
+}
+
+pub struct AuthWidgetComponent {}
+impl AuthWidgetComponent { pub fn new() -> Self { AuthWidgetComponent {} } }
+impl RenderableComponent for AuthWidgetComponent {
+    fn render(self, props: &Map<String, Value>, content: Option<&str>) -> String {
+        let authenticated = props.get("authenticated").and_then(|v| v.as_bool()).unwrap_or(false);
+        let user_name = props.get("user_name").and_then(|v| v.as_str()).unwrap_or("");
+        let avatar = props.get("avatar").and_then(|v| v.as_str());
+
+        if authenticated {
+            format!(r#"<div class="auth-widget auth-widget--authenticated">
+  <button class="auth-widget__trigger">
+    {}
+    <span class="auth-widget__name">{}</span>
+  </button>
+  <div class="auth-widget__menu">
+    <a href="/profile" class="auth-widget__item">Profile</a>
+    <a href="/settings" class="auth-widget__item">Settings</a>
+    <button class="auth-widget__item auth-widget__logout">Logout</button>
+  </div>
+</div>"#,
+                avatar.map(|a| format!(r#"<img class="auth-widget__avatar" src="{}" alt="">"#, a))
+                    .unwrap_or_else(|| r#"<span class="auth-widget__avatar auth-widget__avatar--placeholder"></span>"#.to_string()),
+                escape_html(user_name)
+            )
+        } else {
+            r#"<div class="auth-widget auth-widget--anonymous">
+  <a href="/login" class="btn btn--outline">Log In</a>
+  <a href="/register" class="btn btn--primary">Sign Up</a>
+</div>"#.to_string()
+        }
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Rendered page output
+pub type RenderedPage = type {
+    html: String,
+    hydration_state: HydrationState,
+    meta: PageMeta,
+    cache_control: CacheControl,
+    etag: String,
+}
+
+/// Page metadata
+pub type PageMeta = type {
+    title: String,
+    description: String,
+    canonical_url: String,
+}
+
+/// Cache control header values
+pub type CacheControl = type {
+    public: bool,
+    max_age: i64,
+    s_max_age: Option<i64>,
+    must_revalidate: bool,
+    no_store: bool,
+}
+
+impl CacheControl {
+    pub fn to_header(self) -> String {
+        let mut parts = vec![];
+
+        if self.no_store {
+            return "no-store".to_string();
+        }
+
+        if self.public {
+            parts.push("public".to_string());
+        } else {
+            parts.push("private".to_string());
+        }
+
+        parts.push(format!("max-age={}", self.max_age));
+
+        if let Some(s_max_age) = self.s_max_age {
+            parts.push(format!("s-maxage={}", s_max_age));
+        }
+
+        if self.must_revalidate {
+            parts.push("must-revalidate".to_string());
+        }
+
+        parts.join(", ")
+    }
+}
+
+// ============================================================================
+// Dashboard Data Types
+// ============================================================================
+
+pub type StudentDashboardData = type {
+    enrollments: Vec<EnrollmentSummary>,
+    progress: ProgressSummary,
+    upcoming_deadlines: Vec<Deadline>,
+    achievements: Vec<Achievement>,
+    recommendations: Vec<CourseRecommendation>,
+}
+
+pub type TeacherDashboardData = type {
+    courses: Vec<CourseSummary>,
+    pending_submissions: Vec<SubmissionSummary>,
+    student_stats: StudentStats,
+    announcements: Vec<Announcement>,
+}
+
+pub type AdminDashboardData = type {
+    stats: SystemStats,
+    recent_users: Vec<UserSummary>,
+    system_health: SystemHealth,
+    pending_actions: Vec<AdminAction>,
+}
+
+pub type CourseData = type {
+    id: String,
+    title: String,
+    description: String,
+    thumbnail: Option<String>,
+    instructor: String,
+    modules: Vec<ModuleSummary>,
+}
+
+pub type LessonData = type {
+    id: String,
+    title: String,
+    content: String,
+    duration: i64,
+    video_url: Option<String>,
+}
+
+// Supporting types (minimal definitions)
+pub type EnrollmentSummary = type { course_id: String, course_title: String, progress: f64 }
+pub type ProgressSummary = type { total_courses: i32, completed: i32, in_progress: i32 }
+pub type Deadline = type { title: String, due_date: DateTime, course_id: String }
+pub type Achievement = type { id: String, title: String, earned_at: DateTime }
+pub type CourseRecommendation = type { course_id: String, title: String, reason: String }
+pub type CourseSummary = type { id: String, title: String, student_count: i32 }
+pub type SubmissionSummary = type { id: String, student_name: String, assignment_title: String }
+pub type StudentStats = type { total: i32, active: i32, at_risk: i32 }
+pub type Announcement = type { id: String, title: String, created_at: DateTime }
+pub type SystemStats = type { total_users: i64, total_courses: i64, total_enrollments: i64 }
+pub type UserSummary = type { id: String, name: String, email: String, role: String }
+pub type SystemHealth = type { status: String, uptime: i64, load: f64 }
+pub type AdminAction = type { id: String, action_type: String, description: String }
+pub type ModuleSummary = type { id: String, title: String, lesson_count: i32 }
+
+// ============================================================================
+// Layout Templates
+// ============================================================================
+
+const ADMIN_LAYOUT_START: &str = r#"<div class="layout layout--admin">
+  <aside class="sidebar sidebar--admin">
+    <nav class="sidebar__nav">
+      <a href="/admin" class="sidebar__logo">Intelligo Admin</a>
+      <ul class="sidebar__menu">
+        <li><a href="/admin/dashboard">Dashboard</a></li>
+        <li><a href="/admin/users">Users</a></li>
+        <li><a href="/admin/courses">Courses</a></li>
+        <li><a href="/admin/reports">Reports</a></li>
+        <li><a href="/admin/settings">Settings</a></li>
+      </ul>
+    </nav>
+  </aside>
+  <main class="main main--admin">"#;
+
+const ADMIN_LAYOUT_END: &str = r#"  </main>
+</div>"#;
+
+const TEACHER_LAYOUT_START: &str = r#"<div class="layout layout--teacher">
+  <header class="header header--teacher">
+    <a href="/teacher" class="header__logo">Intelligo</a>
+    <nav class="header__nav">
+      <a href="/teacher/dashboard">Dashboard</a>
+      <a href="/teacher/courses">My Courses</a>
+      <a href="/teacher/students">Students</a>
+      <a href="/teacher/gradebook">Gradebook</a>
+    </nav>
+    <div class="header__actions" data-hydrate="auth-widget"></div>
+  </header>
+  <main class="main main--teacher">"#;
+
+const TEACHER_LAYOUT_END: &str = r#"  </main>
+  <footer class="footer">
+    <p>&copy; Intelligo LMS</p>
+  </footer>
+</div>"#;
+
+const STUDENT_LAYOUT_START: &str = r#"<div class="layout layout--student">
+  <header class="header header--student">
+    <a href="/" class="header__logo">Intelligo</a>
+    <nav class="header__nav">
+      <a href="/dashboard">Dashboard</a>
+      <a href="/courses">My Courses</a>
+      <a href="/calendar">Calendar</a>
+      <a href="/achievements">Achievements</a>
+    </nav>
+    <div class="header__actions">
+      <div data-hydrate="search-bar"></div>
+      <div data-hydrate="notification-bell"></div>
+      <div data-hydrate="auth-widget"></div>
+    </div>
+  </header>
+  <main class="main main--student">"#;
+
+const STUDENT_LAYOUT_END: &str = r#"  </main>
+  <footer class="footer">
+    <p>&copy; Intelligo LMS</p>
+  </footer>
+</div>"#;
+
+const PUBLIC_LAYOUT_START: &str = r#"<div class="layout layout--public">
+  <header class="header header--public">
+    <a href="/" class="header__logo">Intelligo</a>
+    <nav class="header__nav">
+      <a href="/courses">Browse Courses</a>
+      <a href="/about">About</a>
+      <a href="/contact">Contact</a>
+    </nav>
+    <div class="header__actions" data-hydrate="auth-widget"></div>
+  </header>
+  <main class="main main--public">"#;
+
+const PUBLIC_LAYOUT_END: &str = r#"  </main>
+  <footer class="footer">
+    <p>&copy; Intelligo LMS</p>
+  </footer>
+</div>"#;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn escape_html(s: &str) -> String {
+    s.replace("&", "&amp;")
+     .replace("<", "&lt;")
+     .replace(">", "&gt;")
+     .replace("\"", "&quot;")
+     .replace("'", "&#39;")
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace("'", "\\'")
+}
+
+fn generate_component_id(name: &str) -> String {
+    format!("{}_{}", name, std::random::random_u32())
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    data.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<String>>()
+        .join("")
+}

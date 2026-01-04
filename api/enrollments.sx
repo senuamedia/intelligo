@@ -1,0 +1,1603 @@
+/// Intelligo LMS - Enrollments API
+///
+/// This module provides enrollment management endpoints:
+/// - Enrollment CRUD operations
+/// - Bulk enrollment operations
+/// - Self-enrollment and enrollment requests
+/// - Enrollment analytics and reporting
+
+module intelligo::api::enrollments
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::entities::enrollment::*
+use intelligo::entities::course::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the enrollments router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Enrollment CRUD
+        .get("/", move |req| list_enrollments(req, db.clone()))
+        .get("/:enrollment_id", move |req| get_enrollment(req, db.clone()))
+        .post("/", move |req| create_enrollment(req, db.clone()))
+        .patch("/:enrollment_id", move |req| update_enrollment(req, db.clone()))
+        .delete("/:enrollment_id", move |req| delete_enrollment(req, db.clone()))
+
+        // Course-specific enrollments
+        .get("/courses/:course_id", move |req| get_course_enrollments(req, db.clone()))
+        .post("/courses/:course_id/bulk", move |req| bulk_enroll(req, db.clone()))
+        .delete("/courses/:course_id/bulk", move |req| bulk_unenroll(req, db.clone()))
+
+        // User-specific enrollments
+        .get("/users/:user_id", move |req| get_user_enrollments(req, db.clone()))
+        .get("/my", move |req| get_my_enrollments(req, db.clone()))
+
+        // Self-enrollment
+        .post("/courses/:course_id/self-enroll", move |req| self_enroll(req, db.clone()))
+        .delete("/courses/:course_id/self-unenroll", move |req| self_unenroll(req, db.clone()))
+
+        // Enrollment requests
+        .get("/requests", move |req| list_enrollment_requests(req, db.clone()))
+        .post("/courses/:course_id/request", move |req| request_enrollment(req, db.clone()))
+        .post("/requests/:request_id/approve", move |req| approve_request(req, db.clone()))
+        .post("/requests/:request_id/deny", move |req| deny_request(req, db.clone()))
+
+        // Invitations
+        .post("/courses/:course_id/invite", move |req| send_invitation(req, db.clone()))
+        .post("/invitations/:code/accept", move |req| accept_invitation(req, db.clone()))
+        .get("/invitations/:code", move |req| get_invitation(req, db.clone()))
+
+        // Sections
+        .get("/courses/:course_id/sections", move |req| get_course_sections(req, db.clone()))
+        .post("/courses/:course_id/sections", move |req| create_section(req, db.clone()))
+        .patch("/sections/:section_id", move |req| update_section(req, db.clone()))
+        .delete("/sections/:section_id", move |req| delete_section(req, db.clone()))
+        .post("/sections/:section_id/assign", move |req| assign_to_section(req, db.clone()))
+
+        // Analytics
+        .get("/courses/:course_id/analytics", move |req| get_enrollment_analytics(req, db.clone()))
+        .get("/courses/:course_id/activity", move |req| get_enrollment_activity(req, db.clone()))
+
+        // Import/Export
+        .get("/courses/:course_id/export", move |req| export_enrollments(req, db.clone()))
+        .post("/courses/:course_id/import", move |req| import_enrollments(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Enrollment response
+type EnrollmentResponse {
+    id: EnrollmentId,
+    user_id: UserId,
+    user_name: String,
+    user_email: String,
+    user_avatar: Option<String>,
+    course_id: CourseId,
+    course_title: String,
+    course_code: String,
+    role: CourseRole,
+    status: EnrollmentStatus,
+    section_id: Option<String>,
+    section_name: Option<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    progress: Option<EnrollmentProgress>,
+    last_activity: Option<DateTime>,
+    enrolled_at: DateTime,
+    enrolled_by: Option<UserId>,
+    source: EnrollmentSource,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Enrollment progress
+type EnrollmentProgress {
+    completed_items: i32,
+    total_items: i32,
+    percentage: f64,
+    current_grade: Option<f64>,
+    current_letter: Option<String>,
+    time_spent_minutes: i64
+}
+
+/// Create enrollment request
+type CreateEnrollmentRequest {
+    user_id: UserId,
+    course_id: CourseId,
+    role: Option<CourseRole>,
+    section_id: Option<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    notify_user: Option<Bool>,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Update enrollment request
+type UpdateEnrollmentRequest {
+    role: Option<CourseRole>,
+    status: Option<EnrollmentStatus>,
+    section_id: Option<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Bulk enrollment request
+type BulkEnrollRequest {
+    users: List<BulkEnrollUser>,
+    role: Option<CourseRole>,
+    section_id: Option<String>,
+    notify_users: Option<Bool>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>
+}
+
+/// Bulk enroll user entry
+type BulkEnrollUser {
+    user_id: Option<UserId>,
+    email: Option<String>,
+    role: Option<CourseRole>
+}
+
+/// Bulk enrollment response
+type BulkEnrollResponse {
+    enrolled: i32,
+    failed: i32,
+    errors: List<BulkEnrollError>,
+    enrollments: List<EnrollmentResponse>
+}
+
+/// Bulk enroll error
+type BulkEnrollError {
+    user_identifier: String,
+    error: String
+}
+
+/// Self enrollment request
+type SelfEnrollRequest {
+    enrollment_code: Option<String>,
+    section_id: Option<String>
+}
+
+/// Enrollment request
+type EnrollmentRequestResponse {
+    id: String,
+    user_id: UserId,
+    user_name: String,
+    user_email: String,
+    course_id: CourseId,
+    course_title: String,
+    message: Option<String>,
+    status: EnrollmentRequestStatus,
+    requested_at: DateTime,
+    reviewed_at: Option<DateTime>,
+    reviewed_by: Option<UserId>,
+    review_note: Option<String>
+}
+
+/// Enrollment request status
+enum EnrollmentRequestStatus {
+    Pending,
+    Approved,
+    Denied,
+    Expired
+}
+
+/// Invitation request
+type SendInvitationRequest {
+    emails: List<String>,
+    role: Option<CourseRole>,
+    section_id: Option<String>,
+    message: Option<String>,
+    expires_in_days: Option<i32>
+}
+
+/// Invitation response
+type InvitationResponse {
+    id: String,
+    code: String,
+    course_id: CourseId,
+    course_title: String,
+    email: String,
+    role: CourseRole,
+    status: InvitationStatus,
+    expires_at: DateTime,
+    created_at: DateTime,
+    accepted_at: Option<DateTime>
+}
+
+/// Invitation status
+enum InvitationStatus {
+    Pending,
+    Accepted,
+    Expired,
+    Revoked
+}
+
+/// Section response
+type SectionResponse {
+    id: String,
+    course_id: CourseId,
+    name: String,
+    code: Option<String>,
+    description: Option<String>,
+    instructor_ids: List<UserId>,
+    enrollment_count: i32,
+    max_enrollment: Option<i32>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    meeting_times: Option<String>,
+    location: Option<String>,
+    created_at: DateTime
+}
+
+/// Create section request
+type CreateSectionRequest {
+    name: String,
+    code: Option<String>,
+    description: Option<String>,
+    instructor_ids: Option<List<UserId>>,
+    max_enrollment: Option<i32>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    meeting_times: Option<String>,
+    location: Option<String>
+}
+
+/// Enrollment analytics
+type EnrollmentAnalyticsResponse {
+    course_id: CourseId,
+    total_enrolled: i32,
+    active_enrollments: i32,
+    completed_enrollments: i32,
+    dropped_enrollments: i32,
+    enrollment_trend: List<EnrollmentTrendPoint>,
+    role_distribution: List<RoleCount>,
+    section_distribution: List<SectionCount>,
+    completion_stats: CompletionStats
+}
+
+/// Enrollment trend point
+type EnrollmentTrendPoint {
+    date: DateTime,
+    count: i32,
+    cumulative: i32
+}
+
+/// Role count
+type RoleCount {
+    role: CourseRole,
+    count: i32
+}
+
+/// Section count
+type SectionCount {
+    section_id: String,
+    section_name: String,
+    count: i32
+}
+
+/// Completion stats
+type CompletionStats {
+    not_started: i32,
+    in_progress: i32,
+    completed: i32,
+    average_completion_percentage: f64,
+    average_time_to_complete_days: Option<f64>
+}
+
+/// My enrollments response
+type MyEnrollmentsResponse {
+    current: List<EnrollmentWithCourse>,
+    past: List<EnrollmentWithCourse>,
+    upcoming: List<EnrollmentWithCourse>
+}
+
+/// Enrollment with course details
+type EnrollmentWithCourse {
+    enrollment: EnrollmentResponse,
+    course: CourseInfo,
+    next_deadline: Option<DeadlineInfo>,
+    recent_activity: Option<ActivityInfo>
+}
+
+/// Course info
+type CourseInfo {
+    id: CourseId,
+    code: String,
+    title: String,
+    short_description: Option<String>,
+    thumbnail_url: Option<String>,
+    instructor_names: List<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>
+}
+
+/// Deadline info
+type DeadlineInfo {
+    item_title: String,
+    item_type: String,
+    due_date: DateTime
+}
+
+/// Activity info
+type ActivityInfo {
+    description: String,
+    timestamp: DateTime
+}
+
+// =============================================================================
+// ENROLLMENT CRUD
+// =============================================================================
+
+/// List all enrollments (admin)
+async fn list_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let pagination = PaginationParams::from_request(&req);
+
+    let course_id = req.query_param("course_id");
+    let user_id = req.query_param("user_id");
+    let status = req.query_param("status").map(|s| parse_enrollment_status(&s));
+    let role = req.query_param("role").map(|r| parse_course_role(&r));
+
+    let (enrollments, total) = db.enrollments()
+        .find_with_filters(EnrollmentFilters {
+            course_id,
+            user_id,
+            status,
+            role,
+            limit: Some(pagination.limit()),
+            offset: Some(pagination.offset())
+        })
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    let responses: List<EnrollmentResponse> = enrollments.iter()
+        .map(|e| enrollment_to_response(e))
+        .collect();
+
+    Ok(Response::json(ApiResponse::paginated(responses, pagination.to_meta(total), &ctx)))
+}
+
+/// Get single enrollment
+async fn get_enrollment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let enrollment_id = req.param("enrollment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Enrollment ID required".to_string()
+    })?;
+
+    let enrollment = db.enrollments().find_by_id(&enrollment_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Enrollment".to_string(), id: enrollment_id.clone() })?;
+
+    // Check access
+    let is_own = ctx.auth.as_ref().map(|a| a.user_id == enrollment.user_id).unwrap_or(false);
+    if !is_own && !ctx.has_permission(Permission::ViewEnrollments) {
+        return Err(ApiError::Forbidden { message: "Access denied".to_string(), required_permission: None })
+    }
+
+    Ok(Response::json(ApiResponse::success(enrollment_to_response(&enrollment), &ctx)))
+}
+
+/// Create enrollment
+async fn create_enrollment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let body: CreateEnrollmentRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Verify course exists
+    let course = db.courses().find_by_id(&body.course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: body.course_id.clone() })?;
+
+    // Verify user exists
+    let user = db.users().find_by_id(&body.user_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "User".to_string(), id: body.user_id.clone() })?;
+
+    // Check for existing enrollment
+    let existing = db.enrollments().find_by_user_and_course(&body.user_id, &body.course_id).await.ok().flatten();
+    if existing.is_some() {
+        return Err(ApiError::Conflict { message: "User is already enrolled in this course".to_string() })
+    }
+
+    // Check enrollment cap
+    if let Some(cap) = course.enrollment_cap {
+        let current_count = db.enrollments().count_by_course(&body.course_id).await.unwrap_or(0);
+        if current_count >= cap as i64 {
+            return Err(ApiError::BadRequest { message: "Course enrollment cap reached".to_string() })
+        }
+    }
+
+    let enrolled_by = ctx.auth.as_ref().map(|a| a.user_id.clone());
+
+    let enrollment = db.enrollments().create(CreateEnrollmentInput {
+        user_id: body.user_id.clone(),
+        course_id: body.course_id.clone(),
+        role: body.role.unwrap_or(CourseRole::Student),
+        section_id: body.section_id,
+        start_date: body.start_date,
+        end_date: body.end_date,
+        source: EnrollmentSource::Manual,
+        enrolled_by,
+        metadata: body.metadata
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    // Notify user if requested
+    if body.notify_user.unwrap_or(true) {
+        notify_enrollment(&enrollment, &course, &user).await.ok();
+    }
+
+    Ok(Response::json(ApiResponse::success(enrollment_to_response(&enrollment), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Update enrollment
+async fn update_enrollment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let enrollment_id = req.param("enrollment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Enrollment ID required".to_string()
+    })?;
+
+    let body: UpdateEnrollmentRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let enrollment = db.enrollments().update(&enrollment_id, UpdateEnrollmentInput {
+        role: body.role,
+        status: body.status,
+        section_id: body.section_id,
+        start_date: body.start_date,
+        end_date: body.end_date,
+        metadata: body.metadata
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(enrollment_to_response(&enrollment), &ctx)))
+}
+
+/// Delete enrollment
+async fn delete_enrollment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let enrollment_id = req.param("enrollment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Enrollment ID required".to_string()
+    })?;
+
+    db.enrollments().delete(&enrollment_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Enrollment deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// COURSE ENROLLMENTS
+// =============================================================================
+
+/// Get course enrollments
+async fn get_course_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    // Verify course access
+    verify_course_instructor_access(&db, &ctx, &course_id).await?;
+
+    let pagination = PaginationParams::from_request(&req);
+    let status = req.query_param("status").map(|s| parse_enrollment_status(&s));
+    let role = req.query_param("role").map(|r| parse_course_role(&r));
+    let section_id = req.query_param("section_id");
+    let search = req.query_param("search");
+
+    let (enrollments, total) = db.enrollments()
+        .find_by_course_with_filters(&course_id, EnrollmentCourseFilters {
+            status,
+            role,
+            section_id,
+            search,
+            limit: Some(pagination.limit()),
+            offset: Some(pagination.offset())
+        })
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    let responses: List<EnrollmentResponse> = enrollments.iter()
+        .map(|e| enrollment_to_response(e))
+        .collect();
+
+    Ok(Response::json(ApiResponse::paginated(responses, pagination.to_meta(total), &ctx)))
+}
+
+/// Bulk enroll users
+async fn bulk_enroll(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let body: BulkEnrollRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    let enrolled_by = ctx.auth.as_ref().map(|a| a.user_id.clone());
+    let mut enrolled = 0;
+    let mut failed = 0;
+    let mut errors: List<BulkEnrollError> = vec![];
+    let mut enrollments: List<EnrollmentResponse> = vec![];
+
+    for user_entry in body.users {
+        let user_id = if let Some(id) = user_entry.user_id {
+            Some(id)
+        } else if let Some(email) = &user_entry.email {
+            db.users().find_by_email(email).await.ok().flatten().map(|u| u.id)
+        } else {
+            None
+        };
+
+        let identifier = user_entry.user_id.clone()
+            .or(user_entry.email.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        match user_id {
+            Some(uid) => {
+                // Check if already enrolled
+                let existing = db.enrollments().find_by_user_and_course(&uid, &course_id).await.ok().flatten();
+                if existing.is_some() {
+                    errors.push(BulkEnrollError {
+                        user_identifier: identifier,
+                        error: "Already enrolled".to_string()
+                    });
+                    failed += 1;
+                    continue;
+                }
+
+                match db.enrollments().create(CreateEnrollmentInput {
+                    user_id: uid.clone(),
+                    course_id: course_id.clone(),
+                    role: user_entry.role.or(body.role).unwrap_or(CourseRole::Student),
+                    section_id: body.section_id.clone(),
+                    start_date: body.start_date,
+                    end_date: body.end_date,
+                    source: EnrollmentSource::Manual,
+                    enrolled_by: enrolled_by.clone(),
+                    metadata: None
+                }).await {
+                    Ok(e) => {
+                        enrolled += 1;
+                        enrollments.push(enrollment_to_response(&e));
+                    },
+                    Err(e) => {
+                        errors.push(BulkEnrollError {
+                            user_identifier: identifier,
+                            error: e.to_string()
+                        });
+                        failed += 1;
+                    }
+                }
+            },
+            None => {
+                errors.push(BulkEnrollError {
+                    user_identifier: identifier,
+                    error: "User not found".to_string()
+                });
+                failed += 1;
+            }
+        }
+    }
+
+    // Notify users if requested
+    if body.notify_users.unwrap_or(true) && enrolled > 0 {
+        notify_bulk_enrollment(&course, enrolled).await.ok();
+    }
+
+    Ok(Response::json(ApiResponse::success(BulkEnrollResponse {
+        enrolled, failed, errors, enrollments
+    }, &ctx)))
+}
+
+/// Bulk unenroll users
+async fn bulk_unenroll(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct BulkUnenrollRequest {
+        user_ids: List<UserId>,
+        notify_users: Option<Bool>
+    }
+
+    let body: BulkUnenrollRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let mut unenrolled = 0;
+    let mut errors: List<String> = vec![];
+
+    for user_id in body.user_ids {
+        match db.enrollments().delete_by_user_and_course(&user_id, &course_id).await {
+            Ok(_) => unenrolled += 1,
+            Err(e) => errors.push(format!("Error for user {}: {}", user_id, e))
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(Map::from([
+        ("unenrolled".to_string(), Dynamic::Int(unenrolled)),
+        ("errors".to_string(), Dynamic::List(errors.iter().map(|e| Dynamic::String(e.clone())).collect()))
+    ]), &ctx)))
+}
+
+// =============================================================================
+// USER ENROLLMENTS
+// =============================================================================
+
+/// Get user enrollments
+async fn get_user_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    let is_own = ctx.auth.as_ref().map(|a| a.user_id.to_string() == user_id).unwrap_or(false);
+    if !is_own && !ctx.has_permission(Permission::ViewEnrollments) {
+        return Err(ApiError::Forbidden { message: "Access denied".to_string(), required_permission: None })
+    }
+
+    let enrollments = db.enrollments().find_by_user(&user_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    let responses: List<EnrollmentResponse> = enrollments.iter()
+        .map(|e| enrollment_to_response(e))
+        .collect();
+
+    Ok(Response::json(ApiResponse::success(responses, &ctx)))
+}
+
+/// Get my enrollments
+async fn get_my_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let enrollments = db.enrollments().find_by_user(&auth.user_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    let now = DateTime::now();
+    let mut current: List<EnrollmentWithCourse> = vec![];
+    let mut past: List<EnrollmentWithCourse> = vec![];
+    let mut upcoming: List<EnrollmentWithCourse> = vec![];
+
+    for enrollment in enrollments {
+        if let Some(course) = db.courses().find_by_id(&enrollment.course_id).await.ok().flatten() {
+            let enrollment_with_course = build_enrollment_with_course(&enrollment, &course, &db).await;
+
+            if enrollment.status == EnrollmentStatus::Completed {
+                past.push(enrollment_with_course);
+            } else if enrollment.start_date.map(|d| d > now).unwrap_or(false) {
+                upcoming.push(enrollment_with_course);
+            } else {
+                current.push(enrollment_with_course);
+            }
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(MyEnrollmentsResponse {
+        current, past, upcoming
+    }, &ctx)))
+}
+
+// =============================================================================
+// SELF-ENROLLMENT
+// =============================================================================
+
+/// Self enroll in course
+async fn self_enroll(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let body: SelfEnrollRequest = req.json().await.unwrap_or(SelfEnrollRequest {
+        enrollment_code: None,
+        section_id: None
+    });
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    // Check if self enrollment is allowed
+    if !course.self_enrollment {
+        return Err(ApiError::Forbidden {
+            message: "Self-enrollment is not enabled for this course".to_string(),
+            required_permission: None
+        })
+    }
+
+    // Check enrollment code if required
+    if let Some(required_code) = &course.enrollment_code {
+        let provided_code = body.enrollment_code.as_ref().ok_or_else(|| ApiError::BadRequest {
+            message: "Enrollment code required".to_string()
+        })?;
+
+        if provided_code != required_code {
+            return Err(ApiError::BadRequest {
+                message: "Invalid enrollment code".to_string()
+            })
+        }
+    }
+
+    // Check if already enrolled
+    let existing = db.enrollments().find_by_user_and_course(&auth.user_id, &course_id).await.ok().flatten();
+    if existing.is_some() {
+        return Err(ApiError::Conflict {
+            message: "You are already enrolled in this course".to_string()
+        })
+    }
+
+    // Check enrollment cap
+    if let Some(cap) = course.enrollment_cap {
+        let current_count = db.enrollments().count_by_course(&course_id).await.unwrap_or(0);
+        if current_count >= cap as i64 {
+            return Err(ApiError::BadRequest {
+                message: "Course enrollment cap reached".to_string()
+            })
+        }
+    }
+
+    // Check enrollment window
+    let now = DateTime::now();
+    if let Some(start) = course.enrollment_start {
+        if now < start {
+            return Err(ApiError::BadRequest {
+                message: "Enrollment has not opened yet".to_string()
+            })
+        }
+    }
+    if let Some(end) = course.enrollment_end {
+        if now > end {
+            return Err(ApiError::BadRequest {
+                message: "Enrollment has closed".to_string()
+            })
+        }
+    }
+
+    let enrollment = db.enrollments().create(CreateEnrollmentInput {
+        user_id: auth.user_id.clone(),
+        course_id: course_id.clone(),
+        role: CourseRole::Student,
+        section_id: body.section_id,
+        start_date: None,
+        end_date: None,
+        source: EnrollmentSource::SelfEnrollment,
+        enrolled_by: None,
+        metadata: None
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(enrollment_to_response(&enrollment), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Self unenroll from course
+async fn self_unenroll(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let enrollment = db.enrollments().find_by_user_and_course(&auth.user_id, &course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Enrollment".to_string(),
+            id: format!("{}/{}", course_id, auth.user_id)
+        })?;
+
+    // Only allow self-unenroll if originally self-enrolled
+    if enrollment.source != EnrollmentSource::SelfEnrollment {
+        return Err(ApiError::Forbidden {
+            message: "Cannot self-unenroll from this course".to_string(),
+            required_permission: None
+        })
+    }
+
+    db.enrollments().delete(&enrollment.id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Successfully unenrolled".to_string()))
+    ])))
+}
+
+// =============================================================================
+// ENROLLMENT REQUESTS
+// =============================================================================
+
+/// List enrollment requests
+async fn list_enrollment_requests(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.query_param("course_id");
+    let status = req.query_param("status");
+
+    let requests = db.enrollment_requests()
+        .find_with_filters(EnrollmentRequestFilters { course_id, status })
+        .await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    let responses: List<EnrollmentRequestResponse> = requests.iter()
+        .map(|r| enrollment_request_to_response(r))
+        .collect();
+
+    Ok(Response::json(ApiResponse::success(responses, &ctx)))
+}
+
+/// Request enrollment
+async fn request_enrollment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct RequestEnrollmentBody {
+        message: Option<String>
+    }
+
+    let body: RequestEnrollmentBody = req.json().await.unwrap_or(RequestEnrollmentBody { message: None });
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    // Check if already enrolled
+    let existing_enrollment = db.enrollments().find_by_user_and_course(&auth.user_id, &course_id).await.ok().flatten();
+    if existing_enrollment.is_some() {
+        return Err(ApiError::Conflict { message: "Already enrolled".to_string() })
+    }
+
+    // Check for existing pending request
+    let existing_request = db.enrollment_requests()
+        .find_pending_by_user_and_course(&auth.user_id, &course_id)
+        .await
+        .ok()
+        .flatten();
+    if existing_request.is_some() {
+        return Err(ApiError::Conflict { message: "Enrollment request already pending".to_string() })
+    }
+
+    let request = db.enrollment_requests().create(CreateEnrollmentRequestInput {
+        user_id: auth.user_id.clone(),
+        course_id: course_id.clone(),
+        message: body.message
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    // Notify course instructors
+    notify_enrollment_request(&request, &course).await.ok();
+
+    Ok(Response::json(ApiResponse::success(enrollment_request_to_response(&request), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Approve enrollment request
+async fn approve_request(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let request_id = req.param("request_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Request ID required".to_string()
+    })?;
+
+    let enrollment_request = db.enrollment_requests().find_by_id(&request_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "EnrollmentRequest".to_string(), id: request_id.clone() })?;
+
+    if enrollment_request.status != EnrollmentRequestStatus::Pending {
+        return Err(ApiError::BadRequest { message: "Request is not pending".to_string() })
+    }
+
+    let reviewer_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+
+    // Create enrollment
+    let enrollment = db.enrollments().create(CreateEnrollmentInput {
+        user_id: enrollment_request.user_id.clone(),
+        course_id: enrollment_request.course_id.clone(),
+        role: CourseRole::Student,
+        section_id: None,
+        start_date: None,
+        end_date: None,
+        source: EnrollmentSource::Request,
+        enrolled_by: reviewer_id.clone(),
+        metadata: None
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    // Update request status
+    db.enrollment_requests().update_status(&request_id, EnrollmentRequestStatus::Approved, reviewer_id, None).await.ok();
+
+    // Notify user
+    notify_request_approved(&enrollment_request).await.ok();
+
+    Ok(Response::json(ApiResponse::success(enrollment_to_response(&enrollment), &ctx)))
+}
+
+/// Deny enrollment request
+async fn deny_request(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let request_id = req.param("request_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Request ID required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct DenyRequestBody {
+        reason: Option<String>
+    }
+
+    let body: DenyRequestBody = req.json().await.unwrap_or(DenyRequestBody { reason: None });
+
+    let enrollment_request = db.enrollment_requests().find_by_id(&request_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "EnrollmentRequest".to_string(), id: request_id.clone() })?;
+
+    if enrollment_request.status != EnrollmentRequestStatus::Pending {
+        return Err(ApiError::BadRequest { message: "Request is not pending".to_string() })
+    }
+
+    let reviewer_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+
+    db.enrollment_requests().update_status(&request_id, EnrollmentRequestStatus::Denied, reviewer_id, body.reason).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    // Notify user
+    notify_request_denied(&enrollment_request).await.ok();
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Request denied".to_string()))
+    ])))
+}
+
+// =============================================================================
+// INVITATIONS
+// =============================================================================
+
+/// Send enrollment invitations
+async fn send_invitation(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let body: SendInvitationRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    let created_by = ctx.auth.as_ref().map(|a| a.user_id.clone());
+    let expires_at = DateTime::now() + Duration::days(body.expires_in_days.unwrap_or(7) as i64);
+
+    let mut invitations: List<InvitationResponse> = vec![];
+
+    for email in body.emails {
+        let code = generate_invitation_code();
+
+        let invitation = db.invitations().create(CreateInvitationInput {
+            course_id: course_id.clone(),
+            email: email.clone(),
+            role: body.role.clone().unwrap_or(CourseRole::Student),
+            section_id: body.section_id.clone(),
+            code: code.clone(),
+            expires_at,
+            created_by: created_by.clone()
+        }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+        // Send invitation email
+        send_invitation_email(&email, &course, &code, body.message.as_deref()).await.ok();
+
+        invitations.push(invitation_to_response(&invitation));
+    }
+
+    Ok(Response::json(ApiResponse::success(invitations, &ctx)))
+}
+
+/// Accept invitation
+async fn accept_invitation(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let code = req.param("code").ok_or_else(|| ApiError::BadRequest {
+        message: "Invitation code required".to_string()
+    })?;
+
+    let invitation = db.invitations().find_by_code(&code).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Invitation".to_string(), id: code.clone() })?;
+
+    if invitation.status != InvitationStatus::Pending {
+        return Err(ApiError::BadRequest { message: "Invitation is no longer valid".to_string() })
+    }
+
+    if invitation.expires_at < DateTime::now() {
+        return Err(ApiError::BadRequest { message: "Invitation has expired".to_string() })
+    }
+
+    // Create enrollment
+    let enrollment = db.enrollments().create(CreateEnrollmentInput {
+        user_id: auth.user_id.clone(),
+        course_id: invitation.course_id.clone(),
+        role: invitation.role.clone(),
+        section_id: invitation.section_id.clone(),
+        start_date: None,
+        end_date: None,
+        source: EnrollmentSource::Invite,
+        enrolled_by: None,
+        metadata: None
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    // Mark invitation as accepted
+    db.invitations().mark_accepted(&code, &auth.user_id).await.ok();
+
+    Ok(Response::json(ApiResponse::success(enrollment_to_response(&enrollment), &ctx)))
+}
+
+/// Get invitation details
+async fn get_invitation(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let code = req.param("code").ok_or_else(|| ApiError::BadRequest {
+        message: "Invitation code required".to_string()
+    })?;
+
+    let invitation = db.invitations().find_by_code(&code).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Invitation".to_string(), id: code.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(invitation_to_response(&invitation), &ctx)))
+}
+
+// =============================================================================
+// SECTIONS
+// =============================================================================
+
+/// Get course sections
+async fn get_course_sections(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    verify_course_access(&db, &ctx, &course_id).await?;
+
+    let sections = db.sections().find_by_course(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    let responses: List<SectionResponse> = sections.iter()
+        .map(|s| section_to_response(s))
+        .collect();
+
+    Ok(Response::json(ApiResponse::success(responses, &ctx)))
+}
+
+/// Create section
+async fn create_section(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let body: CreateSectionRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let section = db.sections().create(CreateSectionInput {
+        course_id: course_id.clone(),
+        name: body.name,
+        code: body.code,
+        description: body.description,
+        instructor_ids: body.instructor_ids.unwrap_or_default(),
+        max_enrollment: body.max_enrollment,
+        start_date: body.start_date,
+        end_date: body.end_date,
+        meeting_times: body.meeting_times,
+        location: body.location
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(section_to_response(&section), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Update section
+async fn update_section(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let section_id = req.param("section_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Section ID required".to_string()
+    })?;
+
+    let body: CreateSectionRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let section = db.sections().update(&section_id, UpdateSectionInput {
+        name: Some(body.name),
+        code: body.code,
+        description: body.description,
+        instructor_ids: body.instructor_ids,
+        max_enrollment: body.max_enrollment,
+        start_date: body.start_date,
+        end_date: body.end_date,
+        meeting_times: body.meeting_times,
+        location: body.location
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(section_to_response(&section), &ctx)))
+}
+
+/// Delete section
+async fn delete_section(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let section_id = req.param("section_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Section ID required".to_string()
+    })?;
+
+    db.sections().delete(&section_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Section deleted".to_string()))
+    ])))
+}
+
+/// Assign students to section
+async fn assign_to_section(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let section_id = req.param("section_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Section ID required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct AssignToSectionRequest {
+        enrollment_ids: List<EnrollmentId>
+    }
+
+    let body: AssignToSectionRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let mut assigned = 0;
+
+    for enrollment_id in body.enrollment_ids {
+        match db.enrollments().update(&enrollment_id, UpdateEnrollmentInput {
+            role: None,
+            status: None,
+            section_id: Some(section_id.clone()),
+            start_date: None,
+            end_date: None,
+            metadata: None
+        }).await {
+            Ok(_) => assigned += 1,
+            Err(_) => {}
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("assigned".to_string(), Dynamic::Int(assigned))
+    ])))
+}
+
+// =============================================================================
+// ANALYTICS
+// =============================================================================
+
+/// Get enrollment analytics
+async fn get_enrollment_analytics(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    verify_course_instructor_access(&db, &ctx, &course_id).await?;
+
+    let enrollments = db.enrollments().find_by_course(&course_id).await.unwrap_or_default();
+    let sections = db.sections().find_by_course(&course_id).await.unwrap_or_default();
+
+    let analytics = compute_enrollment_analytics(&course_id, &enrollments, &sections);
+
+    Ok(Response::json(ApiResponse::success(analytics, &ctx)))
+}
+
+/// Get enrollment activity
+async fn get_enrollment_activity(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    verify_course_instructor_access(&db, &ctx, &course_id).await?;
+
+    let days = req.query_param("days").and_then(|d| d.parse::<i32>().ok()).unwrap_or(30);
+    let activity = db.enrollment_activity().find_by_course(&course_id, days).await.unwrap_or_default();
+
+    Ok(Response::json(ApiResponse::success(activity, &ctx)))
+}
+
+// =============================================================================
+// IMPORT/EXPORT
+// =============================================================================
+
+/// Export enrollments
+async fn export_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let enrollments = db.enrollments().find_by_course(&course_id).await.unwrap_or_default();
+
+    let mut csv = String::from("User ID,Email,Name,Role,Section,Status,Enrolled At\n");
+    for e in enrollments {
+        csv.push_str(&format!("{},{},{},{},{},{},{}\n",
+            e.user_id,
+            e.user_email.unwrap_or_default(),
+            e.user_name.unwrap_or_default(),
+            format!("{:?}", e.role),
+            e.section_name.unwrap_or_default(),
+            format!("{:?}", e.status),
+            e.enrolled_at.to_rfc3339()
+        ));
+    }
+
+    Ok(Response::new()
+        .with_header("Content-Type", "text/csv")
+        .with_header("Content-Disposition", &format!("attachment; filename=\"enrollments_{}.csv\"", course_id))
+        .with_body(csv))
+}
+
+/// Import enrollments
+async fn import_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageEnrollments)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct ImportRequest {
+        data: String,
+        notify_users: Option<Bool>
+    }
+
+    let body: ImportRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let enrolled_by = ctx.auth.as_ref().map(|a| a.user_id.clone());
+    let mut imported = 0;
+    let mut errors: List<String> = vec![];
+
+    for line in body.data.lines().skip(1) {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 2 {
+            let email = parts[0].trim();
+            let role = parts.get(1).map(|r| parse_course_role(r.trim())).flatten().unwrap_or(CourseRole::Student);
+
+            if let Some(user) = db.users().find_by_email(email).await.ok().flatten() {
+                match db.enrollments().create(CreateEnrollmentInput {
+                    user_id: user.id.clone(),
+                    course_id: course_id.clone(),
+                    role,
+                    section_id: None,
+                    start_date: None,
+                    end_date: None,
+                    source: EnrollmentSource::Import,
+                    enrolled_by: enrolled_by.clone(),
+                    metadata: None
+                }).await {
+                    Ok(_) => imported += 1,
+                    Err(e) => errors.push(format!("{}: {}", email, e))
+                }
+            } else {
+                errors.push(format!("{}: User not found", email));
+            }
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(Map::from([
+        ("imported".to_string(), Dynamic::Int(imported)),
+        ("errors".to_string(), Dynamic::List(errors.iter().map(|e| Dynamic::String(e.clone())).collect()))
+    ]), &ctx)))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+async fn verify_course_access(db: &Database, ctx: &RequestContext, course_id: &str) -> Result<(), ApiError> {
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    if ctx.is_admin() { return Ok(()) }
+
+    let enrollment = db.enrollments().find_by_user_and_course(&auth.user_id, course_id).await.ok().flatten();
+    if enrollment.is_some() { return Ok(()) }
+
+    Err(ApiError::Forbidden { message: "Access denied".to_string(), required_permission: None })
+}
+
+async fn verify_course_instructor_access(db: &Database, ctx: &RequestContext, course_id: &str) -> Result<(), ApiError> {
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    if ctx.is_admin() { return Ok(()) }
+
+    let enrollment = db.enrollments().find_by_user_and_course(&auth.user_id, course_id).await.ok().flatten();
+    if let Some(e) = enrollment {
+        if e.role.is_instructor() { return Ok(()) }
+    }
+
+    Err(ApiError::Forbidden { message: "Instructor access required".to_string(), required_permission: None })
+}
+
+fn enrollment_to_response(enrollment: &Enrollment) -> EnrollmentResponse {
+    EnrollmentResponse {
+        id: enrollment.id.clone(),
+        user_id: enrollment.user_id.clone(),
+        user_name: enrollment.user_name.clone().unwrap_or_default(),
+        user_email: enrollment.user_email.clone().unwrap_or_default(),
+        user_avatar: enrollment.user_avatar.clone(),
+        course_id: enrollment.course_id.clone(),
+        course_title: enrollment.course_title.clone().unwrap_or_default(),
+        course_code: enrollment.course_code.clone().unwrap_or_default(),
+        role: enrollment.role.clone(),
+        status: enrollment.status.clone(),
+        section_id: enrollment.section_id.clone(),
+        section_name: enrollment.section_name.clone(),
+        start_date: enrollment.start_date,
+        end_date: enrollment.end_date,
+        progress: enrollment.progress.as_ref().map(|p| EnrollmentProgress {
+            completed_items: p.completed_items,
+            total_items: p.total_items,
+            percentage: p.percentage,
+            current_grade: p.current_grade,
+            current_letter: p.current_letter.clone(),
+            time_spent_minutes: p.time_spent_minutes
+        }),
+        last_activity: enrollment.last_activity,
+        enrolled_at: enrollment.enrolled_at,
+        enrolled_by: enrollment.enrolled_by.clone(),
+        source: enrollment.source.clone(),
+        metadata: enrollment.metadata.clone()
+    }
+}
+
+fn enrollment_request_to_response(request: &EnrollmentRequest) -> EnrollmentRequestResponse {
+    EnrollmentRequestResponse {
+        id: request.id.clone(),
+        user_id: request.user_id.clone(),
+        user_name: request.user_name.clone().unwrap_or_default(),
+        user_email: request.user_email.clone().unwrap_or_default(),
+        course_id: request.course_id.clone(),
+        course_title: request.course_title.clone().unwrap_or_default(),
+        message: request.message.clone(),
+        status: request.status.clone(),
+        requested_at: request.requested_at,
+        reviewed_at: request.reviewed_at,
+        reviewed_by: request.reviewed_by.clone(),
+        review_note: request.review_note.clone()
+    }
+}
+
+fn invitation_to_response(invitation: &Invitation) -> InvitationResponse {
+    InvitationResponse {
+        id: invitation.id.clone(),
+        code: invitation.code.clone(),
+        course_id: invitation.course_id.clone(),
+        course_title: invitation.course_title.clone().unwrap_or_default(),
+        email: invitation.email.clone(),
+        role: invitation.role.clone(),
+        status: invitation.status.clone(),
+        expires_at: invitation.expires_at,
+        created_at: invitation.created_at,
+        accepted_at: invitation.accepted_at
+    }
+}
+
+fn section_to_response(section: &Section) -> SectionResponse {
+    SectionResponse {
+        id: section.id.clone(),
+        course_id: section.course_id.clone(),
+        name: section.name.clone(),
+        code: section.code.clone(),
+        description: section.description.clone(),
+        instructor_ids: section.instructor_ids.clone(),
+        enrollment_count: section.enrollment_count,
+        max_enrollment: section.max_enrollment,
+        start_date: section.start_date,
+        end_date: section.end_date,
+        meeting_times: section.meeting_times.clone(),
+        location: section.location.clone(),
+        created_at: section.created_at
+    }
+}
+
+async fn build_enrollment_with_course(enrollment: &Enrollment, course: &Course, db: &Database) -> EnrollmentWithCourse {
+    EnrollmentWithCourse {
+        enrollment: enrollment_to_response(enrollment),
+        course: CourseInfo {
+            id: course.id.clone(),
+            code: course.code.clone(),
+            title: course.title.clone(),
+            short_description: course.short_description.clone(),
+            thumbnail_url: course.thumbnail_url.clone(),
+            instructor_names: vec![],
+            start_date: course.start_date,
+            end_date: course.end_date
+        },
+        next_deadline: None,
+        recent_activity: None
+    }
+}
+
+fn compute_enrollment_analytics(course_id: &str, enrollments: &List<Enrollment>, sections: &List<Section>) -> EnrollmentAnalyticsResponse {
+    let total = enrollments.len() as i32;
+    let active = enrollments.iter().filter(|e| e.status == EnrollmentStatus::Active).count() as i32;
+    let completed = enrollments.iter().filter(|e| e.status == EnrollmentStatus::Completed).count() as i32;
+    let dropped = enrollments.iter().filter(|e| e.status == EnrollmentStatus::Dropped).count() as i32;
+
+    let mut role_counts: Map<CourseRole, i32> = Map::new();
+    for e in enrollments {
+        *role_counts.entry(e.role.clone()).or_insert(0) += 1;
+    }
+
+    let role_distribution = role_counts.iter()
+        .map(|(role, count)| RoleCount { role: role.clone(), count: *count })
+        .collect();
+
+    let mut section_counts: Map<String, i32> = Map::new();
+    for e in enrollments {
+        if let Some(sid) = &e.section_id {
+            *section_counts.entry(sid.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let section_distribution = section_counts.iter()
+        .map(|(sid, count)| {
+            let name = sections.iter().find(|s| s.id == *sid).map(|s| s.name.clone()).unwrap_or_default();
+            SectionCount { section_id: sid.clone(), section_name: name, count: *count }
+        })
+        .collect();
+
+    EnrollmentAnalyticsResponse {
+        course_id: course_id.to_string(),
+        total_enrolled: total,
+        active_enrollments: active,
+        completed_enrollments: completed,
+        dropped_enrollments: dropped,
+        enrollment_trend: vec![],
+        role_distribution,
+        section_distribution,
+        completion_stats: CompletionStats {
+            not_started: 0,
+            in_progress: active,
+            completed,
+            average_completion_percentage: 0.0,
+            average_time_to_complete_days: None
+        }
+    }
+}
+
+fn parse_enrollment_status(s: &str) -> Option<EnrollmentStatus> {
+    match s.to_lowercase().as_str() {
+        "active" => Some(EnrollmentStatus::Active),
+        "completed" => Some(EnrollmentStatus::Completed),
+        "dropped" => Some(EnrollmentStatus::Dropped),
+        "pending" => Some(EnrollmentStatus::Pending),
+        _ => None
+    }
+}
+
+fn parse_course_role(s: &str) -> Option<CourseRole> {
+    match s.to_lowercase().as_str() {
+        "student" => Some(CourseRole::Student),
+        "instructor" => Some(CourseRole::Instructor),
+        "ta" | "teaching_assistant" => Some(CourseRole::TeachingAssistant),
+        "observer" => Some(CourseRole::Observer),
+        "designer" => Some(CourseRole::Designer),
+        _ => None
+    }
+}
+
+fn generate_invitation_code() -> String {
+    use std::random::random;
+    let chars: Vec<char> = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect();
+    (0..8).map(|_| chars[(random::<u8>() as usize) % chars.len()]).collect()
+}
+
+async fn notify_enrollment(enrollment: &Enrollment, course: &Course, user: &User) -> Result<(), String> { Ok(()) }
+async fn notify_bulk_enrollment(course: &Course, count: i32) -> Result<(), String> { Ok(()) }
+async fn notify_enrollment_request(request: &EnrollmentRequest, course: &Course) -> Result<(), String> { Ok(()) }
+async fn notify_request_approved(request: &EnrollmentRequest) -> Result<(), String> { Ok(()) }
+async fn notify_request_denied(request: &EnrollmentRequest) -> Result<(), String> { Ok(()) }
+async fn send_invitation_email(email: &str, course: &Course, code: &str, message: Option<&str>) -> Result<(), String> { Ok(()) }
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use EnrollmentResponse;
+pub use BulkEnrollResponse;
+pub use SectionResponse;

@@ -1,0 +1,427 @@
+// SSO Integration Module for Intelligo LMS
+// Provides Single Sign-On capabilities via SAML 2.0, OpenID Connect, and LDAP/AD
+
+module intelligo::integrations::sso
+
+pub use intelligo::integrations::sso::saml::*
+pub use intelligo::integrations::sso::oidc::*
+pub use intelligo::integrations::sso::ldap::*
+
+use intelligo::core::types::*
+use intelligo::core::auth::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+
+/// Supported SSO provider types
+pub enum SsoProviderType {
+    Saml2,
+    Oidc,
+    Ldap,
+    ActiveDirectory,
+}
+
+/// Unified SSO configuration
+pub type SsoConfig {
+    provider_id: String,
+    provider_type: SsoProviderType,
+    display_name: String,
+    enabled: bool,
+    organization_id: Option<String>,
+
+    // Provider-specific configuration
+    saml_config: Option<SamlConfig>,
+    oidc_config: Option<OidcConfig>,
+    ldap_config: Option<LdapConfig>,
+
+    // Common settings
+    auto_provision_users: bool,
+    default_role: Option<String>,
+    attribute_mappings: HashMap<String, String>,
+    allowed_domains: Vec<String>,
+
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// SSO authentication result
+pub type SsoAuthResult {
+    success: bool,
+    user_id: Option<Uuid>,
+    email: Option<String>,
+    display_name: Option<String>,
+    attributes: HashMap<String, String>,
+    groups: Vec<String>,
+    session_token: Option<String>,
+    provider_id: String,
+    provider_type: SsoProviderType,
+    is_new_user: bool,
+    error: Option<SsoError>,
+}
+
+/// SSO session information
+pub type SsoSession {
+    session_id: Uuid,
+    user_id: Uuid,
+    provider_id: String,
+    provider_type: SsoProviderType,
+    authenticated_at: DateTime,
+    expires_at: DateTime,
+    attributes: HashMap<String, String>,
+    single_logout_url: Option<String>,
+}
+
+/// SSO error types
+pub enum SsoError {
+    ConfigurationError { message: String },
+    AuthenticationFailed { message: String },
+    UserNotFound { identifier: String },
+    UserDisabled { user_id: String },
+    InvalidAssertion { details: String },
+    TokenExpired,
+    InvalidSignature,
+    ProviderUnavailable { provider_id: String },
+    AttributeMappingError { attribute: String },
+    DomainNotAllowed { domain: String },
+    ProvisioningError { message: String },
+    SessionError { message: String },
+    NetworkError { message: String },
+}
+
+impl SsoError {
+    pub fn to_string(self) -> String {
+        match self {
+            SsoError::ConfigurationError { message } =>
+                format!("SSO configuration error: {}", message),
+            SsoError::AuthenticationFailed { message } =>
+                format!("Authentication failed: {}", message),
+            SsoError::UserNotFound { identifier } =>
+                format!("User not found: {}", identifier),
+            SsoError::UserDisabled { user_id } =>
+                format!("User account disabled: {}", user_id),
+            SsoError::InvalidAssertion { details } =>
+                format!("Invalid assertion: {}", details),
+            SsoError::TokenExpired =>
+                "Authentication token has expired".to_string(),
+            SsoError::InvalidSignature =>
+                "Invalid cryptographic signature".to_string(),
+            SsoError::ProviderUnavailable { provider_id } =>
+                format!("SSO provider unavailable: {}", provider_id),
+            SsoError::AttributeMappingError { attribute } =>
+                format!("Failed to map attribute: {}", attribute),
+            SsoError::DomainNotAllowed { domain } =>
+                format!("Email domain not allowed: {}", domain),
+            SsoError::ProvisioningError { message } =>
+                format!("User provisioning failed: {}", message),
+            SsoError::SessionError { message } =>
+                format!("Session error: {}", message),
+            SsoError::NetworkError { message } =>
+                format!("Network error: {}", message),
+        }
+    }
+}
+
+/// SSO Provider trait - common interface for all SSO implementations
+pub trait SsoProvider {
+    /// Get provider configuration
+    fn get_config(self) -> SsoConfig
+
+    /// Initialize authentication flow
+    async fn initiate_auth(self, return_url: String) -> Result<SsoAuthRequest, SsoError>
+
+    /// Process authentication callback/response
+    async fn process_callback(self, request: SsoCallbackRequest) -> Result<SsoAuthResult, SsoError>
+
+    /// Validate an existing session
+    async fn validate_session(self, session_id: Uuid) -> Result<SsoSession, SsoError>
+
+    /// Terminate a session (logout)
+    async fn terminate_session(self, session_id: Uuid) -> Result<(), SsoError>
+
+    /// Get single logout URL if supported
+    fn get_logout_url(self, session_id: Uuid, return_url: String) -> Option<String>
+}
+
+/// SSO authentication request (redirect to IdP)
+pub type SsoAuthRequest {
+    redirect_url: String,
+    state: String,
+    nonce: Option<String>,
+    relay_state: Option<String>,
+}
+
+/// SSO callback request (from IdP)
+pub type SsoCallbackRequest {
+    // SAML specific
+    saml_response: Option<String>,
+    relay_state: Option<String>,
+
+    // OIDC specific
+    code: Option<String>,
+    state: Option<String>,
+    id_token: Option<String>,
+
+    // Common
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// SSO Manager actor - coordinates SSO operations
+pub actor SsoManager {
+    providers: HashMap<String, Box<dyn SsoProvider>>,
+    sessions: HashMap<Uuid, SsoSession>,
+    config_store: Box<dyn SsoConfigStore>,
+    user_service: Box<dyn UserProvisioningService>,
+
+    pub fn new(
+        config_store: Box<dyn SsoConfigStore>,
+        user_service: Box<dyn UserProvisioningService>
+    ) -> Self {
+        SsoManager {
+            providers: HashMap::new(),
+            sessions: HashMap::new(),
+            config_store: config_store,
+            user_service: user_service,
+        }
+    }
+
+    /// Register an SSO provider
+    pub async fn register_provider(mut self, provider: Box<dyn SsoProvider>) -> Result<(), SsoError> {
+        let config = provider.get_config();
+        self.providers.insert(config.provider_id.clone(), provider);
+        Ok(())
+    }
+
+    /// Load all configured providers
+    pub async fn load_providers(mut self) -> Result<(), SsoError> {
+        let configs = self.config_store.list_configs().await?;
+
+        for config in configs {
+            if config.enabled {
+                let provider = self.create_provider(config).await?;
+                self.providers.insert(provider.get_config().provider_id.clone(), provider);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a provider from configuration
+    async fn create_provider(self, config: SsoConfig) -> Result<Box<dyn SsoProvider>, SsoError> {
+        match config.provider_type {
+            SsoProviderType::Saml2 => {
+                let saml_config = config.saml_config.ok_or(
+                    SsoError::ConfigurationError {
+                        message: "SAML configuration required".to_string()
+                    }
+                )?;
+                Ok(Box::new(SamlProvider::new(config.provider_id, saml_config)))
+            },
+            SsoProviderType::Oidc => {
+                let oidc_config = config.oidc_config.ok_or(
+                    SsoError::ConfigurationError {
+                        message: "OIDC configuration required".to_string()
+                    }
+                )?;
+                Ok(Box::new(OidcProvider::new(config.provider_id, oidc_config)))
+            },
+            SsoProviderType::Ldap | SsoProviderType::ActiveDirectory => {
+                let ldap_config = config.ldap_config.ok_or(
+                    SsoError::ConfigurationError {
+                        message: "LDAP configuration required".to_string()
+                    }
+                )?;
+                Ok(Box::new(LdapProvider::new(config.provider_id, ldap_config)))
+            },
+        }
+    }
+
+    /// Initiate SSO authentication for a provider
+    pub async fn initiate_auth(
+        self,
+        provider_id: String,
+        return_url: String
+    ) -> Result<SsoAuthRequest, SsoError> {
+        let provider = self.providers.get(&provider_id).ok_or(
+            SsoError::ProviderUnavailable { provider_id: provider_id.clone() }
+        )?;
+
+        provider.initiate_auth(return_url).await
+    }
+
+    /// Process SSO callback and authenticate user
+    pub async fn process_callback(
+        mut self,
+        provider_id: String,
+        request: SsoCallbackRequest
+    ) -> Result<SsoAuthResult, SsoError> {
+        let provider = self.providers.get(&provider_id).ok_or(
+            SsoError::ProviderUnavailable { provider_id: provider_id.clone() }
+        )?;
+
+        let config = provider.get_config();
+        let mut result = provider.process_callback(request).await?;
+
+        // Validate domain if restrictions are configured
+        if !config.allowed_domains.is_empty() {
+            if let Some(ref email) = result.email {
+                let domain = email.split('@').last().unwrap_or("");
+                if !config.allowed_domains.contains(&domain.to_string()) {
+                    return Err(SsoError::DomainNotAllowed { domain: domain.to_string() });
+                }
+            }
+        }
+
+        // Provision or update user if needed
+        if result.success {
+            let user_result = self.user_service.provision_or_update_user(
+                ProvisionRequest {
+                    email: result.email.clone(),
+                    display_name: result.display_name.clone(),
+                    attributes: result.attributes.clone(),
+                    groups: result.groups.clone(),
+                    provider_id: provider_id.clone(),
+                    auto_provision: config.auto_provision_users,
+                    default_role: config.default_role.clone(),
+                }
+            ).await;
+
+            match user_result {
+                Ok(user) => {
+                    result.user_id = Some(user.user_id);
+                    result.is_new_user = user.is_new;
+
+                    // Create session
+                    let session = SsoSession {
+                        session_id: Uuid::new_v4(),
+                        user_id: user.user_id,
+                        provider_id: provider_id,
+                        provider_type: config.provider_type,
+                        authenticated_at: DateTime::now(),
+                        expires_at: DateTime::now() + Duration::hours(8),
+                        attributes: result.attributes.clone(),
+                        single_logout_url: None,
+                    };
+
+                    self.sessions.insert(session.session_id, session.clone());
+                    result.session_token = Some(session.session_id.to_string());
+                },
+                Err(e) => {
+                    result.success = false;
+                    result.error = Some(SsoError::ProvisioningError {
+                        message: e.to_string()
+                    });
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Validate an SSO session
+    pub async fn validate_session(self, session_id: Uuid) -> Result<SsoSession, SsoError> {
+        let session = self.sessions.get(&session_id).ok_or(
+            SsoError::SessionError { message: "Session not found".to_string() }
+        )?;
+
+        if session.expires_at < DateTime::now() {
+            return Err(SsoError::TokenExpired);
+        }
+
+        Ok(session.clone())
+    }
+
+    /// Logout from SSO session
+    pub async fn logout(
+        mut self,
+        session_id: Uuid,
+        return_url: String
+    ) -> Result<Option<String>, SsoError> {
+        let session = self.sessions.remove(&session_id).ok_or(
+            SsoError::SessionError { message: "Session not found".to_string() }
+        )?;
+
+        // Get provider for single logout if supported
+        if let Some(provider) = self.providers.get(&session.provider_id) {
+            let logout_url = provider.get_logout_url(session_id, return_url);
+
+            // Terminate session at provider
+            let _ = provider.terminate_session(session_id).await;
+
+            return Ok(logout_url);
+        }
+
+        Ok(None)
+    }
+
+    /// List available SSO providers for an organization
+    pub async fn list_providers(
+        self,
+        organization_id: Option<String>
+    ) -> Result<Vec<SsoProviderInfo>, SsoError> {
+        let mut providers = Vec::new();
+
+        for (id, provider) in &self.providers {
+            let config = provider.get_config();
+
+            // Filter by organization if specified
+            if let Some(ref org_id) = organization_id {
+                if config.organization_id.as_ref() != Some(org_id) {
+                    continue;
+                }
+            }
+
+            providers.push(SsoProviderInfo {
+                provider_id: id.clone(),
+                display_name: config.display_name,
+                provider_type: config.provider_type,
+                enabled: config.enabled,
+            });
+        }
+
+        Ok(providers)
+    }
+}
+
+/// Provider info for listing
+pub type SsoProviderInfo {
+    provider_id: String,
+    display_name: String,
+    provider_type: SsoProviderType,
+    enabled: bool,
+}
+
+/// User provisioning request
+pub type ProvisionRequest {
+    email: Option<String>,
+    display_name: Option<String>,
+    attributes: HashMap<String, String>,
+    groups: Vec<String>,
+    provider_id: String,
+    auto_provision: bool,
+    default_role: Option<String>,
+}
+
+/// User provisioning result
+pub type ProvisionResult {
+    user_id: Uuid,
+    is_new: bool,
+}
+
+/// SSO configuration store trait
+pub trait SsoConfigStore {
+    async fn get_config(self, provider_id: String) -> Result<SsoConfig, SsoError>
+    async fn save_config(self, config: SsoConfig) -> Result<(), SsoError>
+    async fn delete_config(self, provider_id: String) -> Result<(), SsoError>
+    async fn list_configs(self) -> Result<Vec<SsoConfig>, SsoError>
+}
+
+/// User provisioning service trait
+pub trait UserProvisioningService {
+    async fn provision_or_update_user(
+        self,
+        request: ProvisionRequest
+    ) -> Result<ProvisionResult, SsoError>
+
+    async fn find_user_by_email(self, email: String) -> Result<Option<Uuid>, SsoError>
+    async fn update_user_groups(self, user_id: Uuid, groups: Vec<String>) -> Result<(), SsoError>
+}

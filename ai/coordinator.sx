@@ -1,0 +1,1532 @@
+// =============================================================================
+// INTELLIGO LMS - AI Coordinator
+// =============================================================================
+// Central orchestration layer for all AI hives following CHAI patterns.
+// Coordinates cross-hive operations, manages shared resources, handles
+// routing, load balancing, cost tracking, and provides unified API access
+// to the AI subsystem.
+// =============================================================================
+
+module intelligo::ai::coordinator
+
+use intelligo::core::types::*
+use intelligo::ai::hives::assessment_hive::{AssessmentHive, GradingTask, GradingResult, AssessmentError}
+use intelligo::ai::hives::learning_path_hive::{LearningPathHive, PathRecommendation, DiagnosticResult, LearningPathError}
+use intelligo::ai::hives::content_hive::{ContentHive, GeneratedQuestion, GeneratedLesson, GeneratedRubric, ContentError}
+use intelligo::ai::hives::tutor_hive::{TutorHive, TutorSession, ChatResponse, StudyGuide, TutorError}
+use intelligo::ai::hives::observation_hive::{ObservationHive, SystemHealth, LearningAnalyticsReport, AtRiskStudent, ObservationError}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set, VecDeque}
+use std::sync::{Arc, RwLock, Mutex}
+
+// =============================================================================
+// Coordinator Types
+// =============================================================================
+
+type RequestId = String
+type TenantId = String
+
+/// Coordinator configuration
+pub struct CoordinatorConfig {
+    /// Maximum concurrent requests per tenant
+    max_requests_per_tenant: i32,
+    /// Global rate limit (requests per second)
+    global_rate_limit: f64,
+    /// Request timeout
+    request_timeout: Duration,
+    /// Cost tracking enabled
+    cost_tracking_enabled: bool,
+    /// Cost budget per tenant (monthly)
+    tenant_cost_budget: Option<f64>,
+    /// Enable request caching
+    caching_enabled: bool,
+    /// Cache TTL
+    cache_ttl: Duration,
+    /// Enable circuit breaker
+    circuit_breaker_enabled: bool,
+    /// Circuit breaker failure threshold
+    circuit_breaker_threshold: i32,
+    /// Enable load balancing across model instances
+    load_balancing_enabled: bool,
+    /// Health check interval
+    health_check_interval: Duration,
+    /// Enable request prioritization
+    prioritization_enabled: bool,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        CoordinatorConfig {
+            max_requests_per_tenant: 100,
+            global_rate_limit: 1000.0,
+            request_timeout: Duration::seconds(120),
+            cost_tracking_enabled: true,
+            tenant_cost_budget: None,
+            caching_enabled: true,
+            cache_ttl: Duration::hours(1),
+            circuit_breaker_enabled: true,
+            circuit_breaker_threshold: 5,
+            load_balancing_enabled: true,
+            health_check_interval: Duration::seconds(30),
+            prioritization_enabled: true,
+        }
+    }
+}
+
+/// AI request with routing information
+pub struct AiRequest {
+    id: RequestId,
+    tenant_id: TenantId,
+    request_type: AiRequestType,
+    priority: RequestPriority,
+    context: RequestContext,
+    created_at: DateTime,
+    timeout: Duration,
+}
+
+/// AI request type for routing
+pub enum AiRequestType {
+    // Assessment Hive
+    GradeSubmission(GradeSubmissionRequest),
+    CheckPlagiarism(PlagiarismCheckRequest),
+    CalibrateGrading(CalibrationRequest),
+
+    // Learning Path Hive
+    GetLearningPath(LearningPathRequest),
+    GetRecommendations(RecommendationRequest),
+    RunDiagnostic(DiagnosticRequest),
+    UpdateMastery(MasteryUpdateRequest),
+
+    // Content Hive
+    GenerateQuestions(QuestionGenerationRequest),
+    CreateLesson(LessonCreationRequest),
+    BuildRubric(RubricBuildRequest),
+    SummarizeContent(SummarizationRequest),
+    TranscribeMedia(TranscriptionRequest),
+
+    // Tutor Hive
+    StartTutorSession(TutorSessionRequest),
+    Chat(ChatRequest),
+    ExplainConcept(ConceptExplanationRequest),
+    GeneratePractice(PracticeGenerationRequest),
+    CreateStudyGuide(StudyGuideRequest),
+
+    // Observation Hive
+    GetSystemHealth,
+    GenerateAnalyticsReport(AnalyticsReportRequest),
+    EvaluateStudentRisk(RiskEvaluationRequest),
+    PredictCompletion(CompletionPredictionRequest),
+}
+
+/// Request priority
+pub enum RequestPriority {
+    /// Critical operations (real-time tutoring)
+    Critical,
+    /// High priority (grading during exam)
+    High,
+    /// Normal priority (standard operations)
+    Normal,
+    /// Low priority (background tasks)
+    Low,
+    /// Batch operations
+    Batch,
+}
+
+/// Request context
+pub struct RequestContext {
+    user_id: Option<UserId>,
+    course_id: Option<CourseId>,
+    session_id: Option<String>,
+    metadata: Map<String, Dynamic>,
+}
+
+/// AI response wrapper
+pub struct AiResponse {
+    request_id: RequestId,
+    result: AiResult,
+    metrics: ResponseMetrics,
+    completed_at: DateTime,
+}
+
+/// AI result enum
+pub enum AiResult {
+    // Assessment results
+    GradingResult(GradingResult),
+    PlagiarismResult(PlagiarismResult),
+    CalibrationResult(CalibrationAdjustments),
+
+    // Learning path results
+    LearningPath(PathRecommendation),
+    Recommendations(List<ContentRecommendation>),
+    Diagnostic(DiagnosticResult),
+    MasteryUpdated,
+
+    // Content results
+    Questions(List<GeneratedQuestion>),
+    Lesson(GeneratedLesson),
+    Rubric(GeneratedRubric),
+    Summary(GeneratedSummary),
+    Transcript(GeneratedTranscript),
+
+    // Tutor results
+    TutorSession(TutorSession),
+    ChatResponse(ChatResponse),
+    ConceptExplanation(ConceptExplanation),
+    PracticeProblem(PracticeProblem),
+    StudyGuide(StudyGuide),
+
+    // Observation results
+    SystemHealth(SystemHealth),
+    AnalyticsReport(LearningAnalyticsReport),
+    RiskAssessment(AtRiskStudent),
+    CompletionPrediction(CompletionPrediction),
+
+    // Error
+    Error(CoordinatorError),
+}
+
+/// Response metrics
+pub struct ResponseMetrics {
+    processing_time_ms: i64,
+    tokens_used: i64,
+    cost: f64,
+    hive_used: String,
+    cache_hit: bool,
+}
+
+// =============================================================================
+// Request Types (simplified wrappers)
+// =============================================================================
+
+pub struct GradeSubmissionRequest {
+    submission_id: SubmissionId,
+    assessment_id: AssessmentId,
+    generate_feedback: bool,
+    check_plagiarism: bool,
+}
+
+pub struct PlagiarismCheckRequest {
+    submission_id: SubmissionId,
+    comparison_pool: List<SubmissionId>,
+}
+
+pub struct CalibrationRequest {
+    assessment_id: AssessmentId,
+    samples: List<CalibrationSample>,
+}
+
+pub struct LearningPathRequest {
+    student_id: StudentId,
+    graph_id: String,
+    goal: LearningGoal,
+}
+
+pub struct RecommendationRequest {
+    student_id: StudentId,
+    graph_id: String,
+    count: i32,
+}
+
+pub struct DiagnosticRequest {
+    student_id: StudentId,
+    graph_id: String,
+}
+
+pub struct MasteryUpdateRequest {
+    student_id: StudentId,
+    node_id: String,
+    source: MasterySource,
+}
+
+pub struct QuestionGenerationRequest {
+    source_content: String,
+    count: i32,
+    question_types: List<QuestionType>,
+    bloom_levels: List<BloomLevel>,
+    language: String,
+}
+
+pub struct LessonCreationRequest {
+    topic: String,
+    audience_level: SkillLevel,
+    target_duration: i32,
+    learning_objectives: List<LearningObjective>,
+    language: String,
+}
+
+pub struct RubricBuildRequest {
+    assessment_description: String,
+    learning_objectives: List<LearningObjective>,
+    criteria_count: i32,
+    total_points: f32,
+}
+
+pub struct SummarizationRequest {
+    content: String,
+    summary_type: SummaryType,
+    target_length: LengthTarget,
+    language: String,
+}
+
+pub struct TranscriptionRequest {
+    media_url: String,
+    language: Option<String>,
+    include_timestamps: bool,
+}
+
+pub struct TutorSessionRequest {
+    student_id: StudentId,
+    course_id: CourseId,
+    config: Option<SessionConfig>,
+}
+
+pub struct ChatRequest {
+    session_id: String,
+    message: String,
+}
+
+pub struct ConceptExplanationRequest {
+    session_id: String,
+    concept: String,
+}
+
+pub struct PracticeGenerationRequest {
+    session_id: String,
+    topic: String,
+    difficulty: SkillLevel,
+}
+
+pub struct StudyGuideRequest {
+    session_id: String,
+    topic: StudyGuideScope,
+    include_practice: bool,
+}
+
+pub struct AnalyticsReportRequest {
+    scope: AnalyticsScope,
+    period: AnalyticsPeriod,
+}
+
+pub struct RiskEvaluationRequest {
+    student_id: StudentId,
+    course_id: CourseId,
+}
+
+pub struct CompletionPredictionRequest {
+    student_id: StudentId,
+    course_id: CourseId,
+}
+
+// =============================================================================
+// Cost Tracking
+// =============================================================================
+
+/// Cost tracker for AI usage
+pub struct CostTracker {
+    /// Per-tenant costs
+    tenant_costs: Map<TenantId, TenantCostRecord>,
+    /// Per-hive costs
+    hive_costs: Map<String, f64>,
+    /// Daily cost history
+    daily_history: VecDeque<DailyCost>,
+    /// Total cost
+    total_cost: f64,
+}
+
+impl CostTracker {
+    pub fn new() -> Self {
+        CostTracker {
+            tenant_costs: Map::new(),
+            hive_costs: Map::new(),
+            daily_history: VecDeque::with_capacity(90),
+            total_cost: 0.0,
+        }
+    }
+
+    pub fn record_cost(&mut self, tenant_id: &TenantId, hive: &str, cost: f64, tokens: i64) {
+        // Update tenant costs
+        let record = self.tenant_costs.entry(tenant_id.clone())
+            .or_insert_with(|| TenantCostRecord::new());
+        record.add_cost(cost, tokens);
+
+        // Update hive costs
+        *self.hive_costs.entry(hive.to_string()).or_insert(0.0) += cost;
+
+        // Update total
+        self.total_cost += cost;
+
+        // Update daily history
+        let today = DateTime::now().date();
+        if let Some(last) = self.daily_history.back_mut() {
+            if last.date == today {
+                last.cost += cost;
+                last.tokens += tokens;
+                return;
+            }
+        }
+
+        if self.daily_history.len() >= 90 {
+            self.daily_history.pop_front();
+        }
+        self.daily_history.push_back(DailyCost {
+            date: today,
+            cost,
+            tokens,
+        });
+    }
+
+    pub fn get_tenant_cost(&self, tenant_id: &TenantId) -> Option<&TenantCostRecord> {
+        self.tenant_costs.get(tenant_id)
+    }
+
+    pub fn get_monthly_cost(&self, tenant_id: &TenantId) -> f64 {
+        self.tenant_costs.get(tenant_id)
+            .map(|r| r.monthly_cost)
+            .unwrap_or(0.0)
+    }
+
+    pub fn is_over_budget(&self, tenant_id: &TenantId, budget: f64) -> bool {
+        self.get_monthly_cost(tenant_id) >= budget
+    }
+}
+
+/// Tenant cost record
+pub struct TenantCostRecord {
+    total_cost: f64,
+    monthly_cost: f64,
+    monthly_tokens: i64,
+    requests_this_month: i64,
+    month_start: DateTime,
+}
+
+impl TenantCostRecord {
+    pub fn new() -> Self {
+        TenantCostRecord {
+            total_cost: 0.0,
+            monthly_cost: 0.0,
+            monthly_tokens: 0,
+            requests_this_month: 0,
+            month_start: DateTime::now().start_of_month(),
+        }
+    }
+
+    pub fn add_cost(&mut self, cost: f64, tokens: i64) {
+        // Reset monthly if new month
+        let current_month = DateTime::now().start_of_month();
+        if current_month > self.month_start {
+            self.monthly_cost = 0.0;
+            self.monthly_tokens = 0;
+            self.requests_this_month = 0;
+            self.month_start = current_month;
+        }
+
+        self.total_cost += cost;
+        self.monthly_cost += cost;
+        self.monthly_tokens += tokens;
+        self.requests_this_month += 1;
+    }
+}
+
+/// Daily cost record
+pub struct DailyCost {
+    date: DateTime,
+    cost: f64,
+    tokens: i64,
+}
+
+// =============================================================================
+// Circuit Breaker
+// =============================================================================
+
+/// Circuit breaker for fault tolerance
+pub struct CircuitBreaker {
+    state: CircuitState,
+    failure_count: i32,
+    threshold: i32,
+    last_failure: Option<DateTime>,
+    reset_timeout: Duration,
+}
+
+/// Circuit state
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitBreaker {
+    pub fn new(threshold: i32) -> Self {
+        CircuitBreaker {
+            state: CircuitState::Closed,
+            failure_count: 0,
+            threshold,
+            last_failure: None,
+            reset_timeout: Duration::seconds(30),
+        }
+    }
+
+    pub fn is_available(&mut self) -> bool {
+        match self.state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                if let Some(last) = &self.last_failure {
+                    if DateTime::now() - *last > self.reset_timeout {
+                        self.state = CircuitState::HalfOpen;
+                        return true;
+                    }
+                }
+                false
+            },
+            CircuitState::HalfOpen => true,
+        }
+    }
+
+    pub fn record_success(&mut self) {
+        self.failure_count = 0;
+        self.state = CircuitState::Closed;
+    }
+
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_failure = Some(DateTime::now());
+
+        if self.failure_count >= self.threshold {
+            self.state = CircuitState::Open;
+        }
+    }
+}
+
+// =============================================================================
+// Rate Limiter
+// =============================================================================
+
+/// Token bucket rate limiter
+pub struct RateLimiter {
+    tokens: f64,
+    capacity: f64,
+    refill_rate: f64,
+    last_refill: DateTime,
+}
+
+impl RateLimiter {
+    pub fn new(rate_per_second: f64) -> Self {
+        RateLimiter {
+            tokens: rate_per_second,
+            capacity: rate_per_second * 10.0, // Allow burst of 10 seconds
+            refill_rate: rate_per_second,
+            last_refill: DateTime::now(),
+        }
+    }
+
+    pub fn try_acquire(&mut self) -> bool {
+        self.refill();
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = DateTime::now();
+        let elapsed = (now - self.last_refill).as_seconds() as f64;
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+        self.last_refill = now;
+    }
+}
+
+// =============================================================================
+// Request Queue
+// =============================================================================
+
+/// Priority request queue
+pub struct RequestQueue {
+    critical: VecDeque<AiRequest>,
+    high: VecDeque<AiRequest>,
+    normal: VecDeque<AiRequest>,
+    low: VecDeque<AiRequest>,
+    batch: VecDeque<AiRequest>,
+}
+
+impl RequestQueue {
+    pub fn new() -> Self {
+        RequestQueue {
+            critical: VecDeque::new(),
+            high: VecDeque::new(),
+            normal: VecDeque::new(),
+            low: VecDeque::new(),
+            batch: VecDeque::new(),
+        }
+    }
+
+    pub fn enqueue(&mut self, request: AiRequest) {
+        match request.priority {
+            RequestPriority::Critical => self.critical.push_back(request),
+            RequestPriority::High => self.high.push_back(request),
+            RequestPriority::Normal => self.normal.push_back(request),
+            RequestPriority::Low => self.low.push_back(request),
+            RequestPriority::Batch => self.batch.push_back(request),
+        }
+    }
+
+    pub fn dequeue(&mut self) -> Option<AiRequest> {
+        self.critical.pop_front()
+            .or_else(|| self.high.pop_front())
+            .or_else(|| self.normal.pop_front())
+            .or_else(|| self.low.pop_front())
+            .or_else(|| self.batch.pop_front())
+    }
+
+    pub fn len(&self) -> usize {
+        self.critical.len() + self.high.len() + self.normal.len() + self.low.len() + self.batch.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// =============================================================================
+// Hive Registry
+// =============================================================================
+
+/// Registry of all AI hives
+pub struct HiveRegistry {
+    assessment: Option<Arc<AssessmentHive>>,
+    learning_path: Option<Arc<LearningPathHive>>,
+    content: Option<Arc<ContentHive>>,
+    tutor: Option<Arc<TutorHive>>,
+    observation: Option<Arc<ObservationHive>>,
+}
+
+impl HiveRegistry {
+    pub fn new() -> Self {
+        HiveRegistry {
+            assessment: None,
+            learning_path: None,
+            content: None,
+            tutor: None,
+            observation: None,
+        }
+    }
+
+    pub fn register_assessment(&mut self, hive: Arc<AssessmentHive>) {
+        self.assessment = Some(hive);
+    }
+
+    pub fn register_learning_path(&mut self, hive: Arc<LearningPathHive>) {
+        self.learning_path = Some(hive);
+    }
+
+    pub fn register_content(&mut self, hive: Arc<ContentHive>) {
+        self.content = Some(hive);
+    }
+
+    pub fn register_tutor(&mut self, hive: Arc<TutorHive>) {
+        self.tutor = Some(hive);
+    }
+
+    pub fn register_observation(&mut self, hive: Arc<ObservationHive>) {
+        self.observation = Some(hive);
+    }
+
+    pub fn get_assessment(&self) -> Option<&Arc<AssessmentHive>> {
+        self.assessment.as_ref()
+    }
+
+    pub fn get_learning_path(&self) -> Option<&Arc<LearningPathHive>> {
+        self.learning_path.as_ref()
+    }
+
+    pub fn get_content(&self) -> Option<&Arc<ContentHive>> {
+        self.content.as_ref()
+    }
+
+    pub fn get_tutor(&self) -> Option<&Arc<TutorHive>> {
+        self.tutor.as_ref()
+    }
+
+    pub fn get_observation(&self) -> Option<&Arc<ObservationHive>> {
+        self.observation.as_ref()
+    }
+}
+
+// =============================================================================
+// AI Coordinator Actor
+// =============================================================================
+
+/// Central AI Coordinator
+pub actor AiCoordinator {
+    var config: CoordinatorConfig = CoordinatorConfig::default()
+    var hives: HiveRegistry = HiveRegistry::new()
+
+    var cost_tracker: CostTracker = CostTracker::new()
+    var circuit_breakers: Map<String, CircuitBreaker> = Map::new()
+    var rate_limiters: Map<TenantId, RateLimiter> = Map::new()
+    var global_rate_limiter: RateLimiter
+
+    var request_queue: RequestQueue = RequestQueue::new()
+    var pending_requests: Map<RequestId, AiRequest> = Map::new()
+    var request_cache: Map<String, (AiResult, DateTime)> = Map::new()
+
+    var metrics: CoordinatorMetrics = CoordinatorMetrics::default()
+    var is_running: bool = false
+
+    pub fn new() -> Self {
+        let config = CoordinatorConfig::default();
+
+        AiCoordinator {
+            config: config.clone(),
+            global_rate_limiter: RateLimiter::new(config.global_rate_limit),
+            ..Default::default()
+        }
+    }
+
+    /// Initialize all hives
+    pub receive Initialize() -> Result<(), CoordinatorError> {
+        println!("[AiCoordinator] Initializing all hives...");
+
+        // Create and register all hives
+        let assessment_hive = Arc::new(AssessmentHive::new());
+        let learning_path_hive = Arc::new(LearningPathHive::new());
+        let content_hive = Arc::new(ContentHive::new());
+        let tutor_hive = Arc::new(TutorHive::new());
+        let observation_hive = Arc::new(ObservationHive::new());
+
+        self.hives.register_assessment(assessment_hive);
+        self.hives.register_learning_path(learning_path_hive);
+        self.hives.register_content(content_hive);
+        self.hives.register_tutor(tutor_hive);
+        self.hives.register_observation(observation_hive);
+
+        // Initialize circuit breakers
+        self.circuit_breakers.insert("assessment".to_string(), CircuitBreaker::new(self.config.circuit_breaker_threshold));
+        self.circuit_breakers.insert("learning_path".to_string(), CircuitBreaker::new(self.config.circuit_breaker_threshold));
+        self.circuit_breakers.insert("content".to_string(), CircuitBreaker::new(self.config.circuit_breaker_threshold));
+        self.circuit_breakers.insert("tutor".to_string(), CircuitBreaker::new(self.config.circuit_breaker_threshold));
+        self.circuit_breakers.insert("observation".to_string(), CircuitBreaker::new(self.config.circuit_breaker_threshold));
+
+        println!("[AiCoordinator] All hives registered");
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Start all hives
+    pub receive Start() -> Result<(), CoordinatorError> {
+        if self.is_running {
+            return Err(CoordinatorError::AlreadyRunning);
+        }
+
+        println!("[AiCoordinator] Starting all hives...");
+
+        // Start each hive
+        if let Some(hive) = self.hives.get_assessment() {
+            send hive <- Start().await?;
+        }
+        if let Some(hive) = self.hives.get_learning_path() {
+            send hive <- Start().await?;
+        }
+        if let Some(hive) = self.hives.get_content() {
+            send hive <- Start().await?;
+        }
+        if let Some(hive) = self.hives.get_tutor() {
+            send hive <- Start().await?;
+        }
+        if let Some(hive) = self.hives.get_observation() {
+            send hive <- Start().await?;
+        }
+
+        self.is_running = true;
+
+        // Start background tasks
+        spawn self.process_request_queue();
+        spawn self.health_check_loop();
+        spawn self.cache_cleanup_loop();
+
+        println!("[AiCoordinator] All hives started");
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Stop all hives
+    pub receive Stop() {
+        println!("[AiCoordinator] Stopping all hives...");
+
+        self.is_running = false;
+
+        if let Some(hive) = self.hives.get_assessment() {
+            send hive <- Stop();
+        }
+        if let Some(hive) = self.hives.get_learning_path() {
+            send hive <- Stop();
+        }
+        if let Some(hive) = self.hives.get_content() {
+            send hive <- Stop();
+        }
+        if let Some(hive) = self.hives.get_tutor() {
+            send hive <- Stop();
+        }
+        if let Some(hive) = self.hives.get_observation() {
+            send hive <- Stop();
+        }
+
+        println!("[AiCoordinator] All hives stopped");
+        checkpoint();
+    }
+
+    /// Submit an AI request
+    pub receive Submit(request: AiRequest) -> Result<AiResponse, CoordinatorError> {
+        let start_time = DateTime::now();
+        let request_id = request.id.clone();
+
+        // Check rate limits
+        if !self.check_rate_limit(&request.tenant_id) {
+            return Err(CoordinatorError::RateLimitExceeded { tenant_id: request.tenant_id.clone() });
+        }
+
+        // Check budget
+        if let Some(budget) = self.config.tenant_cost_budget {
+            if self.cost_tracker.is_over_budget(&request.tenant_id, budget) {
+                return Err(CoordinatorError::BudgetExceeded { tenant_id: request.tenant_id.clone() });
+            }
+        }
+
+        // Check cache
+        let cache_key = self.compute_cache_key(&request);
+        if self.config.caching_enabled {
+            if let Some((result, cached_at)) = self.request_cache.get(&cache_key) {
+                if DateTime::now() - *cached_at < self.config.cache_ttl {
+                    self.metrics.cache_hits += 1;
+                    return Ok(AiResponse {
+                        request_id,
+                        result: result.clone(),
+                        metrics: ResponseMetrics {
+                            processing_time_ms: 0,
+                            tokens_used: 0,
+                            cost: 0.0,
+                            hive_used: "cache".to_string(),
+                            cache_hit: true,
+                        },
+                        completed_at: DateTime::now(),
+                    });
+                }
+            }
+        }
+
+        // Route to appropriate hive
+        let result = self.route_request(&request).await?;
+
+        // Calculate metrics
+        let processing_time = (DateTime::now() - start_time).as_millis() as i64;
+
+        // Track cost
+        let (tokens, cost, hive_name) = self.extract_cost_info(&result);
+        self.cost_tracker.record_cost(&request.tenant_id, &hive_name, cost, tokens);
+
+        // Cache result
+        if self.config.caching_enabled && self.is_cacheable(&request) {
+            self.request_cache.insert(cache_key, (result.clone(), DateTime::now()));
+        }
+
+        // Update metrics
+        self.metrics.requests_processed += 1;
+        self.metrics.total_processing_time_ms += processing_time;
+
+        checkpoint();
+        Ok(AiResponse {
+            request_id,
+            result,
+            metrics: ResponseMetrics {
+                processing_time_ms: processing_time,
+                tokens_used: tokens,
+                cost,
+                hive_used: hive_name,
+                cache_hit: false,
+            },
+            completed_at: DateTime::now(),
+        })
+    }
+
+    /// Queue a request for async processing
+    pub receive QueueRequest(request: AiRequest) -> RequestId {
+        let request_id = request.id.clone();
+        self.pending_requests.insert(request_id.clone(), request.clone());
+        self.request_queue.enqueue(request);
+        self.metrics.requests_queued += 1;
+        checkpoint();
+        request_id
+    }
+
+    /// Get request status
+    pub receive GetRequestStatus(request_id: RequestId) -> Option<RequestStatus> {
+        if self.pending_requests.contains_key(&request_id) {
+            Some(RequestStatus::Pending)
+        } else {
+            None
+        }
+    }
+
+    /// Get coordinator health
+    pub receive GetHealth() -> CoordinatorHealth {
+        let mut hive_health = Map::new();
+
+        for (name, cb) in &self.circuit_breakers {
+            hive_health.insert(name.clone(), HiveHealth {
+                available: cb.is_available(),
+                circuit_state: match cb.state {
+                    CircuitState::Closed => "closed".to_string(),
+                    CircuitState::Open => "open".to_string(),
+                    CircuitState::HalfOpen => "half_open".to_string(),
+                },
+                failure_count: cb.failure_count,
+            });
+        }
+
+        CoordinatorHealth {
+            is_running: self.is_running,
+            queue_depth: self.request_queue.len(),
+            hive_health,
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    /// Get cost report
+    pub receive GetCostReport(tenant_id: Option<TenantId>) -> CostReport {
+        match tenant_id {
+            Some(tid) => {
+                let record = self.cost_tracker.get_tenant_cost(&tid);
+                CostReport {
+                    total_cost: record.map(|r| r.total_cost).unwrap_or(0.0),
+                    monthly_cost: record.map(|r| r.monthly_cost).unwrap_or(0.0),
+                    monthly_tokens: record.map(|r| r.monthly_tokens).unwrap_or(0),
+                    by_hive: self.cost_tracker.hive_costs.clone(),
+                }
+            },
+            None => {
+                CostReport {
+                    total_cost: self.cost_tracker.total_cost,
+                    monthly_cost: 0.0, // Would sum all tenants
+                    monthly_tokens: 0,
+                    by_hive: self.cost_tracker.hive_costs.clone(),
+                }
+            }
+        }
+    }
+
+    /// Get all metrics
+    pub receive GetMetrics() -> CoordinatorMetrics {
+        self.metrics.clone()
+    }
+
+    // =========================================================================
+    // Convenience Methods for Direct Hive Access
+    // =========================================================================
+
+    /// Grade a submission
+    pub receive GradeSubmission(tenant_id: TenantId, request: GradeSubmissionRequest) -> Result<GradingResult, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::GradeSubmission(request),
+            priority: RequestPriority::High,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: self.config.request_timeout,
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::GradingResult(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    /// Get learning path
+    pub receive GetLearningPath(tenant_id: TenantId, request: LearningPathRequest) -> Result<PathRecommendation, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::GetLearningPath(request),
+            priority: RequestPriority::Normal,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: self.config.request_timeout,
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::LearningPath(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    /// Generate quiz questions
+    pub receive GenerateQuestions(tenant_id: TenantId, request: QuestionGenerationRequest) -> Result<List<GeneratedQuestion>, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::GenerateQuestions(request),
+            priority: RequestPriority::Normal,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: self.config.request_timeout,
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::Questions(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    /// Start tutor session
+    pub receive StartTutorSession(tenant_id: TenantId, request: TutorSessionRequest) -> Result<TutorSession, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::StartTutorSession(request),
+            priority: RequestPriority::High,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: self.config.request_timeout,
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::TutorSession(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    /// Chat with tutor
+    pub receive ChatWithTutor(tenant_id: TenantId, request: ChatRequest) -> Result<ChatResponse, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::Chat(request),
+            priority: RequestPriority::Critical,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: Duration::seconds(30),
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::ChatResponse(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    /// Get system health
+    pub receive GetSystemHealth(tenant_id: TenantId) -> Result<SystemHealth, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::GetSystemHealth,
+            priority: RequestPriority::Low,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: self.config.request_timeout,
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::SystemHealth(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    /// Evaluate student risk
+    pub receive EvaluateRisk(tenant_id: TenantId, request: RiskEvaluationRequest) -> Result<AtRiskStudent, CoordinatorError> {
+        let ai_request = AiRequest {
+            id: RequestId(generate_uuid()),
+            tenant_id,
+            request_type: AiRequestType::EvaluateStudentRisk(request),
+            priority: RequestPriority::Normal,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: self.config.request_timeout,
+        };
+
+        let response = send self <- Submit(ai_request)?;
+        match response.result {
+            AiResult::RiskAssessment(r) => Ok(r),
+            AiResult::Error(e) => Err(e),
+            _ => Err(CoordinatorError::UnexpectedResult),
+        }
+    }
+
+    // =========================================================================
+    // Internal Methods
+    // =========================================================================
+
+    fn check_rate_limit(&mut self, tenant_id: &TenantId) -> bool {
+        // Check global rate limit
+        if !self.global_rate_limiter.try_acquire() {
+            return false;
+        }
+
+        // Check per-tenant rate limit
+        let limiter = self.rate_limiters.entry(tenant_id.clone())
+            .or_insert_with(|| RateLimiter::new(100.0)); // 100 req/sec per tenant
+
+        limiter.try_acquire()
+    }
+
+    async fn route_request(&mut self, request: &AiRequest) -> Result<AiResult, CoordinatorError> {
+        match &request.request_type {
+            // Assessment Hive routing
+            AiRequestType::GradeSubmission(req) => {
+                self.route_to_assessment_hive(request, |hive| async {
+                    // Would call actual hive method
+                    Ok(AiResult::GradingResult(GradingResult::default()))
+                }).await
+            },
+            AiRequestType::CheckPlagiarism(req) => {
+                self.route_to_assessment_hive(request, |hive| async {
+                    Ok(AiResult::PlagiarismResult(PlagiarismResult::default()))
+                }).await
+            },
+
+            // Learning Path Hive routing
+            AiRequestType::GetLearningPath(req) => {
+                self.route_to_learning_path_hive(request, |hive| async {
+                    Ok(AiResult::LearningPath(PathRecommendation::default()))
+                }).await
+            },
+            AiRequestType::GetRecommendations(req) => {
+                self.route_to_learning_path_hive(request, |hive| async {
+                    Ok(AiResult::Recommendations(vec![]))
+                }).await
+            },
+
+            // Content Hive routing
+            AiRequestType::GenerateQuestions(req) => {
+                self.route_to_content_hive(request, |hive| async {
+                    Ok(AiResult::Questions(vec![]))
+                }).await
+            },
+            AiRequestType::CreateLesson(req) => {
+                self.route_to_content_hive(request, |hive| async {
+                    Ok(AiResult::Lesson(GeneratedLesson::default()))
+                }).await
+            },
+
+            // Tutor Hive routing
+            AiRequestType::StartTutorSession(req) => {
+                self.route_to_tutor_hive(request, |hive| async {
+                    Ok(AiResult::TutorSession(TutorSession::default()))
+                }).await
+            },
+            AiRequestType::Chat(req) => {
+                self.route_to_tutor_hive(request, |hive| async {
+                    Ok(AiResult::ChatResponse(ChatResponse::default()))
+                }).await
+            },
+
+            // Observation Hive routing
+            AiRequestType::GetSystemHealth => {
+                self.route_to_observation_hive(request, |hive| async {
+                    Ok(AiResult::SystemHealth(SystemHealth::default()))
+                }).await
+            },
+            AiRequestType::EvaluateStudentRisk(req) => {
+                self.route_to_observation_hive(request, |hive| async {
+                    Ok(AiResult::RiskAssessment(AtRiskStudent::default()))
+                }).await
+            },
+
+            _ => Err(CoordinatorError::UnsupportedRequestType),
+        }
+    }
+
+    async fn route_to_assessment_hive<F, Fut>(&mut self, request: &AiRequest, handler: F) -> Result<AiResult, CoordinatorError>
+    where
+        F: FnOnce(&Arc<AssessmentHive>) -> Fut,
+        Fut: std::future::Future<Output = Result<AiResult, CoordinatorError>>,
+    {
+        let hive = self.hives.get_assessment()
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "assessment".to_string() })?;
+
+        let cb = self.circuit_breakers.get_mut("assessment")
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "assessment".to_string() })?;
+
+        if !cb.is_available() {
+            return Err(CoordinatorError::CircuitOpen { hive: "assessment".to_string() });
+        }
+
+        match handler(hive).await {
+            Ok(result) => {
+                cb.record_success();
+                Ok(result)
+            },
+            Err(e) => {
+                cb.record_failure();
+                self.metrics.errors += 1;
+                Err(e)
+            }
+        }
+    }
+
+    async fn route_to_learning_path_hive<F, Fut>(&mut self, request: &AiRequest, handler: F) -> Result<AiResult, CoordinatorError>
+    where
+        F: FnOnce(&Arc<LearningPathHive>) -> Fut,
+        Fut: std::future::Future<Output = Result<AiResult, CoordinatorError>>,
+    {
+        let hive = self.hives.get_learning_path()
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "learning_path".to_string() })?;
+
+        let cb = self.circuit_breakers.get_mut("learning_path")
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "learning_path".to_string() })?;
+
+        if !cb.is_available() {
+            return Err(CoordinatorError::CircuitOpen { hive: "learning_path".to_string() });
+        }
+
+        match handler(hive).await {
+            Ok(result) => {
+                cb.record_success();
+                Ok(result)
+            },
+            Err(e) => {
+                cb.record_failure();
+                self.metrics.errors += 1;
+                Err(e)
+            }
+        }
+    }
+
+    async fn route_to_content_hive<F, Fut>(&mut self, request: &AiRequest, handler: F) -> Result<AiResult, CoordinatorError>
+    where
+        F: FnOnce(&Arc<ContentHive>) -> Fut,
+        Fut: std::future::Future<Output = Result<AiResult, CoordinatorError>>,
+    {
+        let hive = self.hives.get_content()
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "content".to_string() })?;
+
+        let cb = self.circuit_breakers.get_mut("content")
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "content".to_string() })?;
+
+        if !cb.is_available() {
+            return Err(CoordinatorError::CircuitOpen { hive: "content".to_string() });
+        }
+
+        match handler(hive).await {
+            Ok(result) => {
+                cb.record_success();
+                Ok(result)
+            },
+            Err(e) => {
+                cb.record_failure();
+                self.metrics.errors += 1;
+                Err(e)
+            }
+        }
+    }
+
+    async fn route_to_tutor_hive<F, Fut>(&mut self, request: &AiRequest, handler: F) -> Result<AiResult, CoordinatorError>
+    where
+        F: FnOnce(&Arc<TutorHive>) -> Fut,
+        Fut: std::future::Future<Output = Result<AiResult, CoordinatorError>>,
+    {
+        let hive = self.hives.get_tutor()
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "tutor".to_string() })?;
+
+        let cb = self.circuit_breakers.get_mut("tutor")
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "tutor".to_string() })?;
+
+        if !cb.is_available() {
+            return Err(CoordinatorError::CircuitOpen { hive: "tutor".to_string() });
+        }
+
+        match handler(hive).await {
+            Ok(result) => {
+                cb.record_success();
+                Ok(result)
+            },
+            Err(e) => {
+                cb.record_failure();
+                self.metrics.errors += 1;
+                Err(e)
+            }
+        }
+    }
+
+    async fn route_to_observation_hive<F, Fut>(&mut self, request: &AiRequest, handler: F) -> Result<AiResult, CoordinatorError>
+    where
+        F: FnOnce(&Arc<ObservationHive>) -> Fut,
+        Fut: std::future::Future<Output = Result<AiResult, CoordinatorError>>,
+    {
+        let hive = self.hives.get_observation()
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "observation".to_string() })?;
+
+        let cb = self.circuit_breakers.get_mut("observation")
+            .ok_or(CoordinatorError::HiveNotAvailable { hive: "observation".to_string() })?;
+
+        if !cb.is_available() {
+            return Err(CoordinatorError::CircuitOpen { hive: "observation".to_string() });
+        }
+
+        match handler(hive).await {
+            Ok(result) => {
+                cb.record_success();
+                Ok(result)
+            },
+            Err(e) => {
+                cb.record_failure();
+                self.metrics.errors += 1;
+                Err(e)
+            }
+        }
+    }
+
+    fn compute_cache_key(&self, request: &AiRequest) -> String {
+        // Create deterministic cache key from request
+        format!("{:?}:{:?}", request.tenant_id, request.request_type)
+    }
+
+    fn is_cacheable(&self, request: &AiRequest) -> bool {
+        // Only cache certain request types
+        matches!(request.request_type,
+            AiRequestType::GenerateQuestions(_) |
+            AiRequestType::CreateLesson(_) |
+            AiRequestType::BuildRubric(_) |
+            AiRequestType::SummarizeContent(_)
+        )
+    }
+
+    fn extract_cost_info(&self, result: &AiResult) -> (i64, f64, String) {
+        // Extract tokens and cost from result
+        // Would be populated from actual hive responses
+        (0, 0.0, "unknown".to_string())
+    }
+
+    async fn process_request_queue(&mut self) {
+        while self.is_running {
+            if let Some(request) = self.request_queue.dequeue() {
+                let request_id = request.id.clone();
+
+                match self.route_request(&request).await {
+                    Ok(result) => {
+                        // Store result for retrieval
+                        self.pending_requests.remove(&request_id);
+                    },
+                    Err(e) => {
+                        // Handle error
+                        self.metrics.errors += 1;
+                    }
+                }
+            }
+
+            sleep(Duration::millis(10)).await;
+        }
+    }
+
+    async fn health_check_loop(&mut self) {
+        while self.is_running {
+            // Check health of all hives
+            for (name, cb) in &mut self.circuit_breakers {
+                // Would ping actual hives
+            }
+
+            sleep(self.config.health_check_interval).await;
+        }
+    }
+
+    async fn cache_cleanup_loop(&mut self) {
+        while self.is_running {
+            let now = DateTime::now();
+
+            // Remove expired cache entries
+            self.request_cache.retain(|_, (_, cached_at)| {
+                now - *cached_at < self.config.cache_ttl
+            });
+
+            sleep(Duration::minutes(5)).await;
+        }
+    }
+}
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Request status
+pub enum RequestStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
+}
+
+/// Coordinator health
+pub struct CoordinatorHealth {
+    is_running: bool,
+    queue_depth: usize,
+    hive_health: Map<String, HiveHealth>,
+    metrics: CoordinatorMetrics,
+}
+
+/// Hive health
+pub struct HiveHealth {
+    available: bool,
+    circuit_state: String,
+    failure_count: i32,
+}
+
+/// Cost report
+pub struct CostReport {
+    total_cost: f64,
+    monthly_cost: f64,
+    monthly_tokens: i64,
+    by_hive: Map<String, f64>,
+}
+
+/// Coordinator metrics
+#[derive(Clone, Default)]
+pub struct CoordinatorMetrics {
+    pub requests_processed: i64,
+    pub requests_queued: i64,
+    pub cache_hits: i64,
+    pub cache_misses: i64,
+    pub errors: i64,
+    pub total_processing_time_ms: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        RequestContext {
+            user_id: None,
+            course_id: None,
+            session_id: None,
+            metadata: Map::new(),
+        }
+    }
+}
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+pub enum CoordinatorError {
+    AlreadyRunning,
+    NotRunning,
+    HiveNotAvailable { hive: String },
+    CircuitOpen { hive: String },
+    RateLimitExceeded { tenant_id: TenantId },
+    BudgetExceeded { tenant_id: TenantId },
+    RequestTimeout { request_id: RequestId },
+    UnsupportedRequestType,
+    UnexpectedResult,
+    HiveError { hive: String, message: String },
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_coordinator_creation() {
+        let coordinator = AiCoordinator::new();
+        assert!(!coordinator.is_running);
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        let mut limiter = RateLimiter::new(10.0);
+
+        // Should allow burst
+        for _ in 0..100 {
+            assert!(limiter.try_acquire());
+        }
+
+        // Eventually should throttle
+        let mut denied = false;
+        for _ in 0..1000 {
+            if !limiter.try_acquire() {
+                denied = true;
+                break;
+            }
+        }
+        assert!(denied);
+    }
+
+    #[test]
+    fn test_circuit_breaker() {
+        let mut cb = CircuitBreaker::new(3);
+
+        assert!(cb.is_available());
+
+        // Record failures
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_available());
+
+        cb.record_failure();
+        assert!(!cb.is_available()); // Should be open now
+    }
+
+    #[test]
+    fn test_request_queue_priority() {
+        let mut queue = RequestQueue::new();
+
+        queue.enqueue(AiRequest {
+            id: RequestId("low".to_string()),
+            tenant_id: TenantId("t1".to_string()),
+            request_type: AiRequestType::GetSystemHealth,
+            priority: RequestPriority::Low,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: Duration::seconds(30),
+        });
+
+        queue.enqueue(AiRequest {
+            id: RequestId("critical".to_string()),
+            tenant_id: TenantId("t1".to_string()),
+            request_type: AiRequestType::GetSystemHealth,
+            priority: RequestPriority::Critical,
+            context: RequestContext::default(),
+            created_at: DateTime::now(),
+            timeout: Duration::seconds(30),
+        });
+
+        // Critical should come first
+        let first = queue.dequeue().unwrap();
+        assert_eq!(first.id.0, "critical");
+    }
+
+    #[test]
+    fn test_cost_tracker() {
+        let mut tracker = CostTracker::new();
+
+        tracker.record_cost(&TenantId("t1".to_string()), "assessment", 0.05, 1000);
+        tracker.record_cost(&TenantId("t1".to_string()), "content", 0.03, 500);
+
+        let record = tracker.get_tenant_cost(&TenantId("t1".to_string())).unwrap();
+        assert!((record.monthly_cost - 0.08).abs() < 0.001);
+    }
+}

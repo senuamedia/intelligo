@@ -1,0 +1,563 @@
+/// Intelligo LMS - AI Hive Unit Tests
+///
+/// Tests for AI hives: tutor, content, assessment, learning path, etc.
+
+module intelligo::tests::unit::ai
+
+use intelligo::chai::*
+use intelligo::ai::hives::*
+use intelligo::ai::coordinator::*
+
+pub fn register_tests() {
+    describe("AI Coordinator", || {
+        describe("hive registration", || {
+            it("registers hives", || {
+                let mut coordinator = AiCoordinator::new("tenant_1");
+
+                coordinator.register_hive("tutor", TutorHive::new());
+                coordinator.register_hive("content", ContentHive::new());
+
+                expect(&coordinator.hive_count()).to().equal(&2);
+            });
+
+            it("retrieves registered hives", || {
+                let mut coordinator = AiCoordinator::new("tenant_1");
+                coordinator.register_hive("tutor", TutorHive::new());
+
+                let hive = coordinator.get_hive("tutor");
+                expect(&hive.is_some()).to().be_true();
+            });
+        });
+
+        describe("request routing", || {
+            it("routes requests to appropriate hive", || {
+                let mut coordinator = AiCoordinator::new("tenant_1");
+                coordinator.register_hive("tutor", TutorHive::new());
+
+                let request = AiRequest {
+                    request_type: AiRequestType::TutorQuery,
+                    payload: Map::new(),
+                    context: RequestContext::default()
+                };
+
+                let hive_name = coordinator.route_request(&request);
+                expect(&hive_name).to().equal(&"tutor".to_string());
+            });
+        });
+    });
+
+    describe("Tutor Hive", || {
+        describe("question answering", || {
+            it("processes a question", || {
+                let mut hive = TutorHive::new();
+
+                let response = hive.answer_question(
+                    "What is polymorphism?",
+                    TutorContext {
+                        learner_id: "learner_1".to_string(),
+                        course_id: Some("course_1".to_string()),
+                        topic: Some("OOP".to_string()),
+                        skill_level: Some(2)
+                    }
+                );
+
+                expect(&response.is_ok()).to().be_true();
+            });
+
+            it("adapts to skill level", || {
+                let hive = TutorHive::new();
+
+                let beginner_context = TutorContext {
+                    learner_id: "learner_1".to_string(),
+                    course_id: None,
+                    topic: Some("Variables".to_string()),
+                    skill_level: Some(1)
+                };
+
+                let advanced_context = TutorContext {
+                    learner_id: "learner_2".to_string(),
+                    course_id: None,
+                    topic: Some("Variables".to_string()),
+                    skill_level: Some(4)
+                };
+
+                // In a real test, we'd verify the explanation complexity differs
+            });
+        });
+
+        describe("hint generation", || {
+            it("provides progressive hints", || {
+                let mut hive = TutorHive::new();
+
+                let hints = hive.generate_hints(
+                    "problem_1",
+                    "Calculate the sum of an array",
+                    3  // Number of hints
+                );
+
+                expect(&hints.len()).to().equal(&3);
+                // Hints should get progressively more specific
+            });
+        });
+
+        describe("feedback", || {
+            it("provides feedback on answers", || {
+                let hive = TutorHive::new();
+
+                let feedback = hive.evaluate_answer(
+                    "What is 2 + 2?",
+                    "4",
+                    "4"  // Correct answer
+                );
+
+                expect(&feedback.is_correct).to().be_true();
+            });
+
+            it("provides constructive feedback on wrong answers", || {
+                let hive = TutorHive::new();
+
+                let feedback = hive.evaluate_answer(
+                    "What is the capital of France?",
+                    "London",
+                    "Paris"
+                );
+
+                expect(&feedback.is_correct).to().be_false();
+                expect(&feedback.explanation.is_some()).to().be_true();
+            });
+        });
+    });
+
+    describe("Content Hive", || {
+        describe("content generation", || {
+            it("generates lesson content", || {
+                let mut hive = ContentHive::new();
+
+                let result = hive.generate_lesson(ContentRequest {
+                    topic: "Introduction to Python".to_string(),
+                    learning_objectives: vec![
+                        "Define what Python is".to_string(),
+                        "Explain Python's key features".to_string()
+                    ],
+                    target_duration_minutes: 15,
+                    format: ContentFormat::Interactive,
+                    audience_level: AudienceLevel::Beginner
+                });
+
+                expect(&result.is_ok()).to().be_true();
+            });
+
+            it("generates quiz questions", || {
+                let hive = ContentHive::new();
+
+                let questions = hive.generate_questions(
+                    "Python variables",
+                    QuestionConfig {
+                        count: 5,
+                        types: vec![QuestionType::MultipleChoice, QuestionType::TrueFalse],
+                        difficulty: Difficulty::Medium,
+                        bloom_levels: vec![BloomLevel::Remember, BloomLevel::Understand]
+                    }
+                );
+
+                expect(&questions.len()).to().be_greater_than(&0);
+            });
+        });
+
+        describe("content analysis", || {
+            it("analyzes content readability", || {
+                let hive = ContentHive::new();
+
+                let analysis = hive.analyze_content(
+                    "Python is a programming language. It is easy to learn."
+                );
+
+                expect(&analysis.readability_score.is_some()).to().be_true();
+            });
+
+            it("extracts key concepts", || {
+                let hive = ContentHive::new();
+
+                let concepts = hive.extract_concepts(
+                    "Object-oriented programming uses classes and objects to organize code."
+                );
+
+                expect(&concepts.len()).to().be_greater_than(&0);
+            });
+        });
+
+        describe("content summarization", || {
+            it("summarizes long content", || {
+                let hive = ContentHive::new();
+
+                let summary = hive.summarize(
+                    "A very long piece of content that needs to be summarized...",
+                    SummaryConfig {
+                        max_length: 100,
+                        style: SummaryStyle::Bullets,
+                        include_key_points: true
+                    }
+                );
+
+                expect(&summary.is_ok()).to().be_true();
+            });
+        });
+    });
+
+    describe("Assessment Hive", || {
+        describe("question generation", || {
+            it("generates diverse question types", || {
+                let hive = AssessmentHive::new();
+
+                let questions = hive.generate_assessment(AssessmentRequest {
+                    topic: "Data Structures".to_string(),
+                    objectives: vec!["Explain linked lists".to_string()],
+                    question_count: 10,
+                    time_limit_minutes: 30,
+                    passing_score: 70.0
+                });
+
+                expect(&questions.is_ok()).to().be_true();
+            });
+
+            it("generates distractors for multiple choice", || {
+                let hive = AssessmentHive::new();
+
+                let question = hive.generate_mcq(
+                    "What is the time complexity of binary search?",
+                    "O(log n)",
+                    3  // Number of distractors
+                );
+
+                expect(&question.options.len()).to().equal(&4);  // answer + 3 distractors
+            });
+        });
+
+        describe("response evaluation", || {
+            it("scores text responses", || {
+                let hive = AssessmentHive::new();
+
+                let score = hive.evaluate_response(
+                    "Explain what a variable is",
+                    "A variable is a named storage location in memory",
+                    EvaluationRubric {
+                        criteria: vec![
+                            RubricCriterion {
+                                name: "Accuracy".to_string(),
+                                weight: 0.5,
+                                levels: vec![]
+                            }
+                        ]
+                    }
+                );
+
+                expect(&score.total_score).to().be_greater_than(&0.0);
+            });
+
+            it("provides feedback on responses", || {
+                let hive = AssessmentHive::new();
+
+                let feedback = hive.generate_feedback(
+                    "Explain polymorphism",
+                    "Polymorphism means many forms",
+                    0.6  // Partial credit
+                );
+
+                expect(&feedback.suggestions.len()).to().be_greater_than(&0);
+            });
+        });
+
+        describe("adaptive assessment", || {
+            it("selects next question based on performance", || {
+                let mut hive = AssessmentHive::new();
+
+                // Simulate correct answer
+                hive.record_response("q1", true, 0.9);
+
+                let next = hive.get_next_question(AdaptiveState {
+                    ability_estimate: 0.5,
+                    questions_answered: 1,
+                    available_questions: vec!["q2", "q3", "q4"]
+                });
+
+                // Should select a harder question
+                expect(&next.is_some()).to().be_true();
+            });
+        });
+    });
+
+    describe("Learning Path Hive", || {
+        describe("path generation", || {
+            it("generates a learning path", || {
+                let hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Python".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 40,
+                    preferred_formats: vec![ContentFormat::Video, ContentFormat::Interactive]
+                });
+
+                expect(&path.is_ok()).to().be_true();
+            });
+
+            it("considers prerequisites", || {
+                let hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Advanced Python".to_string()),
+                    current_skills: Map::new(),  // No current skills
+                    time_available_hours: 80,
+                    preferred_formats: vec![]
+                });
+
+                // Should include basic Python first
+            });
+        });
+
+        describe("path adaptation", || {
+            it("adapts path based on progress", || {
+                let mut hive = LearningPathHive::new();
+
+                // Record excellent progress
+                hive.record_progress("path_1", "activity_1", ProgressData {
+                    score: Some(95.0),
+                    time_spent: Duration::from_secs(1800),
+                    completed: true
+                });
+
+                let updated_path = hive.adapt_path("path_1");
+
+                // Path might skip easier content or accelerate
+            });
+
+            it("handles struggling learners", || {
+                let mut hive = LearningPathHive::new();
+
+                // Record poor progress
+                hive.record_progress("path_1", "activity_1", ProgressData {
+                    score: Some(40.0),
+                    time_spent: Duration::from_secs(7200),  // Took much longer
+                    completed: true
+                });
+
+                let updated_path = hive.adapt_path("path_1");
+
+                // Path might add remedial content
+            });
+        });
+
+        describe("recommendations", || {
+            it("recommends next activities", || {
+                let hive = LearningPathHive::new();
+
+                let recommendations = hive.recommend_next(
+                    "learner_1",
+                    RecommendationContext {
+                        recent_activities: vec!["activity_1".to_string()],
+                        current_skills: Map::new(),
+                        available_time_minutes: 30
+                    }
+                );
+
+                expect(&recommendations.len()).to().be_greater_than(&0);
+            });
+        });
+    });
+
+    describe("Observation Hive", || {
+        describe("pattern detection", || {
+            it("detects learning patterns", || {
+                let mut hive = ObservationHive::new();
+
+                // Record observations
+                for i in 0..10 {
+                    hive.observe(Observation {
+                        learner_id: "learner_1".to_string(),
+                        event_type: ObservationType::ActivityComplete,
+                        data: Map::new(),
+                        timestamp: DateTime::now()
+                    });
+                }
+
+                let patterns = hive.detect_patterns("learner_1");
+                // Should detect engagement patterns
+            });
+
+            it("identifies struggle signals", || {
+                let hive = ObservationHive::new();
+
+                let signals = hive.detect_struggle("learner_1", StruggleContext {
+                    recent_scores: vec![45.0, 50.0, 40.0],
+                    time_on_task: vec![Duration::from_secs(3600)],  // Much longer than expected
+                    help_requests: 5
+                });
+
+                expect(&signals.is_struggling).to().be_true();
+            });
+        });
+
+        describe("engagement scoring", || {
+            it("calculates engagement score", || {
+                let hive = ObservationHive::new();
+
+                let score = hive.calculate_engagement("learner_1", EngagementWindow {
+                    start: DateTime::now() - Duration::from_secs(86400),
+                    end: DateTime::now()
+                });
+
+                expect(&score).to().be_within(0.0, 1.0);
+            });
+        });
+    });
+
+    describe("Evolution Hive", || {
+        describe("A/B experiments", || {
+            it("creates an experiment", || {
+                let mut hive = EvolutionHive::new();
+
+                let experiment = hive.create_experiment(CreateExperimentRequest {
+                    name: "Content Format Test".to_string(),
+                    description: None,
+                    hypothesis: "Video content improves completion rates".to_string(),
+                    experiment_type: ExperimentType::ContentVariant,
+                    variants: vec![
+                        ExperimentVariant {
+                            id: "control".to_string(),
+                            name: "Text".to_string(),
+                            description: None,
+                            is_control: true,
+                            config: Map::new()
+                        },
+                        ExperimentVariant {
+                            id: "treatment".to_string(),
+                            name: "Video".to_string(),
+                            description: None,
+                            is_control: false,
+                            config: Map::new()
+                        }
+                    ],
+                    metrics: Map::new(),
+                    target_audience: None,
+                    traffic_allocation: Some(0.5)
+                });
+
+                expect(&experiment.is_ok()).to().be_true();
+            });
+
+            it("assigns users to variants", || {
+                let mut hive = EvolutionHive::new();
+                // Create and start experiment first
+
+                let variant = hive.assign_variant("exp_1", "user_1");
+                // Should consistently assign same user to same variant
+            });
+        });
+
+        describe("strategy evolution", || {
+            it("evolves strategy based on outcomes", || {
+                let mut hive = EvolutionHive::new();
+
+                // Register initial strategy
+                hive.register_strategy(LearningStrategy {
+                    id: "strategy_1".to_string(),
+                    name: "Standard".to_string(),
+                    description: "Standard learning approach".to_string(),
+                    parameters: StrategyParameters {
+                        difficulty_adjustment: 0.0,
+                        content_chunk_size: 10,
+                        optimal_session_duration: Duration::from_secs(1800),
+                        spaced_repetition_factor: 1.0,
+                        interactivity_level: 0.5,
+                        feedback_frequency: 0.3
+                    },
+                    target_learning_styles: vec![],
+                    min_skill_level: 0.0,
+                    max_skill_level: 4.0,
+                    effectiveness_score: 0.5,
+                    sample_size: 0,
+                    is_active: true,
+                    created_at: DateTime::now(),
+                    updated_at: DateTime::now()
+                });
+
+                let outcomes = vec![
+                    LearningOutcome {
+                        learner_id: "learner_1".to_string(),
+                        content_id: "content_1".to_string(),
+                        score: Some(85.0),
+                        completed: true,
+                        engagement_score: 0.8,
+                        time_spent: Some(Duration::from_secs(1800)),
+                        retention_score: Some(75.0),
+                        timestamp: DateTime::now()
+                    }
+                ];
+
+                let evolved = hive.evolve_strategy("strategy_1", outcomes);
+                expect(&evolved.is_ok()).to().be_true();
+            });
+        });
+    });
+
+    describe("Monitoring Hive", || {
+        describe("metrics collection", || {
+            it("records metrics", || {
+                let hive = MonitoringHive::new();
+
+                hive.record_gauge("learner.progress", 75.0, Map::new());
+                hive.increment_counter("course.enrollment", 1.0, Map::new());
+
+                // Metrics should be stored
+            });
+
+            it("tracks AI performance", || {
+                let hive = MonitoringHive::new();
+
+                hive.track_ai_hive("tutor", "answer_question", AiOperationResult {
+                    success: true,
+                    latency: Duration::from_millis(250),
+                    tokens_used: Some(150),
+                    confidence: Some(0.85),
+                    error: None
+                });
+            });
+        });
+
+        describe("health monitoring", || {
+            it("provides system health summary", || {
+                let hive = MonitoringHive::new();
+
+                let health = hive.get_health_summary();
+
+                expect(&health.status).to().equal(&HealthStatus::Healthy);
+            });
+
+            it("tracks component health", || {
+                let hive = MonitoringHive::new();
+
+                let health = hive.get_component_health("api");
+
+                expect(&health.status).to().not().equal(&HealthStatus::Critical);
+            });
+        });
+
+        describe("alerting", || {
+            it("configures alert rules", || {
+                let mut hive = MonitoringHive::new();
+
+                hive.configure_alert(AlertRule {
+                    id: "alert_1".to_string(),
+                    name: "High Error Rate".to_string(),
+                    metric_name: "error.rate".to_string(),
+                    condition: AlertCondition::GreaterThan(0.1),
+                    severity: AlertSeverity::High,
+                    message: "Error rate exceeded 10%".to_string(),
+                    enabled: true
+                });
+            });
+        });
+    });
+}

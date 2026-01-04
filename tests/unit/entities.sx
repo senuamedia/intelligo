@@ -1,0 +1,242 @@
+/// Intelligo LMS - Entity Unit Tests
+///
+/// Tests for core entity types: Course, Module, Lesson, etc.
+
+module intelligo::tests::unit::entities
+
+use intelligo::chai::*
+use intelligo::entities::course::*
+use intelligo::entities::module::*
+use intelligo::entities::lesson::*
+use intelligo::entities::enrollment::*
+use intelligo::entities::activity::*
+
+pub fn register_tests() {
+    describe("Course Entity", || {
+        describe("creation", || {
+            it("creates a course with required fields", || {
+                let course = Course::new("tenant_1", "Introduction to Testing");
+
+                expect(&course.title).to().equal(&"Introduction to Testing".to_string());
+                expect(&course.tenant_id).to().equal(&"tenant_1".to_string());
+                expect(&course.status).to().equal(&CourseStatus::Draft);
+            });
+
+            it("generates a unique ID", || {
+                let course1 = Course::new("tenant_1", "Course 1");
+                let course2 = Course::new("tenant_1", "Course 2");
+
+                expect(&course1.id).to().not().equal(&course2.id);
+            });
+
+            it("generates a slug from title", || {
+                let course = Course::new("tenant_1", "My Awesome Course!");
+
+                expect(&course.slug).to().equal(&"my-awesome-course".to_string());
+            });
+        });
+
+        describe("status transitions", || {
+            it("can publish a draft course", || {
+                let mut course = Course::new("tenant_1", "Test Course");
+
+                let result = course.publish();
+
+                expect(&result.is_ok()).to().be_true();
+                expect(&course.status).to().equal(&CourseStatus::Published);
+            });
+
+            it("cannot publish an already published course", || {
+                let mut course = Course::new("tenant_1", "Test Course");
+                course.publish().unwrap();
+
+                let result = course.publish();
+
+                expect(&result.is_err()).to().be_true();
+            });
+
+            it("can archive a published course", || {
+                let mut course = Course::new("tenant_1", "Test Course");
+                course.publish().unwrap();
+
+                let result = course.archive();
+
+                expect(&result.is_ok()).to().be_true();
+                expect(&course.status).to().equal(&CourseStatus::Archived);
+            });
+        });
+
+        describe("module management", || {
+            it("can add a module to a course", || {
+                let mut course = Course::new("tenant_1", "Test Course");
+                let module = Module::new(&course.id, "Module 1");
+
+                course.add_module(&module.id);
+
+                expect(&course.modules.len()).to().equal(&1);
+            });
+
+            it("maintains module order", || {
+                let mut course = Course::new("tenant_1", "Test Course");
+                let module1 = Module::new(&course.id, "Module 1");
+                let module2 = Module::new(&course.id, "Module 2");
+
+                course.add_module(&module1.id);
+                course.add_module(&module2.id);
+
+                expect(&course.modules[0]).to().equal(&module1.id);
+                expect(&course.modules[1]).to().equal(&module2.id);
+            });
+        });
+    });
+
+    describe("Module Entity", || {
+        it("creates a module with course reference", || {
+            let module = Module::new("course_1", "Getting Started");
+
+            expect(&module.title).to().equal(&"Getting Started".to_string());
+            expect(&module.course_id).to().equal(&"course_1".to_string());
+        });
+
+        it("can add lessons to a module", || {
+            let mut module = Module::new("course_1", "Module 1");
+            let lesson = Lesson::new(&module.id, "Lesson 1");
+
+            module.add_lesson(&lesson.id);
+
+            expect(&module.lessons.len()).to().equal(&1);
+        });
+    });
+
+    describe("Lesson Entity", || {
+        it("creates a lesson with module reference", || {
+            let lesson = Lesson::new("module_1", "Introduction");
+
+            expect(&lesson.title).to().equal(&"Introduction".to_string());
+            expect(&lesson.module_id).to().equal(&"module_1".to_string());
+        });
+
+        it("defaults to content type", || {
+            let lesson = Lesson::new("module_1", "Lesson 1");
+
+            expect(&lesson.lesson_type).to().equal(&LessonType::Content);
+        });
+
+        it("can set content", || {
+            let mut lesson = Lesson::new("module_1", "Lesson 1");
+
+            lesson.set_content("This is the lesson content", "text/html");
+
+            expect(&lesson.content.is_some()).to().be_true();
+        });
+    });
+
+    describe("Enrollment Entity", || {
+        describe("creation", || {
+            it("creates an enrollment with pending status", || {
+                let enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Pending);
+                expect(&enrollment.progress).to().equal(&0.0);
+            });
+        });
+
+        describe("progress tracking", || {
+            it("updates progress correctly", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                enrollment.update_progress(50.0);
+
+                expect(&enrollment.progress).to().equal(&50.0);
+            });
+
+            it("clamps progress to 0-100", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                enrollment.update_progress(150.0);
+                expect(&enrollment.progress).to().equal(&100.0);
+
+                enrollment.update_progress(-10.0);
+                expect(&enrollment.progress).to().equal(&0.0);
+            });
+
+            it("marks as completed when progress reaches 100", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment.activate().unwrap();
+
+                enrollment.update_progress(100.0);
+
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Completed);
+            });
+        });
+
+        describe("status transitions", || {
+            it("can activate a pending enrollment", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                let result = enrollment.activate();
+
+                expect(&result.is_ok()).to().be_true();
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Active);
+            });
+
+            it("cannot complete without being active first", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                let result = enrollment.complete();
+
+                expect(&result.is_err()).to().be_true();
+            });
+        });
+    });
+
+    describe("Activity Entity", || {
+        describe("creation", || {
+            it("creates an activity with type", || {
+                let activity = Activity::new("tenant_1", "SCORM Module", ActivityType::Scorm);
+
+                expect(&activity.title).to().equal(&"SCORM Module".to_string());
+                expect(&activity.activity_type).to().equal(&ActivityType::Scorm);
+            });
+
+            it("creates a video activity", || {
+                let activity = Activity::new("tenant_1", "Intro Video", ActivityType::Video);
+
+                expect(&activity.activity_type).to().equal(&ActivityType::Video);
+            });
+        });
+
+        describe("configuration", || {
+            it("can set completion criteria", || {
+                let mut activity = Activity::new("tenant_1", "Quiz", ActivityType::Quiz);
+
+                activity.set_completion_criteria(CompletionCriteria {
+                    minimum_score: Some(80.0),
+                    must_complete: true,
+                    time_required: None
+                });
+
+                expect(&activity.completion_criteria.is_some()).to().be_true();
+            });
+
+            it("can add prerequisites", || {
+                let mut activity = Activity::new("tenant_1", "Advanced Quiz", ActivityType::Quiz);
+
+                activity.add_prerequisite("activity_1", PrerequisiteType::MustComplete);
+
+                expect(&activity.prerequisites.len()).to().equal(&1);
+            });
+        });
+
+        describe("course mapping", || {
+            it("can map activity to course", || {
+                let activity = Activity::new("tenant_1", "Lesson 1", ActivityType::Reading);
+                let mapping = CourseActivityMapping::new("course_1", &activity.id, 1);
+
+                expect(&mapping.course_id).to().equal(&"course_1".to_string());
+                expect(&mapping.activity_id).to().equal(&activity.id);
+                expect(&mapping.order).to().equal(&1);
+            });
+        });
+    });
+}

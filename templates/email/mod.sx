@@ -1,0 +1,122 @@
+// Email Templates Module for Intelligo LMS
+// Exports all email template configurations and builders
+
+module intelligo::templates::email
+
+pub use intelligo::templates::email::welcome::*
+pub use intelligo::templates::email::password_reset::*
+pub use intelligo::templates::email::enrollment::*
+pub use intelligo::templates::email::course_completion::*
+pub use intelligo::templates::email::assignment::*
+pub use intelligo::templates::email::certificate::*
+pub use intelligo::templates::email::reminder::*
+pub use intelligo::templates::email::invitation::*
+
+use intelligo::templates::*
+use std::collections::HashMap
+
+/// Email template category
+pub enum EmailCategory {
+    Onboarding,
+    Security,
+    Learning,
+    Assessment,
+    Achievement,
+    Notification,
+    Administrative,
+}
+
+/// Email template registry
+pub actor EmailTemplateRegistry {
+    templates: HashMap<String, TemplateConfig>,
+
+    pub fn new() -> Self {
+        let mut registry = EmailTemplateRegistry {
+            templates: HashMap::new(),
+        };
+
+        // Register all built-in templates
+        registry.register_builtin_templates();
+
+        registry
+    }
+
+    /// Register all built-in email templates
+    fn register_builtin_templates(mut self) {
+        // Onboarding templates
+        self.templates.insert(
+            welcome::TEMPLATE_ID.to_string(),
+            welcome::get_template_config()
+        );
+
+        // Security templates
+        self.templates.insert(
+            password_reset::TEMPLATE_ID.to_string(),
+            password_reset::get_template_config()
+        );
+
+        // Learning templates
+        self.templates.insert(
+            enrollment::TEMPLATE_ID.to_string(),
+            enrollment::get_template_config()
+        );
+        self.templates.insert(
+            course_completion::TEMPLATE_ID.to_string(),
+            course_completion::get_template_config()
+        );
+        self.templates.insert(
+            reminder::TEMPLATE_ID.to_string(),
+            reminder::get_template_config()
+        );
+
+        // Assessment templates
+        self.templates.insert(
+            assignment::SUBMISSION_TEMPLATE_ID.to_string(),
+            assignment::get_submission_template_config()
+        );
+        self.templates.insert(
+            assignment::GRADED_TEMPLATE_ID.to_string(),
+            assignment::get_graded_template_config()
+        );
+
+        // Achievement templates
+        self.templates.insert(
+            certificate::TEMPLATE_ID.to_string(),
+            certificate::get_template_config()
+        );
+
+        // Administrative templates
+        self.templates.insert(
+            invitation::TEMPLATE_ID.to_string(),
+            invitation::get_template_config()
+        );
+    }
+
+    /// Get a template by ID
+    pub fn get(self, template_id: &str) -> Option<TemplateConfig> {
+        self.templates.get(template_id).cloned()
+    }
+
+    /// Get all templates
+    pub fn get_all(self) -> Vec<TemplateConfig> {
+        self.templates.values().cloned().collect()
+    }
+
+    /// Get templates by category
+    pub fn get_by_category(self, category: &str) -> Vec<TemplateConfig> {
+        self.templates.values()
+            .filter(|t| t.category == category)
+            .cloned()
+            .collect()
+    }
+
+    /// Register a custom template
+    pub fn register(mut self, config: TemplateConfig) {
+        self.templates.insert(config.template_id.clone(), config);
+    }
+
+    /// Unregister a template
+    pub fn unregister(mut self, template_id: &str) -> Option<TemplateConfig> {
+        self.templates.remove(template_id)
+    }
+}

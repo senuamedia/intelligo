@@ -1,0 +1,755 @@
+// Student Information System (SIS) Integration Module for Intelligo LMS
+// Provides roster sync, grade passback, and enrollment management
+
+module intelligo::integrations::sis
+
+pub use intelligo::integrations::sis::core::*
+pub use intelligo::integrations::sis::csv::*
+pub use intelligo::integrations::sis::oneroster::*
+pub use intelligo::integrations::sis::sis_sync::*
+
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+
+/// Supported SIS provider types
+pub enum SisProviderType {
+    Csv,
+    OneRoster,
+    PowerSchool,
+    Infinite_Campus,
+    Skyward,
+    Clever,
+    ClassLink,
+    Custom,
+}
+
+impl SisProviderType {
+    pub fn to_string(self) -> String {
+        match self {
+            SisProviderType::Csv => "CSV".to_string(),
+            SisProviderType::OneRoster => "OneRoster".to_string(),
+            SisProviderType::PowerSchool => "PowerSchool".to_string(),
+            SisProviderType::Infinite_Campus => "Infinite Campus".to_string(),
+            SisProviderType::Skyward => "Skyward".to_string(),
+            SisProviderType::Clever => "Clever".to_string(),
+            SisProviderType::ClassLink => "ClassLink".to_string(),
+            SisProviderType::Custom => "Custom".to_string(),
+        }
+    }
+}
+
+/// SIS Configuration
+pub type SisConfig {
+    provider_id: String,
+    provider_type: SisProviderType,
+    display_name: String,
+    enabled: bool,
+    organization_id: String,
+
+    // Connection settings
+    api_endpoint: Option<String>,
+    api_key: Option<String>,
+    api_secret: Option<String>,
+    oauth_config: Option<SisOAuthConfig>,
+
+    // Sync settings
+    sync_users: bool,
+    sync_courses: bool,
+    sync_enrollments: bool,
+    sync_grades: bool,
+    sync_attendance: bool,
+
+    // Schedule
+    auto_sync: bool,
+    sync_interval: Duration,
+    last_sync: Option<DateTime>,
+    next_sync: Option<DateTime>,
+
+    // Mapping configuration
+    field_mappings: SisFieldMappings,
+    role_mappings: HashMap<String, String>,
+    term_mappings: HashMap<String, String>,
+
+    // Behavior settings
+    create_missing_users: bool,
+    create_missing_courses: bool,
+    deactivate_missing_users: bool,
+    archive_missing_courses: bool,
+
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// OAuth configuration for SIS
+pub type SisOAuthConfig {
+    client_id: String,
+    client_secret: String,
+    token_url: String,
+    scope: Option<String>,
+}
+
+/// Field mappings for SIS sync
+pub type SisFieldMappings {
+    // User field mappings
+    user_id: String,
+    user_email: String,
+    user_first_name: String,
+    user_last_name: String,
+    user_role: Option<String>,
+    user_grade_level: Option<String>,
+    user_status: Option<String>,
+
+    // Course field mappings
+    course_id: String,
+    course_code: String,
+    course_name: String,
+    course_description: Option<String>,
+    course_term: Option<String>,
+    course_status: Option<String>,
+
+    // Enrollment field mappings
+    enrollment_user_id: String,
+    enrollment_course_id: String,
+    enrollment_role: String,
+    enrollment_status: Option<String>,
+    enrollment_start_date: Option<String>,
+    enrollment_end_date: Option<String>,
+
+    // Grade field mappings
+    grade_user_id: Option<String>,
+    grade_course_id: Option<String>,
+    grade_assignment_id: Option<String>,
+    grade_score: Option<String>,
+    grade_max_score: Option<String>,
+}
+
+impl SisFieldMappings {
+    pub fn default() -> Self {
+        SisFieldMappings {
+            user_id: "sourcedId".to_string(),
+            user_email: "email".to_string(),
+            user_first_name: "givenName".to_string(),
+            user_last_name: "familyName".to_string(),
+            user_role: Some("role".to_string()),
+            user_grade_level: Some("grades".to_string()),
+            user_status: Some("status".to_string()),
+
+            course_id: "sourcedId".to_string(),
+            course_code: "courseCode".to_string(),
+            course_name: "title".to_string(),
+            course_description: Some("description".to_string()),
+            course_term: Some("terms".to_string()),
+            course_status: Some("status".to_string()),
+
+            enrollment_user_id: "user.sourcedId".to_string(),
+            enrollment_course_id: "class.sourcedId".to_string(),
+            enrollment_role: "role".to_string(),
+            enrollment_status: Some("status".to_string()),
+            enrollment_start_date: Some("beginDate".to_string()),
+            enrollment_end_date: Some("endDate".to_string()),
+
+            grade_user_id: Some("user.sourcedId".to_string()),
+            grade_course_id: Some("class.sourcedId".to_string()),
+            grade_assignment_id: Some("lineItem.sourcedId".to_string()),
+            grade_score: Some("score".to_string()),
+            grade_max_score: Some("resultValueMax".to_string()),
+        }
+    }
+}
+
+/// SIS User representation
+pub type SisUser {
+    source_id: String,
+    email: String,
+    first_name: String,
+    last_name: String,
+    username: Option<String>,
+    role: SisRole,
+    grade_levels: Vec<String>,
+    status: SisUserStatus,
+    phone: Option<String>,
+    metadata: HashMap<String, String>,
+}
+
+/// SIS User roles
+pub enum SisRole {
+    Student,
+    Teacher,
+    Administrator,
+    Parent,
+    Guardian,
+    Aide,
+    Counselor,
+    Other { name: String },
+}
+
+impl SisRole {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "student" => SisRole::Student,
+            "teacher" | "instructor" => SisRole::Teacher,
+            "administrator" | "admin" => SisRole::Administrator,
+            "parent" => SisRole::Parent,
+            "guardian" => SisRole::Guardian,
+            "aide" | "assistant" => SisRole::Aide,
+            "counselor" => SisRole::Counselor,
+            _ => SisRole::Other { name: s.to_string() },
+        }
+    }
+
+    pub fn to_lms_role(self) -> String {
+        match self {
+            SisRole::Student => "student".to_string(),
+            SisRole::Teacher => "instructor".to_string(),
+            SisRole::Administrator => "admin".to_string(),
+            SisRole::Parent | SisRole::Guardian => "observer".to_string(),
+            SisRole::Aide => "ta".to_string(),
+            SisRole::Counselor => "advisor".to_string(),
+            SisRole::Other { name } => name.to_lowercase(),
+        }
+    }
+}
+
+/// SIS User status
+pub enum SisUserStatus {
+    Active,
+    Inactive,
+    ToBeDeleted,
+}
+
+impl SisUserStatus {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "active" => SisUserStatus::Active,
+            "inactive" | "disabled" => SisUserStatus::Inactive,
+            "tobedeleted" | "deleted" => SisUserStatus::ToBeDeleted,
+            _ => SisUserStatus::Active,
+        }
+    }
+}
+
+/// SIS Course representation
+pub type SisCourse {
+    source_id: String,
+    code: String,
+    name: String,
+    description: Option<String>,
+    term_ids: Vec<String>,
+    status: SisCourseStatus,
+    subject_codes: Vec<String>,
+    grade_levels: Vec<String>,
+    metadata: HashMap<String, String>,
+}
+
+/// SIS Course status
+pub enum SisCourseStatus {
+    Active,
+    Inactive,
+    ToBeDeleted,
+}
+
+impl SisCourseStatus {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "active" => SisCourseStatus::Active,
+            "inactive" => SisCourseStatus::Inactive,
+            "tobedeleted" | "deleted" => SisCourseStatus::ToBeDeleted,
+            _ => SisCourseStatus::Active,
+        }
+    }
+}
+
+/// SIS Class/Section representation
+pub type SisClass {
+    source_id: String,
+    course_id: String,
+    name: String,
+    code: Option<String>,
+    term_ids: Vec<String>,
+    status: SisCourseStatus,
+    periods: Vec<String>,
+    location: Option<String>,
+    metadata: HashMap<String, String>,
+}
+
+/// SIS Enrollment representation
+pub type SisEnrollment {
+    source_id: String,
+    user_id: String,
+    class_id: String,
+    role: SisRole,
+    status: SisEnrollmentStatus,
+    begin_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    primary: bool,
+}
+
+/// SIS Enrollment status
+pub enum SisEnrollmentStatus {
+    Active,
+    Inactive,
+    ToBeDeleted,
+}
+
+impl SisEnrollmentStatus {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "active" => SisEnrollmentStatus::Active,
+            "inactive" => SisEnrollmentStatus::Inactive,
+            "tobedeleted" | "deleted" => SisEnrollmentStatus::ToBeDeleted,
+            _ => SisEnrollmentStatus::Active,
+        }
+    }
+}
+
+/// SIS Term/Academic period
+pub type SisTerm {
+    source_id: String,
+    name: String,
+    start_date: DateTime,
+    end_date: DateTime,
+    status: SisTermStatus,
+    term_type: SisTermType,
+}
+
+/// SIS Term status
+pub enum SisTermStatus {
+    Active,
+    Inactive,
+    ToBeDeleted,
+}
+
+/// SIS Term type
+pub enum SisTermType {
+    Year,
+    Semester,
+    Trimester,
+    Quarter,
+    GradingPeriod,
+    Term,
+    Other { name: String },
+}
+
+/// SIS Grade/Result
+pub type SisGrade {
+    source_id: String,
+    user_id: String,
+    class_id: String,
+    line_item_id: Option<String>,
+    score: f64,
+    max_score: Option<f64>,
+    status: SisGradeStatus,
+    submitted_at: DateTime,
+    comment: Option<String>,
+}
+
+/// SIS Grade status
+pub enum SisGradeStatus {
+    Submitted,
+    PartiallySubmitted,
+    NotSubmitted,
+    Exempt,
+}
+
+/// SIS Sync result
+pub type SisSyncResult {
+    provider_id: String,
+    started_at: DateTime,
+    completed_at: DateTime,
+    success: bool,
+
+    // Statistics
+    users_processed: u32,
+    users_created: u32,
+    users_updated: u32,
+    users_deactivated: u32,
+    users_errors: u32,
+
+    courses_processed: u32,
+    courses_created: u32,
+    courses_updated: u32,
+    courses_archived: u32,
+    courses_errors: u32,
+
+    enrollments_processed: u32,
+    enrollments_created: u32,
+    enrollments_updated: u32,
+    enrollments_removed: u32,
+    enrollments_errors: u32,
+
+    grades_processed: u32,
+    grades_synced: u32,
+    grades_errors: u32,
+
+    // Errors
+    errors: Vec<SisSyncError>,
+    warnings: Vec<String>,
+}
+
+impl SisSyncResult {
+    pub fn new(provider_id: String) -> Self {
+        SisSyncResult {
+            provider_id: provider_id,
+            started_at: DateTime::now(),
+            completed_at: DateTime::now(),
+            success: true,
+
+            users_processed: 0,
+            users_created: 0,
+            users_updated: 0,
+            users_deactivated: 0,
+            users_errors: 0,
+
+            courses_processed: 0,
+            courses_created: 0,
+            courses_updated: 0,
+            courses_archived: 0,
+            courses_errors: 0,
+
+            enrollments_processed: 0,
+            enrollments_created: 0,
+            enrollments_updated: 0,
+            enrollments_removed: 0,
+            enrollments_errors: 0,
+
+            grades_processed: 0,
+            grades_synced: 0,
+            grades_errors: 0,
+
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    pub fn total_processed(self) -> u32 {
+        self.users_processed + self.courses_processed +
+        self.enrollments_processed + self.grades_processed
+    }
+
+    pub fn total_errors(self) -> u32 {
+        self.users_errors + self.courses_errors +
+        self.enrollments_errors + self.grades_errors
+    }
+}
+
+/// SIS Sync error
+pub type SisSyncError {
+    entity_type: String,
+    entity_id: String,
+    error_code: String,
+    message: String,
+    details: Option<String>,
+}
+
+/// SIS Error types
+pub enum SisError {
+    ConfigurationError { message: String },
+    ConnectionError { message: String },
+    AuthenticationError { message: String },
+    ParseError { entity: String, details: String },
+    ValidationError { entity: String, field: String, message: String },
+    NotFoundError { entity_type: String, entity_id: String },
+    DuplicateError { entity_type: String, entity_id: String },
+    RateLimitError { retry_after: Option<Duration> },
+    SyncError { message: String },
+    ApiError { status: u16, message: String },
+}
+
+impl SisError {
+    pub fn to_string(self) -> String {
+        match self {
+            SisError::ConfigurationError { message } =>
+                format!("Configuration error: {}", message),
+            SisError::ConnectionError { message } =>
+                format!("Connection error: {}", message),
+            SisError::AuthenticationError { message } =>
+                format!("Authentication error: {}", message),
+            SisError::ParseError { entity, details } =>
+                format!("Parse error for {}: {}", entity, details),
+            SisError::ValidationError { entity, field, message } =>
+                format!("Validation error for {}.{}: {}", entity, field, message),
+            SisError::NotFoundError { entity_type, entity_id } =>
+                format!("{} not found: {}", entity_type, entity_id),
+            SisError::DuplicateError { entity_type, entity_id } =>
+                format!("Duplicate {} found: {}", entity_type, entity_id),
+            SisError::RateLimitError { retry_after } =>
+                format!("Rate limit exceeded, retry after: {:?}", retry_after),
+            SisError::SyncError { message } =>
+                format!("Sync error: {}", message),
+            SisError::ApiError { status, message } =>
+                format!("API error ({}): {}", status, message),
+        }
+    }
+}
+
+/// SIS Manager actor - coordinates SIS operations
+pub actor SisManager {
+    providers: HashMap<String, Box<dyn SisProvider>>,
+    config_store: Box<dyn SisConfigStore>,
+    user_service: Box<dyn SisUserService>,
+    course_service: Box<dyn SisCourseService>,
+    enrollment_service: Box<dyn SisEnrollmentService>,
+
+    pub fn new(
+        config_store: Box<dyn SisConfigStore>,
+        user_service: Box<dyn SisUserService>,
+        course_service: Box<dyn SisCourseService>,
+        enrollment_service: Box<dyn SisEnrollmentService>
+    ) -> Self {
+        SisManager {
+            providers: HashMap::new(),
+            config_store: config_store,
+            user_service: user_service,
+            course_service: course_service,
+            enrollment_service: enrollment_service,
+        }
+    }
+
+    /// Register a SIS provider
+    pub async fn register_provider(
+        mut self,
+        provider: Box<dyn SisProvider>
+    ) -> Result<(), SisError> {
+        let config = provider.get_config();
+        self.providers.insert(config.provider_id.clone(), provider);
+        Ok(())
+    }
+
+    /// Load all configured providers
+    pub async fn load_providers(mut self) -> Result<(), SisError> {
+        let configs = self.config_store.list_configs().await?;
+
+        for config in configs {
+            if config.enabled {
+                let provider = self.create_provider(config).await?;
+                self.providers.insert(provider.get_config().provider_id.clone(), provider);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a provider from configuration
+    async fn create_provider(self, config: SisConfig) -> Result<Box<dyn SisProvider>, SisError> {
+        match config.provider_type {
+            SisProviderType::Csv => {
+                Ok(Box::new(CsvSisProvider::new(config)))
+            },
+            SisProviderType::OneRoster => {
+                Ok(Box::new(OneRosterProvider::new(config)))
+            },
+            _ => {
+                Err(SisError::ConfigurationError {
+                    message: format!("Unsupported provider type: {:?}", config.provider_type)
+                })
+            }
+        }
+    }
+
+    /// Get a provider by ID
+    pub fn get_provider(self, provider_id: String) -> Option<&Box<dyn SisProvider>> {
+        self.providers.get(&provider_id)
+    }
+
+    /// List all providers
+    pub fn list_providers(self) -> Vec<SisProviderInfo> {
+        self.providers.iter().map(|(id, provider)| {
+            let config = provider.get_config();
+            SisProviderInfo {
+                provider_id: id.clone(),
+                display_name: config.display_name,
+                provider_type: config.provider_type,
+                enabled: config.enabled,
+                last_sync: config.last_sync,
+                next_sync: config.next_sync,
+            }
+        }).collect()
+    }
+
+    /// Run full sync for a provider
+    pub async fn sync(
+        mut self,
+        provider_id: String,
+        options: SyncOptions
+    ) -> Result<SisSyncResult, SisError> {
+        let provider = self.providers.get_mut(&provider_id).ok_or(
+            SisError::NotFoundError {
+                entity_type: "provider".to_string(),
+                entity_id: provider_id.clone()
+            }
+        )?;
+
+        let sync_manager = SyncManager::new(
+            provider,
+            self.user_service.clone(),
+            self.course_service.clone(),
+            self.enrollment_service.clone(),
+        );
+
+        let result = sync_manager.run_sync(options).await?;
+
+        // Update last sync time
+        let mut config = provider.get_config();
+        config.last_sync = Some(DateTime::now());
+        if config.auto_sync {
+            config.next_sync = Some(DateTime::now() + config.sync_interval);
+        }
+        self.config_store.save_config(config).await?;
+
+        Ok(result)
+    }
+
+    /// Get sync status for a provider
+    pub async fn get_sync_status(self, provider_id: String) -> Result<SyncStatus, SisError> {
+        let provider = self.providers.get(&provider_id).ok_or(
+            SisError::NotFoundError {
+                entity_type: "provider".to_string(),
+                entity_id: provider_id.clone()
+            }
+        )?;
+
+        let config = provider.get_config();
+
+        Ok(SyncStatus {
+            provider_id: provider_id,
+            last_sync: config.last_sync,
+            next_sync: config.next_sync,
+            is_syncing: false, // Would check actual sync state
+            sync_enabled: config.auto_sync,
+        })
+    }
+
+    /// Test provider connection
+    pub async fn test_connection(self, provider_id: String) -> Result<ConnectionTestResult, SisError> {
+        let provider = self.providers.get(&provider_id).ok_or(
+            SisError::NotFoundError {
+                entity_type: "provider".to_string(),
+                entity_id: provider_id.clone()
+            }
+        )?;
+
+        provider.test_connection().await
+    }
+}
+
+/// SIS Provider info for listing
+pub type SisProviderInfo {
+    provider_id: String,
+    display_name: String,
+    provider_type: SisProviderType,
+    enabled: bool,
+    last_sync: Option<DateTime>,
+    next_sync: Option<DateTime>,
+}
+
+/// Sync status
+pub type SyncStatus {
+    provider_id: String,
+    last_sync: Option<DateTime>,
+    next_sync: Option<DateTime>,
+    is_syncing: bool,
+    sync_enabled: bool,
+}
+
+/// Sync options
+pub type SyncOptions {
+    sync_users: bool,
+    sync_courses: bool,
+    sync_enrollments: bool,
+    sync_grades: bool,
+    full_sync: bool,
+    dry_run: bool,
+    since: Option<DateTime>,
+}
+
+impl SyncOptions {
+    pub fn full() -> Self {
+        SyncOptions {
+            sync_users: true,
+            sync_courses: true,
+            sync_enrollments: true,
+            sync_grades: true,
+            full_sync: true,
+            dry_run: false,
+            since: None,
+        }
+    }
+
+    pub fn incremental(since: DateTime) -> Self {
+        SyncOptions {
+            sync_users: true,
+            sync_courses: true,
+            sync_enrollments: true,
+            sync_grades: true,
+            full_sync: false,
+            dry_run: false,
+            since: Some(since),
+        }
+    }
+
+    pub fn dry_run() -> Self {
+        SyncOptions {
+            sync_users: true,
+            sync_courses: true,
+            sync_enrollments: true,
+            sync_grades: true,
+            full_sync: true,
+            dry_run: true,
+            since: None,
+        }
+    }
+}
+
+/// Connection test result
+pub type ConnectionTestResult {
+    success: bool,
+    message: String,
+    latency_ms: u64,
+    version: Option<String>,
+    capabilities: Vec<String>,
+}
+
+/// SIS Configuration store trait
+pub trait SisConfigStore {
+    async fn get_config(self, provider_id: String) -> Result<SisConfig, SisError>
+    async fn save_config(self, config: SisConfig) -> Result<(), SisError>
+    async fn delete_config(self, provider_id: String) -> Result<(), SisError>
+    async fn list_configs(self) -> Result<Vec<SisConfig>, SisError>
+}
+
+/// SIS User service trait
+pub trait SisUserService {
+    async fn find_by_source_id(self, source_id: String) -> Result<Option<Uuid>, SisError>
+    async fn find_by_email(self, email: String) -> Result<Option<Uuid>, SisError>
+    async fn create_user(self, user: SisUser) -> Result<Uuid, SisError>
+    async fn update_user(self, user_id: Uuid, user: SisUser) -> Result<(), SisError>
+    async fn deactivate_user(self, user_id: Uuid) -> Result<(), SisError>
+    async fn get_all_source_ids(self) -> Result<Vec<String>, SisError>
+}
+
+/// SIS Course service trait
+pub trait SisCourseService {
+    async fn find_by_source_id(self, source_id: String) -> Result<Option<Uuid>, SisError>
+    async fn create_course(self, course: SisCourse) -> Result<Uuid, SisError>
+    async fn update_course(self, course_id: Uuid, course: SisCourse) -> Result<(), SisError>
+    async fn archive_course(self, course_id: Uuid) -> Result<(), SisError>
+    async fn get_all_source_ids(self) -> Result<Vec<String>, SisError>
+}
+
+/// SIS Enrollment service trait
+pub trait SisEnrollmentService {
+    async fn find_enrollment(
+        self,
+        user_id: Uuid,
+        course_id: Uuid
+    ) -> Result<Option<Uuid>, SisError>
+    async fn create_enrollment(self, enrollment: SisEnrollment) -> Result<Uuid, SisError>
+    async fn update_enrollment(
+        self,
+        enrollment_id: Uuid,
+        enrollment: SisEnrollment
+    ) -> Result<(), SisError>
+    async fn remove_enrollment(self, enrollment_id: Uuid) -> Result<(), SisError>
+    async fn get_enrollments_for_course(self, course_id: Uuid) -> Result<Vec<Uuid>, SisError>
+}

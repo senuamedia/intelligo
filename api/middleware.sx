@@ -1,0 +1,1496 @@
+/// Intelligo LMS - API Middleware
+///
+/// This module provides middleware components for the REST API:
+/// - Authentication middleware for JWT/session validation
+/// - Authorization middleware for RBAC enforcement
+/// - Rate limiting middleware
+/// - Error handling middleware
+/// - Request logging and tracing
+
+module intelligo::api::middleware
+
+use intelligo::core::types::*
+use intelligo::core::auth::{
+    AuthContext, Session, Token, TokenType, AuthProvider,
+    validate_token, refresh_token, revoke_token
+}
+use intelligo::core::security::{
+    Permission, RolePermissions, check_permission, require_permission,
+    TenantContext, get_tenant_from_request
+}
+use modulus::http::{Request, Response, Next, StatusCode, Headers}
+use modulus::runtime::{Context, Error as RuntimeError}
+use std::time::{DateTime, Duration, Instant}
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock, Mutex}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// API-specific error types
+enum ApiError {
+    /// Authentication required
+    Unauthorized { message: String },
+
+    /// Permission denied
+    Forbidden { message: String, required_permission: Option<String> },
+
+    /// Resource not found
+    NotFound { resource: String, id: String },
+
+    /// Validation error
+    ValidationError { field: String, message: String, errors: List<FieldError> },
+
+    /// Rate limit exceeded
+    RateLimitExceeded { retry_after: Duration },
+
+    /// Conflict (e.g., duplicate resource)
+    Conflict { message: String },
+
+    /// Internal server error
+    InternalError { message: String, trace_id: String },
+
+    /// Bad request
+    BadRequest { message: String },
+
+    /// Service unavailable
+    ServiceUnavailable { message: String, retry_after: Option<Duration> },
+
+    /// Request timeout
+    Timeout { message: String },
+
+    /// Payload too large
+    PayloadTooLarge { max_size: i64, actual_size: i64 }
+}
+
+/// Field-level validation error
+type FieldError {
+    field: String,
+    code: String,
+    message: String
+}
+
+impl ApiError {
+    /// Get HTTP status code for error
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ApiError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden { .. } => StatusCode::FORBIDDEN,
+            ApiError::NotFound { .. } => StatusCode::NOT_FOUND,
+            ApiError::ValidationError { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::Conflict { .. } => StatusCode::CONFLICT,
+            ApiError::InternalError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            ApiError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Timeout { .. } => StatusCode::REQUEST_TIMEOUT,
+            ApiError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE
+        }
+    }
+
+    /// Convert to JSON response body
+    fn to_json(&self) -> Map<String, Dynamic> {
+        let mut response = Map::new();
+        response.insert("error".to_string(), Dynamic::Bool(true));
+
+        match self {
+            ApiError::Unauthorized { message } => {
+                response.insert("type".to_string(), Dynamic::String("unauthorized".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+            },
+            ApiError::Forbidden { message, required_permission } => {
+                response.insert("type".to_string(), Dynamic::String("forbidden".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+                if let Some(perm) = required_permission {
+                    response.insert("required_permission".to_string(), Dynamic::String(perm.clone()));
+                }
+            },
+            ApiError::NotFound { resource, id } => {
+                response.insert("type".to_string(), Dynamic::String("not_found".to_string()));
+                response.insert("message".to_string(), Dynamic::String(format!("{} with id '{}' not found", resource, id)));
+                response.insert("resource".to_string(), Dynamic::String(resource.clone()));
+                response.insert("id".to_string(), Dynamic::String(id.clone()));
+            },
+            ApiError::ValidationError { field, message, errors } => {
+                response.insert("type".to_string(), Dynamic::String("validation_error".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+                response.insert("field".to_string(), Dynamic::String(field.clone()));
+                let error_list: List<Dynamic> = errors.iter().map(|e| {
+                    let mut err = Map::new();
+                    err.insert("field".to_string(), Dynamic::String(e.field.clone()));
+                    err.insert("code".to_string(), Dynamic::String(e.code.clone()));
+                    err.insert("message".to_string(), Dynamic::String(e.message.clone()));
+                    Dynamic::Map(err)
+                }).collect();
+                response.insert("errors".to_string(), Dynamic::List(error_list));
+            },
+            ApiError::RateLimitExceeded { retry_after } => {
+                response.insert("type".to_string(), Dynamic::String("rate_limit_exceeded".to_string()));
+                response.insert("message".to_string(), Dynamic::String("Rate limit exceeded".to_string()));
+                response.insert("retry_after_seconds".to_string(), Dynamic::Int(retry_after.as_seconds() as i64));
+            },
+            ApiError::Conflict { message } => {
+                response.insert("type".to_string(), Dynamic::String("conflict".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+            },
+            ApiError::InternalError { message, trace_id } => {
+                response.insert("type".to_string(), Dynamic::String("internal_error".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+                response.insert("trace_id".to_string(), Dynamic::String(trace_id.clone()));
+            },
+            ApiError::BadRequest { message } => {
+                response.insert("type".to_string(), Dynamic::String("bad_request".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+            },
+            ApiError::ServiceUnavailable { message, retry_after } => {
+                response.insert("type".to_string(), Dynamic::String("service_unavailable".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+                if let Some(retry) = retry_after {
+                    response.insert("retry_after_seconds".to_string(), Dynamic::Int(retry.as_seconds() as i64));
+                }
+            },
+            ApiError::Timeout { message } => {
+                response.insert("type".to_string(), Dynamic::String("timeout".to_string()));
+                response.insert("message".to_string(), Dynamic::String(message.clone()));
+            },
+            ApiError::PayloadTooLarge { max_size, actual_size } => {
+                response.insert("type".to_string(), Dynamic::String("payload_too_large".to_string()));
+                response.insert("message".to_string(), Dynamic::String("Request payload too large".to_string()));
+                response.insert("max_size".to_string(), Dynamic::Int(*max_size));
+                response.insert("actual_size".to_string(), Dynamic::Int(*actual_size));
+            }
+        }
+
+        response
+    }
+
+    /// Convert to HTTP response
+    fn to_response(&self) -> Response {
+        Response::json(self.to_json())
+            .with_status(self.status_code())
+    }
+}
+
+// =============================================================================
+// REQUEST CONTEXT
+// =============================================================================
+
+/// Extended request context with authentication and tenant info
+type RequestContext {
+    /// Request ID for tracing
+    request_id: String,
+
+    /// Trace ID for distributed tracing
+    trace_id: String,
+
+    /// Authenticated user context
+    auth: Option<AuthContext>,
+
+    /// Tenant context
+    tenant: Option<TenantContext>,
+
+    /// Request start time
+    started_at: Instant,
+
+    /// IP address
+    ip_address: String,
+
+    /// User agent
+    user_agent: Option<String>,
+
+    /// Request path
+    path: String,
+
+    /// HTTP method
+    method: String,
+
+    /// Correlation headers
+    correlation_id: Option<String>
+}
+
+impl RequestContext {
+    /// Create a new request context
+    fn from_request(req: &Request) -> RequestContext {
+        let request_id = generate_request_id();
+        let trace_id = req.header("X-Trace-ID")
+            .unwrap_or_else(|| generate_trace_id());
+        let correlation_id = req.header("X-Correlation-ID");
+
+        RequestContext {
+            request_id,
+            trace_id,
+            auth: None,
+            tenant: None,
+            started_at: Instant::now(),
+            ip_address: req.remote_addr().unwrap_or("unknown".to_string()),
+            user_agent: req.header("User-Agent"),
+            path: req.path().to_string(),
+            method: req.method().to_string(),
+            correlation_id
+        }
+    }
+
+    /// Get user ID if authenticated
+    fn user_id(&self) -> Option<UserId> {
+        self.auth.as_ref().map(|a| a.user_id.clone())
+    }
+
+    /// Get tenant ID
+    fn tenant_id(&self) -> Option<TenantId> {
+        self.tenant.as_ref().map(|t| t.tenant_id.clone())
+    }
+
+    /// Check if authenticated
+    fn is_authenticated(&self) -> Bool {
+        self.auth.is_some()
+    }
+
+    /// Get elapsed time
+    fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    /// Check permission
+    fn has_permission(&self, permission: Permission) -> Bool {
+        if let Some(auth) = &self.auth {
+            return check_permission(auth, permission)
+        }
+        false
+    }
+
+    /// Require permission or return error
+    fn require_permission(&self, permission: Permission) -> Result<(), ApiError> {
+        if !self.has_permission(permission) {
+            return Err(ApiError::Forbidden {
+                message: "Insufficient permissions".to_string(),
+                required_permission: Some(format!("{:?}", permission))
+            })
+        }
+        Ok(())
+    }
+
+    /// Check if user has role
+    fn has_role(&self, role: SystemRole) -> Bool {
+        if let Some(auth) = &self.auth {
+            return auth.roles.contains(&role)
+        }
+        false
+    }
+
+    /// Check if user is admin
+    fn is_admin(&self) -> Bool {
+        self.has_role(SystemRole::Admin) || self.has_role(SystemRole::SuperAdmin)
+    }
+
+    /// Check if user is the owner of a resource
+    fn is_owner(&self, owner_id: &UserId) -> Bool {
+        if let Some(auth) = &self.auth {
+            return &auth.user_id == owner_id
+        }
+        false
+    }
+}
+
+// =============================================================================
+// AUTHENTICATION MIDDLEWARE
+// =============================================================================
+
+/// Authentication middleware configuration
+type AuthConfig {
+    /// Whether authentication is required
+    required: Bool,
+
+    /// Allowed token types
+    allowed_token_types: List<TokenType>,
+
+    /// Skip authentication for these paths
+    skip_paths: List<String>,
+
+    /// Skip authentication for these methods on paths
+    skip_methods: Map<String, List<String>>
+}
+
+impl AuthConfig {
+    /// Default configuration (authentication required)
+    fn default() -> AuthConfig {
+        AuthConfig {
+            required: true,
+            allowed_token_types: vec![TokenType::Access, TokenType::Session],
+            skip_paths: vec![],
+            skip_methods: Map::new()
+        }
+    }
+
+    /// Optional authentication configuration
+    fn optional() -> AuthConfig {
+        AuthConfig {
+            required: false,
+            allowed_token_types: vec![TokenType::Access, TokenType::Session],
+            skip_paths: vec![],
+            skip_methods: Map::new()
+        }
+    }
+
+    /// Configuration with skip paths
+    fn with_skip_paths(mut self, paths: List<String>) -> AuthConfig {
+        self.skip_paths = paths;
+        self
+    }
+
+    /// Check if path should skip authentication
+    fn should_skip(&self, path: &str, method: &str) -> Bool {
+        // Check exact path match
+        if self.skip_paths.contains(&path.to_string()) {
+            return true
+        }
+
+        // Check method-specific skip
+        if let Some(methods) = self.skip_methods.get(path) {
+            if methods.contains(&method.to_string()) {
+                return true
+            }
+        }
+
+        // Check pattern matching (basic glob support)
+        for skip_path in &self.skip_paths {
+            if skip_path.ends_with("*") {
+                let prefix = &skip_path[..skip_path.len() - 1];
+                if path.starts_with(prefix) {
+                    return true
+                }
+            }
+        }
+
+        false
+    }
+}
+
+/// Authentication middleware
+async fn auth_middleware(
+    req: Request,
+    ctx: &mut RequestContext,
+    config: &AuthConfig,
+    next: Next
+) -> Result<Response, ApiError> {
+    // Check if we should skip authentication
+    if config.should_skip(&ctx.path, &ctx.method) {
+        return next.run(req).await.map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })
+    }
+
+    // Extract token from request
+    let token = extract_token(&req);
+
+    match token {
+        Some(token_str) => {
+            // Validate the token
+            match validate_token(&token_str).await {
+                Ok(auth_context) => {
+                    // Check token type is allowed
+                    if !config.allowed_token_types.contains(&auth_context.token_type) {
+                        return Err(ApiError::Unauthorized {
+                            message: "Invalid token type for this endpoint".to_string()
+                        })
+                    }
+
+                    // Check token expiration
+                    if auth_context.is_expired() {
+                        return Err(ApiError::Unauthorized {
+                            message: "Token has expired".to_string()
+                        })
+                    }
+
+                    // Set auth context
+                    ctx.auth = Some(auth_context);
+                },
+                Err(e) => {
+                    if config.required {
+                        return Err(ApiError::Unauthorized {
+                            message: format!("Invalid token: {}", e)
+                        })
+                    }
+                }
+            }
+        },
+        None => {
+            if config.required {
+                return Err(ApiError::Unauthorized {
+                    message: "Authentication required".to_string()
+                })
+            }
+        }
+    }
+
+    // Continue to next middleware/handler
+    next.run(req).await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })
+}
+
+/// Extract token from request (Authorization header or cookie)
+fn extract_token(req: &Request) -> Option<String> {
+    // Try Authorization header first
+    if let Some(auth_header) = req.header("Authorization") {
+        if auth_header.starts_with("Bearer ") {
+            return Some(auth_header[7..].to_string())
+        }
+    }
+
+    // Try cookie
+    if let Some(cookie_header) = req.header("Cookie") {
+        for cookie in cookie_header.split("; ") {
+            if cookie.starts_with("access_token=") {
+                return Some(cookie[13..].to_string())
+            }
+            if cookie.starts_with("session_token=") {
+                return Some(cookie[14..].to_string())
+            }
+        }
+    }
+
+    // Try query parameter (for websocket connections)
+    if let Some(token) = req.query_param("token") {
+        return Some(token)
+    }
+
+    None
+}
+
+// =============================================================================
+// TENANT MIDDLEWARE
+// =============================================================================
+
+/// Tenant resolution middleware
+async fn tenant_middleware(
+    req: Request,
+    ctx: &mut RequestContext,
+    next: Next
+) -> Result<Response, ApiError> {
+    // Try to resolve tenant from request
+    let tenant_context = get_tenant_from_request(&req).await;
+
+    match tenant_context {
+        Ok(tenant) => {
+            ctx.tenant = Some(tenant);
+        },
+        Err(e) => {
+            // If user is authenticated, try to get tenant from user's primary tenant
+            if let Some(auth) = &ctx.auth {
+                if let Some(primary_tenant) = &auth.primary_tenant_id {
+                    ctx.tenant = Some(TenantContext {
+                        tenant_id: primary_tenant.clone(),
+                        tenant_name: "".to_string(),
+                        settings: Map::new()
+                    });
+                }
+            }
+        }
+    }
+
+    next.run(req).await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })
+}
+
+// =============================================================================
+// AUTHORIZATION MIDDLEWARE
+// =============================================================================
+
+/// Authorization middleware builder
+type AuthzConfig {
+    /// Required permissions
+    required_permissions: List<Permission>,
+
+    /// Required any of these permissions (OR logic)
+    any_permissions: List<Permission>,
+
+    /// Required roles
+    required_roles: List<SystemRole>,
+
+    /// Custom authorization check
+    custom_check: Option<fn(&RequestContext) -> Bool>
+}
+
+impl AuthzConfig {
+    /// Create new authorization config
+    fn new() -> AuthzConfig {
+        AuthzConfig {
+            required_permissions: vec![],
+            any_permissions: vec![],
+            required_roles: vec![],
+            custom_check: None
+        }
+    }
+
+    /// Require specific permission
+    fn require_permission(mut self, permission: Permission) -> AuthzConfig {
+        self.required_permissions.push(permission);
+        self
+    }
+
+    /// Require any of these permissions
+    fn require_any_permission(mut self, permissions: List<Permission>) -> AuthzConfig {
+        self.any_permissions = permissions;
+        self
+    }
+
+    /// Require specific role
+    fn require_role(mut self, role: SystemRole) -> AuthzConfig {
+        self.required_roles.push(role);
+        self
+    }
+
+    /// Add custom authorization check
+    fn with_custom_check(mut self, check: fn(&RequestContext) -> Bool) -> AuthzConfig {
+        self.custom_check = Some(check);
+        self
+    }
+
+    /// Check authorization
+    fn check(&self, ctx: &RequestContext) -> Result<(), ApiError> {
+        // Must be authenticated
+        if ctx.auth.is_none() {
+            return Err(ApiError::Unauthorized {
+                message: "Authentication required".to_string()
+            })
+        }
+
+        // Check required permissions (AND logic)
+        for permission in &self.required_permissions {
+            if !ctx.has_permission(permission.clone()) {
+                return Err(ApiError::Forbidden {
+                    message: "Insufficient permissions".to_string(),
+                    required_permission: Some(format!("{:?}", permission))
+                })
+            }
+        }
+
+        // Check any permissions (OR logic)
+        if !self.any_permissions.is_empty() {
+            let has_any = self.any_permissions.iter()
+                .any(|p| ctx.has_permission(p.clone()));
+            if !has_any {
+                return Err(ApiError::Forbidden {
+                    message: "Insufficient permissions".to_string(),
+                    required_permission: None
+                })
+            }
+        }
+
+        // Check required roles
+        for role in &self.required_roles {
+            if !ctx.has_role(role.clone()) {
+                return Err(ApiError::Forbidden {
+                    message: format!("Role {:?} required", role),
+                    required_permission: None
+                })
+            }
+        }
+
+        // Run custom check
+        if let Some(check) = self.custom_check {
+            if !check(ctx) {
+                return Err(ApiError::Forbidden {
+                    message: "Custom authorization check failed".to_string(),
+                    required_permission: None
+                })
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Authorization middleware
+async fn authz_middleware(
+    req: Request,
+    ctx: &RequestContext,
+    config: &AuthzConfig,
+    next: Next
+) -> Result<Response, ApiError> {
+    // Check authorization
+    config.check(ctx)?;
+
+    // Continue to next middleware/handler
+    next.run(req).await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })
+}
+
+// =============================================================================
+// RATE LIMITING MIDDLEWARE
+// =============================================================================
+
+/// Rate limit configuration
+type RateLimitConfig {
+    /// Maximum requests per window
+    max_requests: i32,
+
+    /// Time window duration
+    window: Duration,
+
+    /// Key extractor (how to identify the rate limit key)
+    key_type: RateLimitKeyType,
+
+    /// Whether to apply per-endpoint limits
+    per_endpoint: Bool,
+
+    /// Burst allowance (temporary spike)
+    burst: i32,
+
+    /// Skip rate limiting for certain conditions
+    skip_for_roles: List<SystemRole>
+}
+
+/// How to key rate limits
+enum RateLimitKeyType {
+    /// By IP address
+    IpAddress,
+    /// By authenticated user
+    User,
+    /// By tenant
+    Tenant,
+    /// By API key
+    ApiKey,
+    /// Combination of IP and user
+    IpAndUser
+}
+
+impl RateLimitConfig {
+    /// Default rate limit (100 requests per minute)
+    fn default() -> RateLimitConfig {
+        RateLimitConfig {
+            max_requests: 100,
+            window: Duration::minutes(1),
+            key_type: RateLimitKeyType::IpAndUser,
+            per_endpoint: false,
+            burst: 20,
+            skip_for_roles: vec![SystemRole::SuperAdmin]
+        }
+    }
+
+    /// Strict rate limit (10 requests per minute)
+    fn strict() -> RateLimitConfig {
+        RateLimitConfig {
+            max_requests: 10,
+            window: Duration::minutes(1),
+            key_type: RateLimitKeyType::IpAndUser,
+            per_endpoint: true,
+            burst: 5,
+            skip_for_roles: vec![SystemRole::SuperAdmin]
+        }
+    }
+
+    /// Lenient rate limit (1000 requests per minute)
+    fn lenient() -> RateLimitConfig {
+        RateLimitConfig {
+            max_requests: 1000,
+            window: Duration::minutes(1),
+            key_type: RateLimitKeyType::IpAndUser,
+            per_endpoint: false,
+            burst: 100,
+            skip_for_roles: vec![SystemRole::Admin, SystemRole::SuperAdmin]
+        }
+    }
+
+    /// Get rate limit key for request
+    fn get_key(&self, ctx: &RequestContext) -> String {
+        let base_key = match self.key_type {
+            RateLimitKeyType::IpAddress => ctx.ip_address.clone(),
+            RateLimitKeyType::User => {
+                ctx.user_id()
+                    .map(|u| format!("user:{}", u))
+                    .unwrap_or_else(|| format!("ip:{}", ctx.ip_address))
+            },
+            RateLimitKeyType::Tenant => {
+                ctx.tenant_id()
+                    .map(|t| format!("tenant:{}", t))
+                    .unwrap_or_else(|| format!("ip:{}", ctx.ip_address))
+            },
+            RateLimitKeyType::ApiKey => {
+                // Would extract from auth context if using API keys
+                format!("ip:{}", ctx.ip_address)
+            },
+            RateLimitKeyType::IpAndUser => {
+                let user_part = ctx.user_id()
+                    .map(|u| format!("user:{}", u))
+                    .unwrap_or_else(|| "anon".to_string());
+                format!("{}:{}", ctx.ip_address, user_part)
+            }
+        };
+
+        if self.per_endpoint {
+            format!("{}:{}:{}", base_key, ctx.method, ctx.path)
+        } else {
+            base_key
+        }
+    }
+
+    /// Check if should skip rate limiting
+    fn should_skip(&self, ctx: &RequestContext) -> Bool {
+        if let Some(auth) = &ctx.auth {
+            for role in &self.skip_for_roles {
+                if auth.roles.contains(role) {
+                    return true
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Rate limit state for a key
+type RateLimitState {
+    /// Request count in current window
+    count: i32,
+
+    /// Window start time
+    window_start: Instant,
+
+    /// Burst tokens available
+    burst_tokens: i32
+}
+
+/// Rate limiter (in-memory, should use Redis in production)
+type RateLimiter {
+    states: Arc<RwLock<Map<String, RateLimitState>>>,
+    config: RateLimitConfig
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter
+    fn new(config: RateLimitConfig) -> RateLimiter {
+        RateLimiter {
+            states: Arc::new(RwLock::new(Map::new())),
+            config
+        }
+    }
+
+    /// Check and update rate limit
+    fn check(&self, key: &str) -> Result<RateLimitInfo, Duration> {
+        let mut states = self.states.write().unwrap();
+        let now = Instant::now();
+
+        let state = states.entry(key.to_string()).or_insert(RateLimitState {
+            count: 0,
+            window_start: now,
+            burst_tokens: self.config.burst
+        });
+
+        // Check if window has expired
+        if now.duration_since(state.window_start) >= self.config.window {
+            // Reset window
+            state.count = 0;
+            state.window_start = now;
+            state.burst_tokens = self.config.burst;
+        }
+
+        // Check if within limits
+        let effective_limit = self.config.max_requests + state.burst_tokens.min(0);
+
+        if state.count >= effective_limit {
+            // Rate limit exceeded
+            let retry_after = self.config.window - now.duration_since(state.window_start);
+            return Err(retry_after)
+        }
+
+        // Increment counter
+        state.count += 1;
+
+        // Use burst token if over normal limit
+        if state.count > self.config.max_requests {
+            state.burst_tokens -= 1;
+        }
+
+        Ok(RateLimitInfo {
+            limit: self.config.max_requests,
+            remaining: effective_limit - state.count,
+            reset: state.window_start + self.config.window
+        })
+    }
+}
+
+/// Rate limit information for headers
+type RateLimitInfo {
+    limit: i32,
+    remaining: i32,
+    reset: Instant
+}
+
+/// Rate limiting middleware
+async fn rate_limit_middleware(
+    req: Request,
+    ctx: &RequestContext,
+    limiter: &RateLimiter,
+    next: Next
+) -> Result<Response, ApiError> {
+    // Skip for certain roles
+    if limiter.config.should_skip(ctx) {
+        return next.run(req).await.map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })
+    }
+
+    // Get rate limit key
+    let key = limiter.config.get_key(ctx);
+
+    // Check rate limit
+    match limiter.check(&key) {
+        Ok(info) => {
+            // Continue and add rate limit headers to response
+            let mut response = next.run(req).await.map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?;
+
+            response.set_header("X-RateLimit-Limit", &info.limit.to_string());
+            response.set_header("X-RateLimit-Remaining", &info.remaining.to_string());
+            response.set_header("X-RateLimit-Reset", &info.reset.as_secs().to_string());
+
+            Ok(response)
+        },
+        Err(retry_after) => {
+            Err(ApiError::RateLimitExceeded { retry_after })
+        }
+    }
+}
+
+// =============================================================================
+// ERROR HANDLING MIDDLEWARE
+// =============================================================================
+
+/// Error handler middleware
+async fn error_handler_middleware(
+    req: Request,
+    ctx: &RequestContext,
+    next: Next
+) -> Response {
+    match next.run(req).await {
+        Ok(response) => response,
+        Err(error) => {
+            // Log the error
+            log_error(ctx, &error);
+
+            // Convert to API error if needed
+            let api_error = match error.downcast::<ApiError>() {
+                Ok(api_err) => api_err,
+                Err(other_err) => ApiError::InternalError {
+                    message: other_err.to_string(),
+                    trace_id: ctx.trace_id.clone()
+                }
+            };
+
+            // Return error response
+            api_error.to_response()
+        }
+    }
+}
+
+/// Log error with context
+fn log_error(ctx: &RequestContext, error: &RuntimeError) {
+    // In production, this would send to logging service
+    eprintln!(
+        "[ERROR] {} {} - request_id={} trace_id={} error={}",
+        ctx.method,
+        ctx.path,
+        ctx.request_id,
+        ctx.trace_id,
+        error
+    );
+}
+
+// =============================================================================
+// REQUEST LOGGING MIDDLEWARE
+// =============================================================================
+
+/// Request logging configuration
+type LoggingConfig {
+    /// Log request bodies
+    log_body: Bool,
+
+    /// Log response bodies
+    log_response: Bool,
+
+    /// Paths to skip logging
+    skip_paths: List<String>,
+
+    /// Sensitive headers to mask
+    sensitive_headers: List<String>,
+
+    /// Maximum body length to log
+    max_body_length: i64
+}
+
+impl LoggingConfig {
+    fn default() -> LoggingConfig {
+        LoggingConfig {
+            log_body: false,
+            log_response: false,
+            skip_paths: vec!["/health".to_string(), "/ready".to_string()],
+            sensitive_headers: vec![
+                "Authorization".to_string(),
+                "Cookie".to_string(),
+                "X-API-Key".to_string()
+            ],
+            max_body_length: 10000
+        }
+    }
+}
+
+/// Request logging middleware
+async fn logging_middleware(
+    req: Request,
+    ctx: &RequestContext,
+    config: &LoggingConfig,
+    next: Next
+) -> Result<Response, RuntimeError> {
+    // Skip logging for certain paths
+    if config.skip_paths.contains(&ctx.path) {
+        return next.run(req).await
+    }
+
+    // Log request
+    log_request(ctx, &req, config);
+
+    // Execute request
+    let result = next.run(req).await;
+
+    // Log response
+    let elapsed = ctx.elapsed();
+    match &result {
+        Ok(response) => {
+            log_response(ctx, response, elapsed, config);
+        },
+        Err(error) => {
+            log_error_response(ctx, error, elapsed);
+        }
+    }
+
+    result
+}
+
+/// Log incoming request
+fn log_request(ctx: &RequestContext, req: &Request, config: &LoggingConfig) {
+    println!(
+        "[REQUEST] {} {} - request_id={} trace_id={} ip={} user_id={:?}",
+        ctx.method,
+        ctx.path,
+        ctx.request_id,
+        ctx.trace_id,
+        ctx.ip_address,
+        ctx.user_id()
+    );
+}
+
+/// Log response
+fn log_response(ctx: &RequestContext, response: &Response, elapsed: Duration, config: &LoggingConfig) {
+    println!(
+        "[RESPONSE] {} {} - request_id={} status={} elapsed_ms={}",
+        ctx.method,
+        ctx.path,
+        ctx.request_id,
+        response.status().as_u16(),
+        elapsed.as_millis()
+    );
+}
+
+/// Log error response
+fn log_error_response(ctx: &RequestContext, error: &RuntimeError, elapsed: Duration) {
+    eprintln!(
+        "[ERROR_RESPONSE] {} {} - request_id={} error={} elapsed_ms={}",
+        ctx.method,
+        ctx.path,
+        ctx.request_id,
+        error,
+        elapsed.as_millis()
+    );
+}
+
+// =============================================================================
+// CORS MIDDLEWARE
+// =============================================================================
+
+/// CORS configuration
+type CorsConfig {
+    /// Allowed origins
+    allowed_origins: List<String>,
+
+    /// Allow all origins
+    allow_any_origin: Bool,
+
+    /// Allowed methods
+    allowed_methods: List<String>,
+
+    /// Allowed headers
+    allowed_headers: List<String>,
+
+    /// Exposed headers
+    exposed_headers: List<String>,
+
+    /// Allow credentials
+    allow_credentials: Bool,
+
+    /// Max age for preflight cache
+    max_age: Duration
+}
+
+impl CorsConfig {
+    fn default() -> CorsConfig {
+        CorsConfig {
+            allowed_origins: vec![],
+            allow_any_origin: false,
+            allowed_methods: vec![
+                "GET".to_string(),
+                "POST".to_string(),
+                "PUT".to_string(),
+                "PATCH".to_string(),
+                "DELETE".to_string(),
+                "OPTIONS".to_string()
+            ],
+            allowed_headers: vec![
+                "Content-Type".to_string(),
+                "Authorization".to_string(),
+                "X-Requested-With".to_string(),
+                "X-Trace-ID".to_string(),
+                "X-Correlation-ID".to_string()
+            ],
+            exposed_headers: vec![
+                "X-Request-ID".to_string(),
+                "X-Trace-ID".to_string(),
+                "X-RateLimit-Limit".to_string(),
+                "X-RateLimit-Remaining".to_string(),
+                "X-RateLimit-Reset".to_string()
+            ],
+            allow_credentials: true,
+            max_age: Duration::hours(24)
+        }
+    }
+
+    /// Check if origin is allowed
+    fn is_origin_allowed(&self, origin: &str) -> Bool {
+        if self.allow_any_origin {
+            return true
+        }
+        self.allowed_origins.contains(&origin.to_string())
+    }
+}
+
+/// CORS middleware
+async fn cors_middleware(
+    req: Request,
+    config: &CorsConfig,
+    next: Next
+) -> Result<Response, RuntimeError> {
+    let origin = req.header("Origin");
+
+    // Handle preflight request
+    if req.method() == "OPTIONS" {
+        return Ok(build_preflight_response(config, origin))
+    }
+
+    // Continue with request
+    let mut response = next.run(req).await?;
+
+    // Add CORS headers
+    if let Some(origin) = origin {
+        if config.is_origin_allowed(&origin) {
+            response.set_header("Access-Control-Allow-Origin", &origin);
+            if config.allow_credentials {
+                response.set_header("Access-Control-Allow-Credentials", "true");
+            }
+            response.set_header(
+                "Access-Control-Expose-Headers",
+                &config.exposed_headers.join(", ")
+            );
+        }
+    }
+
+    Ok(response)
+}
+
+/// Build preflight response
+fn build_preflight_response(config: &CorsConfig, origin: Option<String>) -> Response {
+    let mut response = Response::new().with_status(StatusCode::NO_CONTENT);
+
+    if let Some(origin) = origin {
+        if config.is_origin_allowed(&origin) {
+            response.set_header("Access-Control-Allow-Origin", &origin);
+            response.set_header(
+                "Access-Control-Allow-Methods",
+                &config.allowed_methods.join(", ")
+            );
+            response.set_header(
+                "Access-Control-Allow-Headers",
+                &config.allowed_headers.join(", ")
+            );
+            response.set_header(
+                "Access-Control-Max-Age",
+                &config.max_age.as_secs().to_string()
+            );
+            if config.allow_credentials {
+                response.set_header("Access-Control-Allow-Credentials", "true");
+            }
+        }
+    }
+
+    response
+}
+
+// =============================================================================
+// BODY PARSING MIDDLEWARE
+// =============================================================================
+
+/// Body size limit configuration
+type BodyLimitConfig {
+    /// Maximum JSON body size
+    json_limit: i64,
+
+    /// Maximum form body size
+    form_limit: i64,
+
+    /// Maximum file upload size
+    file_limit: i64,
+
+    /// Maximum multipart body size
+    multipart_limit: i64
+}
+
+impl BodyLimitConfig {
+    fn default() -> BodyLimitConfig {
+        BodyLimitConfig {
+            json_limit: 1024 * 1024,         // 1 MB
+            form_limit: 1024 * 1024,          // 1 MB
+            file_limit: 100 * 1024 * 1024,    // 100 MB
+            multipart_limit: 100 * 1024 * 1024 // 100 MB
+        }
+    }
+}
+
+/// Body size limit middleware
+async fn body_limit_middleware(
+    req: Request,
+    config: &BodyLimitConfig,
+    ctx: &RequestContext,
+    next: Next
+) -> Result<Response, ApiError> {
+    // Get content length if available
+    if let Some(content_length) = req.header("Content-Length") {
+        if let Ok(length) = content_length.parse::<i64>() {
+            let content_type = req.header("Content-Type").unwrap_or("");
+
+            let max_size = if content_type.contains("application/json") {
+                config.json_limit
+            } else if content_type.contains("multipart/form-data") {
+                config.multipart_limit
+            } else if content_type.contains("application/x-www-form-urlencoded") {
+                config.form_limit
+            } else {
+                config.file_limit
+            };
+
+            if length > max_size {
+                return Err(ApiError::PayloadTooLarge {
+                    max_size,
+                    actual_size: length
+                })
+            }
+        }
+    }
+
+    next.run(req).await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })
+}
+
+// =============================================================================
+// RESPONSE HELPERS
+// =============================================================================
+
+/// Standard API response wrapper
+type ApiResponse<T> {
+    /// Success flag
+    success: Bool,
+
+    /// Response data
+    data: Option<T>,
+
+    /// Pagination metadata
+    pagination: Option<PaginationMeta>,
+
+    /// Request metadata
+    meta: ResponseMeta
+}
+
+/// Pagination metadata
+type PaginationMeta {
+    page: i32,
+    per_page: i32,
+    total: i64,
+    total_pages: i32,
+    has_next: Bool,
+    has_prev: Bool
+}
+
+/// Response metadata
+type ResponseMeta {
+    request_id: String,
+    trace_id: String,
+    timestamp: DateTime
+}
+
+impl<T> ApiResponse<T> {
+    /// Create success response
+    fn success(data: T, ctx: &RequestContext) -> ApiResponse<T> {
+        ApiResponse {
+            success: true,
+            data: Some(data),
+            pagination: None,
+            meta: ResponseMeta {
+                request_id: ctx.request_id.clone(),
+                trace_id: ctx.trace_id.clone(),
+                timestamp: DateTime::now()
+            }
+        }
+    }
+
+    /// Create paginated success response
+    fn paginated(data: T, pagination: PaginationMeta, ctx: &RequestContext) -> ApiResponse<T> {
+        ApiResponse {
+            success: true,
+            data: Some(data),
+            pagination: Some(pagination),
+            meta: ResponseMeta {
+                request_id: ctx.request_id.clone(),
+                trace_id: ctx.trace_id.clone(),
+                timestamp: DateTime::now()
+            }
+        }
+    }
+
+    /// Create empty success response
+    fn empty(ctx: &RequestContext) -> ApiResponse<()> {
+        ApiResponse {
+            success: true,
+            data: None,
+            pagination: None,
+            meta: ResponseMeta {
+                request_id: ctx.request_id.clone(),
+                trace_id: ctx.trace_id.clone(),
+                timestamp: DateTime::now()
+            }
+        }
+    }
+}
+
+/// Pagination parameters from request
+type PaginationParams {
+    page: i32,
+    per_page: i32,
+    sort_by: Option<String>,
+    sort_order: SortOrder
+}
+
+enum SortOrder {
+    Asc,
+    Desc
+}
+
+impl PaginationParams {
+    /// Parse from request query parameters
+    fn from_request(req: &Request) -> PaginationParams {
+        let page = req.query_param("page")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(1)
+            .max(1);
+
+        let per_page = req.query_param("per_page")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(20)
+            .max(1)
+            .min(100);
+
+        let sort_by = req.query_param("sort_by");
+
+        let sort_order = req.query_param("sort_order")
+            .map(|o| if o == "desc" { SortOrder::Desc } else { SortOrder::Asc })
+            .unwrap_or(SortOrder::Desc);
+
+        PaginationParams {
+            page,
+            per_page,
+            sort_by,
+            sort_order
+        }
+    }
+
+    /// Calculate offset for database query
+    fn offset(&self) -> i64 {
+        ((self.page - 1) * self.per_page) as i64
+    }
+
+    /// Get limit for database query
+    fn limit(&self) -> i64 {
+        self.per_page as i64
+    }
+
+    /// Calculate pagination metadata
+    fn to_meta(&self, total: i64) -> PaginationMeta {
+        let total_pages = ((total as f64) / (self.per_page as f64)).ceil() as i32;
+
+        PaginationMeta {
+            page: self.page,
+            per_page: self.per_page,
+            total,
+            total_pages,
+            has_next: self.page < total_pages,
+            has_prev: self.page > 1
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Generate a request ID
+fn generate_request_id() -> String {
+    format!("req_{}", generate_short_id())
+}
+
+/// Generate a trace ID
+fn generate_trace_id() -> String {
+    format!("trace_{}", generate_uuid())
+}
+
+/// Generate a short ID
+fn generate_short_id() -> String {
+    use std::random::random;
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
+    let mut id = String::new();
+    for _ in 0..12 {
+        let idx = (random::<u8>() as usize) % chars.len();
+        id.push(chars[idx]);
+    }
+    id
+}
+
+// =============================================================================
+// MIDDLEWARE CHAIN BUILDER
+// =============================================================================
+
+/// Middleware chain builder for composing middleware
+type MiddlewareChain {
+    auth_config: Option<AuthConfig>,
+    authz_config: Option<AuthzConfig>,
+    rate_limit_config: Option<RateLimitConfig>,
+    cors_config: Option<CorsConfig>,
+    body_limit_config: Option<BodyLimitConfig>,
+    logging_config: Option<LoggingConfig>
+}
+
+impl MiddlewareChain {
+    /// Create new middleware chain
+    fn new() -> MiddlewareChain {
+        MiddlewareChain {
+            auth_config: None,
+            authz_config: None,
+            rate_limit_config: None,
+            cors_config: None,
+            body_limit_config: None,
+            logging_config: None
+        }
+    }
+
+    /// Add authentication middleware
+    fn with_auth(mut self, config: AuthConfig) -> MiddlewareChain {
+        self.auth_config = Some(config);
+        self
+    }
+
+    /// Add authorization middleware
+    fn with_authz(mut self, config: AuthzConfig) -> MiddlewareChain {
+        self.authz_config = Some(config);
+        self
+    }
+
+    /// Add rate limiting middleware
+    fn with_rate_limit(mut self, config: RateLimitConfig) -> MiddlewareChain {
+        self.rate_limit_config = Some(config);
+        self
+    }
+
+    /// Add CORS middleware
+    fn with_cors(mut self, config: CorsConfig) -> MiddlewareChain {
+        self.cors_config = Some(config);
+        self
+    }
+
+    /// Add body limit middleware
+    fn with_body_limit(mut self, config: BodyLimitConfig) -> MiddlewareChain {
+        self.body_limit_config = Some(config);
+        self
+    }
+
+    /// Add logging middleware
+    fn with_logging(mut self, config: LoggingConfig) -> MiddlewareChain {
+        self.logging_config = Some(config);
+        self
+    }
+
+    /// Use default authentication (required)
+    fn with_default_auth(self) -> MiddlewareChain {
+        self.with_auth(AuthConfig::default())
+    }
+
+    /// Use optional authentication
+    fn with_optional_auth(self) -> MiddlewareChain {
+        self.with_auth(AuthConfig::optional())
+    }
+
+    /// Use default rate limiting
+    fn with_default_rate_limit(self) -> MiddlewareChain {
+        self.with_rate_limit(RateLimitConfig::default())
+    }
+
+    /// Use default CORS
+    fn with_default_cors(self) -> MiddlewareChain {
+        self.with_cors(CorsConfig::default())
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use ApiError;
+pub use FieldError;
+pub use RequestContext;
+pub use AuthConfig;
+pub use AuthzConfig;
+pub use RateLimitConfig;
+pub use RateLimiter;
+pub use RateLimitKeyType;
+pub use CorsConfig;
+pub use BodyLimitConfig;
+pub use LoggingConfig;
+pub use ApiResponse;
+pub use PaginationParams;
+pub use PaginationMeta;
+pub use SortOrder;
+pub use MiddlewareChain;
+pub use auth_middleware;
+pub use tenant_middleware;
+pub use authz_middleware;
+pub use rate_limit_middleware;
+pub use error_handler_middleware;
+pub use logging_middleware;
+pub use cors_middleware;
+pub use body_limit_middleware;

@@ -1,0 +1,329 @@
+/// Intelligo LMS - Compliance Unit Tests
+///
+/// Tests for SCORM, xAPI, and LRS compliance modules.
+
+module intelligo::tests::unit::compliance
+
+use intelligo::chai::*
+use intelligo::compliance::scorm::*
+use intelligo::compliance::xapi::*
+use intelligo::compliance::lrs::*
+
+pub fn register_tests() {
+    describe("SCORM 1.2", || {
+        describe("data model", || {
+            it("initializes with correct defaults", || {
+                let runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                expect(&runtime.cmi.core.student_id).to().equal(&"learner_1".to_string());
+                expect(&runtime.cmi.core.lesson_status).to().equal(&"not attempted".to_string());
+            });
+
+            it("validates lesson_status values", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                let result = runtime.set_value("cmi.core.lesson_status", "completed");
+                expect(&result.is_ok()).to().be_true();
+
+                let result = runtime.set_value("cmi.core.lesson_status", "invalid_status");
+                expect(&result.is_err()).to().be_true();
+            });
+
+            it("calculates score scaled correctly", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                runtime.set_value("cmi.core.score.raw", "80").unwrap();
+                runtime.set_value("cmi.core.score.min", "0").unwrap();
+                runtime.set_value("cmi.core.score.max", "100").unwrap();
+
+                let scaled = runtime.get_scaled_score();
+                expect(&scaled.is_some()).to().be_true();
+                expect(&scaled.unwrap()).to().be_close_to(0.8, 0.01);
+            });
+
+            it("tracks session time", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                runtime.set_value("cmi.core.session_time", "00:30:00").unwrap();
+
+                let value = runtime.get_value("cmi.core.session_time").unwrap();
+                expect(&value).to().equal(&"00:30:00".to_string());
+            });
+        });
+
+        describe("API calls", || {
+            it("LMSInitialize returns true on first call", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                let result = runtime.lms_initialize("");
+                expect(&result).to().equal(&"true".to_string());
+            });
+
+            it("LMSFinish commits data", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+                runtime.lms_initialize("");
+
+                let result = runtime.lms_finish("");
+                expect(&result).to().equal(&"true".to_string());
+            });
+
+            it("LMSGetLastError returns error code", || {
+                let runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                let error = runtime.lms_get_last_error();
+                expect(&error).to().equal(&"0".to_string()); // No error
+            });
+        });
+
+        describe("objectives", || {
+            it("can set objective data", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                runtime.set_value("cmi.objectives.0.id", "obj1").unwrap();
+                runtime.set_value("cmi.objectives.0.status", "completed").unwrap();
+                runtime.set_value("cmi.objectives.0.score.raw", "85").unwrap();
+
+                let id = runtime.get_value("cmi.objectives.0.id").unwrap();
+                expect(&id).to().equal(&"obj1".to_string());
+            });
+        });
+    });
+
+    describe("SCORM 2004", || {
+        describe("data model", || {
+            it("uses completion_status instead of lesson_status", || {
+                let runtime = Scorm2004Runtime::new("learner_1", "Test, Learner");
+
+                expect(&runtime.cmi.completion_status).to().equal(&"unknown".to_string());
+                expect(&runtime.cmi.success_status).to().equal(&"unknown".to_string());
+            });
+
+            it("validates completion_status values", || {
+                let mut runtime = Scorm2004Runtime::new("learner_1", "Test, Learner");
+
+                let result = runtime.set_value("cmi.completion_status", "completed");
+                expect(&result.is_ok()).to().be_true();
+
+                let result = runtime.set_value("cmi.completion_status", "browsed");
+                expect(&result.is_err()).to().be_true(); // browsed is SCORM 1.2 only
+            });
+
+            it("tracks progress_measure", || {
+                let mut runtime = Scorm2004Runtime::new("learner_1", "Test, Learner");
+
+                runtime.set_value("cmi.progress_measure", "0.75").unwrap();
+
+                let value = runtime.get_value("cmi.progress_measure").unwrap();
+                expect(&value).to().equal(&"0.75".to_string());
+            });
+        });
+
+        describe("sequencing", || {
+            it("respects navigation requests", || {
+                let mut sequencer = Scorm2004Sequencer::new();
+
+                let result = sequencer.process_navigation_request(NavigationRequest::Continue);
+                expect(&result.is_ok()).to().be_true();
+            });
+
+            it("evaluates preconditions", || {
+                let mut sequencer = Scorm2004Sequencer::new();
+                sequencer.add_activity(Activity {
+                    id: "act1".to_string(),
+                    preconditions: vec![
+                        SequencingRule {
+                            condition: RuleCondition::Completed,
+                            action: RuleAction::Skip
+                        }
+                    ],
+                    ..Default::default()
+                });
+
+                let can_enter = sequencer.can_enter_activity("act1");
+                // Would depend on state
+            });
+        });
+    });
+
+    describe("xAPI", || {
+        describe("statement creation", || {
+            it("creates a valid statement structure", || {
+                let statement = XapiStatement::new(
+                    Actor::agent("mailto:learner@example.com"),
+                    Verb::completed(),
+                    Object::activity("http://example.com/course1")
+                );
+
+                expect(&statement.actor.mbox.is_some()).to().be_true();
+                expect(&statement.verb.id).to().equal(&"http://adlnet.gov/expapi/verbs/completed".to_string());
+            });
+
+            it("includes required fields", || {
+                let statement = XapiStatement::new(
+                    Actor::agent("mailto:learner@example.com"),
+                    Verb::attempted(),
+                    Object::activity("http://example.com/course1")
+                );
+
+                expect(&statement.id.is_some()).to().be_true();
+                expect(&statement.timestamp.is_some()).to().be_true();
+            });
+
+            it("can add result data", || {
+                let mut statement = XapiStatement::new(
+                    Actor::agent("mailto:learner@example.com"),
+                    Verb::passed(),
+                    Object::activity("http://example.com/quiz1")
+                );
+
+                statement.set_result(Result {
+                    score: Some(Score {
+                        scaled: Some(0.85),
+                        raw: Some(85.0),
+                        min: Some(0.0),
+                        max: Some(100.0)
+                    }),
+                    success: Some(true),
+                    completion: Some(true),
+                    duration: Some("PT30M".to_string()),
+                    response: None,
+                    extensions: None
+                });
+
+                expect(&statement.result.is_some()).to().be_true();
+                expect(&statement.result.as_ref().unwrap().success).to().equal(&Some(true));
+            });
+
+            it("can add context", || {
+                let mut statement = XapiStatement::new(
+                    Actor::agent("mailto:learner@example.com"),
+                    Verb::completed(),
+                    Object::activity("http://example.com/lesson1")
+                );
+
+                statement.set_context(Context {
+                    registration: Some("reg-12345".to_string()),
+                    instructor: None,
+                    team: None,
+                    context_activities: Some(ContextActivities {
+                        parent: Some(vec![
+                            Object::activity("http://example.com/course1")
+                        ]),
+                        grouping: None,
+                        category: None,
+                        other: None
+                    }),
+                    revision: None,
+                    platform: Some("Intelligo LMS".to_string()),
+                    language: Some("en-US".to_string()),
+                    statement: None,
+                    extensions: None
+                });
+
+                expect(&statement.context.is_some()).to().be_true();
+            });
+        });
+
+        describe("statement validation", || {
+            it("requires an actor", || {
+                let result = XapiStatement::validate(&XapiStatement {
+                    id: None,
+                    actor: Actor::empty(),
+                    verb: Verb::completed(),
+                    object: Object::activity("http://example.com/course1"),
+                    result: None,
+                    context: None,
+                    timestamp: None,
+                    stored: None,
+                    authority: None,
+                    version: None,
+                    attachments: None
+                });
+
+                expect(&result.is_err()).to().be_true();
+            });
+
+            it("validates verb IRI format", || {
+                let verb = Verb {
+                    id: "not-a-valid-iri".to_string(),
+                    display: None
+                };
+
+                let valid = verb.is_valid();
+                expect(&valid).to().be_false();
+            });
+        });
+
+        describe("common verbs", || {
+            it("has standard ADL verbs", || {
+                expect(&Verb::attempted().id).to().contain(&"attempted".to_string());
+                expect(&Verb::completed().id).to().contain(&"completed".to_string());
+                expect(&Verb::passed().id).to().contain(&"passed".to_string());
+                expect(&Verb::failed().id).to().contain(&"failed".to_string());
+            });
+        });
+    });
+
+    describe("LRS", || {
+        describe("statement storage", || {
+            it("stores a statement", || {
+                let mut lrs = InMemoryLrs::new();
+                let statement = XapiStatement::new(
+                    Actor::agent("mailto:learner@example.com"),
+                    Verb::completed(),
+                    Object::activity("http://example.com/course1")
+                );
+
+                let result = lrs.store_statement(statement.clone());
+
+                expect(&result.is_ok()).to().be_true();
+            });
+
+            it("retrieves statements by actor", || {
+                let mut lrs = InMemoryLrs::new();
+
+                lrs.store_statement(XapiStatement::new(
+                    Actor::agent("mailto:learner1@example.com"),
+                    Verb::completed(),
+                    Object::activity("http://example.com/course1")
+                )).unwrap();
+
+                lrs.store_statement(XapiStatement::new(
+                    Actor::agent("mailto:learner2@example.com"),
+                    Verb::completed(),
+                    Object::activity("http://example.com/course1")
+                )).unwrap();
+
+                let query = StatementQuery {
+                    agent: Some(Actor::agent("mailto:learner1@example.com")),
+                    ..Default::default()
+                };
+
+                let results = lrs.query_statements(&query);
+                expect(&results.len()).to().equal(&1);
+            });
+        });
+
+        describe("state API", || {
+            it("stores and retrieves state", || {
+                let mut lrs = InMemoryLrs::new();
+
+                lrs.set_state(
+                    "http://example.com/course1",
+                    Actor::agent("mailto:learner@example.com"),
+                    "bookmark",
+                    r#"{"page": 5}"#
+                ).unwrap();
+
+                let state = lrs.get_state(
+                    "http://example.com/course1",
+                    Actor::agent("mailto:learner@example.com"),
+                    "bookmark"
+                );
+
+                expect(&state.is_some()).to().be_true();
+                expect(&state.unwrap()).to().contain(&"page".to_string());
+            });
+        });
+    });
+}

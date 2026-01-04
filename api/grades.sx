@@ -1,0 +1,1327 @@
+/// Intelligo LMS - Grades API
+///
+/// This module provides grading and gradebook endpoints:
+/// - Gradebook views (instructor and student)
+/// - Grade entry and modification
+/// - Grade calculations and aggregation
+/// - Grade export and import
+/// - Grade override management
+
+module intelligo::api::grades
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::entities::grade::*
+use intelligo::entities::course::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the grades router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Gradebook views
+        .get("/courses/:course_id/gradebook", move |req| get_gradebook(req, db.clone()))
+        .get("/courses/:course_id/gradebook/student/:student_id", move |req| get_student_grades(req, db.clone()))
+        .get("/courses/:course_id/gradebook/assignment/:assignment_id", move |req| get_assignment_grades(req, db.clone()))
+
+        // Individual grades
+        .get("/:grade_id", move |req| get_grade(req, db.clone()))
+        .post("/", move |req| create_grade(req, db.clone()))
+        .patch("/:grade_id", move |req| update_grade(req, db.clone()))
+        .delete("/:grade_id", move |req| delete_grade(req, db.clone()))
+
+        // Bulk operations
+        .post("/bulk", move |req| bulk_create_grades(req, db.clone()))
+        .patch("/bulk", move |req| bulk_update_grades(req, db.clone()))
+
+        // Grade overrides
+        .post("/:grade_id/override", move |req| create_override(req, db.clone()))
+        .delete("/:grade_id/override", move |req| remove_override(req, db.clone()))
+
+        // Grade calculations
+        .get("/courses/:course_id/calculate/:student_id", move |req| calculate_final_grade(req, db.clone()))
+        .post("/courses/:course_id/recalculate", move |req| recalculate_all_grades(req, db.clone()))
+
+        // Grade history
+        .get("/:grade_id/history", move |req| get_grade_history(req, db.clone()))
+
+        // Export/Import
+        .get("/courses/:course_id/export", move |req| export_grades(req, db.clone()))
+        .post("/courses/:course_id/import", move |req| import_grades(req, db.clone()))
+
+        // Student's own grades
+        .get("/my/courses/:course_id", move |req| get_my_grades(req, db.clone()))
+        .get("/my/summary", move |req| get_my_grade_summary(req, db.clone()))
+
+        // Grade statistics
+        .get("/courses/:course_id/statistics", move |req| get_grade_statistics(req, db.clone()))
+        .get("/courses/:course_id/distribution", move |req| get_grade_distribution(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Gradebook response with all students and grades
+type GradebookResponse {
+    course_id: CourseId,
+    course_title: String,
+    grading_scheme: GradingSchemeResponse,
+    categories: List<GradeCategoryResponse>,
+    assignments: List<GradebookAssignment>,
+    students: List<GradebookStudent>,
+    summary: GradebookSummary
+}
+
+/// Grading scheme response
+type GradingSchemeResponse {
+    id: String,
+    name: String,
+    aggregation_type: GradeAggregationType,
+    passing_grade: f64,
+    letter_grades: List<LetterGradeMapping>,
+    drop_lowest: Option<i32>
+}
+
+/// Letter grade mapping
+type LetterGradeMapping {
+    letter: String,
+    min_percentage: f64,
+    max_percentage: f64,
+    gpa_value: Option<f64>
+}
+
+/// Grade category response
+type GradeCategoryResponse {
+    id: String,
+    name: String,
+    weight: f64,
+    drop_lowest: Option<i32>,
+    assignment_count: i32
+}
+
+/// Gradebook assignment column
+type GradebookAssignment {
+    id: String,
+    title: String,
+    category_id: Option<String>,
+    points_possible: f64,
+    due_date: Option<DateTime>,
+    published: Bool,
+    grading_type: GradingType
+}
+
+/// Gradebook student row
+type GradebookStudent {
+    user_id: UserId,
+    name: String,
+    email: String,
+    avatar_url: Option<String>,
+    section_id: Option<String>,
+    section_name: Option<String>,
+    grades: List<GradebookGrade>,
+    current_grade: Option<f64>,
+    current_letter: Option<String>,
+    final_grade: Option<f64>,
+    final_letter: Option<String>,
+    last_activity: Option<DateTime>
+}
+
+/// Individual grade in gradebook
+type GradebookGrade {
+    assignment_id: String,
+    score: Option<f64>,
+    grade: Option<f64>,
+    letter_grade: Option<String>,
+    status: GradeStatus,
+    submitted_at: Option<DateTime>,
+    graded_at: Option<DateTime>,
+    graded_by: Option<UserId>,
+    has_override: Bool,
+    late: Bool,
+    missing: Bool,
+    excused: Bool
+}
+
+/// Gradebook summary statistics
+type GradebookSummary {
+    total_students: i32,
+    average_grade: Option<f64>,
+    median_grade: Option<f64>,
+    highest_grade: Option<f64>,
+    lowest_grade: Option<f64>,
+    passing_count: i32,
+    failing_count: i32,
+    missing_submissions: i32
+}
+
+/// Student grades response
+type StudentGradesResponse {
+    student: StudentInfo,
+    course: CourseInfo,
+    grades: List<StudentGradeItem>,
+    current_grade: Option<f64>,
+    current_letter: Option<String>,
+    category_grades: List<CategoryGrade>,
+    grade_trend: List<GradeTrendPoint>
+}
+
+/// Student info
+type StudentInfo {
+    user_id: UserId,
+    name: String,
+    email: String,
+    avatar_url: Option<String>,
+    section_name: Option<String>
+}
+
+/// Course info
+type CourseInfo {
+    id: CourseId,
+    title: String,
+    code: String
+}
+
+/// Individual student grade item
+type StudentGradeItem {
+    assignment_id: String,
+    assignment_title: String,
+    category_name: Option<String>,
+    due_date: Option<DateTime>,
+    points_possible: f64,
+    score: Option<f64>,
+    grade: Option<f64>,
+    letter_grade: Option<String>,
+    status: GradeStatus,
+    submission_status: SubmissionStatus,
+    feedback: Option<String>,
+    graded_at: Option<DateTime>,
+    has_override: Bool,
+    excused: Bool
+}
+
+/// Category grade
+type CategoryGrade {
+    category_id: String,
+    category_name: String,
+    weight: f64,
+    earned_points: f64,
+    possible_points: f64,
+    percentage: Option<f64>,
+    weighted_grade: Option<f64>
+}
+
+/// Grade trend point
+type GradeTrendPoint {
+    date: DateTime,
+    cumulative_grade: f64
+}
+
+/// Create grade request
+type CreateGradeRequest {
+    assignment_id: String,
+    student_id: UserId,
+    score: f64,
+    feedback: Option<String>,
+    notify_student: Option<Bool>
+}
+
+/// Update grade request
+type UpdateGradeRequest {
+    score: Option<f64>,
+    feedback: Option<String>,
+    excused: Option<Bool>,
+    notify_student: Option<Bool>
+}
+
+/// Grade override request
+type GradeOverrideRequest {
+    override_score: f64,
+    reason: String,
+    notify_student: Option<Bool>
+}
+
+/// Bulk grade request
+type BulkGradeRequest {
+    assignment_id: String,
+    grades: List<BulkGradeEntry>,
+    notify_students: Option<Bool>
+}
+
+/// Bulk grade entry
+type BulkGradeEntry {
+    student_id: UserId,
+    score: f64,
+    feedback: Option<String>
+}
+
+/// Grade export format
+enum GradeExportFormat {
+    CSV,
+    Excel,
+    PDF
+}
+
+/// Grade statistics response
+type GradeStatisticsResponse {
+    course_id: CourseId,
+    total_students: i32,
+    graded_assignments: i32,
+    grade_statistics: GradeStats,
+    category_statistics: List<CategoryStats>,
+    at_risk_students: List<AtRiskStudent>
+}
+
+/// Grade statistics
+type GradeStats {
+    mean: f64,
+    median: f64,
+    mode: Option<f64>,
+    std_deviation: f64,
+    min: f64,
+    max: f64,
+    range: f64
+}
+
+/// Category statistics
+type CategoryStats {
+    category_id: String,
+    category_name: String,
+    mean: f64,
+    median: f64,
+    completion_rate: f64
+}
+
+/// At-risk student
+type AtRiskStudent {
+    user_id: UserId,
+    name: String,
+    current_grade: f64,
+    missing_assignments: i32,
+    risk_level: RiskLevel
+}
+
+/// Risk level
+enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+/// Grade distribution response
+type GradeDistributionResponse {
+    course_id: CourseId,
+    letter_distribution: List<LetterDistribution>,
+    score_distribution: List<ScoreBucket>,
+    histogram_data: List<HistogramBin>
+}
+
+/// Letter distribution
+type LetterDistribution {
+    letter: String,
+    count: i32,
+    percentage: f64
+}
+
+/// Score bucket
+type ScoreBucket {
+    range_start: f64,
+    range_end: f64,
+    count: i32
+}
+
+/// Histogram bin
+type HistogramBin {
+    bin: i32,
+    count: i32,
+    percentage: f64
+}
+
+/// Grade response
+type GradeResponse {
+    id: String,
+    student_id: UserId,
+    student_name: String,
+    score: Option<f64>,
+    grade: Option<f64>,
+    letter_grade: Option<String>,
+    feedback: Option<String>,
+    status: GradeStatus,
+    has_override: Bool,
+    override_reason: Option<String>,
+    graded_at: Option<DateTime>,
+    graded_by_name: Option<String>,
+    excused: Bool,
+    late: Bool
+}
+
+/// Bulk grade response
+type BulkGradeResponse {
+    created: i32,
+    updated: i32,
+    errors: List<String>,
+    total: i32
+}
+
+/// Grade calculation result
+type GradeCalculationResult {
+    student_id: UserId,
+    course_id: CourseId,
+    current_grade: f64,
+    current_letter: String,
+    projected_grade: Option<f64>,
+    category_grades: List<CategoryGradeCalc>,
+    points_earned: f64,
+    points_possible: f64,
+    assignments_graded: i32,
+    assignments_total: i32
+}
+
+/// Category grade calculation
+type CategoryGradeCalc {
+    category_id: String,
+    category_name: String,
+    weight: f64,
+    grade: f64,
+    weighted_grade: f64,
+    points_earned: f64,
+    points_possible: f64
+}
+
+/// Course grade summary
+type CourseGradeSummary {
+    course_id: CourseId,
+    course_title: String,
+    course_code: String,
+    current_grade: Option<f64>,
+    current_letter: Option<String>,
+    assignments_completed: i32,
+    assignments_total: i32
+}
+
+// =============================================================================
+// GRADEBOOK ENDPOINTS
+// =============================================================================
+
+/// Get full gradebook for a course
+async fn get_gradebook(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    ctx.require_permission(Permission::ViewGradebook)?;
+    verify_course_access(&db, &ctx, &course_id, CourseAccessLevel::Instructor).await?;
+
+    let course = db.courses()
+        .find_by_id(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.clone()
+        })?;
+
+    let grading_scheme = get_grading_scheme(&db, &course).await?;
+    let categories = db.grade_categories().find_by_course(&course_id).await.unwrap_or_default();
+    let assignments = db.assignments().find_gradable_by_course(&course_id).await.unwrap_or_default();
+    let enrollments = db.enrollments().find_by_course(&course_id).await.unwrap_or_default();
+    let grades = db.grades().find_by_course(&course_id).await.unwrap_or_default();
+
+    let gradebook = build_gradebook_response(&course, grading_scheme, categories, assignments, enrollments, grades)?;
+
+    Ok(Response::json(ApiResponse::success(gradebook, &ctx)))
+}
+
+/// Get grades for a specific student
+async fn get_student_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+    let student_id = req.param("student_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Student ID required".to_string()
+    })?;
+
+    let is_own = ctx.auth.as_ref().map(|a| a.user_id.to_string() == student_id).unwrap_or(false);
+
+    if !is_own {
+        ctx.require_permission(Permission::ViewGradebook)?;
+        verify_course_access(&db, &ctx, &course_id, CourseAccessLevel::Instructor).await?;
+    } else {
+        verify_course_access(&db, &ctx, &course_id, CourseAccessLevel::Student).await?;
+    }
+
+    let student = db.users().find_by_id(&student_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "User".to_string(), id: student_id.clone() })?;
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    let grades = db.grades().find_by_user_and_course(&student_id, &course_id).await.unwrap_or_default();
+    let assignments = db.assignments().find_gradable_by_course(&course_id).await.unwrap_or_default();
+
+    let response = build_student_grades_response(&student, &course, assignments, grades)?;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Get grades for assignment
+async fn get_assignment_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+    let assignment_id = req.param("assignment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assignment ID required".to_string()
+    })?;
+
+    ctx.require_permission(Permission::ViewGradebook)?;
+    verify_course_access(&db, &ctx, &course_id, CourseAccessLevel::Instructor).await?;
+
+    let grades = db.grades().find_by_assignment(&assignment_id).await.unwrap_or_default();
+    let stats = calculate_assignment_statistics(&grades);
+
+    Ok(Response::json(ApiResponse::success(Map::from([
+        ("grades".to_string(), Dynamic::List(grades.iter().map(|g| Dynamic::Map(grade_to_map(g))).collect())),
+        ("statistics".to_string(), Dynamic::Map(stats_to_map(&stats)))
+    ]), &ctx)))
+}
+
+// =============================================================================
+// INDIVIDUAL GRADE ENDPOINTS
+// =============================================================================
+
+/// Get a single grade
+async fn get_grade(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let grade_id = req.param("grade_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Grade ID required".to_string()
+    })?;
+
+    let grade = db.grades().find_by_id(&grade_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Grade".to_string(), id: grade_id.clone() })?;
+
+    let is_own = ctx.auth.as_ref().map(|a| a.user_id == grade.student_id).unwrap_or(false);
+    if !is_own {
+        ctx.require_permission(Permission::ViewGradebook)?;
+    }
+
+    Ok(Response::json(ApiResponse::success(grade_to_response(&grade), &ctx)))
+}
+
+/// Create a new grade
+async fn create_grade(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let body: CreateGradeRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let assignment = db.assignments().find_by_id(&body.assignment_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Assignment".to_string(), id: body.assignment_id.clone() })?;
+
+    let existing = db.grades().find_by_assignment_and_student(&body.assignment_id, &body.student_id).await.ok().flatten();
+    if existing.is_some() {
+        return Err(ApiError::Conflict { message: "Grade already exists".to_string() })
+    }
+
+    let grader_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+
+    let grade = db.grades().create(CreateGradeInput {
+        assignment_id: body.assignment_id.clone(),
+        student_id: body.student_id.clone(),
+        score: body.score,
+        feedback: body.feedback,
+        graded_by: grader_id,
+        graded_at: Some(DateTime::now())
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    if body.notify_student.unwrap_or(false) {
+        notify_grade_posted(&grade, &assignment).await.ok();
+    }
+
+    Ok(Response::json(ApiResponse::success(grade_to_response(&grade), &ctx)).with_status(StatusCode::CREATED))
+}
+
+/// Update a grade
+async fn update_grade(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let grade_id = req.param("grade_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Grade ID required".to_string()
+    })?;
+
+    let body: UpdateGradeRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let grader_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+
+    let grade = db.grades().update(&grade_id, UpdateGradeInput {
+        score: body.score,
+        feedback: body.feedback,
+        excused: body.excused,
+        graded_by: grader_id,
+        graded_at: Some(DateTime::now())
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(grade_to_response(&grade), &ctx)))
+}
+
+/// Delete a grade
+async fn delete_grade(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let grade_id = req.param("grade_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Grade ID required".to_string()
+    })?;
+
+    db.grades().delete(&grade_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Grade deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// BULK OPERATIONS
+// =============================================================================
+
+/// Bulk create grades
+async fn bulk_create_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let body: BulkGradeRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let grader_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+    let mut created = 0;
+    let mut updated = 0;
+    let mut errors: List<String> = vec![];
+
+    for entry in body.grades {
+        let existing = db.grades().find_by_assignment_and_student(&body.assignment_id, &entry.student_id).await.ok().flatten();
+
+        let result = if let Some(existing_grade) = existing {
+            db.grades().update(&existing_grade.id, UpdateGradeInput {
+                score: Some(entry.score),
+                feedback: entry.feedback,
+                excused: None,
+                graded_by: grader_id.clone(),
+                graded_at: Some(DateTime::now())
+            }).await.map(|_| { updated += 1; })
+        } else {
+            db.grades().create(CreateGradeInput {
+                assignment_id: body.assignment_id.clone(),
+                student_id: entry.student_id.clone(),
+                score: entry.score,
+                feedback: entry.feedback,
+                graded_by: grader_id.clone(),
+                graded_at: Some(DateTime::now())
+            }).await.map(|_| { created += 1; })
+        };
+
+        if let Err(e) = result {
+            errors.push(format!("Error for student {}: {}", entry.student_id, e));
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(BulkGradeResponse {
+        created, updated, errors, total: body.grades.len() as i32
+    }, &ctx)))
+}
+
+/// Bulk update grades
+async fn bulk_update_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    #[derive(Deserialize)]
+    struct BulkUpdateRequest {
+        updates: List<GradeUpdateEntry>
+    }
+
+    #[derive(Deserialize)]
+    struct GradeUpdateEntry {
+        grade_id: String,
+        score: Option<f64>,
+        feedback: Option<String>
+    }
+
+    let body: BulkUpdateRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let grader_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+    let mut updated = 0;
+    let mut errors: List<String> = vec![];
+
+    for entry in body.updates {
+        match db.grades().update(&entry.grade_id, UpdateGradeInput {
+            score: entry.score,
+            feedback: entry.feedback,
+            excused: None,
+            graded_by: grader_id.clone(),
+            graded_at: Some(DateTime::now())
+        }).await {
+            Ok(_) => updated += 1,
+            Err(e) => errors.push(format!("Error for grade {}: {}", entry.grade_id, e))
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(BulkGradeResponse {
+        created: 0, updated, errors, total: body.updates.len() as i32
+    }, &ctx)))
+}
+
+// =============================================================================
+// GRADE OVERRIDES
+// =============================================================================
+
+/// Create grade override
+async fn create_override(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::OverrideGrades)?;
+
+    let grade_id = req.param("grade_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Grade ID required".to_string()
+    })?;
+
+    let body: GradeOverrideRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let grader_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+
+    let grade = db.grades().create_override(&grade_id, CreateOverrideInput {
+        override_score: body.override_score,
+        reason: body.reason,
+        overridden_by: grader_id
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(grade_to_response(&grade), &ctx)))
+}
+
+/// Remove grade override
+async fn remove_override(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::OverrideGrades)?;
+
+    let grade_id = req.param("grade_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Grade ID required".to_string()
+    })?;
+
+    let grade = db.grades().remove_override(&grade_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(grade_to_response(&grade), &ctx)))
+}
+
+// =============================================================================
+// CALCULATIONS
+// =============================================================================
+
+/// Calculate final grade for student
+async fn calculate_final_grade(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+    let student_id = req.param("student_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Student ID required".to_string()
+    })?;
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    let grades = db.grades().find_by_user_and_course(&student_id, &course_id).await.unwrap_or_default();
+    let assignments = db.assignments().find_gradable_by_course(&course_id).await.unwrap_or_default();
+    let categories = db.grade_categories().find_by_course(&course_id).await.unwrap_or_default();
+    let grading_scheme = get_grading_scheme(&db, &course).await?;
+
+    let calculation = calculate_weighted_grade(&student_id, &course_id, &grades, &assignments, &categories, &grading_scheme)?;
+
+    Ok(Response::json(ApiResponse::success(calculation, &ctx)))
+}
+
+/// Recalculate all grades in course
+async fn recalculate_all_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let enrollments = db.enrollments().find_by_course(&course_id).await.unwrap_or_default();
+    let mut recalculated = 0;
+
+    for enrollment in enrollments {
+        db.grades().recalculate_final_grade(&enrollment.user_id, &course_id).await.ok();
+        recalculated += 1;
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String(format!("Recalculated grades for {} students", recalculated)))
+    ])))
+}
+
+// =============================================================================
+// HISTORY
+// =============================================================================
+
+/// Get grade history
+async fn get_grade_history(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewGradebook)?;
+
+    let grade_id = req.param("grade_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Grade ID required".to_string()
+    })?;
+
+    let history = db.grade_history().find_by_grade(&grade_id).await.unwrap_or_default();
+
+    Ok(Response::json(ApiResponse::success(history, &ctx)))
+}
+
+// =============================================================================
+// EXPORT/IMPORT
+// =============================================================================
+
+/// Export grades
+async fn export_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewGradebook)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let format = req.query_param("format").map(|f| match f.as_str() {
+        "excel" => GradeExportFormat::Excel,
+        "pdf" => GradeExportFormat::PDF,
+        _ => GradeExportFormat::CSV
+    }).unwrap_or(GradeExportFormat::CSV);
+
+    let grades = db.grades().find_by_course(&course_id).await.unwrap_or_default();
+    let enrollments = db.enrollments().find_by_course(&course_id).await.unwrap_or_default();
+    let assignments = db.assignments().find_gradable_by_course(&course_id).await.unwrap_or_default();
+
+    let (content, content_type, filename) = match format {
+        GradeExportFormat::CSV => {
+            let csv = generate_grades_csv(&grades, &enrollments, &assignments)?;
+            (csv, "text/csv", format!("grades_{}.csv", course_id))
+        },
+        GradeExportFormat::Excel => {
+            let excel = generate_grades_excel(&grades, &enrollments, &assignments)?;
+            (excel, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", format!("grades_{}.xlsx", course_id))
+        },
+        GradeExportFormat::PDF => {
+            let pdf = generate_grades_pdf(&grades, &enrollments, &assignments)?;
+            (pdf, "application/pdf", format!("grades_{}.pdf", course_id))
+        }
+    };
+
+    Ok(Response::new()
+        .with_header("Content-Type", content_type)
+        .with_header("Content-Disposition", &format!("attachment; filename=\"{}\"", filename))
+        .with_body(content))
+}
+
+/// Import grades
+async fn import_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct GradeImportRequest {
+        assignment_id: String,
+        format: String,
+        data: String
+    }
+
+    let body: GradeImportRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let import_data = parse_grade_import(&body.data, &body.format)?;
+    let grader_id = ctx.auth.as_ref().map(|a| a.user_id.clone());
+    let mut imported = 0;
+    let mut errors: List<String> = vec![];
+
+    for row in import_data {
+        match db.grades().upsert(UpsertGradeInput {
+            assignment_id: body.assignment_id.clone(),
+            student_id: row.student_id.clone(),
+            score: row.score,
+            feedback: row.feedback,
+            graded_by: grader_id.clone(),
+            graded_at: Some(DateTime::now())
+        }).await {
+            Ok(_) => imported += 1,
+            Err(e) => errors.push(format!("Error for student {}: {}", row.student_id, e))
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(Map::from([
+        ("imported".to_string(), Dynamic::Int(imported)),
+        ("errors".to_string(), Dynamic::List(errors.iter().map(|e| Dynamic::String(e.clone())).collect()))
+    ]), &ctx)))
+}
+
+// =============================================================================
+// STUDENT VIEWS
+// =============================================================================
+
+/// Get my grades for a course
+async fn get_my_grades(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let enrollment = db.enrollments().find_by_user_and_course(&auth.user_id, &course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::Forbidden { message: "Not enrolled".to_string(), required_permission: None })?;
+
+    let course = db.courses().find_by_id(&course_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "Course".to_string(), id: course_id.clone() })?;
+
+    if !course.settings.show_gradebook_to_students {
+        return Err(ApiError::Forbidden {
+            message: "Gradebook not available".to_string(),
+            required_permission: None
+        })
+    }
+
+    let grades = db.grades().find_by_user_and_course(&auth.user_id, &course_id).await.unwrap_or_default();
+    let assignments = db.assignments().find_published_by_course(&course_id).await.unwrap_or_default();
+
+    let student = db.users().find_by_id(&auth.user_id).await.ok().flatten()
+        .unwrap_or_else(|| User::default());
+
+    let response = build_student_grades_response(&student, &course, assignments, grades)?;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Get grade summary across all courses
+async fn get_my_grade_summary(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let enrollments = db.enrollments().find_active_by_user(&auth.user_id).await.unwrap_or_default();
+    let mut course_grades: List<CourseGradeSummary> = vec![];
+
+    for enrollment in enrollments {
+        if let Some(course) = db.courses().find_by_id(&enrollment.course_id).await.ok().flatten() {
+            if course.settings.show_gradebook_to_students {
+                let grades = db.grades().find_by_user_and_course(&auth.user_id, &course.id).await.unwrap_or_default();
+                let current_grade = calculate_current_grade(&grades);
+
+                course_grades.push(CourseGradeSummary {
+                    course_id: course.id.clone(),
+                    course_title: course.title.clone(),
+                    course_code: course.code.clone(),
+                    current_grade,
+                    current_letter: current_grade.map(|g| grade_to_letter(g)),
+                    assignments_completed: grades.len() as i32,
+                    assignments_total: 0
+                });
+            }
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(course_grades, &ctx)))
+}
+
+// =============================================================================
+// STATISTICS
+// =============================================================================
+
+/// Get grade statistics
+async fn get_grade_statistics(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewGradebook)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    verify_course_access(&db, &ctx, &course_id, CourseAccessLevel::Instructor).await?;
+
+    let grades = db.grades().find_by_course(&course_id).await.unwrap_or_default();
+    let enrollments = db.enrollments().find_by_course(&course_id).await.unwrap_or_default();
+
+    let statistics = compute_grade_statistics(&course_id, &grades, &enrollments)?;
+
+    Ok(Response::json(ApiResponse::success(statistics, &ctx)))
+}
+
+/// Get grade distribution
+async fn get_grade_distribution(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewGradebook)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    verify_course_access(&db, &ctx, &course_id, CourseAccessLevel::Instructor).await?;
+
+    let final_grades = db.grades().find_final_grades_by_course(&course_id).await.unwrap_or_default();
+    let distribution = compute_grade_distribution(&course_id, &final_grades)?;
+
+    Ok(Response::json(ApiResponse::success(distribution, &ctx)))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+enum CourseAccessLevel {
+    Student,
+    Instructor
+}
+
+async fn verify_course_access(db: &Database, ctx: &RequestContext, course_id: &str, level: CourseAccessLevel) -> Result<(), ApiError> {
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    if ctx.is_admin() { return Ok(()) }
+
+    let enrollment = db.enrollments().find_by_user_and_course(&auth.user_id, course_id).await.ok().flatten();
+
+    match level {
+        CourseAccessLevel::Student => {
+            if enrollment.is_some() { return Ok(()) }
+        },
+        CourseAccessLevel::Instructor => {
+            if let Some(e) = enrollment {
+                if e.role.is_instructor() { return Ok(()) }
+            }
+        }
+    }
+
+    Err(ApiError::Forbidden { message: "Insufficient access".to_string(), required_permission: None })
+}
+
+async fn get_grading_scheme(db: &Database, course: &Course) -> Result<GradingSchemeResponse, ApiError> {
+    if let Some(scheme_id) = &course.grading_scheme_id {
+        if let Some(scheme) = db.grading_schemes().find_by_id(scheme_id).await.ok().flatten() {
+            return Ok(GradingSchemeResponse {
+                id: scheme.id,
+                name: scheme.name,
+                aggregation_type: scheme.aggregation_type,
+                passing_grade: scheme.passing_grade,
+                letter_grades: scheme.letter_grades.into_iter().map(|lg| LetterGradeMapping {
+                    letter: lg.letter,
+                    min_percentage: lg.min_percentage,
+                    max_percentage: lg.max_percentage,
+                    gpa_value: lg.gpa_value
+                }).collect(),
+                drop_lowest: scheme.drop_lowest
+            })
+        }
+    }
+    Ok(default_grading_scheme())
+}
+
+fn default_grading_scheme() -> GradingSchemeResponse {
+    GradingSchemeResponse {
+        id: "default".to_string(),
+        name: "Standard".to_string(),
+        aggregation_type: GradeAggregationType::WeightedMean,
+        passing_grade: 60.0,
+        letter_grades: vec![
+            LetterGradeMapping { letter: "A".to_string(), min_percentage: 90.0, max_percentage: 100.0, gpa_value: Some(4.0) },
+            LetterGradeMapping { letter: "B".to_string(), min_percentage: 80.0, max_percentage: 89.99, gpa_value: Some(3.0) },
+            LetterGradeMapping { letter: "C".to_string(), min_percentage: 70.0, max_percentage: 79.99, gpa_value: Some(2.0) },
+            LetterGradeMapping { letter: "D".to_string(), min_percentage: 60.0, max_percentage: 69.99, gpa_value: Some(1.0) },
+            LetterGradeMapping { letter: "F".to_string(), min_percentage: 0.0, max_percentage: 59.99, gpa_value: Some(0.0) }
+        ],
+        drop_lowest: None
+    }
+}
+
+fn grade_to_response(grade: &Grade) -> GradeResponse {
+    GradeResponse {
+        id: grade.id.clone(),
+        student_id: grade.student_id.clone(),
+        student_name: "".to_string(),
+        score: grade.score,
+        grade: grade.calculated_grade,
+        letter_grade: grade.letter_grade.clone(),
+        feedback: grade.feedback.clone(),
+        status: grade.status.clone(),
+        has_override: grade.has_override,
+        override_reason: grade.override_reason.clone(),
+        graded_at: grade.graded_at,
+        graded_by_name: None,
+        excused: grade.excused,
+        late: grade.late
+    }
+}
+
+fn grade_to_map(grade: &Grade) -> Map<String, Dynamic> {
+    let mut m = Map::new();
+    m.insert("id".to_string(), Dynamic::String(grade.id.clone()));
+    m.insert("student_id".to_string(), Dynamic::String(grade.student_id.clone()));
+    m.insert("score".to_string(), grade.score.map(Dynamic::Float).unwrap_or(Dynamic::Null));
+    m
+}
+
+fn stats_to_map(stats: &GradeStats) -> Map<String, Dynamic> {
+    let mut m = Map::new();
+    m.insert("mean".to_string(), Dynamic::Float(stats.mean));
+    m.insert("median".to_string(), Dynamic::Float(stats.median));
+    m.insert("std_deviation".to_string(), Dynamic::Float(stats.std_deviation));
+    m.insert("min".to_string(), Dynamic::Float(stats.min));
+    m.insert("max".to_string(), Dynamic::Float(stats.max));
+    m
+}
+
+fn calculate_assignment_statistics(grades: &List<Grade>) -> GradeStats {
+    let scores: Vec<f64> = grades.iter().filter_map(|g| g.score).collect();
+    if scores.is_empty() {
+        return GradeStats { mean: 0.0, median: 0.0, mode: None, std_deviation: 0.0, min: 0.0, max: 0.0, range: 0.0 }
+    }
+
+    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted[sorted.len() / 2];
+    let min = *sorted.first().unwrap_or(&0.0);
+    let max = *sorted.last().unwrap_or(&0.0);
+    let variance = scores.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / scores.len() as f64;
+
+    GradeStats { mean, median, mode: None, std_deviation: variance.sqrt(), min, max, range: max - min }
+}
+
+fn calculate_current_grade(grades: &List<Grade>) -> Option<f64> {
+    if grades.is_empty() { return None }
+    let total: f64 = grades.iter().filter_map(|g| g.calculated_grade).sum();
+    Some(total / grades.len() as f64)
+}
+
+fn grade_to_letter(grade: f64) -> String {
+    if grade >= 90.0 { "A".to_string() }
+    else if grade >= 80.0 { "B".to_string() }
+    else if grade >= 70.0 { "C".to_string() }
+    else if grade >= 60.0 { "D".to_string() }
+    else { "F".to_string() }
+}
+
+fn build_gradebook_response(course: &Course, grading_scheme: GradingSchemeResponse, categories: List<GradeCategory>, assignments: List<Assignment>, enrollments: List<Enrollment>, grades: List<Grade>) -> Result<GradebookResponse, ApiError> {
+    Ok(GradebookResponse {
+        course_id: course.id.clone(),
+        course_title: course.title.clone(),
+        grading_scheme,
+        categories: categories.iter().map(|c| GradeCategoryResponse {
+            id: c.id.clone(), name: c.name.clone(), weight: c.weight, drop_lowest: c.drop_lowest, assignment_count: 0
+        }).collect(),
+        assignments: assignments.iter().map(|a| GradebookAssignment {
+            id: a.id.clone(), title: a.title.clone(), category_id: a.category_id.clone(),
+            points_possible: a.points_possible, due_date: a.due_date, published: a.published, grading_type: a.grading_type.clone()
+        }).collect(),
+        students: vec![],
+        summary: GradebookSummary {
+            total_students: enrollments.len() as i32, average_grade: None, median_grade: None,
+            highest_grade: None, lowest_grade: None, passing_count: 0, failing_count: 0, missing_submissions: 0
+        }
+    })
+}
+
+fn build_student_grades_response(student: &User, course: &Course, assignments: List<Assignment>, grades: List<Grade>) -> Result<StudentGradesResponse, ApiError> {
+    Ok(StudentGradesResponse {
+        student: StudentInfo {
+            user_id: student.id.clone(),
+            name: format!("{} {}", student.first_name, student.last_name),
+            email: student.email.clone(),
+            avatar_url: student.avatar_url.clone(),
+            section_name: None
+        },
+        course: CourseInfo { id: course.id.clone(), title: course.title.clone(), code: course.code.clone() },
+        grades: grades.iter().map(|g| {
+            let assignment = assignments.iter().find(|a| a.id == g.assignment_id);
+            StudentGradeItem {
+                assignment_id: g.assignment_id.clone(),
+                assignment_title: assignment.map(|a| a.title.clone()).unwrap_or_default(),
+                category_name: None,
+                due_date: assignment.and_then(|a| a.due_date),
+                points_possible: assignment.map(|a| a.points_possible).unwrap_or(0.0),
+                score: g.score,
+                grade: g.calculated_grade,
+                letter_grade: g.letter_grade.clone(),
+                status: g.status.clone(),
+                submission_status: SubmissionStatus::Submitted,
+                feedback: g.feedback.clone(),
+                graded_at: g.graded_at,
+                has_override: g.has_override,
+                excused: g.excused
+            }
+        }).collect(),
+        current_grade: calculate_current_grade(&grades),
+        current_letter: calculate_current_grade(&grades).map(|g| grade_to_letter(g)),
+        category_grades: vec![],
+        grade_trend: vec![]
+    })
+}
+
+fn calculate_weighted_grade(student_id: &str, course_id: &str, grades: &List<Grade>, assignments: &List<Assignment>, categories: &List<GradeCategory>, scheme: &GradingSchemeResponse) -> Result<GradeCalculationResult, ApiError> {
+    let total_earned: f64 = grades.iter().filter_map(|g| g.score).sum();
+    let total_possible: f64 = grades.iter().filter_map(|g| {
+        assignments.iter().find(|a| a.id == g.assignment_id).map(|a| a.points_possible)
+    }).sum();
+
+    let current_grade = if total_possible > 0.0 { (total_earned / total_possible) * 100.0 } else { 0.0 };
+
+    Ok(GradeCalculationResult {
+        student_id: student_id.to_string(),
+        course_id: course_id.to_string(),
+        current_grade,
+        current_letter: grade_to_letter(current_grade),
+        projected_grade: None,
+        category_grades: vec![],
+        points_earned: total_earned,
+        points_possible: total_possible,
+        assignments_graded: grades.len() as i32,
+        assignments_total: assignments.len() as i32
+    })
+}
+
+fn compute_grade_statistics(course_id: &str, grades: &List<Grade>, enrollments: &List<Enrollment>) -> Result<GradeStatisticsResponse, ApiError> {
+    let stats = calculate_assignment_statistics(grades);
+    Ok(GradeStatisticsResponse {
+        course_id: course_id.to_string(),
+        total_students: enrollments.len() as i32,
+        graded_assignments: 0,
+        grade_statistics: stats,
+        category_statistics: vec![],
+        at_risk_students: vec![]
+    })
+}
+
+fn compute_grade_distribution(course_id: &str, grades: &List<Grade>) -> Result<GradeDistributionResponse, ApiError> {
+    let mut letter_counts: Map<String, i32> = Map::new();
+    for grade in grades {
+        if let Some(letter) = &grade.letter_grade {
+            *letter_counts.entry(letter.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let total = grades.len() as f64;
+    let letter_distribution = letter_counts.iter().map(|(letter, count)| LetterDistribution {
+        letter: letter.clone(),
+        count: *count,
+        percentage: (*count as f64 / total) * 100.0
+    }).collect();
+
+    Ok(GradeDistributionResponse {
+        course_id: course_id.to_string(),
+        letter_distribution,
+        score_distribution: vec![],
+        histogram_data: vec![]
+    })
+}
+
+fn generate_grades_csv(grades: &List<Grade>, enrollments: &List<Enrollment>, assignments: &List<Assignment>) -> Result<String, ApiError> {
+    let mut csv = String::from("Student ID,Assignment,Score,Grade,Letter\n");
+    for grade in grades {
+        csv.push_str(&format!("{},{},{},{},{}\n",
+            grade.student_id,
+            grade.assignment_id,
+            grade.score.map(|s| s.to_string()).unwrap_or_default(),
+            grade.calculated_grade.map(|g| g.to_string()).unwrap_or_default(),
+            grade.letter_grade.clone().unwrap_or_default()
+        ));
+    }
+    Ok(csv)
+}
+
+fn generate_grades_excel(grades: &List<Grade>, enrollments: &List<Enrollment>, assignments: &List<Assignment>) -> Result<String, ApiError> {
+    Ok(String::new())
+}
+
+fn generate_grades_pdf(grades: &List<Grade>, enrollments: &List<Enrollment>, assignments: &List<Assignment>) -> Result<String, ApiError> {
+    Ok(String::new())
+}
+
+type GradeImportRow {
+    student_id: UserId,
+    score: f64,
+    feedback: Option<String>
+}
+
+fn parse_grade_import(data: &str, format: &str) -> Result<List<GradeImportRow>, ApiError> {
+    let mut rows = vec![];
+    for line in data.lines().skip(1) {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 2 {
+            if let Ok(score) = parts[1].trim().parse::<f64>() {
+                rows.push(GradeImportRow {
+                    student_id: parts[0].trim().to_string(),
+                    score,
+                    feedback: parts.get(2).map(|s| s.trim().to_string())
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+async fn notify_grade_posted(grade: &Grade, assignment: &Assignment) -> Result<(), String> {
+    Ok(())
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use GradebookResponse;
+pub use StudentGradesResponse;
+pub use GradeResponse;

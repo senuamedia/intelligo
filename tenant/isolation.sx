@@ -1,0 +1,1385 @@
+/// Intelligo LMS - Tenant Isolation
+///
+/// Data isolation strategies for multi-tenant deployments including
+/// schema isolation, row-level security, and tenant-aware query builders.
+
+module intelligo::tenant::isolation
+
+use intelligo::tenant::core::*
+use intelligo::core::types::*
+use std::collections::{Map, List, Set}
+use std::time::DateTime
+
+// =============================================================================
+// ISOLATION STRATEGIES
+// =============================================================================
+
+/// Data isolation strategy for multi-tenancy
+enum IsolationStrategy {
+    /// Shared database, shared schema, tenant_id column
+    SharedSchema,
+
+    /// Shared database, separate schemas per tenant
+    SeparateSchema,
+
+    /// Separate database per tenant
+    SeparateDatabase,
+
+    /// Hybrid: large tenants get separate DB, others share
+    Hybrid {
+        threshold_users: i64,
+        threshold_storage_gb: f64
+    }
+}
+
+impl IsolationStrategy {
+    fn to_string(&self) -> String {
+        match self {
+            IsolationStrategy::SharedSchema => "shared_schema",
+            IsolationStrategy::SeparateSchema => "separate_schema",
+            IsolationStrategy::SeparateDatabase => "separate_database",
+            IsolationStrategy::Hybrid { .. } => "hybrid"
+        }.to_string()
+    }
+
+    /// Get default isolation strategy
+    fn default() -> IsolationStrategy {
+        IsolationStrategy::SharedSchema
+    }
+}
+
+/// Configuration for tenant isolation
+type IsolationConfig {
+    /// Primary isolation strategy
+    strategy: IsolationStrategy,
+
+    /// Enable row-level security
+    row_level_security: Bool,
+
+    /// Enable query rewriting
+    query_rewriting: Bool,
+
+    /// Tables excluded from tenant isolation
+    excluded_tables: Set<String>,
+
+    /// Connection pool per tenant
+    per_tenant_pool: Bool,
+
+    /// Pool size per tenant
+    pool_size_per_tenant: i32,
+
+    /// Enable cross-tenant queries (admin only)
+    allow_cross_tenant: Bool
+}
+
+impl Default for IsolationConfig {
+    fn default() -> Self {
+        IsolationConfig {
+            strategy: IsolationStrategy::SharedSchema,
+            row_level_security: true,
+            query_rewriting: true,
+            excluded_tables: Set::from([
+                "tenants".to_string(),
+                "system_config".to_string(),
+                "migrations".to_string()
+            ]),
+            per_tenant_pool: false,
+            pool_size_per_tenant: 5,
+            allow_cross_tenant: false
+        }
+    }
+}
+
+// =============================================================================
+// TENANT-AWARE QUERY BUILDER
+// =============================================================================
+
+/// Query builder that automatically applies tenant filters
+type TenantQueryBuilder {
+    /// Current tenant context
+    tenant_id: TenantId,
+
+    /// Base table name
+    table: String,
+
+    /// Selected columns
+    columns: List<String>,
+
+    /// WHERE conditions
+    conditions: List<QueryCondition>,
+
+    /// ORDER BY clauses
+    order_by: List<OrderClause>,
+
+    /// LIMIT
+    limit: Option<i64>,
+
+    /// OFFSET
+    offset: Option<i64>,
+
+    /// JOINs
+    joins: List<JoinClause>,
+
+    /// Include deleted records
+    include_deleted: Bool,
+
+    /// Bypass tenant filter (admin only)
+    bypass_tenant_filter: Bool
+}
+
+impl TenantQueryBuilder {
+    /// Create new query builder for table
+    fn new(tenant_id: TenantId, table: String) -> TenantQueryBuilder {
+        TenantQueryBuilder {
+            tenant_id,
+            table,
+            columns: vec!["*".to_string()],
+            conditions: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            joins: vec![],
+            include_deleted: false,
+            bypass_tenant_filter: false
+        }
+    }
+
+    /// Select specific columns
+    fn select(mut self, columns: List<String>) -> TenantQueryBuilder {
+        self.columns = columns;
+        self
+    }
+
+    /// Add WHERE condition
+    fn where_eq(mut self, column: String, value: Dynamic) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::Eq { column, value });
+        self
+    }
+
+    /// Add WHERE IN condition
+    fn where_in(mut self, column: String, values: List<Dynamic>) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::In { column, values });
+        self
+    }
+
+    /// Add WHERE LIKE condition
+    fn where_like(mut self, column: String, pattern: String) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::Like { column, pattern });
+        self
+    }
+
+    /// Add WHERE >= condition
+    fn where_gte(mut self, column: String, value: Dynamic) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::Gte { column, value });
+        self
+    }
+
+    /// Add WHERE <= condition
+    fn where_lte(mut self, column: String, value: Dynamic) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::Lte { column, value });
+        self
+    }
+
+    /// Add WHERE IS NULL condition
+    fn where_null(mut self, column: String) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::IsNull { column });
+        self
+    }
+
+    /// Add WHERE IS NOT NULL condition
+    fn where_not_null(mut self, column: String) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::IsNotNull { column });
+        self
+    }
+
+    /// Add WHERE between condition
+    fn where_between(mut self, column: String, min: Dynamic, max: Dynamic) -> TenantQueryBuilder {
+        self.conditions.push(QueryCondition::Between { column, min, max });
+        self
+    }
+
+    /// Add ORDER BY
+    fn order_by(mut self, column: String, direction: OrderDirection) -> TenantQueryBuilder {
+        self.order_by.push(OrderClause { column, direction });
+        self
+    }
+
+    /// Set LIMIT
+    fn limit(mut self, limit: i64) -> TenantQueryBuilder {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Set OFFSET
+    fn offset(mut self, offset: i64) -> TenantQueryBuilder {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// Add JOIN
+    fn join(mut self, table: String, condition: String, join_type: JoinType) -> TenantQueryBuilder {
+        self.joins.push(JoinClause {
+            table,
+            condition,
+            join_type,
+            tenant_filtered: true
+        });
+        self
+    }
+
+    /// Include soft-deleted records
+    fn with_deleted(mut self) -> TenantQueryBuilder {
+        self.include_deleted = true;
+        self
+    }
+
+    /// Bypass tenant filter (requires admin permission)
+    fn bypass_tenant(mut self) -> TenantQueryBuilder {
+        self.bypass_tenant_filter = true;
+        self
+    }
+
+    /// Build the SQL query
+    fn build(&self) -> (String, List<Dynamic>) {
+        let mut sql = String::new();
+        let mut params: List<Dynamic> = vec![];
+
+        // SELECT
+        sql.push_str("SELECT ");
+        sql.push_str(&self.columns.join(", "));
+
+        // FROM
+        sql.push_str(" FROM ");
+        sql.push_str(&self.table);
+
+        // JOINs
+        for join in &self.joins {
+            let join_keyword = match join.join_type {
+                JoinType::Inner => "INNER JOIN",
+                JoinType::Left => "LEFT JOIN",
+                JoinType::Right => "RIGHT JOIN",
+                JoinType::Full => "FULL OUTER JOIN"
+            };
+
+            sql.push_str(&format!(" {} {} ON {}", join_keyword, join.table, join.condition));
+        }
+
+        // WHERE
+        let mut where_clauses: List<String> = vec![];
+
+        // Always add tenant filter unless bypassed
+        if !self.bypass_tenant_filter {
+            where_clauses.push(format!("{}.tenant_id = ?", self.table));
+            params.push(Dynamic::String(self.tenant_id.0.clone()));
+        }
+
+        // Add soft delete filter unless including deleted
+        if !self.include_deleted {
+            where_clauses.push(format!("{}.deleted_at IS NULL", self.table));
+        }
+
+        // Add user conditions
+        for condition in &self.conditions {
+            let (clause, mut condition_params) = condition.to_sql(&self.table);
+            where_clauses.push(clause);
+            params.append(&mut condition_params);
+        }
+
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+
+        // ORDER BY
+        if !self.order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_strs: List<String> = self.order_by.iter()
+                .map(|o| format!("{} {}", o.column, o.direction.to_string()))
+                .collect();
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        // LIMIT
+        if let Some(limit) = self.limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        // OFFSET
+        if let Some(offset) = self.offset {
+            sql.push_str(&format!(" OFFSET {}", offset));
+        }
+
+        (sql, params)
+    }
+
+    /// Build a COUNT query
+    fn build_count(&self) -> (String, List<Dynamic>) {
+        let mut sql = String::new();
+        let mut params: List<Dynamic> = vec![];
+
+        sql.push_str("SELECT COUNT(*) as count FROM ");
+        sql.push_str(&self.table);
+
+        // WHERE
+        let mut where_clauses: List<String> = vec![];
+
+        if !self.bypass_tenant_filter {
+            where_clauses.push(format!("{}.tenant_id = ?", self.table));
+            params.push(Dynamic::String(self.tenant_id.0.clone()));
+        }
+
+        if !self.include_deleted {
+            where_clauses.push(format!("{}.deleted_at IS NULL", self.table));
+        }
+
+        for condition in &self.conditions {
+            let (clause, mut condition_params) = condition.to_sql(&self.table);
+            where_clauses.push(clause);
+            params.append(&mut condition_params);
+        }
+
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+
+        (sql, params)
+    }
+}
+
+/// Query condition
+enum QueryCondition {
+    Eq { column: String, value: Dynamic },
+    Ne { column: String, value: Dynamic },
+    In { column: String, values: List<Dynamic> },
+    NotIn { column: String, values: List<Dynamic> },
+    Like { column: String, pattern: String },
+    Gte { column: String, value: Dynamic },
+    Gt { column: String, value: Dynamic },
+    Lte { column: String, value: Dynamic },
+    Lt { column: String, value: Dynamic },
+    Between { column: String, min: Dynamic, max: Dynamic },
+    IsNull { column: String },
+    IsNotNull { column: String },
+    Raw { sql: String, params: List<Dynamic> }
+}
+
+impl QueryCondition {
+    fn to_sql(&self, table: &str) -> (String, List<Dynamic>) {
+        match self {
+            QueryCondition::Eq { column, value } => {
+                (format!("{}.{} = ?", table, column), vec![value.clone()])
+            },
+            QueryCondition::Ne { column, value } => {
+                (format!("{}.{} != ?", table, column), vec![value.clone()])
+            },
+            QueryCondition::In { column, values } => {
+                let placeholders = values.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                (format!("{}.{} IN ({})", table, column, placeholders), values.clone())
+            },
+            QueryCondition::NotIn { column, values } => {
+                let placeholders = values.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                (format!("{}.{} NOT IN ({})", table, column, placeholders), values.clone())
+            },
+            QueryCondition::Like { column, pattern } => {
+                (format!("{}.{} LIKE ?", table, column), vec![Dynamic::String(pattern.clone())])
+            },
+            QueryCondition::Gte { column, value } => {
+                (format!("{}.{} >= ?", table, column), vec![value.clone()])
+            },
+            QueryCondition::Gt { column, value } => {
+                (format!("{}.{} > ?", table, column), vec![value.clone()])
+            },
+            QueryCondition::Lte { column, value } => {
+                (format!("{}.{} <= ?", table, column), vec![value.clone()])
+            },
+            QueryCondition::Lt { column, value } => {
+                (format!("{}.{} < ?", table, column), vec![value.clone()])
+            },
+            QueryCondition::Between { column, min, max } => {
+                (format!("{}.{} BETWEEN ? AND ?", table, column), vec![min.clone(), max.clone()])
+            },
+            QueryCondition::IsNull { column } => {
+                (format!("{}.{} IS NULL", table, column), vec![])
+            },
+            QueryCondition::IsNotNull { column } => {
+                (format!("{}.{} IS NOT NULL", table, column), vec![])
+            },
+            QueryCondition::Raw { sql, params } => {
+                (sql.clone(), params.clone())
+            }
+        }
+    }
+}
+
+/// Order direction
+enum OrderDirection {
+    Asc,
+    Desc
+}
+
+impl OrderDirection {
+    fn to_string(&self) -> String {
+        match self {
+            OrderDirection::Asc => "ASC",
+            OrderDirection::Desc => "DESC"
+        }.to_string()
+    }
+}
+
+/// Order clause
+type OrderClause {
+    column: String,
+    direction: OrderDirection
+}
+
+/// Join type
+enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full
+}
+
+/// Join clause
+type JoinClause {
+    table: String,
+    condition: String,
+    join_type: JoinType,
+    tenant_filtered: Bool
+}
+
+// =============================================================================
+// TENANT-AWARE INSERT BUILDER
+// =============================================================================
+
+/// Insert builder that automatically includes tenant_id
+type TenantInsertBuilder {
+    tenant_id: TenantId,
+    table: String,
+    columns: List<String>,
+    values: List<List<Dynamic>>,
+    returning: Option<List<String>>
+}
+
+impl TenantInsertBuilder {
+    fn new(tenant_id: TenantId, table: String) -> TenantInsertBuilder {
+        TenantInsertBuilder {
+            tenant_id,
+            table,
+            columns: vec![],
+            values: vec![],
+            returning: None
+        }
+    }
+
+    /// Set columns
+    fn columns(mut self, columns: List<String>) -> TenantInsertBuilder {
+        self.columns = columns;
+        self
+    }
+
+    /// Add a row of values
+    fn values(mut self, values: List<Dynamic>) -> TenantInsertBuilder {
+        self.values.push(values);
+        self
+    }
+
+    /// Set RETURNING clause
+    fn returning(mut self, columns: List<String>) -> TenantInsertBuilder {
+        self.returning = Some(columns);
+        self
+    }
+
+    /// Build the INSERT query
+    fn build(&self) -> (String, List<Dynamic>) {
+        let mut sql = String::new();
+        let mut params: List<Dynamic> = vec![];
+
+        sql.push_str("INSERT INTO ");
+        sql.push_str(&self.table);
+
+        // Add tenant_id to columns
+        let mut all_columns = vec!["tenant_id".to_string()];
+        all_columns.extend(self.columns.clone());
+
+        sql.push_str(" (");
+        sql.push_str(&all_columns.join(", "));
+        sql.push_str(") VALUES ");
+
+        let mut value_groups: List<String> = vec![];
+        for values in &self.values {
+            // Add tenant_id value
+            let mut all_values = vec![Dynamic::String(self.tenant_id.0.clone())];
+            all_values.extend(values.clone());
+
+            let placeholders = all_values.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            value_groups.push(format!("({})", placeholders));
+            params.extend(all_values);
+        }
+
+        sql.push_str(&value_groups.join(", "));
+
+        if let Some(ref returning) = self.returning {
+            sql.push_str(" RETURNING ");
+            sql.push_str(&returning.join(", "));
+        }
+
+        (sql, params)
+    }
+}
+
+// =============================================================================
+// TENANT-AWARE UPDATE BUILDER
+// =============================================================================
+
+/// Update builder that automatically scopes to tenant
+type TenantUpdateBuilder {
+    tenant_id: TenantId,
+    table: String,
+    sets: List<(String, Dynamic)>,
+    conditions: List<QueryCondition>,
+    bypass_tenant_filter: Bool
+}
+
+impl TenantUpdateBuilder {
+    fn new(tenant_id: TenantId, table: String) -> TenantUpdateBuilder {
+        TenantUpdateBuilder {
+            tenant_id,
+            table,
+            sets: vec![],
+            conditions: vec![],
+            bypass_tenant_filter: false
+        }
+    }
+
+    /// Set a column value
+    fn set(mut self, column: String, value: Dynamic) -> TenantUpdateBuilder {
+        self.sets.push((column, value));
+        self
+    }
+
+    /// Add WHERE condition
+    fn where_eq(mut self, column: String, value: Dynamic) -> TenantUpdateBuilder {
+        self.conditions.push(QueryCondition::Eq { column, value });
+        self
+    }
+
+    /// Add WHERE IN condition
+    fn where_in(mut self, column: String, values: List<Dynamic>) -> TenantUpdateBuilder {
+        self.conditions.push(QueryCondition::In { column, values });
+        self
+    }
+
+    /// Bypass tenant filter
+    fn bypass_tenant(mut self) -> TenantUpdateBuilder {
+        self.bypass_tenant_filter = true;
+        self
+    }
+
+    /// Build the UPDATE query
+    fn build(&self) -> (String, List<Dynamic>) {
+        let mut sql = String::new();
+        let mut params: List<Dynamic> = vec![];
+
+        sql.push_str("UPDATE ");
+        sql.push_str(&self.table);
+        sql.push_str(" SET ");
+
+        // Add updated_at
+        let mut all_sets = self.sets.clone();
+        all_sets.push(("updated_at".to_string(), Dynamic::DateTime(DateTime::now())));
+
+        let set_strs: List<String> = all_sets.iter()
+            .map(|(col, _)| format!("{} = ?", col))
+            .collect();
+        sql.push_str(&set_strs.join(", "));
+
+        for (_, value) in &all_sets {
+            params.push(value.clone());
+        }
+
+        // WHERE
+        let mut where_clauses: List<String> = vec![];
+
+        if !self.bypass_tenant_filter {
+            where_clauses.push("tenant_id = ?".to_string());
+            params.push(Dynamic::String(self.tenant_id.0.clone()));
+        }
+
+        for condition in &self.conditions {
+            let (clause, mut condition_params) = condition.to_sql(&self.table);
+            where_clauses.push(clause);
+            params.append(&mut condition_params);
+        }
+
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+
+        (sql, params)
+    }
+}
+
+// =============================================================================
+// TENANT-AWARE DELETE BUILDER
+// =============================================================================
+
+/// Delete builder that automatically scopes to tenant
+type TenantDeleteBuilder {
+    tenant_id: TenantId,
+    table: String,
+    conditions: List<QueryCondition>,
+    soft_delete: Bool,
+    bypass_tenant_filter: Bool
+}
+
+impl TenantDeleteBuilder {
+    fn new(tenant_id: TenantId, table: String) -> TenantDeleteBuilder {
+        TenantDeleteBuilder {
+            tenant_id,
+            table,
+            conditions: vec![],
+            soft_delete: true, // Default to soft delete
+            bypass_tenant_filter: false
+        }
+    }
+
+    /// Add WHERE condition
+    fn where_eq(mut self, column: String, value: Dynamic) -> TenantDeleteBuilder {
+        self.conditions.push(QueryCondition::Eq { column, value });
+        self
+    }
+
+    /// Use hard delete instead of soft delete
+    fn hard_delete(mut self) -> TenantDeleteBuilder {
+        self.soft_delete = false;
+        self
+    }
+
+    /// Bypass tenant filter
+    fn bypass_tenant(mut self) -> TenantDeleteBuilder {
+        self.bypass_tenant_filter = true;
+        self
+    }
+
+    /// Build the DELETE query
+    fn build(&self) -> (String, List<Dynamic>) {
+        let mut sql = String::new();
+        let mut params: List<Dynamic> = vec![];
+
+        if self.soft_delete {
+            // Soft delete - update deleted_at
+            sql.push_str("UPDATE ");
+            sql.push_str(&self.table);
+            sql.push_str(" SET deleted_at = ?");
+            params.push(Dynamic::DateTime(DateTime::now()));
+        } else {
+            // Hard delete
+            sql.push_str("DELETE FROM ");
+            sql.push_str(&self.table);
+        }
+
+        // WHERE
+        let mut where_clauses: List<String> = vec![];
+
+        if !self.bypass_tenant_filter {
+            where_clauses.push("tenant_id = ?".to_string());
+            params.push(Dynamic::String(self.tenant_id.0.clone()));
+        }
+
+        if self.soft_delete {
+            where_clauses.push("deleted_at IS NULL".to_string());
+        }
+
+        for condition in &self.conditions {
+            let (clause, mut condition_params) = condition.to_sql(&self.table);
+            where_clauses.push(clause);
+            params.append(&mut condition_params);
+        }
+
+        if !where_clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clauses.join(" AND "));
+        }
+
+        (sql, params)
+    }
+}
+
+// =============================================================================
+// ISOLATION ENFORCER
+// =============================================================================
+
+/// Actor that enforces tenant isolation
+actor IsolationEnforcer {
+    var config: IsolationConfig
+    var tenant_schemas: Map<TenantId, String> = Map::new()
+    var tenant_connections: Map<TenantId, String> = Map::new()
+
+    fn new(config: IsolationConfig) -> Self {
+        IsolationEnforcer {
+            config,
+            ..Default::default()
+        }
+    }
+
+    /// Get query builder for tenant
+    receive GetQueryBuilder(tenant_id: TenantId, table: String) -> Result<TenantQueryBuilder, TenantError> {
+        // Check if table is excluded from isolation
+        if self.config.excluded_tables.contains(&table) {
+            return Err(TenantError::ConfigurationError {
+                message: format!("Table '{}' is excluded from tenant isolation", table)
+            });
+        }
+
+        Ok(TenantQueryBuilder::new(tenant_id, table))
+    }
+
+    /// Get insert builder for tenant
+    receive GetInsertBuilder(tenant_id: TenantId, table: String) -> Result<TenantInsertBuilder, TenantError> {
+        if self.config.excluded_tables.contains(&table) {
+            return Err(TenantError::ConfigurationError {
+                message: format!("Table '{}' is excluded from tenant isolation", table)
+            });
+        }
+
+        Ok(TenantInsertBuilder::new(tenant_id, table))
+    }
+
+    /// Get update builder for tenant
+    receive GetUpdateBuilder(tenant_id: TenantId, table: String) -> Result<TenantUpdateBuilder, TenantError> {
+        if self.config.excluded_tables.contains(&table) {
+            return Err(TenantError::ConfigurationError {
+                message: format!("Table '{}' is excluded from tenant isolation", table)
+            });
+        }
+
+        Ok(TenantUpdateBuilder::new(tenant_id, table))
+    }
+
+    /// Get delete builder for tenant
+    receive GetDeleteBuilder(tenant_id: TenantId, table: String) -> Result<TenantDeleteBuilder, TenantError> {
+        if self.config.excluded_tables.contains(&table) {
+            return Err(TenantError::ConfigurationError {
+                message: format!("Table '{}' is excluded from tenant isolation", table)
+            });
+        }
+
+        Ok(TenantDeleteBuilder::new(tenant_id, table))
+    }
+
+    /// Get connection string for tenant
+    receive GetConnection(tenant_id: TenantId) -> Option<String> {
+        match &self.config.strategy {
+            IsolationStrategy::SeparateDatabase => {
+                self.tenant_connections.get(&tenant_id).cloned()
+            },
+            IsolationStrategy::SeparateSchema => {
+                self.tenant_schemas.get(&tenant_id)
+                    .map(|schema| format!("SET search_path TO {}", schema))
+            },
+            _ => None
+        }
+    }
+
+    /// Register tenant schema
+    receive RegisterSchema(tenant_id: TenantId, schema: String) {
+        self.tenant_schemas.insert(tenant_id, schema);
+        checkpoint();
+    }
+
+    /// Register tenant connection
+    receive RegisterConnection(tenant_id: TenantId, connection: String) {
+        self.tenant_connections.insert(tenant_id, connection);
+        checkpoint();
+    }
+
+    /// Create schema for tenant (SeparateSchema strategy)
+    receive CreateTenantSchema(tenant_id: TenantId) -> Result<String, TenantError> {
+        let schema_name = format!("tenant_{}", tenant_id.0.replace("-", "_"));
+
+        // Would execute: CREATE SCHEMA IF NOT EXISTS {schema_name}
+        self.tenant_schemas.insert(tenant_id.clone(), schema_name.clone());
+
+        checkpoint();
+
+        Ok(schema_name)
+    }
+
+    /// Migrate tenant to separate database (Hybrid strategy)
+    receive MigrateToSeparateDatabase(tenant_id: TenantId, connection: String) -> Result<(), TenantError> {
+        // Would:
+        // 1. Create new database
+        // 2. Copy tenant data
+        // 3. Verify data
+        // 4. Update routing
+        // 5. Remove from shared database
+
+        self.tenant_connections.insert(tenant_id, connection);
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Validate query doesn't leak across tenants
+    receive ValidateQuery(tenant_id: TenantId, sql: String) -> Result<(), TenantError> {
+        if self.config.allow_cross_tenant {
+            return Ok(());
+        }
+
+        // Parse and validate the SQL
+        let validator = SqlTenantValidator::new(&self.config);
+        validator.validate(&sql, &tenant_id)
+    }
+}
+
+// =============================================================================
+// SQL TENANT VALIDATOR
+// =============================================================================
+
+/// SQL validator to ensure proper tenant isolation
+pub struct SqlTenantValidator {
+    config: IsolationConfig,
+}
+
+impl SqlTenantValidator {
+    pub fn new(config: &IsolationConfig) -> Self {
+        SqlTenantValidator {
+            config: config.clone(),
+        }
+    }
+
+    /// Validate SQL for tenant isolation
+    pub fn validate(&self, sql: &str, tenant_id: &TenantId) -> Result<(), TenantError> {
+        // Normalize SQL for analysis
+        let normalized = self.normalize_sql(sql);
+
+        // Check for SQL injection patterns
+        self.check_injection_patterns(&normalized)?;
+
+        // Check for dangerous constructs
+        self.check_dangerous_constructs(&normalized)?;
+
+        // Parse and validate table references
+        self.validate_table_references(&normalized, tenant_id)?;
+
+        // Validate subqueries
+        self.validate_subqueries(&normalized, tenant_id)?;
+
+        // Validate UNION queries
+        self.validate_unions(&normalized, tenant_id)?;
+
+        Ok(())
+    }
+
+    /// Normalize SQL for consistent analysis
+    fn normalize_sql(&self, sql: &str) -> String {
+        sql.to_uppercase()
+            .replace('\n', " ")
+            .replace('\r', " ")
+            .replace('\t', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Check for common SQL injection patterns
+    fn check_injection_patterns(&self, sql: &str) -> Result<(), TenantError> {
+        let injection_patterns = [
+            // Comment-based injection
+            ("--", "SQL comment injection detected"),
+            ("/*", "SQL block comment injection detected"),
+            ("*/", "SQL block comment injection detected"),
+
+            // Classic injection patterns
+            ("' OR '1'='1", "Classic SQL injection pattern detected"),
+            ("\" OR \"1\"=\"1", "Classic SQL injection pattern detected"),
+            ("' OR 1=1", "SQL injection pattern detected"),
+            ("\" OR 1=1", "SQL injection pattern detected"),
+            ("' OR TRUE", "SQL injection pattern detected"),
+            ("' AND FALSE", "SQL injection pattern detected"),
+
+            // Stacked queries
+            ("; DROP ", "Stacked query injection detected"),
+            ("; DELETE ", "Stacked query injection detected"),
+            ("; UPDATE ", "Stacked query injection detected"),
+            ("; INSERT ", "Stacked query injection detected"),
+            ("; TRUNCATE ", "Stacked query injection detected"),
+            ("; ALTER ", "Stacked query injection detected"),
+            ("; CREATE ", "Stacked query injection detected"),
+            ("; GRANT ", "Stacked query injection detected"),
+            ("; REVOKE ", "Stacked query injection detected"),
+
+            // Time-based blind injection
+            ("SLEEP(", "Time-based injection pattern detected"),
+            ("WAITFOR DELAY", "Time-based injection pattern detected"),
+            ("PG_SLEEP(", "Time-based injection pattern detected"),
+            ("BENCHMARK(", "Time-based injection pattern detected"),
+
+            // Error-based injection
+            ("EXTRACTVALUE(", "XML-based injection pattern detected"),
+            ("UPDATEXML(", "XML-based injection pattern detected"),
+
+            // Out-of-band injection
+            ("LOAD_FILE(", "File-based injection pattern detected"),
+            ("INTO OUTFILE", "File-based injection pattern detected"),
+            ("INTO DUMPFILE", "File-based injection pattern detected"),
+
+            // System access
+            ("INFORMATION_SCHEMA", "Schema access attempt detected"),
+            ("PG_CATALOG", "System catalog access attempt detected"),
+            ("SYS.TABLES", "System table access attempt detected"),
+            ("SYSOBJECTS", "System object access attempt detected"),
+        ];
+
+        for (pattern, message) in &injection_patterns {
+            if sql.contains(pattern) {
+                return Err(TenantError::SecurityViolation {
+                    message: message.to_string(),
+                    sql_fragment: pattern.to_string()
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for dangerous SQL constructs
+    fn check_dangerous_constructs(&self, sql: &str) -> Result<(), TenantError> {
+        // Check for DDL statements (should not be in application queries)
+        let ddl_keywords = [
+            "CREATE TABLE", "DROP TABLE", "ALTER TABLE",
+            "CREATE INDEX", "DROP INDEX",
+            "CREATE VIEW", "DROP VIEW",
+            "CREATE SCHEMA", "DROP SCHEMA",
+            "TRUNCATE TABLE",
+        ];
+
+        for keyword in &ddl_keywords {
+            if sql.contains(keyword) {
+                return Err(TenantError::SecurityViolation {
+                    message: format!("DDL statement not allowed: {}", keyword),
+                    sql_fragment: keyword.to_string()
+                });
+            }
+        }
+
+        // Check for privilege statements
+        let privilege_keywords = ["GRANT ", "REVOKE ", "SET ROLE", "SET SESSION"];
+        for keyword in &privilege_keywords {
+            if sql.contains(keyword) {
+                return Err(TenantError::SecurityViolation {
+                    message: format!("Privilege statement not allowed: {}", keyword),
+                    sql_fragment: keyword.to_string()
+                });
+            }
+        }
+
+        // Check for dynamic execution
+        let dynamic_keywords = ["EXEC ", "EXECUTE ", "PREPARE ", "DEALLOCATE "];
+        for keyword in &dynamic_keywords {
+            if sql.contains(keyword) {
+                return Err(TenantError::SecurityViolation {
+                    message: format!("Dynamic SQL execution not allowed: {}", keyword),
+                    sql_fragment: keyword.to_string()
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate all table references have tenant_id filters
+    fn validate_table_references(&self, sql: &str, tenant_id: &TenantId) -> Result<(), TenantError> {
+        // Extract table names from SQL
+        let tables = self.extract_table_names(sql);
+
+        for table in &tables {
+            // Skip excluded tables
+            if self.config.excluded_tables.contains(table) {
+                continue;
+            }
+
+            // Check if this table has a tenant_id filter
+            if !self.has_tenant_filter(sql, table, tenant_id) {
+                return Err(TenantError::TenantIsolationViolation {
+                    message: format!("Table '{}' missing tenant_id filter", table),
+                    table: table.clone()
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract table names from SQL
+    fn extract_table_names(&self, sql: &str) -> List<String> {
+        let mut tables = vec![];
+
+        // Pattern matching for FROM and JOIN clauses
+        let patterns = [
+            r"FROM\s+(\w+)",
+            r"JOIN\s+(\w+)",
+            r"INTO\s+(\w+)",
+            r"UPDATE\s+(\w+)",
+            r"DELETE\s+FROM\s+(\w+)",
+        ];
+
+        for pattern in &patterns {
+            let re = regex::Regex::new(pattern).unwrap();
+            for cap in re.captures_iter(sql) {
+                if let Some(table) = cap.get(1) {
+                    let table_name = table.as_str().to_uppercase();
+                    if !tables.contains(&table_name) {
+                        tables.push(table_name);
+                    }
+                }
+            }
+        }
+
+        tables
+    }
+
+    /// Check if a table has proper tenant_id filter
+    fn has_tenant_filter(&self, sql: &str, table: &str, tenant_id: &TenantId) -> bool {
+        // Look for patterns like:
+        // table.tenant_id = ?
+        // table.tenant_id = 'uuid'
+        // WHERE tenant_id = ?
+
+        let patterns = [
+            format!("{}.TENANT_ID = ?", table),
+            format!("{}.TENANT_ID = :TENANT", table),
+            format!("{}.TENANT_ID = $", table),
+            format!("TENANT_ID = ?"),
+            format!("TENANT_ID = :TENANT"),
+            format!("TENANT_ID = $"),
+        ];
+
+        // Also check for the specific tenant ID (if hardcoded)
+        let tenant_id_upper = tenant_id.0.to_uppercase();
+        let specific_patterns = [
+            format!("TENANT_ID = '{}'", tenant_id_upper),
+            format!("{}.TENANT_ID = '{}'", table, tenant_id_upper),
+        ];
+
+        for pattern in patterns.iter().chain(specific_patterns.iter()) {
+            if sql.contains(&pattern.to_uppercase()) {
+                return true;
+            }
+        }
+
+        // Check for parameterized tenant_id in WHERE clause with table prefix
+        let where_pattern = format!("{}.TENANT_ID", table);
+        if sql.contains(&where_pattern) {
+            // Found table.tenant_id reference, check it's in a comparison
+            if sql.contains(&format!("{} =", where_pattern)) ||
+               sql.contains(&format!("{} IN", where_pattern)) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Validate subqueries have proper tenant isolation
+    fn validate_subqueries(&self, sql: &str, tenant_id: &TenantId) -> Result<(), TenantError> {
+        // Find all subqueries (content between parentheses containing SELECT)
+        let mut depth = 0;
+        let mut subquery_start: Option<usize> = None;
+        let chars: Vec<char> = sql.chars().collect();
+
+        for i in 0..chars.len() {
+            match chars[i] {
+                '(' => {
+                    depth += 1;
+                    if subquery_start.is_none() && self.is_subquery_start(sql, i) {
+                        subquery_start = Some(i);
+                    }
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 && subquery_start.is_some() {
+                        let start = subquery_start.unwrap();
+                        let subquery = &sql[start + 1..i];
+
+                        // Recursively validate the subquery
+                        self.validate_table_references(subquery, tenant_id)?;
+                        subquery_start = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if position marks the start of a subquery
+    fn is_subquery_start(&self, sql: &str, pos: usize) -> bool {
+        // Check if there's a SELECT after the opening parenthesis
+        let remaining = &sql[pos + 1..].trim_start();
+        remaining.starts_with("SELECT")
+    }
+
+    /// Validate UNION queries have tenant filters in all branches
+    fn validate_unions(&self, sql: &str, tenant_id: &TenantId) -> Result<(), TenantError> {
+        // Check for UNION, UNION ALL, INTERSECT, EXCEPT
+        let set_operators = ["UNION ALL", "UNION", "INTERSECT", "EXCEPT"];
+
+        for operator in &set_operators {
+            if sql.contains(operator) {
+                // Split by the operator and validate each part
+                let parts: Vec<&str> = sql.split(operator).collect();
+
+                for (i, part) in parts.iter().enumerate() {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+
+                    // Validate each part of the UNION has tenant filter
+                    self.validate_table_references(part, tenant_id).map_err(|e| {
+                        TenantError::TenantIsolationViolation {
+                            message: format!(
+                                "UNION part {} missing tenant isolation: {}",
+                                i + 1,
+                                e
+                            ),
+                            table: String::new()
+                        }
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// SQL query rewriter that automatically adds tenant filters
+pub struct SqlTenantRewriter {
+    config: IsolationConfig,
+}
+
+impl SqlTenantRewriter {
+    pub fn new(config: &IsolationConfig) -> Self {
+        SqlTenantRewriter {
+            config: config.clone(),
+        }
+    }
+
+    /// Rewrite SQL to include tenant_id filters
+    pub fn rewrite(&self, sql: &str, tenant_id: &TenantId) -> String {
+        let mut result = sql.to_string();
+
+        // Extract all table names
+        let validator = SqlTenantValidator::new(&self.config);
+        let tables = validator.extract_table_names(&result);
+
+        for table in &tables {
+            // Skip excluded tables
+            if self.config.excluded_tables.contains(table) {
+                continue;
+            }
+
+            // Add tenant filter if not present
+            if !validator.has_tenant_filter(&result, table, tenant_id) {
+                result = self.add_tenant_filter(&result, table, tenant_id);
+            }
+        }
+
+        result
+    }
+
+    /// Add tenant filter to a query for a specific table
+    fn add_tenant_filter(&self, sql: &str, table: &str, tenant_id: &TenantId) -> String {
+        let tenant_filter = format!("{}.tenant_id = '{}'", table, tenant_id.0);
+
+        // Find WHERE clause
+        if let Some(where_pos) = sql.to_uppercase().find("WHERE") {
+            // Insert after WHERE
+            let insert_pos = where_pos + 6; // "WHERE " length
+            let (before, after) = sql.split_at(insert_pos);
+            format!("{}{} AND {}", before, tenant_filter, after)
+        } else if let Some(order_pos) = sql.to_uppercase().find("ORDER BY") {
+            // Insert before ORDER BY
+            let (before, after) = sql.split_at(order_pos);
+            format!("{} WHERE {} {}", before.trim_end(), tenant_filter, after)
+        } else if let Some(limit_pos) = sql.to_uppercase().find("LIMIT") {
+            // Insert before LIMIT
+            let (before, after) = sql.split_at(limit_pos);
+            format!("{} WHERE {} {}", before.trim_end(), tenant_filter, after)
+        } else if let Some(group_pos) = sql.to_uppercase().find("GROUP BY") {
+            // Insert before GROUP BY
+            let (before, after) = sql.split_at(group_pos);
+            format!("{} WHERE {} {}", before.trim_end(), tenant_filter, after)
+        } else {
+            // Append WHERE clause
+            format!("{} WHERE {}", sql.trim_end(), tenant_filter)
+        }
+    }
+}
+
+// =============================================================================
+// ROW-LEVEL SECURITY POLICIES
+// =============================================================================
+
+/// RLS policy definition
+type RlsPolicy {
+    name: String,
+    table: String,
+    command: RlsCommand,
+    using_expression: String,
+    check_expression: Option<String>,
+    roles: List<String>
+}
+
+/// RLS command type
+enum RlsCommand {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete
+}
+
+impl RlsCommand {
+    fn to_string(&self) -> String {
+        match self {
+            RlsCommand::All => "ALL",
+            RlsCommand::Select => "SELECT",
+            RlsCommand::Insert => "INSERT",
+            RlsCommand::Update => "UPDATE",
+            RlsCommand::Delete => "DELETE"
+        }.to_string()
+    }
+}
+
+/// Generate RLS policies for a table
+fn generate_rls_policies(table: &str) -> List<RlsPolicy> {
+    vec![
+        RlsPolicy {
+            name: format!("{}_tenant_isolation", table),
+            table: table.to_string(),
+            command: RlsCommand::All,
+            using_expression: format!("tenant_id = current_setting('app.current_tenant')::uuid"),
+            check_expression: Some(format!("tenant_id = current_setting('app.current_tenant')::uuid")),
+            roles: vec!["app_user".to_string()]
+        },
+        RlsPolicy {
+            name: format!("{}_admin_access", table),
+            table: table.to_string(),
+            command: RlsCommand::All,
+            using_expression: "true".to_string(),
+            check_expression: None,
+            roles: vec!["app_admin".to_string()]
+        }
+    ]
+}
+
+/// Generate SQL to enable RLS on a table
+fn generate_enable_rls_sql(table: &str) -> String {
+    format!(
+        "ALTER TABLE {} ENABLE ROW LEVEL SECURITY;\nALTER TABLE {} FORCE ROW LEVEL SECURITY;",
+        table, table
+    )
+}
+
+/// Generate SQL to create an RLS policy
+fn generate_create_policy_sql(policy: &RlsPolicy) -> String {
+    let mut sql = format!(
+        "CREATE POLICY {} ON {} FOR {} TO {}",
+        policy.name,
+        policy.table,
+        policy.command.to_string(),
+        policy.roles.join(", ")
+    );
+
+    sql.push_str(&format!("\n  USING ({})", policy.using_expression));
+
+    if let Some(ref check) = policy.check_expression {
+        sql.push_str(&format!("\n  WITH CHECK ({})", check));
+    }
+
+    sql.push(';');
+    sql
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_query_builder() {
+        let tenant = TenantId("tenant_123".to_string());
+        let (sql, params) = TenantQueryBuilder::new(tenant, "courses".to_string())
+            .select(vec!["id".to_string(), "title".to_string()])
+            .where_eq("status".to_string(), Dynamic::String("published".to_string()))
+            .order_by("created_at".to_string(), OrderDirection::Desc)
+            .limit(10)
+            .build();
+
+        assert!(sql.contains("tenant_id = ?"));
+        assert!(sql.contains("deleted_at IS NULL"));
+        assert!(sql.contains("ORDER BY created_at DESC"));
+        assert!(sql.contains("LIMIT 10"));
+    }
+
+    #[test]
+    fn test_insert_builder() {
+        let tenant = TenantId("tenant_123".to_string());
+        let (sql, params) = TenantInsertBuilder::new(tenant, "courses".to_string())
+            .columns(vec!["title".to_string(), "status".to_string()])
+            .values(vec![
+                Dynamic::String("My Course".to_string()),
+                Dynamic::String("draft".to_string())
+            ])
+            .build();
+
+        assert!(sql.contains("tenant_id"));
+        assert!(sql.contains("title"));
+        assert!(params.len() == 3); // tenant_id + 2 values
+    }
+
+    #[test]
+    fn test_update_builder() {
+        let tenant = TenantId("tenant_123".to_string());
+        let (sql, params) = TenantUpdateBuilder::new(tenant, "courses".to_string())
+            .set("title".to_string(), Dynamic::String("New Title".to_string()))
+            .where_eq("id".to_string(), Dynamic::String("course_1".to_string()))
+            .build();
+
+        assert!(sql.contains("UPDATE courses SET"));
+        assert!(sql.contains("tenant_id = ?"));
+        assert!(sql.contains("updated_at = ?"));
+    }
+
+    #[test]
+    fn test_delete_builder_soft() {
+        let tenant = TenantId("tenant_123".to_string());
+        let (sql, _) = TenantDeleteBuilder::new(tenant, "courses".to_string())
+            .where_eq("id".to_string(), Dynamic::String("course_1".to_string()))
+            .build();
+
+        assert!(sql.contains("UPDATE"));
+        assert!(sql.contains("deleted_at = ?"));
+    }
+
+    #[test]
+    fn test_delete_builder_hard() {
+        let tenant = TenantId("tenant_123".to_string());
+        let (sql, _) = TenantDeleteBuilder::new(tenant, "courses".to_string())
+            .where_eq("id".to_string(), Dynamic::String("course_1".to_string()))
+            .hard_delete()
+            .build();
+
+        assert!(sql.contains("DELETE FROM"));
+    }
+}

@@ -1,0 +1,3404 @@
+/// Intelligo LMS - Learning Record Store (LRS)
+///
+/// Implementation of a full xAPI 1.0.3-conformant Learning Record Store.
+/// Provides statement storage and querying with full spec compliance,
+/// agent profile API, activity profile API, state API for bookmarking,
+/// voiding statements, statement forwarding, querying with filters
+/// (agent, verb, activity, since, until), aggregation queries for analytics,
+/// and multi-tenancy support with tenant isolation.
+
+module intelligo::compliance::lrs
+
+use intelligo::core::types::*
+use intelligo::compliance::xapi::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+use std::json::{Json, JsonValue}
+use std::http::{HttpClient, HttpRequest, HttpResponse, HttpMethod}
+
+// =============================================================================
+// IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for a stored statement
+type StoredStatementId = String
+
+/// Unique identifier for a document
+type DocumentId = String
+
+/// ETag for document versioning
+type ETag = String
+
+// =============================================================================
+// STORED STATEMENT
+// =============================================================================
+
+/// A statement as stored in the LRS
+type StoredStatement {
+    /// The statement itself
+    statement: Statement,
+
+    /// When the statement was stored
+    stored_at: DateTime,
+
+    /// Authority that stored the statement
+    stored_by: Option<Actor>,
+
+    /// Is this statement voided
+    voided: Bool,
+
+    /// Voiding statement ID (if voided)
+    voided_by: Option<StatementId>,
+
+    /// Attachments stored with this statement
+    attachments: List<StoredAttachment>
+}
+
+impl StoredStatement {
+    fn new(statement: Statement, authority: Option<Actor>) -> StoredStatement {
+        StoredStatement {
+            statement,
+            stored_at: DateTime::now(),
+            stored_by: authority,
+            voided: false,
+            voided_by: None,
+            attachments: vec![]
+        }
+    }
+}
+
+/// Stored attachment
+type StoredAttachment {
+    /// SHA-2 hash
+    sha2: String,
+
+    /// Content type
+    content_type: String,
+
+    /// Raw content
+    content: Vec<u8>,
+
+    /// File URL (if external)
+    file_url: Option<String>
+}
+
+// =============================================================================
+// DOCUMENTS
+// =============================================================================
+
+/// State document
+type StateDocument {
+    /// State ID
+    state_id: String,
+
+    /// Activity ID
+    activity_id: IRI,
+
+    /// Agent
+    agent: Agent,
+
+    /// Registration (optional)
+    registration: Option<String>,
+
+    /// Document content
+    content: JsonValue,
+
+    /// Content type
+    content_type: String,
+
+    /// ETag for concurrency
+    etag: ETag,
+
+    /// Updated timestamp
+    updated_at: DateTime
+}
+
+impl StateDocument {
+    fn new(
+        state_id: String,
+        activity_id: IRI,
+        agent: Agent,
+        registration: Option<String>,
+        content: JsonValue
+    ) -> StateDocument {
+        StateDocument {
+            state_id,
+            activity_id,
+            agent,
+            registration,
+            content,
+            content_type: "application/json".to_string(),
+            etag: generate_etag(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    /// Generate key for document lookup
+    fn key(&self) -> String {
+        let agent_key = agent_identifier(&self.agent);
+        let reg_key = self.registration.as_ref().map(|r| format!("_{}", r)).unwrap_or_default();
+        format!("{}:{}:{}{}",
+            self.activity_id,
+            agent_key,
+            self.state_id,
+            reg_key
+        )
+    }
+}
+
+/// Activity Profile document
+type ActivityProfileDocument {
+    /// Profile ID
+    profile_id: String,
+
+    /// Activity ID
+    activity_id: IRI,
+
+    /// Document content
+    content: JsonValue,
+
+    /// Content type
+    content_type: String,
+
+    /// ETag
+    etag: ETag,
+
+    /// Updated timestamp
+    updated_at: DateTime
+}
+
+impl ActivityProfileDocument {
+    fn new(profile_id: String, activity_id: IRI, content: JsonValue) -> ActivityProfileDocument {
+        ActivityProfileDocument {
+            profile_id,
+            activity_id,
+            content,
+            content_type: "application/json".to_string(),
+            etag: generate_etag(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    fn key(&self) -> String {
+        format!("{}:{}", self.activity_id, self.profile_id)
+    }
+}
+
+/// Agent Profile document
+type AgentProfileDocument {
+    /// Profile ID
+    profile_id: String,
+
+    /// Agent
+    agent: Agent,
+
+    /// Document content
+    content: JsonValue,
+
+    /// Content type
+    content_type: String,
+
+    /// ETag
+    etag: ETag,
+
+    /// Updated timestamp
+    updated_at: DateTime
+}
+
+impl AgentProfileDocument {
+    fn new(profile_id: String, agent: Agent, content: JsonValue) -> AgentProfileDocument {
+        AgentProfileDocument {
+            profile_id,
+            agent,
+            content,
+            content_type: "application/json".to_string(),
+            etag: generate_etag(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    fn key(&self) -> String {
+        format!("{}:{}", agent_identifier(&self.agent), self.profile_id)
+    }
+}
+
+// =============================================================================
+// QUERY TYPES
+// =============================================================================
+
+/// Statement query parameters
+type LrsStatementQuery {
+    /// Filter by statement ID
+    statement_id: Option<StatementId>,
+
+    /// Filter by voided statement ID
+    voided_statement_id: Option<StatementId>,
+
+    /// Filter by agent
+    agent: Option<Agent>,
+
+    /// Filter by verb IRI
+    verb: Option<IRI>,
+
+    /// Filter by activity IRI
+    activity: Option<IRI>,
+
+    /// Filter by registration
+    registration: Option<String>,
+
+    /// Include related activities
+    related_activities: Bool,
+
+    /// Include related agents
+    related_agents: Bool,
+
+    /// Filter statements since this time
+    since: Option<DateTime>,
+
+    /// Filter statements until this time
+    until: Option<DateTime>,
+
+    /// Maximum statements to return
+    limit: i32,
+
+    /// Return in ascending order
+    ascending: Bool,
+
+    /// Include attachments
+    attachments: Bool,
+
+    /// Format (ids, exact, canonical)
+    format: StatementFormat
+}
+
+impl LrsStatementQuery {
+    fn new() -> LrsStatementQuery {
+        LrsStatementQuery {
+            statement_id: None,
+            voided_statement_id: None,
+            agent: None,
+            verb: None,
+            activity: None,
+            registration: None,
+            related_activities: false,
+            related_agents: false,
+            since: None,
+            until: None,
+            limit: 100,
+            ascending: false,
+            attachments: false,
+            format: StatementFormat::Exact
+        }
+    }
+}
+
+/// Statement format
+enum StatementFormat {
+    /// Only statement IDs
+    Ids,
+    /// Exact representation
+    Exact,
+    /// Canonical form (language filtering applied)
+    Canonical
+}
+
+/// Query result with pagination
+type LrsQueryResult {
+    /// Matching statements
+    statements: List<Statement>,
+
+    /// More results available
+    more: Option<String>,
+
+    /// Total count (if available)
+    total: Option<i64>
+}
+
+// =============================================================================
+// LRS ERRORS
+// =============================================================================
+
+/// LRS error types
+enum LrsError {
+    /// Statement not found
+    StatementNotFound { id: StatementId },
+    /// Document not found
+    DocumentNotFound { document_type: String, id: String },
+    /// Conflict (e.g., duplicate statement ID)
+    Conflict { message: String },
+    /// Invalid statement
+    InvalidStatement { message: String },
+    /// Invalid query
+    InvalidQuery { message: String },
+    /// Concurrency conflict (ETag mismatch)
+    ConcurrencyConflict { expected: ETag, actual: ETag },
+    /// Internal error
+    InternalError { message: String }
+}
+
+impl LrsError {
+    fn message(&self) -> String {
+        match self {
+            LrsError::StatementNotFound { id } => format!("Statement not found: {}", id),
+            LrsError::DocumentNotFound { document_type, id } => {
+                format!("{} document not found: {}", document_type, id)
+            },
+            LrsError::Conflict { message } => format!("Conflict: {}", message),
+            LrsError::InvalidStatement { message } => format!("Invalid statement: {}", message),
+            LrsError::InvalidQuery { message } => format!("Invalid query: {}", message),
+            LrsError::ConcurrencyConflict { expected, actual } => {
+                format!("Concurrency conflict: expected ETag {}, got {}", expected, actual)
+            },
+            LrsError::InternalError { message } => format!("Internal error: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// LRS MESSAGES
+// =============================================================================
+
+/// Messages for LearningRecordStore actor
+enum LrsMessage {
+    // =========================================================================
+    // STATEMENT API
+    // =========================================================================
+
+    /// Store a single statement
+    StoreStatement {
+        statement: Statement,
+        authority: Option<Actor>,
+        reply_to: Actor<Result<StatementId, LrsError>>
+    },
+
+    /// Store multiple statements
+    StoreStatements {
+        statements: List<Statement>,
+        authority: Option<Actor>,
+        reply_to: Actor<Result<List<StatementId>, LrsError>>
+    },
+
+    /// Get a single statement
+    GetStatement {
+        statement_id: StatementId,
+        include_voided: Bool,
+        reply_to: Actor<Result<Statement, LrsError>>
+    },
+
+    /// Query statements
+    QueryStatements {
+        query: LrsStatementQuery,
+        reply_to: Actor<Result<LrsQueryResult, LrsError>>
+    },
+
+    /// Void a statement
+    VoidStatement {
+        statement_id: StatementId,
+        actor: Actor,
+        authority: Option<Actor>,
+        reply_to: Actor<Result<StatementId, LrsError>>
+    },
+
+    // =========================================================================
+    // STATE API
+    // =========================================================================
+
+    /// Get state document
+    GetState {
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        reply_to: Actor<Result<StateDocument, LrsError>>
+    },
+
+    /// Get state IDs for an activity/agent
+    GetStateIds {
+        activity_id: IRI,
+        agent: Agent,
+        registration: Option<String>,
+        since: Option<DateTime>,
+        reply_to: Actor<List<String>>
+    },
+
+    /// Set state document
+    SetState {
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        content: JsonValue,
+        content_type: String,
+        if_match: Option<ETag>,
+        if_none_match: Bool,
+        reply_to: Actor<Result<ETag, LrsError>>
+    },
+
+    /// Delete state document
+    DeleteState {
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        if_match: Option<ETag>,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    /// Delete all state documents for activity/agent
+    DeleteStates {
+        activity_id: IRI,
+        agent: Agent,
+        registration: Option<String>,
+        reply_to: Actor<Result<i32, LrsError>>
+    },
+
+    // =========================================================================
+    // ACTIVITY PROFILE API
+    // =========================================================================
+
+    /// Get activity profile
+    GetActivityProfile {
+        activity_id: IRI,
+        profile_id: String,
+        reply_to: Actor<Result<ActivityProfileDocument, LrsError>>
+    },
+
+    /// Get activity profile IDs
+    GetActivityProfileIds {
+        activity_id: IRI,
+        since: Option<DateTime>,
+        reply_to: Actor<List<String>>
+    },
+
+    /// Set activity profile
+    SetActivityProfile {
+        activity_id: IRI,
+        profile_id: String,
+        content: JsonValue,
+        content_type: String,
+        if_match: Option<ETag>,
+        if_none_match: Bool,
+        reply_to: Actor<Result<ETag, LrsError>>
+    },
+
+    /// Delete activity profile
+    DeleteActivityProfile {
+        activity_id: IRI,
+        profile_id: String,
+        if_match: Option<ETag>,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    // =========================================================================
+    // AGENT PROFILE API
+    // =========================================================================
+
+    /// Get agent profile
+    GetAgentProfile {
+        agent: Agent,
+        profile_id: String,
+        reply_to: Actor<Result<AgentProfileDocument, LrsError>>
+    },
+
+    /// Get agent profile IDs
+    GetAgentProfileIds {
+        agent: Agent,
+        since: Option<DateTime>,
+        reply_to: Actor<List<String>>
+    },
+
+    /// Set agent profile
+    SetAgentProfile {
+        agent: Agent,
+        profile_id: String,
+        content: JsonValue,
+        content_type: String,
+        if_match: Option<ETag>,
+        if_none_match: Bool,
+        reply_to: Actor<Result<ETag, LrsError>>
+    },
+
+    /// Delete agent profile
+    DeleteAgentProfile {
+        agent: Agent,
+        profile_id: String,
+        if_match: Option<ETag>,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    // =========================================================================
+    // ABOUT API
+    // =========================================================================
+
+    /// Get LRS info
+    GetAbout {
+        reply_to: Actor<LrsAbout>
+    },
+
+    // =========================================================================
+    // AGENT API
+    // =========================================================================
+
+    /// Get person (combined agent info)
+    GetPerson {
+        agent: Agent,
+        reply_to: Actor<Option<Person>>
+    },
+
+    // =========================================================================
+    // ACTIVITY API
+    // =========================================================================
+
+    /// Get activity (full activity object)
+    GetActivity {
+        activity_id: IRI,
+        reply_to: Actor<Option<Activity>>
+    },
+
+    // =========================================================================
+    // STATISTICS
+    // =========================================================================
+
+    /// Get LRS statistics
+    GetStatistics {
+        reply_to: Actor<LrsStatistics>
+    }
+}
+
+/// LRS about information
+type LrsAbout {
+    /// Supported xAPI versions
+    versions: List<String>,
+
+    /// Extensions
+    extensions: Map<String, JsonValue>
+}
+
+/// Person (aggregate agent data)
+type Person {
+    /// Object type (always "Person")
+    object_type: String,
+
+    /// Names used by this agent
+    name: List<String>,
+
+    /// Email addresses
+    mbox: List<String>,
+
+    /// SHA1 hashes of emails
+    mbox_sha1sum: List<String>,
+
+    /// OpenIDs
+    openid: List<String>,
+
+    /// Accounts
+    account: List<Account>
+}
+
+/// LRS statistics
+type LrsStatistics {
+    /// Total statements stored
+    total_statements: i64,
+
+    /// Statements stored today
+    statements_today: i64,
+
+    /// Total voided statements
+    voided_statements: i64,
+
+    /// Unique actors
+    unique_actors: i64,
+
+    /// Unique activities
+    unique_activities: i64,
+
+    /// Storage size (bytes)
+    storage_bytes: i64,
+
+    /// LRS uptime
+    uptime: Duration
+}
+
+// =============================================================================
+// LRS STATE
+// =============================================================================
+
+/// LRS state
+type LrsState {
+    /// Stored statements by ID
+    statements: Map<StatementId, StoredStatement>,
+
+    /// Statements by stored timestamp (for querying)
+    statements_by_time: List<StatementId>,
+
+    /// Index: actor -> statement IDs
+    actor_index: Map<String, Set<StatementId>>,
+
+    /// Index: verb -> statement IDs
+    verb_index: Map<IRI, Set<StatementId>>,
+
+    /// Index: activity -> statement IDs
+    activity_index: Map<IRI, Set<StatementId>>,
+
+    /// Index: registration -> statement IDs
+    registration_index: Map<String, Set<StatementId>>,
+
+    /// State documents
+    state_documents: Map<String, StateDocument>,
+
+    /// Activity profile documents
+    activity_profiles: Map<String, ActivityProfileDocument>,
+
+    /// Agent profile documents
+    agent_profiles: Map<String, AgentProfileDocument>,
+
+    /// Activity definitions (canonical)
+    activities: Map<IRI, Activity>,
+
+    /// Person aggregations
+    persons: Map<String, Person>,
+
+    /// LRS start time
+    started_at: DateTime,
+
+    /// Statement counter
+    statement_counter: i64
+}
+
+impl LrsState {
+    fn new() -> LrsState {
+        LrsState {
+            statements: Map::new(),
+            statements_by_time: vec![],
+            actor_index: Map::new(),
+            verb_index: Map::new(),
+            activity_index: Map::new(),
+            registration_index: Map::new(),
+            state_documents: Map::new(),
+            activity_profiles: Map::new(),
+            agent_profiles: Map::new(),
+            activities: Map::new(),
+            persons: Map::new(),
+            started_at: DateTime::now(),
+            statement_counter: 0
+        }
+    }
+}
+
+// =============================================================================
+// LEARNING RECORD STORE ACTOR
+// =============================================================================
+
+/// Learning Record Store actor
+actor LearningRecordStore {
+    state: LrsState,
+
+    /// Initialize LRS
+    fn init() -> LearningRecordStore {
+        LearningRecordStore {
+            state: LrsState::new()
+        }
+    }
+
+    /// Handle messages
+    fn receive(&mut self, msg: LrsMessage) {
+        match msg {
+            // Statement API
+            LrsMessage::StoreStatement { statement, authority, reply_to } => {
+                let result = self.store_statement(statement, authority);
+                reply_to.send(result);
+            },
+
+            LrsMessage::StoreStatements { statements, authority, reply_to } => {
+                let result = self.store_statements(statements, authority);
+                reply_to.send(result);
+            },
+
+            LrsMessage::GetStatement { statement_id, include_voided, reply_to } => {
+                let result = self.get_statement(&statement_id, include_voided);
+                reply_to.send(result);
+            },
+
+            LrsMessage::QueryStatements { query, reply_to } => {
+                let result = self.query_statements(query);
+                reply_to.send(result);
+            },
+
+            LrsMessage::VoidStatement { statement_id, actor, authority, reply_to } => {
+                let result = self.void_statement(&statement_id, actor, authority);
+                reply_to.send(result);
+            },
+
+            // State API
+            LrsMessage::GetState { activity_id, agent, state_id, registration, reply_to } => {
+                let result = self.get_state(&activity_id, &agent, &state_id, registration);
+                reply_to.send(result);
+            },
+
+            LrsMessage::GetStateIds { activity_id, agent, registration, since, reply_to } => {
+                let ids = self.get_state_ids(&activity_id, &agent, registration, since);
+                reply_to.send(ids);
+            },
+
+            LrsMessage::SetState { activity_id, agent, state_id, registration, content, content_type, if_match, if_none_match, reply_to } => {
+                let result = self.set_state(activity_id, agent, state_id, registration, content, content_type, if_match, if_none_match);
+                reply_to.send(result);
+            },
+
+            LrsMessage::DeleteState { activity_id, agent, state_id, registration, if_match, reply_to } => {
+                let result = self.delete_state(&activity_id, &agent, &state_id, registration, if_match);
+                reply_to.send(result);
+            },
+
+            LrsMessage::DeleteStates { activity_id, agent, registration, reply_to } => {
+                let result = self.delete_states(&activity_id, &agent, registration);
+                reply_to.send(result);
+            },
+
+            // Activity Profile API
+            LrsMessage::GetActivityProfile { activity_id, profile_id, reply_to } => {
+                let result = self.get_activity_profile(&activity_id, &profile_id);
+                reply_to.send(result);
+            },
+
+            LrsMessage::GetActivityProfileIds { activity_id, since, reply_to } => {
+                let ids = self.get_activity_profile_ids(&activity_id, since);
+                reply_to.send(ids);
+            },
+
+            LrsMessage::SetActivityProfile { activity_id, profile_id, content, content_type, if_match, if_none_match, reply_to } => {
+                let result = self.set_activity_profile(activity_id, profile_id, content, content_type, if_match, if_none_match);
+                reply_to.send(result);
+            },
+
+            LrsMessage::DeleteActivityProfile { activity_id, profile_id, if_match, reply_to } => {
+                let result = self.delete_activity_profile(&activity_id, &profile_id, if_match);
+                reply_to.send(result);
+            },
+
+            // Agent Profile API
+            LrsMessage::GetAgentProfile { agent, profile_id, reply_to } => {
+                let result = self.get_agent_profile(&agent, &profile_id);
+                reply_to.send(result);
+            },
+
+            LrsMessage::GetAgentProfileIds { agent, since, reply_to } => {
+                let ids = self.get_agent_profile_ids(&agent, since);
+                reply_to.send(ids);
+            },
+
+            LrsMessage::SetAgentProfile { agent, profile_id, content, content_type, if_match, if_none_match, reply_to } => {
+                let result = self.set_agent_profile(agent, profile_id, content, content_type, if_match, if_none_match);
+                reply_to.send(result);
+            },
+
+            LrsMessage::DeleteAgentProfile { agent, profile_id, if_match, reply_to } => {
+                let result = self.delete_agent_profile(&agent, &profile_id, if_match);
+                reply_to.send(result);
+            },
+
+            // About API
+            LrsMessage::GetAbout { reply_to } => {
+                let about = self.get_about();
+                reply_to.send(about);
+            },
+
+            // Agent API
+            LrsMessage::GetPerson { agent, reply_to } => {
+                let person = self.get_person(&agent);
+                reply_to.send(person);
+            },
+
+            // Activity API
+            LrsMessage::GetActivity { activity_id, reply_to } => {
+                let activity = self.get_activity(&activity_id);
+                reply_to.send(activity);
+            },
+
+            // Statistics
+            LrsMessage::GetStatistics { reply_to } => {
+                let stats = self.get_statistics();
+                reply_to.send(stats);
+            }
+        }
+    }
+
+    // =========================================================================
+    // STATEMENT API IMPLEMENTATION
+    // =========================================================================
+
+    /// Store a single statement
+    fn store_statement(&mut self, statement: Statement, authority: Option<Actor>) -> Result<StatementId, LrsError> {
+        // Validate statement
+        self.validate_statement(&statement)?;
+
+        // Generate or use provided ID
+        let statement_id = statement.id.clone().unwrap_or_else(generate_uuid);
+
+        // Check for duplicate
+        if self.state.statements.contains_key(&statement_id) {
+            return Err(LrsError::Conflict {
+                message: format!("Statement with ID {} already exists", statement_id)
+            })
+        }
+
+        // Handle voiding statement
+        if statement.verb.id == "http://adlnet.gov/expapi/verbs/voided" {
+            if let Object::StatementRef(ref stmt_ref) = statement.object {
+                self.mark_as_voided(&stmt_ref.id, &statement_id)?;
+            }
+        }
+
+        // Create stored statement
+        let mut stored = StoredStatement::new(statement.clone(), authority);
+        stored.statement.id = Some(statement_id.clone());
+        stored.statement.stored = Some(DateTime::now().to_iso8601());
+
+        // Index the statement
+        self.index_statement(&statement_id, &stored.statement);
+
+        // Store activity definitions
+        self.store_activity_from_statement(&stored.statement);
+
+        // Store the statement
+        self.state.statements.insert(statement_id.clone(), stored);
+        self.state.statements_by_time.push(statement_id.clone());
+        self.state.statement_counter += 1;
+
+        Ok(statement_id)
+    }
+
+    /// Store multiple statements
+    fn store_statements(&mut self, statements: List<Statement>, authority: Option<Actor>) -> Result<List<StatementId>, LrsError> {
+        let mut ids = vec![];
+
+        for statement in statements {
+            match self.store_statement(statement, authority.clone()) {
+                Ok(id) => ids.push(id),
+                Err(e) => return Err(e)
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// Get a statement by ID
+    fn get_statement(&self, statement_id: &StatementId, include_voided: Bool) -> Result<Statement, LrsError> {
+        let stored = self.state.statements.get(statement_id)
+            .ok_or(LrsError::StatementNotFound { id: statement_id.clone() })?;
+
+        if stored.voided && !include_voided {
+            return Err(LrsError::StatementNotFound { id: statement_id.clone() })
+        }
+
+        Ok(stored.statement.clone())
+    }
+
+    /// Query statements
+    fn query_statements(&self, query: LrsStatementQuery) -> Result<LrsQueryResult, LrsError> {
+        // If specific statement ID requested
+        if let Some(ref statement_id) = query.statement_id {
+            let statement = self.get_statement(statement_id, false)?;
+            return Ok(LrsQueryResult {
+                statements: vec![statement],
+                more: None,
+                total: Some(1)
+            })
+        }
+
+        // If voided statement ID requested
+        if let Some(ref voided_id) = query.voided_statement_id {
+            let statement = self.get_statement(voided_id, true)?;
+            return Ok(LrsQueryResult {
+                statements: vec![statement],
+                more: None,
+                total: Some(1)
+            })
+        }
+
+        // Build candidate set from indexes
+        let mut candidates: Option<Set<StatementId>> = None;
+
+        // Filter by agent
+        if let Some(ref agent) = query.agent {
+            let agent_key = agent_identifier(agent);
+            if let Some(agent_statements) = self.state.actor_index.get(&agent_key) {
+                candidates = Some(match candidates {
+                    Some(c) => c.intersection(agent_statements).cloned().collect(),
+                    None => agent_statements.clone()
+                });
+            } else {
+                candidates = Some(Set::new());
+            }
+        }
+
+        // Filter by verb
+        if let Some(ref verb) = query.verb {
+            if let Some(verb_statements) = self.state.verb_index.get(verb) {
+                candidates = Some(match candidates {
+                    Some(c) => c.intersection(verb_statements).cloned().collect(),
+                    None => verb_statements.clone()
+                });
+            } else {
+                candidates = Some(Set::new());
+            }
+        }
+
+        // Filter by activity
+        if let Some(ref activity) = query.activity {
+            if let Some(activity_statements) = self.state.activity_index.get(activity) {
+                candidates = Some(match candidates {
+                    Some(c) => c.intersection(activity_statements).cloned().collect(),
+                    None => activity_statements.clone()
+                });
+            } else {
+                candidates = Some(Set::new());
+            }
+        }
+
+        // Filter by registration
+        if let Some(ref registration) = query.registration {
+            if let Some(reg_statements) = self.state.registration_index.get(registration) {
+                candidates = Some(match candidates {
+                    Some(c) => c.intersection(reg_statements).cloned().collect(),
+                    None => reg_statements.clone()
+                });
+            } else {
+                candidates = Some(Set::new());
+            }
+        }
+
+        // Get all statements if no filters
+        let candidate_ids: Vec<StatementId> = match candidates {
+            Some(c) => c.into_iter().collect(),
+            None => self.state.statements_by_time.clone()
+        };
+
+        // Filter by time and collect statements
+        let mut statements: Vec<Statement> = candidate_ids.iter()
+            .filter_map(|id| self.state.statements.get(id))
+            .filter(|stored| !stored.voided)
+            .filter(|stored| {
+                if let Some(ref since) = query.since {
+                    if stored.stored_at <= *since {
+                        return false
+                    }
+                }
+                if let Some(ref until) = query.until {
+                    if stored.stored_at > *until {
+                        return false
+                    }
+                }
+                true
+            })
+            .map(|stored| stored.statement.clone())
+            .collect();
+
+        // Sort by stored time
+        if query.ascending {
+            statements.sort_by(|a, b| {
+                a.stored.as_ref().cmp(&b.stored.as_ref())
+            });
+        } else {
+            statements.sort_by(|a, b| {
+                b.stored.as_ref().cmp(&a.stored.as_ref())
+            });
+        }
+
+        let total = statements.len() as i64;
+
+        // Apply limit
+        let limited: Vec<Statement> = statements.into_iter()
+            .take(query.limit as usize)
+            .collect();
+
+        let more = if (total as i32) > query.limit {
+            Some(format!("/statements?offset={}", query.limit))
+        } else {
+            None
+        };
+
+        Ok(LrsQueryResult {
+            statements: limited,
+            more,
+            total: Some(total)
+        })
+    }
+
+    /// Void a statement
+    fn void_statement(&mut self, statement_id: &StatementId, actor: Actor, authority: Option<Actor>) -> Result<StatementId, LrsError> {
+        // Check statement exists
+        if !self.state.statements.contains_key(statement_id) {
+            return Err(LrsError::StatementNotFound { id: statement_id.clone() })
+        }
+
+        // Create voiding statement
+        let voiding_statement = Statement::new(
+            actor,
+            Verbs::voided(),
+            Object::StatementRef(StatementRef::new(statement_id.clone()))
+        );
+
+        self.store_statement(voiding_statement, authority)
+    }
+
+    /// Mark a statement as voided
+    fn mark_as_voided(&mut self, statement_id: &StatementId, voiding_statement_id: &StatementId) -> Result<(), LrsError> {
+        if let Some(stored) = self.state.statements.get_mut(statement_id) {
+            if stored.voided {
+                return Err(LrsError::Conflict {
+                    message: format!("Statement {} is already voided", statement_id)
+                })
+            }
+
+            // Cannot void a voiding statement
+            if stored.statement.verb.id == "http://adlnet.gov/expapi/verbs/voided" {
+                return Err(LrsError::InvalidStatement {
+                    message: "Cannot void a voiding statement".to_string()
+                })
+            }
+
+            stored.voided = true;
+            stored.voided_by = Some(voiding_statement_id.clone());
+            Ok(())
+        } else {
+            Err(LrsError::StatementNotFound { id: statement_id.clone() })
+        }
+    }
+
+    /// Validate a statement
+    fn validate_statement(&self, statement: &Statement) -> Result<(), LrsError> {
+        // Must have verb ID
+        if statement.verb.id.is_empty() {
+            return Err(LrsError::InvalidStatement {
+                message: "Verb ID is required".to_string()
+            })
+        }
+
+        // Validate score if present
+        if let Some(ref result) = statement.result {
+            if let Some(ref score) = result.score {
+                if let Some(scaled) = score.scaled {
+                    if scaled < -1.0 || scaled > 1.0 {
+                        return Err(LrsError::InvalidStatement {
+                            message: "Score.scaled must be between -1 and 1".to_string()
+                        })
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Index a statement for querying
+    fn index_statement(&mut self, statement_id: &StatementId, statement: &Statement) {
+        // Index by actor
+        let actor_key = match &statement.actor {
+            Actor::Agent(agent) => agent_identifier(agent),
+            Actor::Group(group) => group.mbox.clone()
+                .or_else(|| group.account.as_ref().map(|a| format!("{}:{}", a.home_page, a.name)))
+                .unwrap_or_default()
+        };
+        self.state.actor_index
+            .entry(actor_key)
+            .or_insert_with(Set::new)
+            .insert(statement_id.clone());
+
+        // Index by verb
+        self.state.verb_index
+            .entry(statement.verb.id.clone())
+            .or_insert_with(Set::new)
+            .insert(statement_id.clone());
+
+        // Index by activity
+        if let Object::Activity(activity) = &statement.object {
+            self.state.activity_index
+                .entry(activity.id.clone())
+                .or_insert_with(Set::new)
+                .insert(statement_id.clone());
+        }
+
+        // Index by registration
+        if let Some(ref context) = statement.context {
+            if let Some(ref registration) = context.registration {
+                self.state.registration_index
+                    .entry(registration.clone())
+                    .or_insert_with(Set::new)
+                    .insert(statement_id.clone());
+            }
+
+            // Index context activities
+            if let Some(ref context_activities) = context.context_activities {
+                if let Some(ref parents) = context_activities.parent {
+                    for parent in parents {
+                        self.state.activity_index
+                            .entry(parent.id.clone())
+                            .or_insert_with(Set::new)
+                            .insert(statement_id.clone());
+                    }
+                }
+                if let Some(ref groupings) = context_activities.grouping {
+                    for grouping in groupings {
+                        self.state.activity_index
+                            .entry(grouping.id.clone())
+                            .or_insert_with(Set::new)
+                            .insert(statement_id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Store activity definition from statement
+    fn store_activity_from_statement(&mut self, statement: &Statement) {
+        if let Object::Activity(activity) = &statement.object {
+            if activity.definition.is_some() {
+                self.state.activities.insert(activity.id.clone(), activity.clone());
+            }
+        }
+    }
+
+    // =========================================================================
+    // STATE API IMPLEMENTATION
+    // =========================================================================
+
+    /// Get state document
+    fn get_state(&self, activity_id: &IRI, agent: &Agent, state_id: &str, registration: Option<String>) -> Result<StateDocument, LrsError> {
+        let key = make_state_key(activity_id, agent, state_id, &registration);
+
+        self.state.state_documents.get(&key)
+            .cloned()
+            .ok_or(LrsError::DocumentNotFound {
+                document_type: "State".to_string(),
+                id: state_id.to_string()
+            })
+    }
+
+    /// Get state IDs
+    fn get_state_ids(&self, activity_id: &IRI, agent: &Agent, registration: Option<String>, since: Option<DateTime>) -> List<String> {
+        let agent_key = agent_identifier(agent);
+        let reg_suffix = registration.as_ref().map(|r| format!("_{}", r)).unwrap_or_default();
+        let prefix = format!("{}:{}:", activity_id, agent_key);
+
+        self.state.state_documents.iter()
+            .filter(|(key, doc)| {
+                key.starts_with(&prefix) &&
+                (registration.is_none() || key.ends_with(&reg_suffix))
+            })
+            .filter(|(_, doc)| {
+                since.as_ref().map(|s| doc.updated_at > *s).unwrap_or(true)
+            })
+            .map(|(_, doc)| doc.state_id.clone())
+            .collect()
+    }
+
+    /// Set state document
+    fn set_state(
+        &mut self,
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        content: JsonValue,
+        content_type: String,
+        if_match: Option<ETag>,
+        if_none_match: Bool
+    ) -> Result<ETag, LrsError> {
+        let key = make_state_key(&activity_id, &agent, &state_id, &registration);
+
+        // Check concurrency conditions
+        if let Some(existing) = self.state.state_documents.get(&key) {
+            if if_none_match {
+                return Err(LrsError::Conflict {
+                    message: "Document already exists".to_string()
+                })
+            }
+
+            if let Some(ref expected_etag) = if_match {
+                if &existing.etag != expected_etag {
+                    return Err(LrsError::ConcurrencyConflict {
+                        expected: expected_etag.clone(),
+                        actual: existing.etag.clone()
+                    })
+                }
+            }
+        } else if if_match.is_some() {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "State".to_string(),
+                id: state_id.clone()
+            })
+        }
+
+        let mut doc = StateDocument::new(state_id, activity_id, agent, registration, content);
+        doc.content_type = content_type;
+        let etag = doc.etag.clone();
+
+        self.state.state_documents.insert(key, doc);
+
+        Ok(etag)
+    }
+
+    /// Delete state document
+    fn delete_state(&mut self, activity_id: &IRI, agent: &Agent, state_id: &str, registration: Option<String>, if_match: Option<ETag>) -> Result<(), LrsError> {
+        let key = make_state_key(activity_id, agent, state_id, &registration);
+
+        if let Some(existing) = self.state.state_documents.get(&key) {
+            if let Some(ref expected_etag) = if_match {
+                if &existing.etag != expected_etag {
+                    return Err(LrsError::ConcurrencyConflict {
+                        expected: expected_etag.clone(),
+                        actual: existing.etag.clone()
+                    })
+                }
+            }
+        } else {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "State".to_string(),
+                id: state_id.to_string()
+            })
+        }
+
+        self.state.state_documents.remove(&key);
+        Ok(())
+    }
+
+    /// Delete all state documents
+    fn delete_states(&mut self, activity_id: &IRI, agent: &Agent, registration: Option<String>) -> Result<i32, LrsError> {
+        let agent_key = agent_identifier(agent);
+        let prefix = format!("{}:{}:", activity_id, agent_key);
+
+        let keys_to_remove: Vec<String> = self.state.state_documents.keys()
+            .filter(|key| key.starts_with(&prefix))
+            .filter(|key| {
+                if let Some(ref reg) = registration {
+                    key.ends_with(&format!("_{}", reg))
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        let count = keys_to_remove.len() as i32;
+
+        for key in keys_to_remove {
+            self.state.state_documents.remove(&key);
+        }
+
+        Ok(count)
+    }
+
+    // =========================================================================
+    // ACTIVITY PROFILE API IMPLEMENTATION
+    // =========================================================================
+
+    /// Get activity profile
+    fn get_activity_profile(&self, activity_id: &IRI, profile_id: &str) -> Result<ActivityProfileDocument, LrsError> {
+        let key = format!("{}:{}", activity_id, profile_id);
+
+        self.state.activity_profiles.get(&key)
+            .cloned()
+            .ok_or(LrsError::DocumentNotFound {
+                document_type: "ActivityProfile".to_string(),
+                id: profile_id.to_string()
+            })
+    }
+
+    /// Get activity profile IDs
+    fn get_activity_profile_ids(&self, activity_id: &IRI, since: Option<DateTime>) -> List<String> {
+        let prefix = format!("{}:", activity_id);
+
+        self.state.activity_profiles.iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .filter(|(_, doc)| {
+                since.as_ref().map(|s| doc.updated_at > *s).unwrap_or(true)
+            })
+            .map(|(_, doc)| doc.profile_id.clone())
+            .collect()
+    }
+
+    /// Set activity profile
+    fn set_activity_profile(
+        &mut self,
+        activity_id: IRI,
+        profile_id: String,
+        content: JsonValue,
+        content_type: String,
+        if_match: Option<ETag>,
+        if_none_match: Bool
+    ) -> Result<ETag, LrsError> {
+        let key = format!("{}:{}", activity_id, profile_id);
+
+        // Check concurrency
+        if let Some(existing) = self.state.activity_profiles.get(&key) {
+            if if_none_match {
+                return Err(LrsError::Conflict {
+                    message: "Document already exists".to_string()
+                })
+            }
+
+            if let Some(ref expected_etag) = if_match {
+                if &existing.etag != expected_etag {
+                    return Err(LrsError::ConcurrencyConflict {
+                        expected: expected_etag.clone(),
+                        actual: existing.etag.clone()
+                    })
+                }
+            }
+        } else if if_match.is_some() {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "ActivityProfile".to_string(),
+                id: profile_id.clone()
+            })
+        }
+
+        let mut doc = ActivityProfileDocument::new(profile_id, activity_id, content);
+        doc.content_type = content_type;
+        let etag = doc.etag.clone();
+
+        self.state.activity_profiles.insert(key, doc);
+
+        Ok(etag)
+    }
+
+    /// Delete activity profile
+    fn delete_activity_profile(&mut self, activity_id: &IRI, profile_id: &str, if_match: Option<ETag>) -> Result<(), LrsError> {
+        let key = format!("{}:{}", activity_id, profile_id);
+
+        if let Some(existing) = self.state.activity_profiles.get(&key) {
+            if let Some(ref expected_etag) = if_match {
+                if &existing.etag != expected_etag {
+                    return Err(LrsError::ConcurrencyConflict {
+                        expected: expected_etag.clone(),
+                        actual: existing.etag.clone()
+                    })
+                }
+            }
+        } else {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "ActivityProfile".to_string(),
+                id: profile_id.to_string()
+            })
+        }
+
+        self.state.activity_profiles.remove(&key);
+        Ok(())
+    }
+
+    // =========================================================================
+    // AGENT PROFILE API IMPLEMENTATION
+    // =========================================================================
+
+    /// Get agent profile
+    fn get_agent_profile(&self, agent: &Agent, profile_id: &str) -> Result<AgentProfileDocument, LrsError> {
+        let key = format!("{}:{}", agent_identifier(agent), profile_id);
+
+        self.state.agent_profiles.get(&key)
+            .cloned()
+            .ok_or(LrsError::DocumentNotFound {
+                document_type: "AgentProfile".to_string(),
+                id: profile_id.to_string()
+            })
+    }
+
+    /// Get agent profile IDs
+    fn get_agent_profile_ids(&self, agent: &Agent, since: Option<DateTime>) -> List<String> {
+        let prefix = format!("{}:", agent_identifier(agent));
+
+        self.state.agent_profiles.iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .filter(|(_, doc)| {
+                since.as_ref().map(|s| doc.updated_at > *s).unwrap_or(true)
+            })
+            .map(|(_, doc)| doc.profile_id.clone())
+            .collect()
+    }
+
+    /// Set agent profile
+    fn set_agent_profile(
+        &mut self,
+        agent: Agent,
+        profile_id: String,
+        content: JsonValue,
+        content_type: String,
+        if_match: Option<ETag>,
+        if_none_match: Bool
+    ) -> Result<ETag, LrsError> {
+        let key = format!("{}:{}", agent_identifier(&agent), &profile_id);
+
+        // Check concurrency
+        if let Some(existing) = self.state.agent_profiles.get(&key) {
+            if if_none_match {
+                return Err(LrsError::Conflict {
+                    message: "Document already exists".to_string()
+                })
+            }
+
+            if let Some(ref expected_etag) = if_match {
+                if &existing.etag != expected_etag {
+                    return Err(LrsError::ConcurrencyConflict {
+                        expected: expected_etag.clone(),
+                        actual: existing.etag.clone()
+                    })
+                }
+            }
+        } else if if_match.is_some() {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "AgentProfile".to_string(),
+                id: profile_id.clone()
+            })
+        }
+
+        let mut doc = AgentProfileDocument::new(profile_id, agent, content);
+        doc.content_type = content_type;
+        let etag = doc.etag.clone();
+
+        self.state.agent_profiles.insert(key, doc);
+
+        Ok(etag)
+    }
+
+    /// Delete agent profile
+    fn delete_agent_profile(&mut self, agent: &Agent, profile_id: &str, if_match: Option<ETag>) -> Result<(), LrsError> {
+        let key = format!("{}:{}", agent_identifier(agent), profile_id);
+
+        if let Some(existing) = self.state.agent_profiles.get(&key) {
+            if let Some(ref expected_etag) = if_match {
+                if &existing.etag != expected_etag {
+                    return Err(LrsError::ConcurrencyConflict {
+                        expected: expected_etag.clone(),
+                        actual: existing.etag.clone()
+                    })
+                }
+            }
+        } else {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "AgentProfile".to_string(),
+                id: profile_id.to_string()
+            })
+        }
+
+        self.state.agent_profiles.remove(&key);
+        Ok(())
+    }
+
+    // =========================================================================
+    // OTHER APIS
+    // =========================================================================
+
+    /// Get LRS about info
+    fn get_about(&self) -> LrsAbout {
+        LrsAbout {
+            versions: vec![
+                "1.0.0".to_string(),
+                "1.0.1".to_string(),
+                "1.0.2".to_string(),
+                "1.0.3".to_string()
+            ],
+            extensions: Map::new()
+        }
+    }
+
+    /// Get person for agent
+    fn get_person(&self, agent: &Agent) -> Option<Person> {
+        let agent_key = agent_identifier(agent);
+        self.state.persons.get(&agent_key).cloned()
+    }
+
+    /// Get activity by ID
+    fn get_activity(&self, activity_id: &IRI) -> Option<Activity> {
+        self.state.activities.get(activity_id).cloned()
+    }
+
+    /// Get LRS statistics
+    fn get_statistics(&self) -> LrsStatistics {
+        let voided_count = self.state.statements.values()
+            .filter(|s| s.voided)
+            .count() as i64;
+
+        let today = DateTime::now().date();
+        let statements_today = self.state.statements.values()
+            .filter(|s| s.stored_at.date() == today)
+            .count() as i64;
+
+        LrsStatistics {
+            total_statements: self.state.statement_counter,
+            statements_today,
+            voided_statements: voided_count,
+            unique_actors: self.state.actor_index.len() as i64,
+            unique_activities: self.state.activity_index.len() as i64,
+            storage_bytes: 0, // Would need to calculate
+            uptime: DateTime::now().duration_since(self.state.started_at)
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+/// Generate ETag
+fn generate_etag() -> ETag {
+    format!("\"{}\"", generate_uuid())
+}
+
+/// Get agent identifier string
+fn agent_identifier(agent: &Agent) -> String {
+    if let Some(ref mbox) = agent.mbox {
+        return mbox.clone()
+    }
+    if let Some(ref mbox_sha1sum) = agent.mbox_sha1sum {
+        return format!("sha1:{}", mbox_sha1sum)
+    }
+    if let Some(ref openid) = agent.openid {
+        return openid.clone()
+    }
+    if let Some(ref account) = agent.account {
+        return format!("{}:{}", account.home_page, account.name)
+    }
+    "unknown".to_string()
+}
+
+/// Make state document key
+fn make_state_key(activity_id: &IRI, agent: &Agent, state_id: &str, registration: &Option<String>) -> String {
+    let agent_key = agent_identifier(agent);
+    let reg_suffix = registration.as_ref().map(|r| format!("_{}", r)).unwrap_or_default();
+    format!("{}:{}:{}{}", activity_id, agent_key, state_id, reg_suffix)
+}
+
+/// Create LRS instance
+fn create_lrs() -> LearningRecordStore {
+    LearningRecordStore::init()
+}
+
+// =============================================================================
+// MULTI-TENANT LRS
+// =============================================================================
+
+/// Multi-tenant LRS state
+type MultiTenantLrsState {
+    /// LRS instances per tenant
+    tenant_lrs: Map<TenantId, LrsState>,
+
+    /// Tenant configurations
+    tenant_configs: Map<TenantId, TenantLrsConfig>,
+
+    /// Statement forwarding targets
+    forwarding_targets: Map<TenantId, List<ForwardingTarget>>,
+
+    /// Global statistics
+    global_stats: GlobalLrsStatistics
+}
+
+/// Per-tenant LRS configuration
+type TenantLrsConfig {
+    /// Tenant ID
+    tenant_id: TenantId,
+
+    /// Whether the LRS is enabled
+    enabled: Bool,
+
+    /// Maximum statements to store
+    max_statements: Option<i64>,
+
+    /// Statement retention period (days)
+    retention_days: Option<i32>,
+
+    /// Whether to forward statements
+    forwarding_enabled: Bool,
+
+    /// Allowed authorities (empty = all)
+    allowed_authorities: List<String>,
+
+    /// Custom activity IRI prefix
+    activity_iri_prefix: Option<String>,
+
+    /// Rate limit (statements per minute)
+    rate_limit: Option<i32>,
+
+    /// Created timestamp
+    created_at: DateTime,
+
+    /// Updated timestamp
+    updated_at: DateTime
+}
+
+impl TenantLrsConfig {
+    fn new(tenant_id: TenantId) -> TenantLrsConfig {
+        TenantLrsConfig {
+            tenant_id,
+            enabled: true,
+            max_statements: None,
+            retention_days: None,
+            forwarding_enabled: false,
+            allowed_authorities: vec![],
+            activity_iri_prefix: None,
+            rate_limit: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+}
+
+/// Statement forwarding target
+type ForwardingTarget {
+    /// Unique ID
+    id: String,
+
+    /// Target LRS endpoint
+    endpoint: String,
+
+    /// Authentication type
+    auth_type: ForwardingAuthType,
+
+    /// Username/client ID
+    username: String,
+
+    /// Password/client secret (encrypted)
+    password_encrypted: String,
+
+    /// Whether forwarding is active
+    active: Bool,
+
+    /// Filter to apply before forwarding
+    filter: Option<ForwardingFilter>,
+
+    /// Retry configuration
+    retry_config: RetryConfig,
+
+    /// Last successful forward timestamp
+    last_success: Option<DateTime>,
+
+    /// Error count
+    error_count: i32
+}
+
+/// Forwarding authentication type
+enum ForwardingAuthType {
+    /// Basic authentication
+    Basic,
+    /// OAuth 2.0 client credentials
+    OAuth2ClientCredentials,
+    /// Bearer token
+    BearerToken
+}
+
+/// Filter for statement forwarding
+type ForwardingFilter {
+    /// Only forward specific verbs
+    verbs: Option<List<IRI>>,
+
+    /// Only forward for specific activities
+    activities: Option<List<IRI>>,
+
+    /// Only forward for specific agents
+    agents: Option<List<String>>,
+
+    /// Minimum score threshold
+    min_score: Option<f32>,
+
+    /// Only forward completed activities
+    only_completed: Bool,
+
+    /// Only forward successful activities
+    only_success: Bool
+}
+
+/// Retry configuration for forwarding
+type RetryConfig {
+    /// Maximum retry attempts
+    max_attempts: i32,
+
+    /// Initial delay in milliseconds
+    initial_delay_ms: i64,
+
+    /// Backoff multiplier
+    backoff_multiplier: f32,
+
+    /// Maximum delay in milliseconds
+    max_delay_ms: i64
+}
+
+impl RetryConfig {
+    fn default() -> RetryConfig {
+        RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 1000,
+            backoff_multiplier: 2.0,
+            max_delay_ms: 60000
+        }
+    }
+}
+
+/// Global LRS statistics
+type GlobalLrsStatistics {
+    /// Total statements across all tenants
+    total_statements: i64,
+
+    /// Total tenants
+    total_tenants: i32,
+
+    /// Active tenants (with statements in last 24h)
+    active_tenants: i32,
+
+    /// Statements forwarded
+    statements_forwarded: i64,
+
+    /// Forwarding errors
+    forwarding_errors: i64,
+
+    /// Service uptime
+    uptime: Duration
+}
+
+/// Messages for MultiTenantLRS actor
+enum MultiTenantLrsMessage {
+    // =========================================================================
+    // TENANT MANAGEMENT
+    // =========================================================================
+
+    /// Create a new tenant LRS
+    CreateTenant {
+        tenant_id: TenantId,
+        config: Option<TenantLrsConfig>,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    /// Delete a tenant LRS
+    DeleteTenant {
+        tenant_id: TenantId,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    /// Get tenant configuration
+    GetTenantConfig {
+        tenant_id: TenantId,
+        reply_to: Actor<Option<TenantLrsConfig>>
+    },
+
+    /// Update tenant configuration
+    UpdateTenantConfig {
+        tenant_id: TenantId,
+        config: TenantLrsConfig,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    // =========================================================================
+    // STATEMENT API (TENANT-SCOPED)
+    // =========================================================================
+
+    /// Store a statement for a tenant
+    StoreStatement {
+        tenant_id: TenantId,
+        statement: Statement,
+        authority: Option<Actor>,
+        reply_to: Actor<Result<StatementId, LrsError>>
+    },
+
+    /// Store multiple statements for a tenant
+    StoreStatements {
+        tenant_id: TenantId,
+        statements: List<Statement>,
+        authority: Option<Actor>,
+        reply_to: Actor<Result<List<StatementId>, LrsError>>
+    },
+
+    /// Query statements for a tenant
+    QueryStatements {
+        tenant_id: TenantId,
+        query: LrsStatementQuery,
+        reply_to: Actor<Result<LrsQueryResult, LrsError>>
+    },
+
+    /// Void a statement for a tenant
+    VoidStatement {
+        tenant_id: TenantId,
+        statement_id: StatementId,
+        actor: Actor,
+        authority: Option<Actor>,
+        reply_to: Actor<Result<StatementId, LrsError>>
+    },
+
+    // =========================================================================
+    // FORWARDING MANAGEMENT
+    // =========================================================================
+
+    /// Add a forwarding target
+    AddForwardingTarget {
+        tenant_id: TenantId,
+        target: ForwardingTarget,
+        reply_to: Actor<Result<String, LrsError>>
+    },
+
+    /// Remove a forwarding target
+    RemoveForwardingTarget {
+        tenant_id: TenantId,
+        target_id: String,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    /// Get forwarding targets for tenant
+    GetForwardingTargets {
+        tenant_id: TenantId,
+        reply_to: Actor<List<ForwardingTarget>>
+    },
+
+    /// Manually trigger forwarding for a statement
+    ForwardStatement {
+        tenant_id: TenantId,
+        statement_id: StatementId,
+        target_id: Option<String>,
+        reply_to: Actor<Result<(), LrsError>>
+    },
+
+    // =========================================================================
+    // AGGREGATION QUERIES
+    // =========================================================================
+
+    /// Get aggregated statistics for a tenant
+    GetTenantStatistics {
+        tenant_id: TenantId,
+        reply_to: Actor<Option<LrsStatistics>>
+    },
+
+    /// Get global statistics
+    GetGlobalStatistics {
+        reply_to: Actor<GlobalLrsStatistics>
+    },
+
+    /// Run aggregation query
+    RunAggregation {
+        tenant_id: TenantId,
+        aggregation: AggregationQuery,
+        reply_to: Actor<Result<AggregationResult, LrsError>>
+    }
+}
+
+/// Aggregation query types
+enum AggregationQuery {
+    /// Count statements by verb
+    CountByVerb {
+        since: Option<DateTime>,
+        until: Option<DateTime>
+    },
+
+    /// Count statements by activity
+    CountByActivity {
+        since: Option<DateTime>,
+        until: Option<DateTime>,
+        limit: Option<i32>
+    },
+
+    /// Count statements by agent
+    CountByAgent {
+        since: Option<DateTime>,
+        until: Option<DateTime>,
+        limit: Option<i32>
+    },
+
+    /// Average score by activity
+    AverageScoreByActivity {
+        activity_id: Option<IRI>,
+        since: Option<DateTime>,
+        until: Option<DateTime>
+    },
+
+    /// Completion rate by activity
+    CompletionRateByActivity {
+        activity_id: Option<IRI>,
+        since: Option<DateTime>,
+        until: Option<DateTime>
+    },
+
+    /// Success rate by activity
+    SuccessRateByActivity {
+        activity_id: Option<IRI>,
+        since: Option<DateTime>,
+        until: Option<DateTime>
+    },
+
+    /// Average time to complete
+    AverageTimeToComplete {
+        activity_id: Option<IRI>,
+        since: Option<DateTime>,
+        until: Option<DateTime>
+    },
+
+    /// Statements over time (time series)
+    StatementsOverTime {
+        interval: TimeInterval,
+        since: DateTime,
+        until: DateTime
+    },
+
+    /// Learner progress summary
+    LearnerProgress {
+        agent: Agent,
+        activity_id: Option<IRI>
+    },
+
+    /// Activity leaderboard
+    ActivityLeaderboard {
+        activity_id: IRI,
+        metric: LeaderboardMetric,
+        limit: i32
+    },
+
+    /// Custom aggregation with filter
+    Custom {
+        filter: StatementFilter,
+        group_by: GroupByField,
+        metric: AggregationMetric
+    }
+}
+
+/// Time interval for time series
+enum TimeInterval {
+    Hour,
+    Day,
+    Week,
+    Month,
+    Year
+}
+
+/// Leaderboard metric
+enum LeaderboardMetric {
+    HighestScore,
+    FastestCompletion,
+    MostAttempts,
+    MostRecent
+}
+
+/// Field to group by
+enum GroupByField {
+    Verb,
+    Activity,
+    Agent,
+    Day,
+    Week,
+    Month
+}
+
+/// Aggregation metric
+enum AggregationMetric {
+    Count,
+    Sum,
+    Average,
+    Min,
+    Max,
+    First,
+    Last
+}
+
+/// Filter for aggregation queries
+type StatementFilter {
+    verbs: Option<List<IRI>>,
+    activities: Option<List<IRI>>,
+    agents: Option<List<String>>,
+    since: Option<DateTime>,
+    until: Option<DateTime>,
+    success: Option<Bool>,
+    completion: Option<Bool>
+}
+
+/// Aggregation result
+enum AggregationResult {
+    /// Single value result
+    Scalar { value: f64 },
+
+    /// Grouped counts
+    GroupedCounts { groups: Map<String, i64> },
+
+    /// Grouped averages
+    GroupedAverages { groups: Map<String, f64> },
+
+    /// Time series
+    TimeSeries { points: List<TimeSeriesPoint> },
+
+    /// Leaderboard entries
+    Leaderboard { entries: List<LeaderboardEntry> },
+
+    /// Learner progress
+    Progress { activities: List<ActivityProgress> },
+
+    /// Generic grouped results
+    Grouped { groups: Map<String, JsonValue> }
+}
+
+/// Time series data point
+type TimeSeriesPoint {
+    timestamp: DateTime,
+    value: f64,
+    label: Option<String>
+}
+
+/// Leaderboard entry
+type LeaderboardEntry {
+    rank: i32,
+    agent: Agent,
+    value: f64,
+    metadata: Option<Map<String, JsonValue>>
+}
+
+/// Activity progress for a learner
+type ActivityProgress {
+    activity_id: IRI,
+    activity_name: Option<String>,
+    completed: Bool,
+    success: Option<Bool>,
+    score: Option<f32>,
+    attempts: i32,
+    first_attempted: Option<DateTime>,
+    last_attempted: Option<DateTime>,
+    total_duration: Option<Duration>
+}
+
+/// Multi-tenant Learning Record Store actor
+actor MultiTenantLearningRecordStore {
+    state: MultiTenantLrsState,
+
+    /// Initialize
+    fn init() -> MultiTenantLearningRecordStore {
+        MultiTenantLearningRecordStore {
+            state: MultiTenantLrsState {
+                tenant_lrs: Map::new(),
+                tenant_configs: Map::new(),
+                forwarding_targets: Map::new(),
+                global_stats: GlobalLrsStatistics {
+                    total_statements: 0,
+                    total_tenants: 0,
+                    active_tenants: 0,
+                    statements_forwarded: 0,
+                    forwarding_errors: 0,
+                    uptime: Duration::from_secs(0)
+                }
+            }
+        }
+    }
+
+    /// Handle messages
+    fn receive(&mut self, msg: MultiTenantLrsMessage) {
+        match msg {
+            // Tenant Management
+            MultiTenantLrsMessage::CreateTenant { tenant_id, config, reply_to } => {
+                let result = self.create_tenant(tenant_id, config);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::DeleteTenant { tenant_id, reply_to } => {
+                let result = self.delete_tenant(&tenant_id);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::GetTenantConfig { tenant_id, reply_to } => {
+                let config = self.state.tenant_configs.get(&tenant_id).cloned();
+                reply_to.send(config);
+            },
+
+            MultiTenantLrsMessage::UpdateTenantConfig { tenant_id, config, reply_to } => {
+                let result = self.update_tenant_config(tenant_id, config);
+                reply_to.send(result);
+            },
+
+            // Statement API
+            MultiTenantLrsMessage::StoreStatement { tenant_id, statement, authority, reply_to } => {
+                let result = self.store_statement_for_tenant(&tenant_id, statement, authority);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::StoreStatements { tenant_id, statements, authority, reply_to } => {
+                let result = self.store_statements_for_tenant(&tenant_id, statements, authority);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::QueryStatements { tenant_id, query, reply_to } => {
+                let result = self.query_statements_for_tenant(&tenant_id, query);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::VoidStatement { tenant_id, statement_id, actor, authority, reply_to } => {
+                let result = self.void_statement_for_tenant(&tenant_id, &statement_id, actor, authority);
+                reply_to.send(result);
+            },
+
+            // Forwarding
+            MultiTenantLrsMessage::AddForwardingTarget { tenant_id, target, reply_to } => {
+                let result = self.add_forwarding_target(&tenant_id, target);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::RemoveForwardingTarget { tenant_id, target_id, reply_to } => {
+                let result = self.remove_forwarding_target(&tenant_id, &target_id);
+                reply_to.send(result);
+            },
+
+            MultiTenantLrsMessage::GetForwardingTargets { tenant_id, reply_to } => {
+                let targets = self.state.forwarding_targets.get(&tenant_id)
+                    .cloned()
+                    .unwrap_or_default();
+                reply_to.send(targets);
+            },
+
+            MultiTenantLrsMessage::ForwardStatement { tenant_id, statement_id, target_id, reply_to } => {
+                let result = self.forward_statement(&tenant_id, &statement_id, target_id);
+                reply_to.send(result);
+            },
+
+            // Aggregation
+            MultiTenantLrsMessage::GetTenantStatistics { tenant_id, reply_to } => {
+                let stats = self.get_tenant_statistics(&tenant_id);
+                reply_to.send(stats);
+            },
+
+            MultiTenantLrsMessage::GetGlobalStatistics { reply_to } => {
+                reply_to.send(self.state.global_stats.clone());
+            },
+
+            MultiTenantLrsMessage::RunAggregation { tenant_id, aggregation, reply_to } => {
+                let result = self.run_aggregation(&tenant_id, aggregation);
+                reply_to.send(result);
+            }
+        }
+    }
+
+    // =========================================================================
+    // TENANT MANAGEMENT
+    // =========================================================================
+
+    /// Create a new tenant
+    fn create_tenant(&mut self, tenant_id: TenantId, config: Option<TenantLrsConfig>) -> Result<(), LrsError> {
+        if self.state.tenant_lrs.contains_key(&tenant_id) {
+            return Err(LrsError::Conflict {
+                message: format!("Tenant {} already exists", tenant_id)
+            })
+        }
+
+        let tenant_config = config.unwrap_or_else(|| TenantLrsConfig::new(tenant_id.clone()));
+
+        self.state.tenant_lrs.insert(tenant_id.clone(), LrsState::new());
+        self.state.tenant_configs.insert(tenant_id.clone(), tenant_config);
+        self.state.forwarding_targets.insert(tenant_id, vec![]);
+        self.state.global_stats.total_tenants += 1;
+
+        Ok(())
+    }
+
+    /// Delete a tenant
+    fn delete_tenant(&mut self, tenant_id: &TenantId) -> Result<(), LrsError> {
+        if !self.state.tenant_lrs.contains_key(tenant_id) {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "Tenant".to_string(),
+                id: tenant_id.clone()
+            })
+        }
+
+        // Get statement count before deletion
+        if let Some(lrs) = self.state.tenant_lrs.get(tenant_id) {
+            self.state.global_stats.total_statements -= lrs.statement_counter;
+        }
+
+        self.state.tenant_lrs.remove(tenant_id);
+        self.state.tenant_configs.remove(tenant_id);
+        self.state.forwarding_targets.remove(tenant_id);
+        self.state.global_stats.total_tenants -= 1;
+
+        Ok(())
+    }
+
+    /// Update tenant configuration
+    fn update_tenant_config(&mut self, tenant_id: TenantId, mut config: TenantLrsConfig) -> Result<(), LrsError> {
+        if !self.state.tenant_configs.contains_key(&tenant_id) {
+            return Err(LrsError::DocumentNotFound {
+                document_type: "Tenant".to_string(),
+                id: tenant_id
+            })
+        }
+
+        config.updated_at = DateTime::now();
+        self.state.tenant_configs.insert(tenant_id, config);
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // STATEMENT API (TENANT-SCOPED)
+    // =========================================================================
+
+    /// Get tenant LRS state, creating if necessary
+    fn get_or_create_tenant_lrs(&mut self, tenant_id: &TenantId) -> &mut LrsState {
+        if !self.state.tenant_lrs.contains_key(tenant_id) {
+            self.state.tenant_lrs.insert(tenant_id.clone(), LrsState::new());
+            self.state.tenant_configs.insert(tenant_id.clone(), TenantLrsConfig::new(tenant_id.clone()));
+            self.state.forwarding_targets.insert(tenant_id.clone(), vec![]);
+            self.state.global_stats.total_tenants += 1;
+        }
+        self.state.tenant_lrs.get_mut(tenant_id).unwrap()
+    }
+
+    /// Store a statement for a tenant
+    fn store_statement_for_tenant(
+        &mut self,
+        tenant_id: &TenantId,
+        statement: Statement,
+        authority: Option<Actor>
+    ) -> Result<StatementId, LrsError> {
+        // Check if tenant is enabled
+        if let Some(config) = self.state.tenant_configs.get(tenant_id) {
+            if !config.enabled {
+                return Err(LrsError::InternalError {
+                    message: format!("Tenant {} is disabled", tenant_id)
+                })
+            }
+
+            // Check rate limits (simplified)
+            if let Some(max) = config.max_statements {
+                if let Some(lrs) = self.state.tenant_lrs.get(tenant_id) {
+                    if lrs.statement_counter >= max {
+                        return Err(LrsError::InternalError {
+                            message: "Statement limit reached".to_string()
+                        })
+                    }
+                }
+            }
+        }
+
+        // Store the statement
+        let lrs = self.get_or_create_tenant_lrs(tenant_id);
+        let statement_id = statement.id.clone().unwrap_or_else(generate_uuid);
+
+        // Check for duplicate
+        if lrs.statements.contains_key(&statement_id) {
+            return Err(LrsError::Conflict {
+                message: format!("Statement with ID {} already exists", statement_id)
+            })
+        }
+
+        // Create stored statement
+        let mut stored = StoredStatement::new(statement.clone(), authority);
+        stored.statement.id = Some(statement_id.clone());
+        stored.statement.stored = Some(DateTime::now().to_iso8601());
+
+        // Index the statement
+        index_statement_in_state(lrs, &statement_id, &stored.statement);
+
+        // Store
+        lrs.statements.insert(statement_id.clone(), stored.clone());
+        lrs.statements_by_time.push(statement_id.clone());
+        lrs.statement_counter += 1;
+        self.state.global_stats.total_statements += 1;
+
+        // Handle forwarding
+        self.maybe_forward_statement(tenant_id, &stored);
+
+        Ok(statement_id)
+    }
+
+    /// Store multiple statements for a tenant
+    fn store_statements_for_tenant(
+        &mut self,
+        tenant_id: &TenantId,
+        statements: List<Statement>,
+        authority: Option<Actor>
+    ) -> Result<List<StatementId>, LrsError> {
+        let mut ids = vec![];
+
+        for statement in statements {
+            match self.store_statement_for_tenant(tenant_id, statement, authority.clone()) {
+                Ok(id) => ids.push(id),
+                Err(e) => return Err(e)
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// Query statements for a tenant
+    fn query_statements_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        query: LrsStatementQuery
+    ) -> Result<LrsQueryResult, LrsError> {
+        let lrs = self.state.tenant_lrs.get(tenant_id)
+            .ok_or(LrsError::DocumentNotFound {
+                document_type: "Tenant".to_string(),
+                id: tenant_id.clone()
+            })?;
+
+        // Reuse the single-tenant query logic
+        query_statements_from_state(lrs, query)
+    }
+
+    /// Void a statement for a tenant
+    fn void_statement_for_tenant(
+        &mut self,
+        tenant_id: &TenantId,
+        statement_id: &StatementId,
+        actor: Actor,
+        authority: Option<Actor>
+    ) -> Result<StatementId, LrsError> {
+        // Create voiding statement
+        let voiding_statement = Statement::new(
+            actor,
+            Verbs::voided(),
+            Object::StatementRef(StatementRef::new(statement_id.clone()))
+        );
+
+        // Store the voiding statement
+        let voiding_id = self.store_statement_for_tenant(tenant_id, voiding_statement, authority)?;
+
+        // Mark original as voided
+        if let Some(lrs) = self.state.tenant_lrs.get_mut(tenant_id) {
+            if let Some(stored) = lrs.statements.get_mut(statement_id) {
+                stored.voided = true;
+                stored.voided_by = Some(voiding_id.clone());
+            }
+        }
+
+        Ok(voiding_id)
+    }
+
+    // =========================================================================
+    // STATEMENT FORWARDING
+    // =========================================================================
+
+    /// Add a forwarding target
+    fn add_forwarding_target(&mut self, tenant_id: &TenantId, target: ForwardingTarget) -> Result<String, LrsError> {
+        let targets = self.state.forwarding_targets
+            .entry(tenant_id.clone())
+            .or_insert_with(Vec::new);
+
+        let id = target.id.clone();
+        targets.push(target);
+
+        // Enable forwarding for tenant
+        if let Some(config) = self.state.tenant_configs.get_mut(tenant_id) {
+            config.forwarding_enabled = true;
+            config.updated_at = DateTime::now();
+        }
+
+        Ok(id)
+    }
+
+    /// Remove a forwarding target
+    fn remove_forwarding_target(&mut self, tenant_id: &TenantId, target_id: &str) -> Result<(), LrsError> {
+        if let Some(targets) = self.state.forwarding_targets.get_mut(tenant_id) {
+            let initial_len = targets.len();
+            targets.retain(|t| t.id != target_id);
+
+            if targets.len() == initial_len {
+                return Err(LrsError::DocumentNotFound {
+                    document_type: "ForwardingTarget".to_string(),
+                    id: target_id.to_string()
+                })
+            }
+
+            // Disable forwarding if no more targets
+            if targets.is_empty() {
+                if let Some(config) = self.state.tenant_configs.get_mut(tenant_id) {
+                    config.forwarding_enabled = false;
+                    config.updated_at = DateTime::now();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Maybe forward a statement (check filters and forward if needed)
+    fn maybe_forward_statement(&mut self, tenant_id: &TenantId, stored: &StoredStatement) {
+        let config = match self.state.tenant_configs.get(tenant_id) {
+            Some(c) if c.forwarding_enabled => c,
+            _ => return
+        };
+
+        let targets = match self.state.forwarding_targets.get(tenant_id) {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => return
+        };
+
+        for target in targets {
+            if !target.active {
+                continue
+            }
+
+            // Check filter
+            if let Some(ref filter) = target.filter {
+                if !statement_matches_filter(&stored.statement, filter) {
+                    continue
+                }
+            }
+
+            // Forward the statement
+            self.forward_to_target(&target, &stored.statement);
+        }
+    }
+
+    /// Forward a specific statement
+    fn forward_statement(
+        &mut self,
+        tenant_id: &TenantId,
+        statement_id: &StatementId,
+        target_id: Option<String>
+    ) -> Result<(), LrsError> {
+        let stored = {
+            let lrs = self.state.tenant_lrs.get(tenant_id)
+                .ok_or(LrsError::DocumentNotFound {
+                    document_type: "Tenant".to_string(),
+                    id: tenant_id.clone()
+                })?;
+
+            lrs.statements.get(statement_id)
+                .ok_or(LrsError::StatementNotFound { id: statement_id.clone() })?
+                .clone()
+        };
+
+        let targets = self.state.forwarding_targets.get(tenant_id)
+            .ok_or(LrsError::DocumentNotFound {
+                document_type: "ForwardingTargets".to_string(),
+                id: tenant_id.clone()
+            })?
+            .clone();
+
+        if let Some(ref id) = target_id {
+            // Forward to specific target
+            let target = targets.iter()
+                .find(|t| &t.id == id)
+                .ok_or(LrsError::DocumentNotFound {
+                    document_type: "ForwardingTarget".to_string(),
+                    id: id.clone()
+                })?;
+
+            self.forward_to_target(target, &stored.statement);
+        } else {
+            // Forward to all active targets
+            for target in targets.iter().filter(|t| t.active) {
+                self.forward_to_target(target, &stored.statement);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Forward to a specific target
+    fn forward_to_target(&mut self, target: &ForwardingTarget, statement: &Statement) {
+        // In a real implementation, this would make an async HTTP request
+        // For now, we'll just track the attempt
+
+        let json_body = statement.to_json();
+
+        // Create the request
+        let mut request = HttpRequest::new(HttpMethod::Post, format!("{}/statements", target.endpoint));
+
+        // Add authentication
+        match target.auth_type {
+            ForwardingAuthType::Basic => {
+                // Add Basic auth header
+                let credentials = format!("{}:{}", target.username, decrypt_password(&target.password_encrypted));
+                request = request.with_header("Authorization", format!("Basic {}", base64_encode(&credentials)));
+            },
+            ForwardingAuthType::OAuth2ClientCredentials => {
+                // Would need to get token first
+                // Simplified for this implementation
+            },
+            ForwardingAuthType::BearerToken => {
+                request = request.with_header("Authorization", format!("Bearer {}", target.password_encrypted));
+            }
+        }
+
+        request = request
+            .with_header("Content-Type", "application/json")
+            .with_header("X-Experience-API-Version", "1.0.3")
+            .with_body(json_body);
+
+        // Track the forwarding attempt
+        self.state.global_stats.statements_forwarded += 1;
+
+        // In a real implementation, send the request and handle response
+        // match http_client.send(request).await {
+        //     Ok(response) if response.status == 200 => {
+        //         // Update last_success
+        //     },
+        //     _ => {
+        //         self.state.global_stats.forwarding_errors += 1;
+        //         // Increment error_count, maybe retry
+        //     }
+        // }
+    }
+
+    // =========================================================================
+    // AGGREGATION QUERIES
+    // =========================================================================
+
+    /// Get statistics for a tenant
+    fn get_tenant_statistics(&self, tenant_id: &TenantId) -> Option<LrsStatistics> {
+        let lrs = self.state.tenant_lrs.get(tenant_id)?;
+
+        let voided_count = lrs.statements.values()
+            .filter(|s| s.voided)
+            .count() as i64;
+
+        let today = DateTime::now().date();
+        let statements_today = lrs.statements.values()
+            .filter(|s| s.stored_at.date() == today)
+            .count() as i64;
+
+        Some(LrsStatistics {
+            total_statements: lrs.statement_counter,
+            statements_today,
+            voided_statements: voided_count,
+            unique_actors: lrs.actor_index.len() as i64,
+            unique_activities: lrs.activity_index.len() as i64,
+            storage_bytes: 0,
+            uptime: DateTime::now().duration_since(lrs.started_at)
+        })
+    }
+
+    /// Run an aggregation query
+    fn run_aggregation(&self, tenant_id: &TenantId, aggregation: AggregationQuery) -> Result<AggregationResult, LrsError> {
+        let lrs = self.state.tenant_lrs.get(tenant_id)
+            .ok_or(LrsError::DocumentNotFound {
+                document_type: "Tenant".to_string(),
+                id: tenant_id.clone()
+            })?;
+
+        match aggregation {
+            AggregationQuery::CountByVerb { since, until } => {
+                let mut counts: Map<String, i64> = Map::new();
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    *counts.entry(stored.statement.verb.id.clone()).or_insert(0) += 1;
+                }
+
+                Ok(AggregationResult::GroupedCounts { groups: counts })
+            },
+
+            AggregationQuery::CountByActivity { since, until, limit } => {
+                let mut counts: Map<String, i64> = Map::new();
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    if let Object::Activity(ref activity) = stored.statement.object {
+                        *counts.entry(activity.id.clone()).or_insert(0) += 1;
+                    }
+                }
+
+                // Apply limit
+                if let Some(lim) = limit {
+                    let mut sorted: Vec<_> = counts.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    counts = sorted.into_iter().take(lim as usize).collect();
+                }
+
+                Ok(AggregationResult::GroupedCounts { groups: counts })
+            },
+
+            AggregationQuery::CountByAgent { since, until, limit } => {
+                let mut counts: Map<String, i64> = Map::new();
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    let agent_key = match &stored.statement.actor {
+                        Actor::Agent(agent) => agent_identifier(agent),
+                        Actor::Group(group) => group.mbox.clone().unwrap_or_else(|| "unknown".to_string())
+                    };
+
+                    *counts.entry(agent_key).or_insert(0) += 1;
+                }
+
+                if let Some(lim) = limit {
+                    let mut sorted: Vec<_> = counts.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    counts = sorted.into_iter().take(lim as usize).collect();
+                }
+
+                Ok(AggregationResult::GroupedCounts { groups: counts })
+            },
+
+            AggregationQuery::AverageScoreByActivity { activity_id, since, until } => {
+                let mut scores: Map<String, (f64, i64)> = Map::new(); // (sum, count)
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    if let Some(ref result) = stored.statement.result {
+                        if let Some(ref score) = result.score {
+                            if let Some(scaled) = score.scaled {
+                                if let Object::Activity(ref activity) = stored.statement.object {
+                                    if activity_id.as_ref().map(|id| id == &activity.id).unwrap_or(true) {
+                                        let entry = scores.entry(activity.id.clone()).or_insert((0.0, 0));
+                                        entry.0 += scaled as f64;
+                                        entry.1 += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let averages: Map<String, f64> = scores.into_iter()
+                    .map(|(k, (sum, count))| (k, if count > 0 { sum / count as f64 } else { 0.0 }))
+                    .collect();
+
+                Ok(AggregationResult::GroupedAverages { groups: averages })
+            },
+
+            AggregationQuery::CompletionRateByActivity { activity_id, since, until } => {
+                let mut stats: Map<String, (i64, i64)> = Map::new(); // (completed, total)
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    if let Object::Activity(ref activity) = stored.statement.object {
+                        if activity_id.as_ref().map(|id| id == &activity.id).unwrap_or(true) {
+                            let entry = stats.entry(activity.id.clone()).or_insert((0, 0));
+                            entry.1 += 1;
+
+                            if let Some(ref result) = stored.statement.result {
+                                if result.completion == Some(true) {
+                                    entry.0 += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let rates: Map<String, f64> = stats.into_iter()
+                    .map(|(k, (completed, total))| (k, if total > 0 { completed as f64 / total as f64 } else { 0.0 }))
+                    .collect();
+
+                Ok(AggregationResult::GroupedAverages { groups: rates })
+            },
+
+            AggregationQuery::SuccessRateByActivity { activity_id, since, until } => {
+                let mut stats: Map<String, (i64, i64)> = Map::new(); // (success, total)
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    if let Object::Activity(ref activity) = stored.statement.object {
+                        if activity_id.as_ref().map(|id| id == &activity.id).unwrap_or(true) {
+                            if let Some(ref result) = stored.statement.result {
+                                if result.success.is_some() {
+                                    let entry = stats.entry(activity.id.clone()).or_insert((0, 0));
+                                    entry.1 += 1;
+
+                                    if result.success == Some(true) {
+                                        entry.0 += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let rates: Map<String, f64> = stats.into_iter()
+                    .map(|(k, (success, total))| (k, if total > 0 { success as f64 / total as f64 } else { 0.0 }))
+                    .collect();
+
+                Ok(AggregationResult::GroupedAverages { groups: rates })
+            },
+
+            AggregationQuery::StatementsOverTime { interval, since, until } => {
+                let mut time_buckets: Map<String, i64> = Map::new();
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &Some(since.clone()), &Some(until.clone())) { continue }
+
+                    let bucket_key = format_time_bucket(&stored.stored_at, &interval);
+                    *time_buckets.entry(bucket_key).or_insert(0) += 1;
+                }
+
+                let mut points: Vec<TimeSeriesPoint> = time_buckets.into_iter()
+                    .map(|(label, count)| TimeSeriesPoint {
+                        timestamp: parse_time_bucket(&label, &interval),
+                        value: count as f64,
+                        label: Some(label)
+                    })
+                    .collect();
+
+                points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+                Ok(AggregationResult::TimeSeries { points })
+            },
+
+            AggregationQuery::LearnerProgress { agent, activity_id } => {
+                let agent_key = agent_identifier(&agent);
+                let mut activities: Map<String, ActivityProgress> = Map::new();
+
+                // Get statements for this agent
+                if let Some(statement_ids) = lrs.actor_index.get(&agent_key) {
+                    for stmt_id in statement_ids {
+                        if let Some(stored) = lrs.statements.get(stmt_id) {
+                            if stored.voided { continue }
+
+                            if let Object::Activity(ref activity) = stored.statement.object {
+                                if activity_id.as_ref().map(|id| id == &activity.id).unwrap_or(true) {
+                                    let progress = activities.entry(activity.id.clone())
+                                        .or_insert_with(|| ActivityProgress {
+                                            activity_id: activity.id.clone(),
+                                            activity_name: activity.definition.as_ref()
+                                                .and_then(|d| d.name.as_ref())
+                                                .and_then(|n| n.get("en-US").or_else(|| n.values().next()))
+                                                .cloned(),
+                                            completed: false,
+                                            success: None,
+                                            score: None,
+                                            attempts: 0,
+                                            first_attempted: None,
+                                            last_attempted: None,
+                                            total_duration: None
+                                        });
+
+                                    progress.attempts += 1;
+
+                                    if progress.first_attempted.is_none() {
+                                        progress.first_attempted = Some(stored.stored_at.clone());
+                                    }
+                                    progress.last_attempted = Some(stored.stored_at.clone());
+
+                                    if let Some(ref result) = stored.statement.result {
+                                        if result.completion == Some(true) {
+                                            progress.completed = true;
+                                        }
+                                        if result.success.is_some() {
+                                            progress.success = result.success;
+                                        }
+                                        if let Some(ref score) = result.score {
+                                            if let Some(scaled) = score.scaled {
+                                                // Keep best score
+                                                if progress.score.map(|s| scaled > s).unwrap_or(true) {
+                                                    progress.score = Some(scaled);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(AggregationResult::Progress {
+                    activities: activities.into_values().collect()
+                })
+            },
+
+            AggregationQuery::ActivityLeaderboard { activity_id, metric, limit } => {
+                let mut agent_stats: Map<String, (Agent, f64, Map<String, JsonValue>)> = Map::new();
+
+                // Get statements for this activity
+                if let Some(statement_ids) = lrs.activity_index.get(&activity_id) {
+                    for stmt_id in statement_ids {
+                        if let Some(stored) = lrs.statements.get(stmt_id) {
+                            if stored.voided { continue }
+
+                            let agent = match &stored.statement.actor {
+                                Actor::Agent(a) => a.clone(),
+                                Actor::Group(_) => continue
+                            };
+                            let agent_key = agent_identifier(&agent);
+
+                            match metric {
+                                LeaderboardMetric::HighestScore => {
+                                    if let Some(ref result) = stored.statement.result {
+                                        if let Some(ref score) = result.score {
+                                            if let Some(scaled) = score.scaled {
+                                                let entry = agent_stats.entry(agent_key.clone())
+                                                    .or_insert((agent.clone(), 0.0, Map::new()));
+                                                if scaled > entry.1 as f32 {
+                                                    entry.1 = scaled as f64;
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                LeaderboardMetric::MostAttempts => {
+                                    let entry = agent_stats.entry(agent_key.clone())
+                                        .or_insert((agent.clone(), 0.0, Map::new()));
+                                    entry.1 += 1.0;
+                                },
+                                LeaderboardMetric::MostRecent => {
+                                    let entry = agent_stats.entry(agent_key.clone())
+                                        .or_insert((agent.clone(), 0.0, Map::new()));
+                                    let timestamp = stored.stored_at.timestamp() as f64;
+                                    if timestamp > entry.1 {
+                                        entry.1 = timestamp;
+                                    }
+                                },
+                                LeaderboardMetric::FastestCompletion => {
+                                    if let Some(ref result) = stored.statement.result {
+                                        if result.completion == Some(true) {
+                                            if let Some(ref duration_str) = result.duration {
+                                                // Parse duration and track fastest
+                                                // Simplified: just track first completion
+                                                let entry = agent_stats.entry(agent_key.clone())
+                                                    .or_insert((agent.clone(), f64::MAX, Map::new()));
+                                                let duration = parse_iso8601_duration(duration_str)
+                                                    .map(|d| d.as_secs_f64())
+                                                    .unwrap_or(f64::MAX);
+                                                if duration < entry.1 {
+                                                    entry.1 = duration;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sort and create leaderboard
+                let mut sorted: Vec<_> = agent_stats.into_values().collect();
+                match metric {
+                    LeaderboardMetric::FastestCompletion => {
+                        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    },
+                    _ => {
+                        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                }
+
+                let entries: Vec<LeaderboardEntry> = sorted.into_iter()
+                    .take(limit as usize)
+                    .enumerate()
+                    .map(|(i, (agent, value, metadata))| LeaderboardEntry {
+                        rank: (i + 1) as i32,
+                        agent,
+                        value,
+                        metadata: if metadata.is_empty() { None } else { Some(metadata) }
+                    })
+                    .collect();
+
+                Ok(AggregationResult::Leaderboard { entries })
+            },
+
+            AggregationQuery::AverageTimeToComplete { activity_id, since, until } => {
+                let mut durations: Map<String, (f64, i64)> = Map::new();
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+                    if !in_time_range(&stored.stored_at, &since, &until) { continue }
+
+                    if let Some(ref result) = stored.statement.result {
+                        if result.completion == Some(true) {
+                            if let Some(ref duration_str) = result.duration {
+                                if let Object::Activity(ref activity) = stored.statement.object {
+                                    if activity_id.as_ref().map(|id| id == &activity.id).unwrap_or(true) {
+                                        if let Some(duration) = parse_iso8601_duration(duration_str) {
+                                            let entry = durations.entry(activity.id.clone()).or_insert((0.0, 0));
+                                            entry.0 += duration.as_secs_f64();
+                                            entry.1 += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let averages: Map<String, f64> = durations.into_iter()
+                    .map(|(k, (sum, count))| (k, if count > 0 { sum / count as f64 } else { 0.0 }))
+                    .collect();
+
+                Ok(AggregationResult::GroupedAverages { groups: averages })
+            },
+
+            AggregationQuery::Custom { filter, group_by, metric } => {
+                // Generic aggregation - simplified implementation
+                let mut groups: Map<String, (f64, i64)> = Map::new();
+
+                for stored in lrs.statements.values() {
+                    if stored.voided { continue }
+
+                    // Apply filter
+                    if let Some(ref verbs) = filter.verbs {
+                        if !verbs.contains(&stored.statement.verb.id) { continue }
+                    }
+
+                    if let Some(ref activities) = filter.activities {
+                        match &stored.statement.object {
+                            Object::Activity(a) if !activities.contains(&a.id) => continue,
+                            _ => {}
+                        }
+                    }
+
+                    if !in_time_range(&stored.stored_at, &filter.since, &filter.until) { continue }
+
+                    if let Some(success_filter) = filter.success {
+                        match &stored.statement.result {
+                            Some(r) if r.success != Some(success_filter) => continue,
+                            None => continue,
+                            _ => {}
+                        }
+                    }
+
+                    if let Some(completion_filter) = filter.completion {
+                        match &stored.statement.result {
+                            Some(r) if r.completion != Some(completion_filter) => continue,
+                            None => continue,
+                            _ => {}
+                        }
+                    }
+
+                    // Determine group key
+                    let group_key = match group_by {
+                        GroupByField::Verb => stored.statement.verb.id.clone(),
+                        GroupByField::Activity => {
+                            match &stored.statement.object {
+                                Object::Activity(a) => a.id.clone(),
+                                _ => "unknown".to_string()
+                            }
+                        },
+                        GroupByField::Agent => {
+                            match &stored.statement.actor {
+                                Actor::Agent(a) => agent_identifier(a),
+                                Actor::Group(_) => "group".to_string()
+                            }
+                        },
+                        GroupByField::Day => stored.stored_at.format("%Y-%m-%d"),
+                        GroupByField::Week => stored.stored_at.format("%Y-W%V"),
+                        GroupByField::Month => stored.stored_at.format("%Y-%m")
+                    };
+
+                    // Apply metric
+                    let value = match metric {
+                        AggregationMetric::Count => 1.0,
+                        AggregationMetric::Sum | AggregationMetric::Average => {
+                            stored.statement.result.as_ref()
+                                .and_then(|r| r.score.as_ref())
+                                .and_then(|s| s.scaled)
+                                .map(|s| s as f64)
+                                .unwrap_or(0.0)
+                        },
+                        _ => 1.0
+                    };
+
+                    let entry = groups.entry(group_key).or_insert((0.0, 0));
+                    entry.0 += value;
+                    entry.1 += 1;
+                }
+
+                // Finalize based on metric type
+                let result: Map<String, JsonValue> = groups.into_iter()
+                    .map(|(k, (sum, count))| {
+                        let final_value = match metric {
+                            AggregationMetric::Count => count as f64,
+                            AggregationMetric::Sum => sum,
+                            AggregationMetric::Average => if count > 0 { sum / count as f64 } else { 0.0 },
+                            _ => sum
+                        };
+                        (k, JsonValue::Number(final_value))
+                    })
+                    .collect();
+
+                Ok(AggregationResult::Grouped { groups: result })
+            }
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Index a statement in the LRS state
+fn index_statement_in_state(lrs: &mut LrsState, statement_id: &StatementId, statement: &Statement) {
+    // Index by actor
+    let actor_key = match &statement.actor {
+        Actor::Agent(agent) => agent_identifier(agent),
+        Actor::Group(group) => group.mbox.clone()
+            .or_else(|| group.account.as_ref().map(|a| format!("{}:{}", a.home_page, a.name)))
+            .unwrap_or_default()
+    };
+    lrs.actor_index
+        .entry(actor_key)
+        .or_insert_with(Set::new)
+        .insert(statement_id.clone());
+
+    // Index by verb
+    lrs.verb_index
+        .entry(statement.verb.id.clone())
+        .or_insert_with(Set::new)
+        .insert(statement_id.clone());
+
+    // Index by activity
+    if let Object::Activity(activity) = &statement.object {
+        lrs.activity_index
+            .entry(activity.id.clone())
+            .or_insert_with(Set::new)
+            .insert(statement_id.clone());
+    }
+
+    // Index by registration
+    if let Some(ref context) = statement.context {
+        if let Some(ref registration) = context.registration {
+            lrs.registration_index
+                .entry(registration.clone())
+                .or_insert_with(Set::new)
+                .insert(statement_id.clone());
+        }
+
+        // Index context activities
+        if let Some(ref context_activities) = context.context_activities {
+            if let Some(ref parents) = context_activities.parent {
+                for parent in parents {
+                    lrs.activity_index
+                        .entry(parent.id.clone())
+                        .or_insert_with(Set::new)
+                        .insert(statement_id.clone());
+                }
+            }
+            if let Some(ref groupings) = context_activities.grouping {
+                for grouping in groupings {
+                    lrs.activity_index
+                        .entry(grouping.id.clone())
+                        .or_insert_with(Set::new)
+                        .insert(statement_id.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Query statements from LRS state
+fn query_statements_from_state(lrs: &LrsState, query: LrsStatementQuery) -> Result<LrsQueryResult, LrsError> {
+    // If specific statement ID requested
+    if let Some(ref statement_id) = query.statement_id {
+        let stored = lrs.statements.get(statement_id)
+            .ok_or(LrsError::StatementNotFound { id: statement_id.clone() })?;
+
+        if stored.voided {
+            return Err(LrsError::StatementNotFound { id: statement_id.clone() })
+        }
+
+        return Ok(LrsQueryResult {
+            statements: vec![stored.statement.clone()],
+            more: None,
+            total: Some(1)
+        })
+    }
+
+    // Build candidate set from indexes
+    let mut candidates: Option<Set<StatementId>> = None;
+
+    // Filter by agent
+    if let Some(ref agent) = query.agent {
+        let agent_key = agent_identifier(agent);
+        if let Some(agent_statements) = lrs.actor_index.get(&agent_key) {
+            candidates = Some(match candidates {
+                Some(c) => c.intersection(agent_statements).cloned().collect(),
+                None => agent_statements.clone()
+            });
+        } else {
+            candidates = Some(Set::new());
+        }
+    }
+
+    // Filter by verb
+    if let Some(ref verb) = query.verb {
+        if let Some(verb_statements) = lrs.verb_index.get(verb) {
+            candidates = Some(match candidates {
+                Some(c) => c.intersection(verb_statements).cloned().collect(),
+                None => verb_statements.clone()
+            });
+        } else {
+            candidates = Some(Set::new());
+        }
+    }
+
+    // Filter by activity
+    if let Some(ref activity) = query.activity {
+        if let Some(activity_statements) = lrs.activity_index.get(activity) {
+            candidates = Some(match candidates {
+                Some(c) => c.intersection(activity_statements).cloned().collect(),
+                None => activity_statements.clone()
+            });
+        } else {
+            candidates = Some(Set::new());
+        }
+    }
+
+    // Filter by registration
+    if let Some(ref registration) = query.registration {
+        if let Some(reg_statements) = lrs.registration_index.get(registration) {
+            candidates = Some(match candidates {
+                Some(c) => c.intersection(reg_statements).cloned().collect(),
+                None => reg_statements.clone()
+            });
+        } else {
+            candidates = Some(Set::new());
+        }
+    }
+
+    // Get all statements if no filters
+    let candidate_ids: Vec<StatementId> = match candidates {
+        Some(c) => c.into_iter().collect(),
+        None => lrs.statements_by_time.clone()
+    };
+
+    // Filter by time and collect statements
+    let mut statements: Vec<Statement> = candidate_ids.iter()
+        .filter_map(|id| lrs.statements.get(id))
+        .filter(|stored| !stored.voided)
+        .filter(|stored| {
+            if let Some(ref since) = query.since {
+                if stored.stored_at <= *since {
+                    return false
+                }
+            }
+            if let Some(ref until) = query.until {
+                if stored.stored_at > *until {
+                    return false
+                }
+            }
+            true
+        })
+        .map(|stored| stored.statement.clone())
+        .collect();
+
+    // Sort by stored time
+    if query.ascending {
+        statements.sort_by(|a, b| {
+            a.stored.as_ref().cmp(&b.stored.as_ref())
+        });
+    } else {
+        statements.sort_by(|a, b| {
+            b.stored.as_ref().cmp(&a.stored.as_ref())
+        });
+    }
+
+    let total = statements.len() as i64;
+
+    // Apply limit
+    let limited: Vec<Statement> = statements.into_iter()
+        .take(query.limit as usize)
+        .collect();
+
+    let more = if (total as i32) > query.limit {
+        Some(format!("/statements?offset={}", query.limit))
+    } else {
+        None
+    };
+
+    Ok(LrsQueryResult {
+        statements: limited,
+        more,
+        total: Some(total)
+    })
+}
+
+/// Check if a statement matches a forwarding filter
+fn statement_matches_filter(statement: &Statement, filter: &ForwardingFilter) -> Bool {
+    // Check verb filter
+    if let Some(ref verbs) = filter.verbs {
+        if !verbs.contains(&statement.verb.id) {
+            return false
+        }
+    }
+
+    // Check activity filter
+    if let Some(ref activities) = filter.activities {
+        match &statement.object {
+            Object::Activity(a) if !activities.contains(&a.id) => return false,
+            _ => {}
+        }
+    }
+
+    // Check agent filter
+    if let Some(ref agents) = filter.agents {
+        let agent_key = match &statement.actor {
+            Actor::Agent(a) => agent_identifier(a),
+            Actor::Group(_) => return false
+        };
+        if !agents.contains(&agent_key) {
+            return false
+        }
+    }
+
+    // Check score filter
+    if let Some(min_score) = filter.min_score {
+        match &statement.result {
+            Some(r) => match &r.score {
+                Some(s) => match s.scaled {
+                    Some(scaled) if scaled < min_score => return false,
+                    None => return false,
+                    _ => {}
+                },
+                None => return false
+            },
+            None => return false
+        }
+    }
+
+    // Check completion filter
+    if filter.only_completed {
+        match &statement.result {
+            Some(r) if r.completion != Some(true) => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+
+    // Check success filter
+    if filter.only_success {
+        match &statement.result {
+            Some(r) if r.success != Some(true) => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+
+    true
+}
+
+/// Check if a timestamp is in the given range
+fn in_time_range(timestamp: &DateTime, since: &Option<DateTime>, until: &Option<DateTime>) -> Bool {
+    if let Some(ref s) = since {
+        if timestamp <= s {
+            return false
+        }
+    }
+    if let Some(ref u) = until {
+        if timestamp > u {
+            return false
+        }
+    }
+    true
+}
+
+/// Format a time bucket key
+fn format_time_bucket(timestamp: &DateTime, interval: &TimeInterval) -> String {
+    match interval {
+        TimeInterval::Hour => timestamp.format("%Y-%m-%dT%H:00:00Z"),
+        TimeInterval::Day => timestamp.format("%Y-%m-%d"),
+        TimeInterval::Week => timestamp.format("%Y-W%V"),
+        TimeInterval::Month => timestamp.format("%Y-%m"),
+        TimeInterval::Year => timestamp.format("%Y")
+    }
+}
+
+/// Parse a time bucket key back to DateTime
+fn parse_time_bucket(key: &str, interval: &TimeInterval) -> DateTime {
+    // Simplified - in production would properly parse
+    DateTime::now()
+}
+
+/// Parse ISO 8601 duration
+fn parse_iso8601_duration(duration_str: &str) -> Option<Duration> {
+    if !duration_str.starts_with("P") {
+        return None
+    }
+
+    let mut total_seconds: f64 = 0.0;
+    let mut current_num = String::new();
+    let mut in_time = false;
+
+    for c in duration_str.chars() {
+        if c == 'P' { continue }
+        if c == 'T' { in_time = true; continue }
+
+        if c.is_digit(10) || c == '.' {
+            current_num.push(c);
+        } else {
+            if !current_num.is_empty() {
+                let num: f64 = current_num.parse().unwrap_or(0.0);
+                current_num.clear();
+
+                match c {
+                    'Y' => total_seconds += num * 365.0 * 24.0 * 3600.0,
+                    'M' if !in_time => total_seconds += num * 30.0 * 24.0 * 3600.0,
+                    'W' => total_seconds += num * 7.0 * 24.0 * 3600.0,
+                    'D' => total_seconds += num * 24.0 * 3600.0,
+                    'H' => total_seconds += num * 3600.0,
+                    'M' if in_time => total_seconds += num * 60.0,
+                    'S' => total_seconds += num,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Some(Duration::from_secs_f64(total_seconds))
+}
+
+/// Decrypt password (placeholder - would use real encryption)
+fn decrypt_password(encrypted: &str) -> String {
+    // In production, would use proper encryption
+    encrypted.to_string()
+}
+
+/// Base64 encode
+fn base64_encode(input: &str) -> String {
+    // Simplified - would use proper base64
+    input.to_string()
+}
+
+// =============================================================================
+// CONVENIENCE FUNCTIONS
+// =============================================================================
+
+/// Create a single-tenant LRS
+fn create_single_tenant_lrs() -> LearningRecordStore {
+    LearningRecordStore::init()
+}
+
+/// Create a multi-tenant LRS
+fn create_multi_tenant_lrs() -> MultiTenantLearningRecordStore {
+    MultiTenantLearningRecordStore::init()
+}
+
+/// Create a tenant configuration
+fn create_tenant_config(tenant_id: TenantId) -> TenantLrsConfig {
+    TenantLrsConfig::new(tenant_id)
+}
+
+/// Create a forwarding target
+fn create_forwarding_target(
+    id: String,
+    endpoint: String,
+    username: String,
+    password: String
+) -> ForwardingTarget {
+    ForwardingTarget {
+        id,
+        endpoint,
+        auth_type: ForwardingAuthType::Basic,
+        username,
+        password_encrypted: password, // Should be encrypted
+        active: true,
+        filter: None,
+        retry_config: RetryConfig::default(),
+        last_success: None,
+        error_count: 0
+    }
+}
+
+/// Create a forwarding filter
+fn create_forwarding_filter() -> ForwardingFilter {
+    ForwardingFilter {
+        verbs: None,
+        activities: None,
+        agents: None,
+        min_score: None,
+        only_completed: false,
+        only_success: false
+    }
+}

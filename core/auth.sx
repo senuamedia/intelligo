@@ -1,0 +1,3010 @@
+// =============================================================================
+// Intelligo LMS - Authentication System
+// =============================================================================
+// Comprehensive authentication supporting local, OAuth, SAML, and social logins
+// with MFA/2FA support, session management, and LMS-specific features
+// =============================================================================
+
+module intelligo::core::auth
+
+use std::time::{DateTime, Duration, Instant}
+use std::collections::{Map, Set, List}
+use std::crypto::{hash_password, verify_password, random_bytes, hmac_sha256, base32_encode, base32_decode}
+use std::net::http::{HttpClient, HttpRequest}
+use std::jwt::{Jwt, JwtClaims, JwtHeader, JwtAlgorithm}
+use intelligo::core::types::*
+use intelligo::core::storage::EntityStorage
+use intelligo::core::security::{SecurityManager, SecurityContext, SystemRole}
+
+// =============================================================================
+// Type Aliases
+// =============================================================================
+
+type TokenId = String
+type ProviderId = String
+type MfaSecretId = String
+type PasswordResetToken = String
+
+// =============================================================================
+// User Entity
+// =============================================================================
+
+/// LMS User - extends base user concepts for educational context
+type User {
+    id: UserId,
+    /// Unique username
+    username: String,
+    /// Email address
+    email: String,
+    /// Display name shown in UI
+    display_name: String,
+    /// First name
+    first_name: Option<String>,
+    /// Last name
+    last_name: Option<String>,
+    /// Password hash (argon2)
+    password_hash: Option<String>,
+    /// When password was last changed
+    password_changed_at: Option<DateTime>,
+    /// Account status
+    status: UserStatus,
+    /// Email verified
+    email_verified: Bool,
+    /// Phone number (for SMS MFA)
+    phone_number: Option<String>,
+    /// Phone verified
+    phone_verified: Bool,
+    /// User's timezone
+    timezone: Option<String>,
+    /// Preferred locale/language
+    locale: Option<String>,
+    /// Avatar URL
+    avatar_url: Option<String>,
+    /// Tenant this user belongs to
+    tenant_id: TenantId,
+    /// Global system roles
+    roles: Set<RoleId>,
+    /// Last login timestamp
+    last_login_at: Option<DateTime>,
+    /// Last activity timestamp
+    last_activity_at: Option<DateTime>,
+    /// Failed login attempt count
+    failed_login_attempts: i32,
+    /// Account locked until
+    locked_until: Option<DateTime>,
+    /// Account creation
+    created_at: DateTime,
+    updated_at: DateTime,
+    /// Student/Employee ID (for SIS integration)
+    external_id: Option<String>,
+    /// Additional metadata
+    metadata: Map<String, Dynamic>
+}
+
+enum UserStatus {
+    /// Account is active
+    Active,
+    /// Account is pending email verification
+    PendingVerification,
+    /// Account is suspended
+    Suspended { reason: String, until: Option<DateTime> },
+    /// Account is deactivated
+    Deactivated,
+    /// Account is locked due to failed logins
+    Locked { until: DateTime }
+}
+
+impl UserStatus {
+    fn is_active(&self) -> Bool {
+        match self {
+            UserStatus::Active => true,
+            _ => false
+        }
+    }
+
+    fn from_string(s: &str) -> Self {
+        match s {
+            "Active" => UserStatus::Active,
+            "PendingVerification" => UserStatus::PendingVerification,
+            "Deactivated" => UserStatus::Deactivated,
+            s if s.starts_with("Suspended:") => {
+                let reason = s.strip_prefix("Suspended:").unwrap_or("").to_string();
+                UserStatus::Suspended { reason, until: None }
+            },
+            s if s.starts_with("Locked:") => {
+                let until_str = s.strip_prefix("Locked:").unwrap_or("");
+                let until = DateTime::parse(until_str).unwrap_or(DateTime::now());
+                UserStatus::Locked { until }
+            },
+            _ => UserStatus::Active
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            UserStatus::Active => "Active".to_string(),
+            UserStatus::PendingVerification => "PendingVerification".to_string(),
+            UserStatus::Suspended { reason, until: _ } => format!("Suspended:{}", reason),
+            UserStatus::Deactivated => "Deactivated".to_string(),
+            UserStatus::Locked { until } => format!("Locked:{}", until.to_rfc3339())
+        }
+    }
+}
+
+// =============================================================================
+// Authentication Configuration
+// =============================================================================
+
+type AuthConfig {
+    // Session settings
+    session_lifetime: Duration,
+    session_cookie_name: String,
+    session_cookie_secure: Bool,
+    session_cookie_http_only: Bool,
+    session_cookie_same_site: SameSite,
+    max_sessions_per_user: Option<i32>,
+
+    // Token settings
+    access_token_lifetime: Duration,
+    refresh_token_lifetime: Duration,
+    jwt_secret: String,
+    jwt_algorithm: JwtAlgorithm,
+    jwt_issuer: String,
+    jwt_audience: String,
+
+    // Password settings
+    password_min_length: i32,
+    password_require_uppercase: Bool,
+    password_require_lowercase: Bool,
+    password_require_number: Bool,
+    password_require_special: Bool,
+    password_max_age_days: Option<i32>,
+    password_history_count: i32,
+
+    // Login settings
+    max_login_attempts: i32,
+    lockout_duration: Duration,
+    require_email_verification: Bool,
+
+    // MFA settings
+    mfa_enabled: Bool,
+    mfa_required_for_roles: Set<String>,
+    allowed_mfa_methods: Set<MfaMethod>,
+
+    // SSO providers
+    oauth_providers: Map<ProviderId, OAuthProviderConfig>,
+    saml_providers: Map<ProviderId, SamlProviderConfig>,
+
+    // LMS-specific
+    allow_guest_access: Bool,
+    auto_enroll_on_first_login: Bool
+}
+
+enum SameSite {
+    Strict,
+    Lax,
+    None
+}
+
+impl AuthConfig {
+    fn default() -> Self {
+        AuthConfig {
+            session_lifetime: Duration::from_hours(24),
+            session_cookie_name: "intelligo_session".to_string(),
+            session_cookie_secure: true,
+            session_cookie_http_only: true,
+            session_cookie_same_site: SameSite::Lax,
+            max_sessions_per_user: Some(5),
+
+            access_token_lifetime: Duration::from_minutes(15),
+            refresh_token_lifetime: Duration::from_days(7),
+            jwt_secret: "".to_string(), // Must be set
+            jwt_algorithm: JwtAlgorithm::HS256,
+            jwt_issuer: "intelligo".to_string(),
+            jwt_audience: "intelligo".to_string(),
+
+            password_min_length: 8,
+            password_require_uppercase: true,
+            password_require_lowercase: true,
+            password_require_number: true,
+            password_require_special: false,
+            password_max_age_days: None,
+            password_history_count: 5,
+
+            max_login_attempts: 5,
+            lockout_duration: Duration::from_minutes(30),
+            require_email_verification: true,
+
+            mfa_enabled: true,
+            mfa_required_for_roles: Set::from(["administrator".to_string(), "tenant_admin".to_string()]),
+            allowed_mfa_methods: Set::from([MfaMethod::Totp, MfaMethod::Email, MfaMethod::Backup]),
+
+            oauth_providers: Map::new(),
+            saml_providers: Map::new(),
+
+            allow_guest_access: false,
+            auto_enroll_on_first_login: false
+        }
+    }
+}
+
+// =============================================================================
+// OAuth 2.0 / OpenID Connect Configuration
+// =============================================================================
+
+type OAuthProviderConfig {
+    id: ProviderId,
+    name: String,
+    enabled: Bool,
+    provider_type: OAuthProviderType,
+    client_id: String,
+    client_secret: String,
+    authorization_url: String,
+    token_url: String,
+    userinfo_url: Option<String>,
+    jwks_url: Option<String>,
+    scopes: List<String>,
+    response_type: String,
+    redirect_uri: String,
+    // Claim mappings
+    user_id_claim: String,
+    email_claim: String,
+    name_claim: String,
+    first_name_claim: Option<String>,
+    last_name_claim: Option<String>,
+    picture_claim: Option<String>,
+    // Additional settings
+    pkce_enabled: Bool,
+    state_parameter: Bool,
+    nonce_parameter: Bool,
+    // Role mapping
+    role_claim: Option<String>,
+    role_mapping: Map<String, RoleId>,
+    // Auto-provisioning
+    auto_create_user: Bool,
+    default_roles: Set<RoleId>
+}
+
+enum OAuthProviderType {
+    OAuth2,
+    OpenIdConnect,
+    Google,
+    Microsoft,
+    GitHub,
+    Okta,
+    Auth0,
+    Keycloak,
+    AzureAD,
+    Canvas,      // Canvas LMS
+    Blackboard,  // Blackboard LMS
+    Moodle,      // Moodle LMS
+    Custom
+}
+
+// =============================================================================
+// SAML 2.0 Configuration
+// =============================================================================
+
+type SamlProviderConfig {
+    id: ProviderId,
+    name: String,
+    enabled: Bool,
+    // Identity Provider settings
+    idp_entity_id: String,
+    idp_sso_url: String,
+    idp_slo_url: Option<String>,
+    idp_certificate: String,
+    // Service Provider settings
+    sp_entity_id: String,
+    sp_acs_url: String,
+    sp_slo_url: Option<String>,
+    sp_certificate: Option<String>,
+    sp_private_key: Option<String>,
+    // Attribute mappings
+    user_id_attribute: String,
+    email_attribute: String,
+    name_attribute: String,
+    first_name_attribute: Option<String>,
+    last_name_attribute: Option<String>,
+    groups_attribute: Option<String>,
+    // Settings
+    sign_requests: Bool,
+    want_assertions_signed: Bool,
+    want_response_signed: Bool,
+    name_id_format: SamlNameIdFormat,
+    // Role mapping
+    role_attribute: Option<String>,
+    role_mapping: Map<String, RoleId>,
+    // Auto-provisioning
+    auto_create_user: Bool,
+    default_roles: Set<RoleId>
+}
+
+enum SamlNameIdFormat {
+    Unspecified,
+    EmailAddress,
+    Persistent,
+    Transient
+}
+
+// =============================================================================
+// Session & Token Types
+// =============================================================================
+
+/// Authentication session with device tracking
+type AuthSession {
+    id: SessionId,
+    user_id: UserId,
+    tenant_id: TenantId,
+    created_at: DateTime,
+    expires_at: DateTime,
+    last_activity: DateTime,
+    ip_address: Option<String>,
+    user_agent: Option<String>,
+    device_info: Option<DeviceInfo>,
+    auth_method: AuthMethod,
+    mfa_verified: Bool,
+    provider_id: Option<ProviderId>,
+    /// Active course context (for LMS)
+    current_course_id: Option<CourseId>,
+    /// Is this a guest session
+    is_guest: Bool,
+    metadata: Map<String, Dynamic>
+}
+
+type DeviceInfo {
+    device_id: Option<String>,
+    device_type: DeviceType,
+    os: String,
+    os_version: Option<String>,
+    browser: String,
+    browser_version: Option<String>,
+    is_mobile: Bool,
+    /// Device fingerprint for tracking
+    fingerprint: Option<String>
+}
+
+enum DeviceType {
+    Desktop,
+    Mobile,
+    Tablet,
+    Unknown
+}
+
+enum AuthMethod {
+    Password,
+    OAuth { provider: ProviderId },
+    Saml { provider: ProviderId },
+    ApiKey,
+    Token,
+    MagicLink,
+    LtiLaunch { platform: String },
+    Guest
+}
+
+/// JWT-based auth token
+type AuthToken {
+    id: TokenId,
+    token_type: TokenType,
+    user_id: UserId,
+    tenant_id: TenantId,
+    value: String,
+    created_at: DateTime,
+    expires_at: DateTime,
+    revoked: Bool,
+    revoked_at: Option<DateTime>,
+    revoked_reason: Option<String>,
+    scope: Set<String>,
+    /// Session this token belongs to
+    session_id: Option<SessionId>
+}
+
+enum TokenType {
+    Access,
+    Refresh,
+    IdToken,
+    PasswordReset,
+    EmailVerification,
+    MagicLink,
+    ApiKey,
+    LtiToken
+}
+
+type TokenPair {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+    expires_in: i64,
+    scope: String,
+    id_token: Option<String>
+}
+
+// =============================================================================
+// MFA Types
+// =============================================================================
+
+enum MfaMethod {
+    /// Time-based One-Time Password (Google Authenticator, etc.)
+    Totp,
+    /// SMS verification code
+    Sms,
+    /// Email verification code
+    Email,
+    /// WebAuthn/FIDO2 passkey
+    Passkey,
+    /// Backup codes
+    Backup
+}
+
+type MfaEnrollment {
+    id: MfaSecretId,
+    user_id: UserId,
+    method: MfaMethod,
+    /// Secret for TOTP
+    secret: Option<String>,
+    /// Phone number for SMS
+    phone_number: Option<String>,
+    /// Email for email codes
+    email: Option<String>,
+    verified: Bool,
+    created_at: DateTime,
+    last_used: Option<DateTime>,
+    /// Credential ID for passkeys
+    credential_id: Option<String>,
+    /// Public key for passkeys
+    public_key: Option<String>,
+    metadata: Map<String, Dynamic>
+}
+
+type BackupCodes {
+    user_id: UserId,
+    codes: List<BackupCode>,
+    generated_at: DateTime
+}
+
+type BackupCode {
+    code_hash: String,
+    used: Bool,
+    used_at: Option<DateTime>
+}
+
+type TotpEnrollment {
+    id: MfaSecretId,
+    secret: String,
+    provisioning_uri: String,
+    qr_code: String
+}
+
+// =============================================================================
+// Login Request/Response Types
+// =============================================================================
+
+type LoginRequest {
+    username_or_email: String,
+    password: String,
+    remember_me: Bool,
+    mfa_code: Option<String>,
+    mfa_method: Option<MfaMethod>,
+    device_info: Option<DeviceInfo>,
+    /// For LTI launch context
+    lti_context: Option<LtiContext>
+}
+
+type LtiContext {
+    platform_id: String,
+    deployment_id: String,
+    context_id: Option<String>,
+    resource_link_id: Option<String>,
+    roles: List<String>
+}
+
+type LoginResponse {
+    success: Bool,
+    session: Option<AuthSession>,
+    tokens: Option<TokenPair>,
+    requires_mfa: Bool,
+    mfa_methods: List<MfaMethod>,
+    user: Option<AuthenticatedUser>,
+    error: Option<LoginError>,
+    /// MFA challenge token for two-step login
+    mfa_challenge_token: Option<String>
+}
+
+type AuthenticatedUser {
+    id: UserId,
+    username: String,
+    email: String,
+    display_name: String,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    roles: Set<RoleId>,
+    permissions: Set<PermissionId>,
+    avatar_url: Option<String>,
+    email_verified: Bool,
+    mfa_enabled: Bool,
+    tenant_id: TenantId,
+    /// Enrolled courses for quick access
+    enrolled_course_ids: List<CourseId>,
+    /// Teaching courses for instructors
+    teaching_course_ids: List<CourseId>
+}
+
+enum LoginError {
+    InvalidCredentials,
+    AccountLocked { until: DateTime },
+    AccountSuspended { reason: String },
+    AccountDeactivated,
+    EmailNotVerified,
+    MfaRequired,
+    InvalidMfaCode,
+    MfaMethodNotAllowed,
+    SessionLimitReached,
+    IpBlocked,
+    PasswordExpired,
+    TenantSuspended,
+    TenantNotFound,
+    ProviderError { message: String }
+}
+
+impl LoginError {
+    fn to_string(&self) -> String {
+        match self {
+            LoginError::InvalidCredentials => "Invalid username or password".to_string(),
+            LoginError::AccountLocked { until } => format!("Account locked until {}", until),
+            LoginError::AccountSuspended { reason } => format!("Account suspended: {}", reason),
+            LoginError::AccountDeactivated => "Account has been deactivated".to_string(),
+            LoginError::EmailNotVerified => "Please verify your email address".to_string(),
+            LoginError::MfaRequired => "Multi-factor authentication required".to_string(),
+            LoginError::InvalidMfaCode => "Invalid verification code".to_string(),
+            LoginError::MfaMethodNotAllowed => "This MFA method is not allowed".to_string(),
+            LoginError::SessionLimitReached => "Maximum sessions reached".to_string(),
+            LoginError::IpBlocked => "Access from this IP is blocked".to_string(),
+            LoginError::PasswordExpired => "Password has expired, please reset it".to_string(),
+            LoginError::TenantSuspended => "Your organization's access has been suspended".to_string(),
+            LoginError::TenantNotFound => "Organization not found".to_string(),
+            LoginError::ProviderError { message } => format!("Authentication provider error: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// OAuth Flow Types
+// =============================================================================
+
+type OAuthAuthorizationRequest {
+    provider_id: ProviderId,
+    redirect_uri: String,
+    state: String,
+    nonce: Option<String>,
+    code_verifier: Option<String>,
+    scopes: Option<List<String>>
+}
+
+type OAuthCallbackRequest {
+    provider_id: ProviderId,
+    code: String,
+    state: String,
+    code_verifier: Option<String>
+}
+
+type OAuthUserInfo {
+    provider_id: ProviderId,
+    provider_user_id: String,
+    email: Option<String>,
+    email_verified: Bool,
+    name: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    picture: Option<String>,
+    locale: Option<String>,
+    raw_claims: Map<String, Dynamic>
+}
+
+type OAuthState {
+    provider_id: ProviderId,
+    state: String,
+    nonce: Option<String>,
+    code_verifier: Option<String>,
+    redirect_uri: String,
+    created_at: DateTime,
+    expires_at: DateTime
+}
+
+type OAuthTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    scope: Option<String>,
+    id_token: Option<String>
+}
+
+// =============================================================================
+// SAML Flow Types
+// =============================================================================
+
+type SamlAuthRequest {
+    provider_id: ProviderId,
+    relay_state: Option<String>
+}
+
+type SamlAuthResponse {
+    redirect_url: String,
+    request_id: String
+}
+
+type SamlResponse {
+    provider_id: ProviderId,
+    assertion: String,
+    relay_state: Option<String>
+}
+
+type SamlUserInfo {
+    provider_id: ProviderId,
+    name_id: String,
+    session_index: Option<String>,
+    attributes: Map<String, List<String>>
+}
+
+// =============================================================================
+// Password Management Types
+// =============================================================================
+
+type PasswordResetRequest {
+    email: String,
+    tenant_id: TenantId
+}
+
+type PasswordResetConfirm {
+    token: String,
+    new_password: String
+}
+
+type PasswordChangeRequest {
+    user_id: UserId,
+    current_password: String,
+    new_password: String
+}
+
+type PasswordValidationResult {
+    valid: Bool,
+    errors: List<String>
+}
+
+// =============================================================================
+// Account Management Types
+// =============================================================================
+
+type CreateUserRequest {
+    username: String,
+    email: String,
+    password: Option<String>,
+    display_name: String,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    roles: Set<RoleId>,
+    tenant_id: TenantId,
+    external_id: Option<String>,
+    send_verification_email: Bool
+}
+
+type UpdateUserRequest {
+    display_name: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    email: Option<String>,
+    phone_number: Option<String>,
+    timezone: Option<String>,
+    locale: Option<String>,
+    avatar_url: Option<String>
+}
+
+type LinkedAccount {
+    user_id: UserId,
+    provider_id: ProviderId,
+    provider_user_id: String,
+    email: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    linked_at: DateTime,
+    metadata: Map<String, Dynamic>
+}
+
+type LinkedAccountInfo {
+    provider_id: ProviderId,
+    provider_name: String,
+    provider_user_id: String,
+    email: Option<String>,
+    linked_at: DateTime
+}
+
+// =============================================================================
+// Auth Error Types
+// =============================================================================
+
+enum AuthError {
+    InvalidCredentials,
+    UserNotFound,
+    UserExists { email: String },
+    SessionNotFound,
+    SessionExpired,
+    InvalidToken,
+    TokenExpired,
+    TokenRevoked,
+    MfaRequired,
+    MfaNotEnrolled,
+    InvalidMfaCode,
+    ProviderNotFound { id: ProviderId },
+    ProviderDisabled { id: ProviderId },
+    ProviderMismatch,
+    InvalidState,
+    StateExpired,
+    TokenExchangeFailed { message: String },
+    UserInfoFailed { message: String },
+    InvalidResponse { message: String },
+    MissingClaim { claim: String },
+    NoUserInfoEndpoint,
+    InvalidIdToken,
+    InvalidSamlResponse,
+    MissingSamlAttribute { attribute: String },
+    InvalidSamlSignature { message: String },
+    SamlSigningFailed { message: String },
+    NoPrivateKey,
+    AccountNotLinked,
+    EmailRequired,
+    CreateUserFailed { message: String },
+    PasswordValidationFailed { errors: List<String> },
+    PasswordResetExpired,
+    PasswordResetInvalid,
+    TenantNotFound { id: TenantId },
+    TenantSuspended { id: TenantId },
+    RateLimitExceeded,
+    Internal { message: String }
+}
+
+impl AuthError {
+    fn to_string(&self) -> String {
+        match self {
+            AuthError::InvalidCredentials => "Invalid credentials".to_string(),
+            AuthError::UserNotFound => "User not found".to_string(),
+            AuthError::UserExists { email } => format!("User with email {} already exists", email),
+            AuthError::SessionNotFound => "Session not found".to_string(),
+            AuthError::SessionExpired => "Session has expired".to_string(),
+            AuthError::InvalidToken => "Invalid token".to_string(),
+            AuthError::TokenExpired => "Token has expired".to_string(),
+            AuthError::TokenRevoked => "Token has been revoked".to_string(),
+            AuthError::MfaRequired => "Multi-factor authentication required".to_string(),
+            AuthError::MfaNotEnrolled => "MFA is not enrolled".to_string(),
+            AuthError::InvalidMfaCode => "Invalid MFA code".to_string(),
+            AuthError::ProviderNotFound { id } => format!("Provider not found: {}", id),
+            AuthError::ProviderDisabled { id } => format!("Provider is disabled: {}", id),
+            AuthError::ProviderMismatch => "Provider mismatch".to_string(),
+            AuthError::InvalidState => "Invalid state parameter".to_string(),
+            AuthError::StateExpired => "State parameter has expired".to_string(),
+            AuthError::TokenExchangeFailed { message } => format!("Token exchange failed: {}", message),
+            AuthError::UserInfoFailed { message } => format!("Failed to get user info: {}", message),
+            AuthError::InvalidResponse { message } => format!("Invalid response: {}", message),
+            AuthError::MissingClaim { claim } => format!("Missing claim: {}", claim),
+            AuthError::NoUserInfoEndpoint => "No userinfo endpoint configured".to_string(),
+            AuthError::InvalidIdToken => "Invalid ID token".to_string(),
+            AuthError::InvalidSamlResponse => "Invalid SAML response".to_string(),
+            AuthError::MissingSamlAttribute { attribute } => format!("Missing SAML attribute: {}", attribute),
+            AuthError::InvalidSamlSignature { message } => format!("Invalid SAML signature: {}", message),
+            AuthError::SamlSigningFailed { message } => format!("SAML signing failed: {}", message),
+            AuthError::NoPrivateKey => "No private key configured".to_string(),
+            AuthError::AccountNotLinked => "Account is not linked".to_string(),
+            AuthError::EmailRequired => "Email is required".to_string(),
+            AuthError::CreateUserFailed { message } => format!("Failed to create user: {}", message),
+            AuthError::PasswordValidationFailed { errors } => format!("Password validation failed: {}", errors.join(", ")),
+            AuthError::PasswordResetExpired => "Password reset link has expired".to_string(),
+            AuthError::PasswordResetInvalid => "Invalid password reset link".to_string(),
+            AuthError::TenantNotFound { id } => format!("Tenant not found: {}", id),
+            AuthError::TenantSuspended { id } => format!("Tenant is suspended: {}", id),
+            AuthError::RateLimitExceeded => "Rate limit exceeded".to_string(),
+            AuthError::Internal { message } => format!("Internal error: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// Helper Types
+// =============================================================================
+
+type LoginAttemptTracker {
+    count: i32,
+    first_attempt: DateTime,
+    last_attempt: DateTime,
+    locked_until: DateTime,
+    ip_addresses: Set<String>
+}
+
+type PendingVerification {
+    user_id: UserId,
+    verification_type: VerificationType,
+    token: String,
+    created_at: DateTime,
+    expires_at: DateTime
+}
+
+enum VerificationType {
+    Email,
+    Phone,
+    PasswordReset,
+    MfaSetup
+}
+
+type MfaChallenge {
+    token: String,
+    user_id: UserId,
+    methods: List<MfaMethod>,
+    created_at: DateTime,
+    expires_at: DateTime,
+    attempts: i32
+}
+
+// =============================================================================
+// Authentication Manager Actor
+// =============================================================================
+
+/// Main authentication manager for the LMS
+actor AuthManager {
+    var config: AuthConfig
+    var tenant_id: TenantId
+
+    // Session management
+    var sessions: Map<SessionId, AuthSession> = {}
+    var user_sessions: Map<UserId, Set<SessionId>> = {}
+
+    // Token management
+    var tokens: Map<String, AuthToken> = {}
+    var refresh_tokens: Map<String, AuthToken> = {}
+
+    // MFA
+    var mfa_enrollments: Map<UserId, List<MfaEnrollment>> = {}
+    var backup_codes: Map<UserId, BackupCodes> = {}
+    var mfa_challenges: Map<String, MfaChallenge> = {}
+
+    // OAuth state
+    var oauth_states: Map<String, OAuthState> = {}
+    var linked_accounts: Map<UserId, List<LinkedAccount>> = {}
+
+    // Login tracking
+    var login_attempts: Map<String, LoginAttemptTracker> = {}
+    var pending_verifications: Map<String, PendingVerification> = {}
+    var password_reset_tokens: Map<String, PasswordResetToken> = {}
+
+    // Password history
+    var password_history: Map<UserId, List<String>> = {}
+
+    // Dependencies
+    let storage: &EntityStorage
+    let security_manager: &SecurityManager
+    var http_client: HttpClient
+
+    fn new(
+        config: AuthConfig,
+        tenant_id: TenantId,
+        storage: &EntityStorage,
+        security_manager: &SecurityManager
+    ) -> Self {
+        AuthManager {
+            config,
+            tenant_id,
+            storage,
+            security_manager,
+            sessions: {},
+            user_sessions: {},
+            tokens: {},
+            refresh_tokens: {},
+            mfa_enrollments: {},
+            backup_codes: {},
+            mfa_challenges: {},
+            oauth_states: {},
+            linked_accounts: {},
+            login_attempts: {},
+            pending_verifications: {},
+            password_reset_tokens: {},
+            password_history: {},
+            http_client: HttpClient::new()
+        }
+    }
+
+    // =========================================================================
+    // Local Authentication
+    // =========================================================================
+
+    /// Authenticate with username/email and password
+    receive Login(
+        request: LoginRequest,
+        ip_address: Option<String>,
+        user_agent: Option<String>
+    ) -> LoginResponse {
+        let identifier = request.username_or_email.to_lowercase();
+
+        // Check if locked out
+        if self.is_locked(&identifier) {
+            let lockout_until = self.get_lockout_time(&identifier);
+            return LoginResponse {
+                success: false,
+                session: None,
+                tokens: None,
+                requires_mfa: false,
+                mfa_methods: vec![],
+                user: None,
+                error: Some(LoginError::AccountLocked { until: lockout_until }),
+                mfa_challenge_token: None
+            };
+        }
+
+        // Find user
+        let user = match self.find_user_by_identifier(&identifier) {
+            Some(u) => u,
+            None => {
+                self.record_failed_attempt(&identifier, &ip_address);
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: false,
+                    mfa_methods: vec![],
+                    user: None,
+                    error: Some(LoginError::InvalidCredentials),
+                    mfa_challenge_token: None
+                };
+            }
+        };
+
+        // Check user status
+        match &user.status {
+            UserStatus::Suspended { reason, .. } => {
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: false,
+                    mfa_methods: vec![],
+                    user: None,
+                    error: Some(LoginError::AccountSuspended { reason: reason.clone() }),
+                    mfa_challenge_token: None
+                };
+            },
+            UserStatus::Deactivated => {
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: false,
+                    mfa_methods: vec![],
+                    user: None,
+                    error: Some(LoginError::AccountDeactivated),
+                    mfa_challenge_token: None
+                };
+            },
+            UserStatus::Locked { until } => {
+                if DateTime::now() < *until {
+                    return LoginResponse {
+                        success: false,
+                        session: None,
+                        tokens: None,
+                        requires_mfa: false,
+                        mfa_methods: vec![],
+                        user: None,
+                        error: Some(LoginError::AccountLocked { until: *until }),
+                        mfa_challenge_token: None
+                    };
+                }
+            },
+            _ => {}
+        }
+
+        // Verify password
+        let password_hash = match &user.password_hash {
+            Some(h) => h,
+            None => {
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: false,
+                    mfa_methods: vec![],
+                    user: None,
+                    error: Some(LoginError::InvalidCredentials),
+                    mfa_challenge_token: None
+                };
+            }
+        };
+
+        if !verify_password(&request.password, password_hash) {
+            self.record_failed_attempt(&identifier, &ip_address);
+            return LoginResponse {
+                success: false,
+                session: None,
+                tokens: None,
+                requires_mfa: false,
+                mfa_methods: vec![],
+                user: None,
+                error: Some(LoginError::InvalidCredentials),
+                mfa_challenge_token: None
+            };
+        }
+
+        // Check email verification
+        if self.config.require_email_verification && !user.email_verified {
+            return LoginResponse {
+                success: false,
+                session: None,
+                tokens: None,
+                requires_mfa: false,
+                mfa_methods: vec![],
+                user: None,
+                error: Some(LoginError::EmailNotVerified),
+                mfa_challenge_token: None
+            };
+        }
+
+        // Check password expiration
+        if let Some(max_age_days) = self.config.password_max_age_days {
+            if let Some(changed_at) = user.password_changed_at {
+                let expiry = changed_at + Duration::from_days(max_age_days as i64);
+                if DateTime::now() > expiry {
+                    return LoginResponse {
+                        success: false,
+                        session: None,
+                        tokens: None,
+                        requires_mfa: false,
+                        mfa_methods: vec![],
+                        user: None,
+                        error: Some(LoginError::PasswordExpired),
+                        mfa_challenge_token: None
+                    };
+                }
+            }
+        }
+
+        // Check MFA requirement
+        let user_mfa = self.get_verified_mfa_methods(&user.id);
+        let mfa_required = !user_mfa.is_empty() ||
+            user.roles.iter().any(|r| self.config.mfa_required_for_roles.contains(&r.0));
+
+        if mfa_required {
+            if let Some(mfa_code) = &request.mfa_code {
+                // Verify MFA code
+                if !self.verify_mfa_code(&user.id, mfa_code, request.mfa_method.as_ref()) {
+                    return LoginResponse {
+                        success: false,
+                        session: None,
+                        tokens: None,
+                        requires_mfa: true,
+                        mfa_methods: user_mfa.iter().map(|e| e.method.clone()).collect(),
+                        user: None,
+                        error: Some(LoginError::InvalidMfaCode),
+                        mfa_challenge_token: None
+                    };
+                }
+            } else {
+                // MFA code not provided - create challenge
+                let challenge = self.create_mfa_challenge(&user.id, &user_mfa);
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: true,
+                    mfa_methods: user_mfa.iter().map(|e| e.method.clone()).collect(),
+                    user: None,
+                    error: Some(LoginError::MfaRequired),
+                    mfa_challenge_token: Some(challenge.token)
+                };
+            }
+        }
+
+        // Clear login attempts on success
+        self.clear_login_attempts(&identifier);
+
+        // Check session limit
+        if let Some(max_sessions) = self.config.max_sessions_per_user {
+            self.enforce_session_limit(&user.id, max_sessions);
+        }
+
+        // Create session
+        let session = self.create_session(
+            &user.id,
+            &user.tenant_id,
+            AuthMethod::Password,
+            ip_address,
+            user_agent,
+            request.device_info,
+            mfa_required
+        );
+
+        // Generate tokens
+        let tokens = self.generate_token_pair(&user, &session);
+
+        // Update last login
+        self.update_last_login(&user.id);
+
+        checkpoint();
+
+        LoginResponse {
+            success: true,
+            session: Some(session),
+            tokens: Some(tokens),
+            requires_mfa: false,
+            mfa_methods: vec![],
+            user: Some(self.build_authenticated_user(&user)),
+            error: None,
+            mfa_challenge_token: None
+        }
+    }
+
+    /// Complete MFA challenge
+    receive CompleteMfaChallenge(
+        challenge_token: String,
+        mfa_code: String,
+        mfa_method: Option<MfaMethod>,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+        device_info: Option<DeviceInfo>
+    ) -> LoginResponse {
+        let challenge = match self.mfa_challenges.get_mut(&challenge_token) {
+            Some(c) => c,
+            None => {
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: true,
+                    mfa_methods: vec![],
+                    user: None,
+                    error: Some(LoginError::InvalidMfaCode),
+                    mfa_challenge_token: None
+                };
+            }
+        };
+
+        // Check expiration
+        if DateTime::now() > challenge.expires_at {
+            self.mfa_challenges.remove(&challenge_token);
+            return LoginResponse {
+                success: false,
+                session: None,
+                tokens: None,
+                requires_mfa: true,
+                mfa_methods: vec![],
+                user: None,
+                error: Some(LoginError::InvalidMfaCode),
+                mfa_challenge_token: None
+            };
+        }
+
+        // Increment attempts
+        challenge.attempts += 1;
+        if challenge.attempts > 5 {
+            self.mfa_challenges.remove(&challenge_token);
+            return LoginResponse {
+                success: false,
+                session: None,
+                tokens: None,
+                requires_mfa: true,
+                mfa_methods: vec![],
+                user: None,
+                error: Some(LoginError::InvalidMfaCode),
+                mfa_challenge_token: None
+            };
+        }
+
+        // Verify MFA code
+        if !self.verify_mfa_code(&challenge.user_id, &mfa_code, mfa_method.as_ref()) {
+            return LoginResponse {
+                success: false,
+                session: None,
+                tokens: None,
+                requires_mfa: true,
+                mfa_methods: challenge.methods.clone(),
+                user: None,
+                error: Some(LoginError::InvalidMfaCode),
+                mfa_challenge_token: Some(challenge_token)
+            };
+        }
+
+        let user_id = challenge.user_id.clone();
+        self.mfa_challenges.remove(&challenge_token);
+
+        // Get user
+        let user = match self.find_user_by_id(&user_id) {
+            Some(u) => u,
+            None => {
+                return LoginResponse {
+                    success: false,
+                    session: None,
+                    tokens: None,
+                    requires_mfa: false,
+                    mfa_methods: vec![],
+                    user: None,
+                    error: Some(LoginError::InvalidCredentials),
+                    mfa_challenge_token: None
+                };
+            }
+        };
+
+        // Create session
+        let session = self.create_session(
+            &user.id,
+            &user.tenant_id,
+            AuthMethod::Password,
+            ip_address,
+            user_agent,
+            device_info,
+            true
+        );
+
+        // Generate tokens
+        let tokens = self.generate_token_pair(&user, &session);
+
+        // Update last login
+        self.update_last_login(&user.id);
+
+        checkpoint();
+
+        LoginResponse {
+            success: true,
+            session: Some(session),
+            tokens: Some(tokens),
+            requires_mfa: false,
+            mfa_methods: vec![],
+            user: Some(self.build_authenticated_user(&user)),
+            error: None,
+            mfa_challenge_token: None
+        }
+    }
+
+    /// Logout and invalidate session
+    receive Logout(session_id: SessionId) -> Result<(), AuthError> {
+        if let Some(session) = self.sessions.remove(&session_id) {
+            // Remove from user sessions
+            if let Some(user_sessions) = self.user_sessions.get_mut(&session.user_id) {
+                user_sessions.remove(&session_id);
+            }
+
+            // Revoke associated tokens
+            for token in self.tokens.values_mut() {
+                if token.session_id.as_ref() == Some(&session_id) {
+                    token.revoked = true;
+                    token.revoked_at = Some(DateTime::now());
+                    token.revoked_reason = Some("Logout".to_string());
+                }
+            }
+
+            checkpoint();
+            Ok(())
+        } else {
+            Err(AuthError::SessionNotFound)
+        }
+    }
+
+    /// Logout from all devices
+    receive LogoutAll(user_id: UserId) -> Result<i32, AuthError> {
+        let mut count = 0;
+
+        // Remove all sessions
+        if let Some(session_ids) = self.user_sessions.remove(&user_id) {
+            for session_id in session_ids {
+                self.sessions.remove(&session_id);
+                count += 1;
+            }
+        }
+
+        // Revoke all tokens
+        for token in self.tokens.values_mut() {
+            if token.user_id == user_id {
+                token.revoked = true;
+                token.revoked_at = Some(DateTime::now());
+                token.revoked_reason = Some("Logout all".to_string());
+            }
+        }
+
+        checkpoint();
+        Ok(count)
+    }
+
+    // =========================================================================
+    // OAuth 2.0 / OpenID Connect
+    // =========================================================================
+
+    /// Start OAuth authorization flow
+    receive StartOAuthFlow(request: OAuthAuthorizationRequest) -> Result<String, AuthError> {
+        let provider = self.config.oauth_providers.get(&request.provider_id)
+            .ok_or(AuthError::ProviderNotFound { id: request.provider_id.clone() })?;
+
+        if !provider.enabled {
+            return Err(AuthError::ProviderDisabled { id: request.provider_id.clone() });
+        }
+
+        // Generate state
+        let state = generate_random_string(32);
+
+        // Store state
+        self.oauth_states.insert(state.clone(), OAuthState {
+            provider_id: request.provider_id.clone(),
+            state: state.clone(),
+            nonce: request.nonce.clone(),
+            code_verifier: request.code_verifier.clone(),
+            redirect_uri: request.redirect_uri.clone(),
+            created_at: DateTime::now(),
+            expires_at: DateTime::now() + Duration::from_minutes(10)
+        });
+
+        // Build authorization URL
+        let mut auth_url = format!(
+            "{}?client_id={}&redirect_uri={}&response_type={}&scope={}&state={}",
+            provider.authorization_url,
+            url_encode(&provider.client_id),
+            url_encode(&request.redirect_uri),
+            url_encode(&provider.response_type),
+            url_encode(&provider.scopes.join(" ")),
+            url_encode(&state)
+        );
+
+        // Add PKCE if enabled
+        if provider.pkce_enabled {
+            if let Some(verifier) = &request.code_verifier {
+                let challenge = base64_url_encode(&sha256(verifier.as_bytes()));
+                auth_url.push_str(&format!("&code_challenge={}&code_challenge_method=S256", challenge));
+            }
+        }
+
+        // Add nonce for OIDC
+        if provider.nonce_parameter {
+            if let Some(nonce) = &request.nonce {
+                auth_url.push_str(&format!("&nonce={}", url_encode(nonce)));
+            }
+        }
+
+        checkpoint();
+        Ok(auth_url)
+    }
+
+    /// Handle OAuth callback
+    receive HandleOAuthCallback(
+        request: OAuthCallbackRequest,
+        ip_address: Option<String>,
+        user_agent: Option<String>
+    ) -> Result<LoginResponse, AuthError> {
+        // Validate state
+        let oauth_state = self.oauth_states.remove(&request.state)
+            .ok_or(AuthError::InvalidState)?;
+
+        if DateTime::now() > oauth_state.expires_at {
+            return Err(AuthError::StateExpired);
+        }
+
+        if oauth_state.provider_id != request.provider_id {
+            return Err(AuthError::ProviderMismatch);
+        }
+
+        let provider = self.config.oauth_providers.get(&request.provider_id)
+            .ok_or(AuthError::ProviderNotFound { id: request.provider_id.clone() })?;
+
+        // Exchange code for tokens
+        let token_response = self.exchange_oauth_code(provider, &request.code, &oauth_state)?;
+
+        // Get user info
+        let user_info = self.get_oauth_user_info(provider, &token_response)?;
+
+        // Find or create user
+        let user = self.find_or_create_oauth_user(provider, &user_info)?;
+
+        // Link account if not already linked
+        self.link_oauth_account(&user.id, &user_info);
+
+        // Create session
+        let session = self.create_session(
+            &user.id,
+            &user.tenant_id,
+            AuthMethod::OAuth { provider: request.provider_id.clone() },
+            ip_address,
+            user_agent,
+            None,
+            false
+        );
+
+        // Generate tokens
+        let tokens = self.generate_token_pair(&user, &session);
+
+        // Update last login
+        self.update_last_login(&user.id);
+
+        checkpoint();
+
+        Ok(LoginResponse {
+            success: true,
+            session: Some(session),
+            tokens: Some(tokens),
+            requires_mfa: false,
+            mfa_methods: vec![],
+            user: Some(self.build_authenticated_user(&user)),
+            error: None,
+            mfa_challenge_token: None
+        })
+    }
+
+    fn exchange_oauth_code(
+        &self,
+        provider: &OAuthProviderConfig,
+        code: &str,
+        state: &OAuthState
+    ) -> Result<OAuthTokenResponse, AuthError> {
+        let mut form_data = Map::from([
+            ("grant_type".to_string(), "authorization_code".to_string()),
+            ("code".to_string(), code.to_string()),
+            ("redirect_uri".to_string(), state.redirect_uri.clone()),
+            ("client_id".to_string(), provider.client_id.clone()),
+            ("client_secret".to_string(), provider.client_secret.clone())
+        ]);
+
+        if provider.pkce_enabled {
+            if let Some(verifier) = &state.code_verifier {
+                form_data.insert("code_verifier".to_string(), verifier.clone());
+            }
+        }
+
+        let request = HttpRequest::post(&provider.token_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(form_data);
+
+        let response = self.http_client.send(request)
+            .map_err(|e| AuthError::TokenExchangeFailed { message: e.to_string() })?;
+
+        if response.status != 200 {
+            return Err(AuthError::TokenExchangeFailed { message: response.body });
+        }
+
+        std::json::from_str(&response.body)
+            .map_err(|e| AuthError::InvalidResponse { message: e.to_string() })
+    }
+
+    fn get_oauth_user_info(
+        &self,
+        provider: &OAuthProviderConfig,
+        token_response: &OAuthTokenResponse
+    ) -> Result<OAuthUserInfo, AuthError> {
+        // If we have an ID token, decode it
+        if let Some(id_token) = &token_response.id_token {
+            return self.decode_id_token(provider, id_token);
+        }
+
+        // Otherwise call userinfo endpoint
+        if let Some(userinfo_url) = &provider.userinfo_url {
+            let request = HttpRequest::get(userinfo_url)
+                .header("Authorization", format!("Bearer {}", token_response.access_token));
+
+            let response = self.http_client.send(request)
+                .map_err(|e| AuthError::UserInfoFailed { message: e.to_string() })?;
+
+            if response.status != 200 {
+                return Err(AuthError::UserInfoFailed { message: response.body });
+            }
+
+            let claims: Map<String, Dynamic> = std::json::from_str(&response.body)
+                .map_err(|e| AuthError::InvalidResponse { message: e.to_string() })?;
+
+            Ok(OAuthUserInfo {
+                provider_id: provider.id.clone(),
+                provider_user_id: claims.get(&provider.user_id_claim)
+                    .and_then(|v| v.as_string())
+                    .ok_or(AuthError::MissingClaim { claim: provider.user_id_claim.clone() })?,
+                email: claims.get(&provider.email_claim).and_then(|v| v.as_string()),
+                email_verified: claims.get("email_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+                name: claims.get(&provider.name_claim).and_then(|v| v.as_string()),
+                first_name: provider.first_name_claim.as_ref()
+                    .and_then(|c| claims.get(c)).and_then(|v| v.as_string()),
+                last_name: provider.last_name_claim.as_ref()
+                    .and_then(|c| claims.get(c)).and_then(|v| v.as_string()),
+                picture: provider.picture_claim.as_ref()
+                    .and_then(|c| claims.get(c)).and_then(|v| v.as_string()),
+                locale: claims.get("locale").and_then(|v| v.as_string()),
+                raw_claims: claims
+            })
+        } else {
+            Err(AuthError::NoUserInfoEndpoint)
+        }
+    }
+
+    fn decode_id_token(&self, provider: &OAuthProviderConfig, id_token: &str) -> Result<OAuthUserInfo, AuthError> {
+        let parts: Vec<&str> = id_token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(AuthError::InvalidIdToken);
+        }
+
+        let claims_json = base64_url_decode(parts[1])
+            .map_err(|_| AuthError::InvalidIdToken)?;
+        let claims: Map<String, Dynamic> = std::json::from_str(&claims_json)
+            .map_err(|_| AuthError::InvalidIdToken)?;
+
+        Ok(OAuthUserInfo {
+            provider_id: provider.id.clone(),
+            provider_user_id: claims.get(&provider.user_id_claim)
+                .and_then(|v| v.as_string())
+                .ok_or(AuthError::MissingClaim { claim: provider.user_id_claim.clone() })?,
+            email: claims.get(&provider.email_claim).and_then(|v| v.as_string()),
+            email_verified: claims.get("email_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+            name: claims.get(&provider.name_claim).and_then(|v| v.as_string()),
+            first_name: provider.first_name_claim.as_ref()
+                .and_then(|c| claims.get(c)).and_then(|v| v.as_string()),
+            last_name: provider.last_name_claim.as_ref()
+                .and_then(|c| claims.get(c)).and_then(|v| v.as_string()),
+            picture: provider.picture_claim.as_ref()
+                .and_then(|c| claims.get(c)).and_then(|v| v.as_string()),
+            locale: claims.get("locale").and_then(|v| v.as_string()),
+            raw_claims: claims
+        })
+    }
+
+    fn find_or_create_oauth_user(&mut self, provider: &OAuthProviderConfig, user_info: &OAuthUserInfo) -> Result<User, AuthError> {
+        // Check if already linked
+        for (uid, accounts) in &self.linked_accounts {
+            for account in accounts {
+                if account.provider_id == user_info.provider_id &&
+                   account.provider_user_id == user_info.provider_user_id {
+                    return self.find_user_by_id(uid)
+                        .ok_or(AuthError::UserNotFound);
+                }
+            }
+        }
+
+        // Check if user exists with same email
+        if let Some(email) = &user_info.email {
+            if let Some(user) = self.find_user_by_identifier(email) {
+                return Ok(user);
+            }
+        }
+
+        // Create new user if auto-create enabled
+        if !provider.auto_create_user {
+            return Err(AuthError::UserNotFound);
+        }
+
+        let email = user_info.email.clone()
+            .ok_or(AuthError::EmailRequired)?;
+
+        let display_name = user_info.name.clone()
+            .or_else(|| {
+                match (&user_info.first_name, &user_info.last_name) {
+                    (Some(f), Some(l)) => Some(format!("{} {}", f, l)),
+                    (Some(f), None) => Some(f.clone()),
+                    (None, Some(l)) => Some(l.clone()),
+                    _ => None
+                }
+            })
+            .unwrap_or_else(|| email.split('@').next().unwrap_or("User").to_string());
+
+        let user = self.create_user_internal(CreateUserRequest {
+            username: email.split('@').next().unwrap_or("user").to_string(),
+            email,
+            password: None,
+            display_name,
+            first_name: user_info.first_name.clone(),
+            last_name: user_info.last_name.clone(),
+            roles: provider.default_roles.clone(),
+            tenant_id: self.tenant_id.clone(),
+            external_id: None,
+            send_verification_email: false
+        })?;
+
+        Ok(user)
+    }
+
+    fn link_oauth_account(&mut self, user_id: &UserId, user_info: &OAuthUserInfo) {
+        let linked = LinkedAccount {
+            user_id: user_id.clone(),
+            provider_id: user_info.provider_id.clone(),
+            provider_user_id: user_info.provider_user_id.clone(),
+            email: user_info.email.clone(),
+            access_token: None,
+            refresh_token: None,
+            linked_at: DateTime::now(),
+            metadata: user_info.raw_claims.clone()
+        };
+
+        self.linked_accounts.entry(user_id.clone())
+            .or_default()
+            .push(linked);
+    }
+
+    // =========================================================================
+    // SAML 2.0 Authentication
+    // =========================================================================
+
+    /// Start SAML authentication flow
+    receive StartSamlFlow(request: SamlAuthRequest) -> Result<SamlAuthResponse, AuthError> {
+        let provider = self.config.saml_providers.get(&request.provider_id)
+            .ok_or(AuthError::ProviderNotFound { id: request.provider_id.clone() })?;
+
+        if !provider.enabled {
+            return Err(AuthError::ProviderDisabled { id: request.provider_id.clone() });
+        }
+
+        let request_id = format!("_{}", generate_random_string(32));
+        let issue_instant = DateTime::now().to_rfc3339();
+
+        // Build SAML AuthnRequest
+        let authn_request = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+    xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+    ID="{}"
+    Version="2.0"
+    IssueInstant="{}"
+    Destination="{}"
+    AssertionConsumerServiceURL="{}"
+    ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST">
+    <saml:Issuer>{}</saml:Issuer>
+    <samlp:NameIDPolicy Format="{}" AllowCreate="true"/>
+</samlp:AuthnRequest>"#,
+            request_id,
+            issue_instant,
+            provider.idp_sso_url,
+            provider.sp_acs_url,
+            provider.sp_entity_id,
+            match provider.name_id_format {
+                SamlNameIdFormat::EmailAddress => "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                SamlNameIdFormat::Persistent => "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+                SamlNameIdFormat::Transient => "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+                _ => "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"
+            }
+        );
+
+        // Sign if required
+        let final_request = if provider.sign_requests {
+            self.sign_saml_request(&authn_request, provider)?
+        } else {
+            authn_request
+        };
+
+        // Encode for redirect
+        let encoded_request = base64_encode(&deflate_compress(&final_request));
+        let saml_request = url_encode(&encoded_request);
+
+        let mut redirect_url = format!("{}?SAMLRequest={}", provider.idp_sso_url, saml_request);
+
+        if let Some(relay_state) = &request.relay_state {
+            redirect_url.push_str(&format!("&RelayState={}", url_encode(relay_state)));
+        }
+
+        Ok(SamlAuthResponse {
+            redirect_url,
+            request_id
+        })
+    }
+
+    /// Handle SAML response
+    receive HandleSamlResponse(
+        response: SamlResponse,
+        ip_address: Option<String>,
+        user_agent: Option<String>
+    ) -> Result<LoginResponse, AuthError> {
+        let provider = self.config.saml_providers.get(&response.provider_id)
+            .ok_or(AuthError::ProviderNotFound { id: response.provider_id.clone() })?;
+
+        // Decode and validate SAML response
+        let decoded_assertion = base64_decode(&response.assertion)
+            .map_err(|_| AuthError::InvalidSamlResponse)?;
+
+        // Parse SAML response
+        let saml_user = self.parse_saml_response(provider, &decoded_assertion)?;
+
+        // Find or create user
+        let user = self.find_or_create_saml_user(provider, &saml_user)?;
+
+        // Create session
+        let session = self.create_session(
+            &user.id,
+            &user.tenant_id,
+            AuthMethod::Saml { provider: response.provider_id.clone() },
+            ip_address,
+            user_agent,
+            None,
+            false
+        );
+
+        // Generate tokens
+        let tokens = self.generate_token_pair(&user, &session);
+
+        // Update last login
+        self.update_last_login(&user.id);
+
+        checkpoint();
+
+        Ok(LoginResponse {
+            success: true,
+            session: Some(session),
+            tokens: Some(tokens),
+            requires_mfa: false,
+            mfa_methods: vec![],
+            user: Some(self.build_authenticated_user(&user)),
+            error: None,
+            mfa_challenge_token: None
+        })
+    }
+
+    fn parse_saml_response(&self, provider: &SamlProviderConfig, response_xml: &str) -> Result<SamlUserInfo, AuthError> {
+        let xml = std::xml::parse(response_xml)
+            .map_err(|_| AuthError::InvalidSamlResponse)?;
+
+        // Verify signature if required
+        if provider.want_response_signed || provider.want_assertions_signed {
+            self.verify_saml_signature(&xml, &provider.idp_certificate)?;
+        }
+
+        let name_id = xml.find("//saml:NameID/text()")
+            .ok_or(AuthError::MissingSamlAttribute { attribute: "NameID".to_string() })?;
+
+        let session_index = xml.find("//samlp:AuthnStatement/@SessionIndex");
+
+        let mut attributes: Map<String, List<String>> = Map::new();
+        for attr in xml.find_all("//saml:Attribute") {
+            let name = attr.attribute("Name").unwrap_or_default();
+            let values: List<String> = attr.find_all("saml:AttributeValue")
+                .map(|v| v.text().unwrap_or_default())
+                .collect();
+            attributes.insert(name.to_string(), values);
+        }
+
+        Ok(SamlUserInfo {
+            provider_id: provider.id.clone(),
+            name_id,
+            session_index,
+            attributes
+        })
+    }
+
+    fn find_or_create_saml_user(&mut self, provider: &SamlProviderConfig, user_info: &SamlUserInfo) -> Result<User, AuthError> {
+        let email = user_info.attributes.get(&provider.email_attribute)
+            .and_then(|v| v.first().cloned())
+            .ok_or(AuthError::MissingSamlAttribute { attribute: provider.email_attribute.clone() })?;
+
+        if let Some(user) = self.find_user_by_identifier(&email) {
+            return Ok(user);
+        }
+
+        if !provider.auto_create_user {
+            return Err(AuthError::UserNotFound);
+        }
+
+        let name = user_info.attributes.get(&provider.name_attribute)
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_default();
+
+        let first_name = provider.first_name_attribute.as_ref()
+            .and_then(|a| user_info.attributes.get(a))
+            .and_then(|v| v.first().cloned());
+
+        let last_name = provider.last_name_attribute.as_ref()
+            .and_then(|a| user_info.attributes.get(a))
+            .and_then(|v| v.first().cloned());
+
+        let user = self.create_user_internal(CreateUserRequest {
+            username: email.split('@').next().unwrap_or("user").to_string(),
+            email,
+            password: None,
+            display_name: name,
+            first_name,
+            last_name,
+            roles: provider.default_roles.clone(),
+            tenant_id: self.tenant_id.clone(),
+            external_id: None,
+            send_verification_email: false
+        })?;
+
+        Ok(user)
+    }
+
+    fn sign_saml_request(&self, request: &str, provider: &SamlProviderConfig) -> Result<String, AuthError> {
+        if let Some(private_key) = &provider.sp_private_key {
+            std::crypto::sign_xml(request, private_key)
+                .map_err(|e| AuthError::SamlSigningFailed { message: e.to_string() })
+        } else {
+            Err(AuthError::NoPrivateKey)
+        }
+    }
+
+    fn verify_saml_signature(&self, xml: &XmlDocument, certificate: &str) -> Result<(), AuthError> {
+        std::crypto::verify_xml_signature(xml, certificate)
+            .map_err(|e| AuthError::InvalidSamlSignature { message: e.to_string() })
+    }
+
+    // =========================================================================
+    // MFA Management
+    // =========================================================================
+
+    /// Enroll in TOTP MFA
+    receive EnrollTotp(user_id: UserId) -> Result<TotpEnrollment, AuthError> {
+        let secret = base32_encode(&random_bytes(20));
+        let id = generate_uuid();
+
+        let enrollment = MfaEnrollment {
+            id: id.clone(),
+            user_id: user_id.clone(),
+            method: MfaMethod::Totp,
+            secret: Some(secret.clone()),
+            phone_number: None,
+            email: None,
+            verified: false,
+            created_at: DateTime::now(),
+            last_used: None,
+            credential_id: None,
+            public_key: None,
+            metadata: Map::new()
+        };
+
+        self.mfa_enrollments.entry(user_id.clone())
+            .or_default()
+            .push(enrollment);
+
+        // Get user email for label
+        let user = self.find_user_by_id(&user_id)
+            .ok_or(AuthError::UserNotFound)?;
+
+        let provisioning_uri = format!(
+            "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30",
+            url_encode(&self.config.jwt_issuer),
+            url_encode(&user.email),
+            secret,
+            url_encode(&self.config.jwt_issuer)
+        );
+
+        checkpoint();
+
+        Ok(TotpEnrollment {
+            id,
+            secret,
+            provisioning_uri: provisioning_uri.clone(),
+            qr_code: generate_qr_code(&provisioning_uri)
+        })
+    }
+
+    /// Verify and activate TOTP enrollment
+    receive VerifyTotpEnrollment(user_id: UserId, mfa_id: MfaSecretId, code: String) -> Result<(), AuthError> {
+        let enrollments = self.mfa_enrollments.get_mut(&user_id)
+            .ok_or(AuthError::MfaNotEnrolled)?;
+
+        let enrollment = enrollments.iter_mut()
+            .find(|e| e.id == mfa_id && e.method == MfaMethod::Totp)
+            .ok_or(AuthError::MfaNotEnrolled)?;
+
+        let secret = enrollment.secret.as_ref()
+            .ok_or(AuthError::MfaNotEnrolled)?;
+
+        if !self.verify_totp_code(secret, &code) {
+            return Err(AuthError::InvalidMfaCode);
+        }
+
+        enrollment.verified = true;
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Enroll email MFA
+    receive EnrollEmailMfa(user_id: UserId) -> Result<MfaSecretId, AuthError> {
+        let user = self.find_user_by_id(&user_id)
+            .ok_or(AuthError::UserNotFound)?;
+
+        let id = generate_uuid();
+
+        let enrollment = MfaEnrollment {
+            id: id.clone(),
+            user_id: user_id.clone(),
+            method: MfaMethod::Email,
+            secret: None,
+            phone_number: None,
+            email: Some(user.email.clone()),
+            verified: true, // Email is already verified
+            created_at: DateTime::now(),
+            last_used: None,
+            credential_id: None,
+            public_key: None,
+            metadata: Map::new()
+        };
+
+        self.mfa_enrollments.entry(user_id)
+            .or_default()
+            .push(enrollment);
+
+        checkpoint();
+        Ok(id)
+    }
+
+    /// Generate backup codes
+    receive GenerateBackupCodes(user_id: UserId) -> Result<List<String>, AuthError> {
+        let codes: List<String> = (0..10)
+            .map(|_| generate_random_string(8).to_uppercase())
+            .collect();
+
+        let code_hashes: List<BackupCode> = codes.iter()
+            .map(|c| BackupCode {
+                code_hash: hash_password(c).unwrap(),
+                used: false,
+                used_at: None
+            })
+            .collect();
+
+        self.backup_codes.insert(user_id.clone(), BackupCodes {
+            user_id: user_id.clone(),
+            codes: code_hashes,
+            generated_at: DateTime::now()
+        });
+
+        // Add backup as MFA method
+        let enrollment = MfaEnrollment {
+            id: generate_uuid(),
+            user_id: user_id.clone(),
+            method: MfaMethod::Backup,
+            secret: None,
+            phone_number: None,
+            email: None,
+            verified: true,
+            created_at: DateTime::now(),
+            last_used: None,
+            credential_id: None,
+            public_key: None,
+            metadata: Map::new()
+        };
+
+        self.mfa_enrollments.entry(user_id)
+            .or_default()
+            .push(enrollment);
+
+        checkpoint();
+        Ok(codes)
+    }
+
+    /// Get user's MFA enrollments
+    receive GetMfaEnrollments(user_id: UserId) -> List<MfaEnrollment> {
+        self.mfa_enrollments.get(&user_id)
+            .map(|e| e.iter().filter(|m| m.verified).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove MFA enrollment
+    receive RemoveMfaEnrollment(user_id: UserId, mfa_id: MfaSecretId) -> Result<(), AuthError> {
+        if let Some(enrollments) = self.mfa_enrollments.get_mut(&user_id) {
+            enrollments.retain(|e| e.id != mfa_id);
+            checkpoint();
+        }
+        Ok(())
+    }
+
+    fn get_verified_mfa_methods(&self, user_id: &UserId) -> List<MfaEnrollment> {
+        self.mfa_enrollments.get(user_id)
+            .map(|e| e.iter().filter(|m| m.verified).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn create_mfa_challenge(&mut self, user_id: &UserId, methods: &List<MfaEnrollment>) -> MfaChallenge {
+        let challenge = MfaChallenge {
+            token: generate_random_string(64),
+            user_id: user_id.clone(),
+            methods: methods.iter().map(|m| m.method.clone()).collect(),
+            created_at: DateTime::now(),
+            expires_at: DateTime::now() + Duration::from_minutes(5),
+            attempts: 0
+        };
+
+        self.mfa_challenges.insert(challenge.token.clone(), challenge.clone());
+        challenge
+    }
+
+    fn verify_mfa_code(&mut self, user_id: &UserId, code: &str, method: Option<&MfaMethod>) -> Bool {
+        let enrollments = match self.mfa_enrollments.get(user_id) {
+            Some(e) => e,
+            None => return false
+        };
+
+        for enrollment in enrollments.iter().filter(|e| e.verified) {
+            // If method specified, only check that method
+            if let Some(m) = method {
+                if &enrollment.method != m {
+                    continue;
+                }
+            }
+
+            match &enrollment.method {
+                MfaMethod::Totp => {
+                    if let Some(secret) = &enrollment.secret {
+                        if self.verify_totp_code(secret, code) {
+                            return true;
+                        }
+                    }
+                },
+                MfaMethod::Backup => {
+                    if self.verify_backup_code(user_id, code) {
+                        return true;
+                    }
+                },
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn verify_totp_code(&self, secret: &str, code: &str) -> Bool {
+        let secret_bytes = base32_decode(secret).unwrap_or(vec![]);
+        let time_step = (DateTime::now().timestamp() / 30) as u64;
+
+        // Check current and adjacent time steps
+        for offset in -1i64..=1 {
+            let counter = (time_step as i64 + offset) as u64;
+            let expected = self.generate_totp(&secret_bytes, counter);
+            if expected == code {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn generate_totp(&self, secret: &[u8], counter: u64) -> String {
+        let counter_bytes = counter.to_be_bytes();
+        let hash = hmac_sha256(secret, &counter_bytes);
+
+        let offset = (hash[hash.len() - 1] & 0x0f) as usize;
+        let binary = ((hash[offset] & 0x7f) as u32) << 24
+            | (hash[offset + 1] as u32) << 16
+            | (hash[offset + 2] as u32) << 8
+            | (hash[offset + 3] as u32);
+
+        let otp = binary % 1_000_000;
+        format!("{:06}", otp)
+    }
+
+    fn verify_backup_code(&mut self, user_id: &UserId, code: &str) -> Bool {
+        if let Some(backup) = self.backup_codes.get_mut(user_id) {
+            for backup_code in &mut backup.codes {
+                if !backup_code.used && verify_password(code, &backup_code.code_hash) {
+                    backup_code.used = true;
+                    backup_code.used_at = Some(DateTime::now());
+                    checkpoint();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // =========================================================================
+    // Token Management
+    // =========================================================================
+
+    /// Refresh access token
+    receive RefreshToken(refresh_token: String) -> Result<TokenPair, AuthError> {
+        let token = self.refresh_tokens.get(&refresh_token)
+            .ok_or(AuthError::InvalidToken)?;
+
+        if token.revoked {
+            return Err(AuthError::TokenRevoked);
+        }
+
+        if DateTime::now() > token.expires_at {
+            return Err(AuthError::TokenExpired);
+        }
+
+        let user = self.find_user_by_id(&token.user_id)
+            .ok_or(AuthError::UserNotFound)?;
+
+        let session = token.session_id.as_ref()
+            .and_then(|sid| self.sessions.get(sid));
+
+        let tokens = if let Some(s) = session {
+            self.generate_token_pair(&user, s)
+        } else {
+            self.generate_tokens_without_session(&user)
+        };
+
+        checkpoint();
+        Ok(tokens)
+    }
+
+    /// Revoke a token
+    receive RevokeToken(token_value: String, reason: Option<String>) -> Result<(), AuthError> {
+        if let Some(token) = self.tokens.get_mut(&token_value) {
+            token.revoked = true;
+            token.revoked_at = Some(DateTime::now());
+            token.revoked_reason = reason;
+            checkpoint();
+            Ok(())
+        } else {
+            Err(AuthError::InvalidToken)
+        }
+    }
+
+    /// Validate token and return user
+    receive ValidateToken(token_value: String) -> Result<AuthenticatedUser, AuthError> {
+        let claims = self.decode_jwt(&token_value)?;
+
+        let user_id = claims.get("sub")
+            .and_then(|v| v.as_string())
+            .ok_or(AuthError::InvalidToken)?;
+
+        let user = self.find_user_by_id(&UserId(user_id))
+            .ok_or(AuthError::UserNotFound)?;
+
+        Ok(self.build_authenticated_user(&user))
+    }
+
+    fn generate_token_pair(&mut self, user: &User, session: &AuthSession) -> TokenPair {
+        let now = DateTime::now();
+        let access_expires = now + self.config.access_token_lifetime;
+        let refresh_expires = now + self.config.refresh_token_lifetime;
+
+        let access_token = self.generate_jwt(user, &access_expires, Some(&session.id));
+        let refresh_token = generate_random_string(64);
+
+        // Store tokens
+        self.tokens.insert(access_token.clone(), AuthToken {
+            id: generate_uuid(),
+            token_type: TokenType::Access,
+            user_id: user.id.clone(),
+            tenant_id: user.tenant_id.clone(),
+            value: access_token.clone(),
+            created_at: now,
+            expires_at: access_expires,
+            revoked: false,
+            revoked_at: None,
+            revoked_reason: None,
+            scope: Set::from(["read".to_string(), "write".to_string()]),
+            session_id: Some(session.id.clone())
+        });
+
+        self.refresh_tokens.insert(refresh_token.clone(), AuthToken {
+            id: generate_uuid(),
+            token_type: TokenType::Refresh,
+            user_id: user.id.clone(),
+            tenant_id: user.tenant_id.clone(),
+            value: refresh_token.clone(),
+            created_at: now,
+            expires_at: refresh_expires,
+            revoked: false,
+            revoked_at: None,
+            revoked_reason: None,
+            scope: Set::from(["refresh".to_string()]),
+            session_id: Some(session.id.clone())
+        });
+
+        TokenPair {
+            access_token,
+            refresh_token,
+            token_type: "Bearer".to_string(),
+            expires_in: self.config.access_token_lifetime.as_secs(),
+            scope: "read write".to_string(),
+            id_token: None
+        }
+    }
+
+    fn generate_tokens_without_session(&mut self, user: &User) -> TokenPair {
+        let now = DateTime::now();
+        let access_expires = now + self.config.access_token_lifetime;
+        let refresh_expires = now + self.config.refresh_token_lifetime;
+
+        let access_token = self.generate_jwt(user, &access_expires, None);
+        let refresh_token = generate_random_string(64);
+
+        self.tokens.insert(access_token.clone(), AuthToken {
+            id: generate_uuid(),
+            token_type: TokenType::Access,
+            user_id: user.id.clone(),
+            tenant_id: user.tenant_id.clone(),
+            value: access_token.clone(),
+            created_at: now,
+            expires_at: access_expires,
+            revoked: false,
+            revoked_at: None,
+            revoked_reason: None,
+            scope: Set::from(["read".to_string(), "write".to_string()]),
+            session_id: None
+        });
+
+        self.refresh_tokens.insert(refresh_token.clone(), AuthToken {
+            id: generate_uuid(),
+            token_type: TokenType::Refresh,
+            user_id: user.id.clone(),
+            tenant_id: user.tenant_id.clone(),
+            value: refresh_token.clone(),
+            created_at: now,
+            expires_at: refresh_expires,
+            revoked: false,
+            revoked_at: None,
+            revoked_reason: None,
+            scope: Set::from(["refresh".to_string()]),
+            session_id: None
+        });
+
+        TokenPair {
+            access_token,
+            refresh_token,
+            token_type: "Bearer".to_string(),
+            expires_in: self.config.access_token_lifetime.as_secs(),
+            scope: "read write".to_string(),
+            id_token: None
+        }
+    }
+
+    fn generate_jwt(&self, user: &User, expires: &DateTime, session_id: Option<&SessionId>) -> String {
+        let now = DateTime::now();
+
+        let claims = JwtClaims {
+            iss: self.config.jwt_issuer.clone(),
+            sub: user.id.0.clone(),
+            aud: self.config.jwt_audience.clone(),
+            exp: expires.timestamp(),
+            iat: now.timestamp(),
+            nbf: now.timestamp(),
+            jti: generate_uuid(),
+            custom: Map::from([
+                ("email".to_string(), Dynamic::String(user.email.clone())),
+                ("name".to_string(), Dynamic::String(user.display_name.clone())),
+                ("tenant_id".to_string(), Dynamic::String(user.tenant_id.0.clone())),
+                ("roles".to_string(), Dynamic::from(user.roles.iter().map(|r| r.0.clone()).collect::<Vec<_>>())),
+                ("sid".to_string(), Dynamic::String(session_id.map(|s| s.0.clone()).unwrap_or_default()))
+            ])
+        };
+
+        Jwt::encode(&claims, &self.config.jwt_secret, self.config.jwt_algorithm)
+    }
+
+    fn decode_jwt(&self, token: &str) -> Result<Map<String, Dynamic>, AuthError> {
+        Jwt::decode(token, &self.config.jwt_secret, self.config.jwt_algorithm)
+            .map_err(|_| AuthError::InvalidToken)
+    }
+
+    // =========================================================================
+    // Session Management
+    // =========================================================================
+
+    fn create_session(
+        &mut self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        auth_method: AuthMethod,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+        device_info: Option<DeviceInfo>,
+        mfa_verified: Bool
+    ) -> AuthSession {
+        let now = DateTime::now();
+        let session_id = SessionId(generate_random_string(64));
+
+        let device = device_info.or_else(|| {
+            user_agent.as_ref().map(|ua| parse_user_agent(ua))
+        });
+
+        let provider_id = match &auth_method {
+            AuthMethod::OAuth { provider } => Some(provider.clone()),
+            AuthMethod::Saml { provider } => Some(provider.clone()),
+            _ => None
+        };
+
+        let session = AuthSession {
+            id: session_id.clone(),
+            user_id: user_id.clone(),
+            tenant_id: tenant_id.clone(),
+            created_at: now,
+            expires_at: now + self.config.session_lifetime,
+            last_activity: now,
+            ip_address,
+            user_agent,
+            device_info: device,
+            auth_method,
+            mfa_verified,
+            provider_id,
+            current_course_id: None,
+            is_guest: false,
+            metadata: Map::new()
+        };
+
+        self.sessions.insert(session_id.clone(), session.clone());
+        self.user_sessions.entry(user_id.clone())
+            .or_default()
+            .insert(session_id);
+
+        session
+    }
+
+    fn enforce_session_limit(&mut self, user_id: &UserId, max_sessions: i32) {
+        if let Some(session_ids) = self.user_sessions.get_mut(user_id) {
+            while session_ids.len() as i32 > max_sessions {
+                // Remove oldest session
+                let oldest = self.sessions.iter()
+                    .filter(|(id, _)| session_ids.contains(id))
+                    .min_by_key(|(_, s)| s.created_at)
+                    .map(|(id, _)| id.clone());
+
+                if let Some(id) = oldest {
+                    session_ids.remove(&id);
+                    self.sessions.remove(&id);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get user's active sessions
+    receive GetUserSessions(user_id: UserId) -> List<AuthSession> {
+        let now = DateTime::now();
+        self.sessions.values()
+            .filter(|s| s.user_id == user_id && s.expires_at > now)
+            .cloned()
+            .collect()
+    }
+
+    /// Terminate a specific session
+    receive TerminateSession(session_id: SessionId) -> Result<(), AuthError> {
+        if let Some(session) = self.sessions.remove(&session_id) {
+            if let Some(user_sessions) = self.user_sessions.get_mut(&session.user_id) {
+                user_sessions.remove(&session_id);
+            }
+            checkpoint();
+            Ok(())
+        } else {
+            Err(AuthError::SessionNotFound)
+        }
+    }
+
+    /// Update session activity
+    receive TouchSession(session_id: SessionId) -> Result<(), AuthError> {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.last_activity = DateTime::now();
+
+            // Extend session if close to expiry
+            if session.expires_at - DateTime::now() < Duration::from_hours(1) {
+                session.expires_at = DateTime::now() + self.config.session_lifetime;
+            }
+            Ok(())
+        } else {
+            Err(AuthError::SessionNotFound)
+        }
+    }
+
+    /// Set current course context for session
+    receive SetSessionCourse(session_id: SessionId, course_id: Option<CourseId>) -> Result<(), AuthError> {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.current_course_id = course_id;
+            Ok(())
+        } else {
+            Err(AuthError::SessionNotFound)
+        }
+    }
+
+    // =========================================================================
+    // Password Management
+    // =========================================================================
+
+    /// Validate password against policy
+    receive ValidatePassword(password: String) -> PasswordValidationResult {
+        let mut errors = vec![];
+
+        if password.len() < self.config.password_min_length as usize {
+            errors.push(format!("Password must be at least {} characters", self.config.password_min_length));
+        }
+
+        if self.config.password_require_uppercase && !password.chars().any(|c| c.is_uppercase()) {
+            errors.push("Password must contain at least one uppercase letter".to_string());
+        }
+
+        if self.config.password_require_lowercase && !password.chars().any(|c| c.is_lowercase()) {
+            errors.push("Password must contain at least one lowercase letter".to_string());
+        }
+
+        if self.config.password_require_number && !password.chars().any(|c| c.is_numeric()) {
+            errors.push("Password must contain at least one number".to_string());
+        }
+
+        if self.config.password_require_special && !password.chars().any(|c| "!@#$%^&*()_+-=[]{}|;:,.<>?".contains(c)) {
+            errors.push("Password must contain at least one special character".to_string());
+        }
+
+        PasswordValidationResult {
+            valid: errors.is_empty(),
+            errors
+        }
+    }
+
+    /// Change password
+    receive ChangePassword(request: PasswordChangeRequest) -> Result<(), AuthError> {
+        let user = self.find_user_by_id(&request.user_id)
+            .ok_or(AuthError::UserNotFound)?;
+
+        // Verify current password
+        let current_hash = user.password_hash.as_ref()
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        if !verify_password(&request.current_password, current_hash) {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Validate new password
+        let validation = send self <- ValidatePassword(request.new_password.clone());
+        if !validation.valid {
+            return Err(AuthError::PasswordValidationFailed { errors: validation.errors });
+        }
+
+        // Check password history
+        if let Some(history) = self.password_history.get(&request.user_id) {
+            for old_hash in history.iter().take(self.config.password_history_count as usize) {
+                if verify_password(&request.new_password, old_hash) {
+                    return Err(AuthError::PasswordValidationFailed {
+                        errors: vec!["Cannot reuse recent passwords".to_string()]
+                    });
+                }
+            }
+        }
+
+        // Hash new password
+        let new_hash = hash_password(&request.new_password)
+            .map_err(|e| AuthError::Internal { message: e.to_string() })?;
+
+        // Update password history
+        if let Some(old_hash) = &user.password_hash {
+            self.password_history.entry(request.user_id.clone())
+                .or_default()
+                .insert(0, old_hash.clone());
+        }
+
+        // Update user password
+        self.update_user_password(&request.user_id, &new_hash);
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Request password reset
+    receive RequestPasswordReset(request: PasswordResetRequest) -> Result<String, AuthError> {
+        let user = self.find_user_by_identifier(&request.email)
+            .ok_or(AuthError::UserNotFound)?;
+
+        if user.tenant_id != request.tenant_id {
+            return Err(AuthError::TenantNotFound { id: request.tenant_id });
+        }
+
+        let token = generate_random_string(64);
+        let expires_at = DateTime::now() + Duration::from_hours(24);
+
+        self.pending_verifications.insert(token.clone(), PendingVerification {
+            user_id: user.id.clone(),
+            verification_type: VerificationType::PasswordReset,
+            token: token.clone(),
+            created_at: DateTime::now(),
+            expires_at
+        });
+
+        checkpoint();
+        Ok(token)
+    }
+
+    /// Confirm password reset
+    receive ConfirmPasswordReset(request: PasswordResetConfirm) -> Result<(), AuthError> {
+        let verification = self.pending_verifications.remove(&request.token)
+            .ok_or(AuthError::PasswordResetInvalid)?;
+
+        if DateTime::now() > verification.expires_at {
+            return Err(AuthError::PasswordResetExpired);
+        }
+
+        if verification.verification_type != VerificationType::PasswordReset {
+            return Err(AuthError::PasswordResetInvalid);
+        }
+
+        // Validate new password
+        let validation = send self <- ValidatePassword(request.new_password.clone());
+        if !validation.valid {
+            return Err(AuthError::PasswordValidationFailed { errors: validation.errors });
+        }
+
+        // Hash new password
+        let new_hash = hash_password(&request.new_password)
+            .map_err(|e| AuthError::Internal { message: e.to_string() })?;
+
+        // Update user password
+        self.update_user_password(&verification.user_id, &new_hash);
+
+        checkpoint();
+        Ok(())
+    }
+
+    // =========================================================================
+    // User Management
+    // =========================================================================
+
+    /// Create a new user
+    receive CreateUser(request: CreateUserRequest) -> Result<User, AuthError> {
+        self.create_user_internal(request)
+    }
+
+    fn create_user_internal(&mut self, request: CreateUserRequest) -> Result<User, AuthError> {
+        // Check if user already exists
+        if self.find_user_by_identifier(&request.email).is_some() {
+            return Err(AuthError::UserExists { email: request.email });
+        }
+
+        // Hash password if provided
+        let password_hash = if let Some(password) = &request.password {
+            let validation = self.validate_password_sync(password);
+            if !validation.valid {
+                return Err(AuthError::PasswordValidationFailed { errors: validation.errors });
+            }
+            Some(hash_password(password).map_err(|e| AuthError::Internal { message: e.to_string() })?)
+        } else {
+            None
+        };
+
+        let now = DateTime::now();
+        let user = User {
+            id: UserId(generate_uuid()),
+            username: request.username,
+            email: request.email,
+            display_name: request.display_name,
+            first_name: request.first_name,
+            last_name: request.last_name,
+            password_hash,
+            password_changed_at: if request.password.is_some() { Some(now) } else { None },
+            status: if request.send_verification_email {
+                UserStatus::PendingVerification
+            } else {
+                UserStatus::Active
+            },
+            email_verified: !request.send_verification_email,
+            phone_number: None,
+            phone_verified: false,
+            timezone: None,
+            locale: None,
+            avatar_url: None,
+            tenant_id: request.tenant_id,
+            roles: request.roles,
+            last_login_at: None,
+            last_activity_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            created_at: now,
+            updated_at: now,
+            external_id: request.external_id,
+            metadata: Map::new()
+        };
+
+        // Store user (would go to EntityStorage)
+        // send self.storage <- Save("user", &user);
+
+        checkpoint();
+        Ok(user)
+    }
+
+    fn validate_password_sync(&self, password: &str) -> PasswordValidationResult {
+        let mut errors = vec![];
+
+        if password.len() < self.config.password_min_length as usize {
+            errors.push(format!("Password must be at least {} characters", self.config.password_min_length));
+        }
+
+        if self.config.password_require_uppercase && !password.chars().any(|c| c.is_uppercase()) {
+            errors.push("Password must contain at least one uppercase letter".to_string());
+        }
+
+        if self.config.password_require_lowercase && !password.chars().any(|c| c.is_lowercase()) {
+            errors.push("Password must contain at least one lowercase letter".to_string());
+        }
+
+        if self.config.password_require_number && !password.chars().any(|c| c.is_numeric()) {
+            errors.push("Password must contain at least one number".to_string());
+        }
+
+        if self.config.password_require_special && !password.chars().any(|c| "!@#$%^&*()_+-=[]{}|;:,.<>?".contains(c)) {
+            errors.push("Password must contain at least one special character".to_string());
+        }
+
+        PasswordValidationResult {
+            valid: errors.is_empty(),
+            errors
+        }
+    }
+
+    /// Update user profile
+    receive UpdateUser(user_id: UserId, request: UpdateUserRequest) -> Result<User, AuthError> {
+        let user = self.find_user_by_id(&user_id)
+            .ok_or(AuthError::UserNotFound)?;
+
+        // Would update user in storage
+        // For now, return the user as-is
+        Ok(user)
+    }
+
+    /// Get linked accounts for user
+    receive GetLinkedAccounts(user_id: UserId) -> List<LinkedAccountInfo> {
+        self.linked_accounts.get(&user_id)
+            .map(|accounts| accounts.iter().map(|a| LinkedAccountInfo {
+                provider_id: a.provider_id.clone(),
+                provider_name: self.get_provider_name(&a.provider_id),
+                provider_user_id: a.provider_user_id.clone(),
+                email: a.email.clone(),
+                linked_at: a.linked_at
+            }).collect())
+            .unwrap_or_default()
+    }
+
+    /// Unlink account
+    receive UnlinkAccount(user_id: UserId, provider_id: ProviderId) -> Result<(), AuthError> {
+        if let Some(accounts) = self.linked_accounts.get_mut(&user_id) {
+            let initial_len = accounts.len();
+            accounts.retain(|a| a.provider_id != provider_id);
+
+            if accounts.len() == initial_len {
+                return Err(AuthError::AccountNotLinked);
+            }
+
+            checkpoint();
+            Ok(())
+        } else {
+            Err(AuthError::AccountNotLinked)
+        }
+    }
+
+    // =========================================================================
+    // Helper Functions
+    // =========================================================================
+
+    async fn find_user_by_identifier(&self, identifier: &str) -> Option<User> {
+        // Query storage for user by username or email
+        let query = send self.storage <- CreateQuery("user".to_string());
+
+        // Try finding by username first
+        let username_query = query.clone()
+            .where_eq("username", FieldValue::String(identifier.to_lowercase()))
+            .build();
+
+        if let Ok(Some(entity)) = send self.storage <- FindOne(username_query) {
+            return Some(self.entity_to_user(&entity));
+        }
+
+        // Try finding by email
+        let email_query = send self.storage <- CreateQuery("user".to_string());
+        let email_query = email_query
+            .where_eq("email", FieldValue::String(identifier.to_lowercase()))
+            .build();
+
+        if let Ok(Some(entity)) = send self.storage <- FindOne(email_query) {
+            return Some(self.entity_to_user(&entity));
+        }
+
+        // Try finding by external_id (for SIS integration)
+        let external_query = send self.storage <- CreateQuery("user".to_string());
+        let external_query = external_query
+            .where_eq("external_id", FieldValue::String(identifier.to_string()))
+            .build();
+
+        if let Ok(Some(entity)) = send self.storage <- FindOne(external_query) {
+            return Some(self.entity_to_user(&entity));
+        }
+
+        None
+    }
+
+    async fn find_user_by_id(&self, user_id: &UserId) -> Option<User> {
+        // Query storage for user by ID
+        match send self.storage <- Load("user".to_string(), user_id.0.clone()) {
+            Ok(entity) => Some(self.entity_to_user(&entity)),
+            Err(_) => None
+        }
+    }
+
+    async fn update_last_login(&self, user_id: &UserId) {
+        // Load and update user's last login time
+        if let Ok(mut entity) = send self.storage <- Load("user".to_string(), user_id.0.clone()) {
+            entity.fields.insert("last_login_at".to_string(), FieldValue::DateTime(DateTime::now()));
+            entity.updated_by = Some(user_id.clone());
+            let _ = send self.storage <- Update(entity, None);
+        }
+    }
+
+    async fn update_user_password(&self, user_id: &UserId, password_hash: &str) {
+        // Load and update user's password
+        if let Ok(mut entity) = send self.storage <- Load("user".to_string(), user_id.0.clone()) {
+            entity.fields.insert("password_hash".to_string(), FieldValue::String(password_hash.to_string()));
+            entity.fields.insert("password_changed_at".to_string(), FieldValue::DateTime(DateTime::now()));
+            entity.updated_by = Some(user_id.clone());
+            let _ = send self.storage <- Update(entity, None);
+        }
+    }
+
+    fn entity_to_user(&self, entity: &Entity) -> User {
+        User {
+            id: UserId(entity.id.clone()),
+            username: entity.fields.get("username")
+                .and_then(|v| v.as_string())
+                .unwrap_or_default(),
+            email: entity.fields.get("email")
+                .and_then(|v| v.as_string())
+                .unwrap_or_default(),
+            display_name: entity.fields.get("display_name")
+                .and_then(|v| v.as_string())
+                .unwrap_or_default(),
+            first_name: entity.fields.get("first_name")
+                .and_then(|v| v.as_string()),
+            last_name: entity.fields.get("last_name")
+                .and_then(|v| v.as_string()),
+            password_hash: entity.fields.get("password_hash")
+                .and_then(|v| v.as_string()),
+            password_changed_at: entity.fields.get("password_changed_at")
+                .and_then(|v| v.as_datetime()),
+            status: entity.fields.get("status")
+                .and_then(|v| v.as_string())
+                .map(|s| UserStatus::from_string(&s))
+                .unwrap_or(UserStatus::Active),
+            email_verified: entity.fields.get("email_verified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            phone_number: entity.fields.get("phone_number")
+                .and_then(|v| v.as_string()),
+            phone_verified: entity.fields.get("phone_verified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            timezone: entity.fields.get("timezone")
+                .and_then(|v| v.as_string()),
+            locale: entity.fields.get("locale")
+                .and_then(|v| v.as_string()),
+            avatar_url: entity.fields.get("avatar_url")
+                .and_then(|v| v.as_string()),
+            tenant_id: entity.tenant_id.clone(),
+            roles: entity.fields.get("roles")
+                .and_then(|v| match v {
+                    FieldValue::Json(d) => d.as_array()
+                        .map(|arr| arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| RoleId(s.to_string())))
+                            .collect::<Set<RoleId>>()),
+                    _ => None
+                })
+                .unwrap_or_default(),
+            last_login_at: entity.fields.get("last_login_at")
+                .and_then(|v| v.as_datetime()),
+            last_activity_at: entity.fields.get("last_activity_at")
+                .and_then(|v| v.as_datetime()),
+            failed_login_attempts: entity.fields.get("failed_login_attempts")
+                .and_then(|v| v.as_int())
+                .map(|i| i as i32)
+                .unwrap_or(0),
+            locked_until: entity.fields.get("locked_until")
+                .and_then(|v| v.as_datetime()),
+            created_at: entity.created_at,
+            updated_at: entity.updated_at,
+            external_id: entity.fields.get("external_id")
+                .and_then(|v| v.as_string()),
+            metadata: entity.metadata.clone()
+        }
+    }
+
+    fn user_to_entity(&self, user: &User) -> Entity {
+        let mut fields = Map::new();
+        fields.insert("username".to_string(), FieldValue::String(user.username.clone()));
+        fields.insert("email".to_string(), FieldValue::String(user.email.clone()));
+        fields.insert("display_name".to_string(), FieldValue::String(user.display_name.clone()));
+
+        if let Some(ref first_name) = user.first_name {
+            fields.insert("first_name".to_string(), FieldValue::String(first_name.clone()));
+        }
+        if let Some(ref last_name) = user.last_name {
+            fields.insert("last_name".to_string(), FieldValue::String(last_name.clone()));
+        }
+        if let Some(ref password_hash) = user.password_hash {
+            fields.insert("password_hash".to_string(), FieldValue::String(password_hash.clone()));
+        }
+        if let Some(password_changed_at) = user.password_changed_at {
+            fields.insert("password_changed_at".to_string(), FieldValue::DateTime(password_changed_at));
+        }
+
+        fields.insert("status".to_string(), FieldValue::String(user.status.to_string()));
+        fields.insert("email_verified".to_string(), FieldValue::Bool(user.email_verified));
+
+        if let Some(ref phone) = user.phone_number {
+            fields.insert("phone_number".to_string(), FieldValue::String(phone.clone()));
+        }
+        fields.insert("phone_verified".to_string(), FieldValue::Bool(user.phone_verified));
+
+        if let Some(ref tz) = user.timezone {
+            fields.insert("timezone".to_string(), FieldValue::String(tz.clone()));
+        }
+        if let Some(ref locale) = user.locale {
+            fields.insert("locale".to_string(), FieldValue::String(locale.clone()));
+        }
+        if let Some(ref avatar) = user.avatar_url {
+            fields.insert("avatar_url".to_string(), FieldValue::String(avatar.clone()));
+        }
+
+        let roles_json: Vec<String> = user.roles.iter().map(|r| r.0.clone()).collect();
+        fields.insert("roles".to_string(), FieldValue::Json(Dynamic::from(roles_json)));
+
+        if let Some(last_login) = user.last_login_at {
+            fields.insert("last_login_at".to_string(), FieldValue::DateTime(last_login));
+        }
+        if let Some(last_activity) = user.last_activity_at {
+            fields.insert("last_activity_at".to_string(), FieldValue::DateTime(last_activity));
+        }
+
+        fields.insert("failed_login_attempts".to_string(), FieldValue::Int(user.failed_login_attempts as i64));
+
+        if let Some(locked) = user.locked_until {
+            fields.insert("locked_until".to_string(), FieldValue::DateTime(locked));
+        }
+        if let Some(ref ext_id) = user.external_id {
+            fields.insert("external_id".to_string(), FieldValue::String(ext_id.clone()));
+        }
+
+        Entity {
+            id: user.id.0.clone(),
+            entity_type: "user".to_string(),
+            tenant_id: user.tenant_id.clone(),
+            revision: 1,
+            status: EntityStatus::Active,
+            created_by: user.id.clone(),
+            created_at: user.created_at,
+            updated_by: None,
+            updated_at: user.updated_at,
+            deleted: false,
+            deleted_at: None,
+            deleted_by: None,
+            fields,
+            metadata: user.metadata.clone()
+        }
+    }
+
+    fn build_authenticated_user(&self, user: &User) -> AuthenticatedUser {
+        AuthenticatedUser {
+            id: user.id.clone(),
+            username: user.username.clone(),
+            email: user.email.clone(),
+            display_name: user.display_name.clone(),
+            first_name: user.first_name.clone(),
+            last_name: user.last_name.clone(),
+            roles: user.roles.clone(),
+            permissions: Set::new(), // Would compute from security manager
+            avatar_url: user.avatar_url.clone(),
+            email_verified: user.email_verified,
+            mfa_enabled: self.mfa_enrollments.get(&user.id)
+                .map(|e| e.iter().any(|m| m.verified))
+                .unwrap_or(false),
+            tenant_id: user.tenant_id.clone(),
+            enrolled_course_ids: vec![], // Would fetch from enrollments
+            teaching_course_ids: vec![]  // Would fetch from course assignments
+        }
+    }
+
+    fn is_locked(&self, identifier: &str) -> Bool {
+        if let Some(tracker) = self.login_attempts.get(identifier) {
+            if tracker.locked_until > DateTime::now() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn get_lockout_time(&self, identifier: &str) -> DateTime {
+        self.login_attempts.get(identifier)
+            .map(|t| t.locked_until)
+            .unwrap_or(DateTime::now())
+    }
+
+    fn record_failed_attempt(&mut self, identifier: &str, ip_address: &Option<String>) {
+        let tracker = self.login_attempts.entry(identifier.to_string())
+            .or_insert(LoginAttemptTracker {
+                count: 0,
+                first_attempt: DateTime::now(),
+                last_attempt: DateTime::now(),
+                locked_until: DateTime::now(),
+                ip_addresses: Set::new()
+            });
+
+        tracker.count += 1;
+        tracker.last_attempt = DateTime::now();
+
+        if let Some(ip) = ip_address {
+            tracker.ip_addresses.insert(ip.clone());
+        }
+
+        if tracker.count >= self.config.max_login_attempts {
+            tracker.locked_until = DateTime::now() + self.config.lockout_duration;
+        }
+    }
+
+    fn clear_login_attempts(&mut self, identifier: &str) {
+        self.login_attempts.remove(identifier);
+    }
+
+    fn get_provider_name(&self, provider_id: &ProviderId) -> String {
+        if let Some(p) = self.config.oauth_providers.get(provider_id) {
+            return p.name.clone();
+        }
+        if let Some(p) = self.config.saml_providers.get(provider_id) {
+            return p.name.clone();
+        }
+        provider_id.clone()
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn generate_random_string(length: usize) -> String {
+    std::crypto::random_hex(length / 2)
+}
+
+fn url_encode(s: &str) -> String {
+    std::url::encode(s)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    std::base64::encode(data)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    std::base64::decode(s).map_err(|_| ())
+}
+
+fn base64_url_encode(data: &[u8]) -> String {
+    std::base64::encode_url_safe(data)
+}
+
+fn base64_url_decode(s: &str) -> Result<String, ()> {
+    std::base64::decode_url_safe(s)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| ()))
+        .map_err(|_| ())
+}
+
+fn sha256(data: &[u8]) -> Vec<u8> {
+    std::crypto::sha256(data)
+}
+
+fn deflate_compress(data: &str) -> Vec<u8> {
+    std::compress::deflate(data.as_bytes())
+}
+
+fn parse_user_agent(ua: &str) -> DeviceInfo {
+    let is_mobile = ua.contains("Mobile") || ua.contains("Android") || ua.contains("iPhone");
+    let device_type = if is_mobile {
+        if ua.contains("iPad") || ua.contains("Tablet") {
+            DeviceType::Tablet
+        } else {
+            DeviceType::Mobile
+        }
+    } else {
+        DeviceType::Desktop
+    };
+
+    let os = if ua.contains("Windows") { "Windows" }
+        else if ua.contains("Mac OS") { "macOS" }
+        else if ua.contains("Linux") { "Linux" }
+        else if ua.contains("Android") { "Android" }
+        else if ua.contains("iOS") || ua.contains("iPhone") { "iOS" }
+        else { "Unknown" };
+
+    let browser = if ua.contains("Chrome") && !ua.contains("Edg") { "Chrome" }
+        else if ua.contains("Firefox") { "Firefox" }
+        else if ua.contains("Safari") && !ua.contains("Chrome") { "Safari" }
+        else if ua.contains("Edg") { "Edge" }
+        else { "Unknown" };
+
+    DeviceInfo {
+        device_id: None,
+        device_type,
+        os: os.to_string(),
+        os_version: None,
+        browser: browser.to_string(),
+        browser_version: None,
+        is_mobile,
+        fingerprint: None
+    }
+}
+
+fn generate_qr_code(data: &str) -> String {
+    std::qr::generate_svg(data)
+}

@@ -1,0 +1,12 @@
+/// Intelligo LMS - Social Module
+///
+/// Exports social login and sharing integrations.
+
+module intelligo::integrations::social
+
+pub use intelligo::integrations::social::oauth::*
+
+// Re-export commonly used types
+pub use OAuthProvider
+pub use OAuthToken
+pub use SocialProfile

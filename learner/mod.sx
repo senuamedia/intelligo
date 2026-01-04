@@ -1,0 +1,15 @@
+/// Intelligo LMS - Learner Module
+///
+/// Exports learner-facing functionality for course consumption.
+
+module intelligo::learner
+
+pub use intelligo::learner::dashboard::*
+pub use intelligo::learner::player::*
+
+// Re-export commonly used types
+pub use LearnerDashboard
+pub use CourseProgress
+pub use ContentPlayer
+pub use PlayerState
+pub use PlaybackEvent

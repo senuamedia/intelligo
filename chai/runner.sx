@@ -1,0 +1,620 @@
+/// Intelligo LMS - Test Runner
+///
+/// BDD-style test runner with describe/it blocks.
+
+module intelligo::chai::runner
+
+use intelligo::chai::assertions::*
+use std::collections::{Map, List}
+use std::time::{DateTime, Duration, Instant}
+
+// =============================================================================
+// TEST SUITE TYPES
+// =============================================================================
+
+/// A test suite containing multiple tests
+pub type TestSuite {
+    name: String,
+    tests: List<TestCase>,
+    nested_suites: List<TestSuite>,
+    before_all: Option<Box<dyn Fn()>>,
+    after_all: Option<Box<dyn Fn()>>,
+    before_each: Option<Box<dyn Fn()>>,
+    after_each: Option<Box<dyn Fn()>>,
+    only: bool,
+    skip: bool
+}
+
+/// A single test case
+pub type TestCase {
+    name: String,
+    test_fn: Box<dyn Fn()>,
+    only: bool,
+    skip: bool,
+    timeout: Option<Duration>
+}
+
+/// Result of running a test
+pub type TestResult {
+    name: String,
+    suite_path: List<String>,
+    status: TestStatus,
+    duration: Duration,
+    error: Option<String>,
+    stack_trace: Option<String>
+}
+
+/// Status of a test
+pub enum TestStatus {
+    Passed,
+    Failed,
+    Skipped,
+    Timeout
+}
+
+impl TestStatus {
+    pub fn to_string(&self) -> String {
+        match self {
+            TestStatus::Passed => "passed".to_string(),
+            TestStatus::Failed => "failed".to_string(),
+            TestStatus::Skipped => "skipped".to_string(),
+            TestStatus::Timeout => "timeout".to_string()
+        }
+    }
+
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            TestStatus::Passed => "✓",
+            TestStatus::Failed => "✗",
+            TestStatus::Skipped => "○",
+            TestStatus::Timeout => "⏱"
+        }
+    }
+}
+
+/// Overall test run results
+pub type TestRunResults {
+    total: i32,
+    passed: i32,
+    failed: i32,
+    skipped: i32,
+    duration: Duration,
+    results: List<TestResult>
+}
+
+impl TestRunResults {
+    pub fn new() -> TestRunResults {
+        TestRunResults {
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            duration: Duration::zero(),
+            results: vec![]
+        }
+    }
+
+    pub fn add(&mut self, result: TestResult) {
+        self.total += 1;
+        match result.status {
+            TestStatus::Passed => self.passed += 1,
+            TestStatus::Failed => self.failed += 1,
+            TestStatus::Skipped => self.skipped += 1,
+            TestStatus::Timeout => self.failed += 1
+        }
+        self.results.push(result);
+    }
+
+    pub fn success(&self) -> bool {
+        self.failed == 0
+    }
+}
+
+// =============================================================================
+// TEST RUNNER
+// =============================================================================
+
+/// Global test registry
+static mut TEST_REGISTRY: Option<TestRegistry> = None;
+
+/// Test registry holding all suites
+pub type TestRegistry {
+    suites: List<TestSuite>,
+    current_suite: Option<Box<TestSuite>>,
+    suite_stack: List<TestSuite>
+}
+
+impl TestRegistry {
+    pub fn new() -> TestRegistry {
+        TestRegistry {
+            suites: vec![],
+            current_suite: None,
+            suite_stack: vec![]
+        }
+    }
+
+    pub fn global() -> &'static mut TestRegistry {
+        unsafe {
+            if TEST_REGISTRY.is_none() {
+                TEST_REGISTRY = Some(TestRegistry::new());
+            }
+            TEST_REGISTRY.as_mut().unwrap()
+        }
+    }
+
+    pub fn reset() {
+        unsafe {
+            TEST_REGISTRY = Some(TestRegistry::new());
+        }
+    }
+}
+
+// =============================================================================
+// DSL FUNCTIONS
+// =============================================================================
+
+/// Define a test suite
+pub fn describe(name: &str, body: impl Fn()) {
+    let registry = TestRegistry::global();
+
+    // Create new suite
+    let suite = TestSuite {
+        name: name.to_string(),
+        tests: vec![],
+        nested_suites: vec![],
+        before_all: None,
+        after_all: None,
+        before_each: None,
+        after_each: None,
+        only: false,
+        skip: false
+    };
+
+    // Push current suite to stack
+    if let Some(current) = registry.current_suite.take() {
+        registry.suite_stack.push(*current);
+    }
+
+    registry.current_suite = Some(Box::new(suite));
+
+    // Execute body to collect tests
+    body();
+
+    // Pop suite and add to parent or registry
+    let completed_suite = registry.current_suite.take().unwrap();
+
+    if let Some(mut parent) = registry.suite_stack.pop() {
+        parent.nested_suites.push(*completed_suite);
+        registry.current_suite = Some(Box::new(parent));
+    } else {
+        registry.suites.push(*completed_suite);
+    }
+}
+
+/// Define a focused test suite (only this suite runs)
+pub fn describe_only(name: &str, body: impl Fn()) {
+    let registry = TestRegistry::global();
+
+    let mut suite = TestSuite {
+        name: name.to_string(),
+        tests: vec![],
+        nested_suites: vec![],
+        before_all: None,
+        after_all: None,
+        before_each: None,
+        after_each: None,
+        only: true,
+        skip: false
+    };
+
+    if let Some(current) = registry.current_suite.take() {
+        registry.suite_stack.push(*current);
+    }
+
+    registry.current_suite = Some(Box::new(suite));
+    body();
+
+    let completed_suite = registry.current_suite.take().unwrap();
+
+    if let Some(mut parent) = registry.suite_stack.pop() {
+        parent.nested_suites.push(*completed_suite);
+        registry.current_suite = Some(Box::new(parent));
+    } else {
+        registry.suites.push(*completed_suite);
+    }
+}
+
+/// Define a skipped test suite
+pub fn describe_skip(name: &str, body: impl Fn()) {
+    let registry = TestRegistry::global();
+
+    let suite = TestSuite {
+        name: name.to_string(),
+        tests: vec![],
+        nested_suites: vec![],
+        before_all: None,
+        after_all: None,
+        before_each: None,
+        after_each: None,
+        only: false,
+        skip: true
+    };
+
+    if let Some(current) = registry.current_suite.take() {
+        registry.suite_stack.push(*current);
+    }
+
+    registry.current_suite = Some(Box::new(suite));
+    body();
+
+    let completed_suite = registry.current_suite.take().unwrap();
+
+    if let Some(mut parent) = registry.suite_stack.pop() {
+        parent.nested_suites.push(*completed_suite);
+        registry.current_suite = Some(Box::new(parent));
+    } else {
+        registry.suites.push(*completed_suite);
+    }
+}
+
+/// Alias for describe
+pub fn context(name: &str, body: impl Fn()) {
+    describe(name, body)
+}
+
+/// Define a test case
+pub fn it(name: &str, test_fn: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+
+    let test = TestCase {
+        name: name.to_string(),
+        test_fn: Box::new(test_fn),
+        only: false,
+        skip: false,
+        timeout: None
+    };
+
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.tests.push(test);
+    }
+}
+
+/// Define a focused test case
+pub fn it_only(name: &str, test_fn: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+
+    let test = TestCase {
+        name: name.to_string(),
+        test_fn: Box::new(test_fn),
+        only: true,
+        skip: false,
+        timeout: None
+    };
+
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.tests.push(test);
+    }
+}
+
+/// Define a skipped test case
+pub fn it_skip(name: &str, test_fn: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+
+    let test = TestCase {
+        name: name.to_string(),
+        test_fn: Box::new(test_fn),
+        only: false,
+        skip: true,
+        timeout: None
+    };
+
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.tests.push(test);
+    }
+}
+
+/// Alias for it
+pub fn test(name: &str, test_fn: impl Fn() + 'static) {
+    it(name, test_fn)
+}
+
+/// Alias for it
+pub fn specify(name: &str, test_fn: impl Fn() + 'static) {
+    it(name, test_fn)
+}
+
+/// Define before all hook
+pub fn before(hook: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.before_all = Some(Box::new(hook));
+    }
+}
+
+/// Define after all hook
+pub fn after(hook: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.after_all = Some(Box::new(hook));
+    }
+}
+
+/// Define before each hook
+pub fn beforeEach(hook: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.before_each = Some(Box::new(hook));
+    }
+}
+
+/// Define after each hook
+pub fn afterEach(hook: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.after_each = Some(Box::new(hook));
+    }
+}
+
+// =============================================================================
+// TEST EXECUTION
+// =============================================================================
+
+/// Run all registered tests
+pub fn run_tests() -> TestRunResults {
+    let registry = TestRegistry::global();
+    let mut results = TestRunResults::new();
+    let start = Instant::now();
+
+    // Check for focused tests
+    let has_only = check_has_only(&registry.suites);
+
+    for suite in &registry.suites {
+        run_suite(suite, &mut results, vec![], has_only);
+    }
+
+    results.duration = start.elapsed();
+    print_results(&results);
+
+    results
+}
+
+/// Run a single test suite
+fn run_suite(
+    suite: &TestSuite,
+    results: &mut TestRunResults,
+    path: Vec<String>,
+    has_only: bool
+) {
+    let mut current_path = path.clone();
+    current_path.push(suite.name.clone());
+
+    // Skip if not focused when there are focused tests
+    if has_only && !suite.only && !suite_has_only(suite) {
+        // Skip all tests in this suite
+        for test in &suite.tests {
+            results.add(TestResult {
+                name: test.name.clone(),
+                suite_path: current_path.clone(),
+                status: TestStatus::Skipped,
+                duration: Duration::zero(),
+                error: None,
+                stack_trace: None
+            });
+        }
+        return;
+    }
+
+    // Skip if marked as skip
+    if suite.skip {
+        for test in &suite.tests {
+            results.add(TestResult {
+                name: test.name.clone(),
+                suite_path: current_path.clone(),
+                status: TestStatus::Skipped,
+                duration: Duration::zero(),
+                error: None,
+                stack_trace: None
+            });
+        }
+        return;
+    }
+
+    // Run before all hook
+    if let Some(ref before_all) = suite.before_all {
+        before_all();
+    }
+
+    // Run tests
+    for test in &suite.tests {
+        // Skip if not focused when there are focused tests
+        if has_only && !test.only && !suite.only {
+            results.add(TestResult {
+                name: test.name.clone(),
+                suite_path: current_path.clone(),
+                status: TestStatus::Skipped,
+                duration: Duration::zero(),
+                error: None,
+                stack_trace: None
+            });
+            continue;
+        }
+
+        if test.skip {
+            results.add(TestResult {
+                name: test.name.clone(),
+                suite_path: current_path.clone(),
+                status: TestStatus::Skipped,
+                duration: Duration::zero(),
+                error: None,
+                stack_trace: None
+            });
+            continue;
+        }
+
+        // Run before each hook
+        if let Some(ref before_each) = suite.before_each {
+            before_each();
+        }
+
+        // Run the test
+        let start = Instant::now();
+        let result = std::panic::catch_unwind(|| {
+            (test.test_fn)();
+        });
+        let duration = start.elapsed();
+
+        let test_result = match result {
+            Ok(_) => TestResult {
+                name: test.name.clone(),
+                suite_path: current_path.clone(),
+                status: TestStatus::Passed,
+                duration,
+                error: None,
+                stack_trace: None
+            },
+            Err(err) => {
+                let error_msg = if let Some(assertion_err) = err.downcast_ref::<AssertionError>() {
+                    assertion_err.message.clone()
+                } else if let Some(s) = err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown error".to_string()
+                };
+
+                TestResult {
+                    name: test.name.clone(),
+                    suite_path: current_path.clone(),
+                    status: TestStatus::Failed,
+                    duration,
+                    error: Some(error_msg),
+                    stack_trace: None
+                }
+            }
+        };
+
+        results.add(test_result);
+
+        // Run after each hook
+        if let Some(ref after_each) = suite.after_each {
+            after_each();
+        }
+    }
+
+    // Run nested suites
+    for nested in &suite.nested_suites {
+        run_suite(nested, results, current_path.clone(), has_only);
+    }
+
+    // Run after all hook
+    if let Some(ref after_all) = suite.after_all {
+        after_all();
+    }
+}
+
+/// Check if any test or suite has 'only' flag
+fn check_has_only(suites: &[TestSuite]) -> bool {
+    for suite in suites {
+        if suite.only {
+            return true;
+        }
+        if suite_has_only(suite) {
+            return true;
+        }
+    }
+    false
+}
+
+fn suite_has_only(suite: &TestSuite) -> bool {
+    if suite.tests.iter().any(|t| t.only) {
+        return true;
+    }
+    for nested in &suite.nested_suites {
+        if nested.only || suite_has_only(nested) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Print test results
+fn print_results(results: &TestRunResults) {
+    println!("\n");
+
+    // Print individual results
+    for result in &results.results {
+        let path = result.suite_path.join(" > ");
+        let symbol = result.status.symbol();
+
+        match result.status {
+            TestStatus::Passed => {
+                println!("  {} {} > {}", symbol, path, result.name);
+            }
+            TestStatus::Failed => {
+                println!("  {} {} > {}", symbol, path, result.name);
+                if let Some(ref error) = result.error {
+                    println!("      Error: {}", error);
+                }
+            }
+            TestStatus::Skipped => {
+                println!("  {} {} > {} (skipped)", symbol, path, result.name);
+            }
+            TestStatus::Timeout => {
+                println!("  {} {} > {} (timeout)", symbol, path, result.name);
+            }
+        }
+    }
+
+    // Print summary
+    println!("\n");
+    println!("  {} passing ({:?})", results.passed, results.duration);
+    if results.failed > 0 {
+        println!("  {} failing", results.failed);
+    }
+    if results.skipped > 0 {
+        println!("  {} skipped", results.skipped);
+    }
+    println!("");
+}
+
+// =============================================================================
+// ASYNC TEST SUPPORT
+// =============================================================================
+
+/// Define an async test case
+pub fn it_async(name: &str, test_fn: impl Fn() -> std::future::Future<Output = ()> + 'static) {
+    let registry = TestRegistry::global();
+
+    let test = TestCase {
+        name: name.to_string(),
+        test_fn: Box::new(move || {
+            // Run async test in runtime
+            std::runtime::block_on(test_fn());
+        }),
+        only: false,
+        skip: false,
+        timeout: None
+    };
+
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.tests.push(test);
+    }
+}
+
+/// Define a test with timeout
+pub fn it_timeout(name: &str, timeout: Duration, test_fn: impl Fn() + 'static) {
+    let registry = TestRegistry::global();
+
+    let test = TestCase {
+        name: name.to_string(),
+        test_fn: Box::new(test_fn),
+        only: false,
+        skip: false,
+        timeout: Some(timeout)
+    };
+
+    if let Some(ref mut suite) = registry.current_suite {
+        suite.tests.push(test);
+    }
+}

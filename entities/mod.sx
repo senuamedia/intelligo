@@ -1,0 +1,30 @@
+/// Intelligo LMS - Entities Module
+///
+/// Exports all domain entities for the LMS.
+
+module intelligo::entities
+
+pub use intelligo::entities::course::*
+pub use intelligo::entities::module::*
+pub use intelligo::entities::lesson::*
+pub use intelligo::entities::assessment::*
+pub use intelligo::entities::enrollment::*
+pub use intelligo::entities::grade::*
+pub use intelligo::entities::submission::*
+pub use intelligo::entities::activity::*
+
+// Re-export commonly used entities
+pub use Course
+pub use CourseStatus
+pub use Module
+pub use Lesson
+pub use ContentType
+pub use Assessment
+pub use Question
+pub use Enrollment
+pub use EnrollmentStatus
+pub use Grade
+pub use Submission
+pub use SubmissionStatus
+pub use Activity
+pub use ActivityType

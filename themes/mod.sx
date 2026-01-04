@@ -1,0 +1,32 @@
+/// Intelligo LMS - Themes Module
+///
+/// Theming system providing default themes, dark mode support,
+/// per-tenant theme customization, and a comprehensive UI component library.
+
+module intelligo::themes
+
+// Re-export all theme submodules
+pub use intelligo::themes::core::*
+pub use intelligo::themes::default::*
+pub use intelligo::themes::dark::*
+pub use intelligo::themes::customization::*
+pub use intelligo::themes::components::*
+
+// Re-export commonly used types
+pub use Theme
+pub use ThemeBuilder
+pub use ComponentRegistry
+pub use DesignTokens
+pub use StyleSpec
+pub use ComponentDefinition
+pub use WidgetDefinition
+
+/// Initialize themes system
+pub fn init() {
+    println!("[Themes] Initializing theming system")
+}
+
+/// Get the themes module version
+pub fn version() -> String {
+    "1.0.0".to_string()
+}

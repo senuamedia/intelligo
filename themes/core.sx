@@ -1,0 +1,1057 @@
+/// Intelligo LMS - Theme Core
+///
+/// Core theme entity definitions, theme context management, and
+/// theme resolution for the learning management system.
+
+module intelligo::themes::core
+
+use intelligo::core::types::*
+use intelligo::tenant::core::TenantId
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// THEME ENTITY
+// =============================================================================
+
+/// Complete theme definition
+type Theme {
+    /// Unique identifier
+    id: ThemeId,
+
+    /// Theme name
+    name: String,
+
+    /// Theme slug
+    slug: String,
+
+    /// Theme description
+    description: Option<String>,
+
+    /// Theme type
+    theme_type: ThemeType,
+
+    /// Color scheme
+    colors: ThemeColors,
+
+    /// Typography
+    typography: ThemeTypography,
+
+    /// Spacing system
+    spacing: ThemeSpacing,
+
+    /// Border styles
+    borders: ThemeBorders,
+
+    /// Shadow definitions
+    shadows: ThemeShadows,
+
+    /// Animation settings
+    animations: ThemeAnimations,
+
+    /// Component overrides
+    components: Map<String, ComponentStyle>,
+
+    /// Preview image URL
+    preview_image: Option<String>,
+
+    /// Author
+    author: Option<String>,
+
+    /// Version
+    version: String,
+
+    /// Parent theme (for inheritance)
+    parent_id: Option<ThemeId>,
+
+    /// Is system theme (cannot be modified)
+    is_system: Bool,
+
+    /// Is active
+    is_active: Bool,
+
+    /// Created at
+    created_at: DateTime,
+
+    /// Updated at
+    updated_at: DateTime,
+
+    /// Metadata
+    metadata: Map<String, Dynamic>
+}
+
+impl Theme {
+    fn new(name: String, slug: String, theme_type: ThemeType) -> Theme {
+        let now = DateTime::now();
+        Theme {
+            id: ThemeId(generate_uuid()),
+            name,
+            slug,
+            description: None,
+            theme_type,
+            colors: ThemeColors::default(),
+            typography: ThemeTypography::default(),
+            spacing: ThemeSpacing::default(),
+            borders: ThemeBorders::default(),
+            shadows: ThemeShadows::default(),
+            animations: ThemeAnimations::default(),
+            components: Map::new(),
+            preview_image: None,
+            author: None,
+            version: "1.0.0".to_string(),
+            parent_id: None,
+            is_system: false,
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+            metadata: Map::new()
+        }
+    }
+
+    /// Generate CSS from theme
+    fn to_css(&self) -> String {
+        let mut css = String::new();
+
+        // Root variables
+        css.push_str(":root {\n");
+        css.push_str(&self.colors.to_css_vars());
+        css.push_str(&self.typography.to_css_vars());
+        css.push_str(&self.spacing.to_css_vars());
+        css.push_str(&self.borders.to_css_vars());
+        css.push_str(&self.shadows.to_css_vars());
+        css.push_str(&self.animations.to_css_vars());
+        css.push_str("}\n");
+
+        // Component styles
+        for (component, style) in &self.components {
+            css.push_str(&format!("\n/* {} */\n", component));
+            css.push_str(&style.to_css());
+        }
+
+        css
+    }
+
+    /// Merge with parent theme
+    fn merge_with_parent(&self, parent: &Theme) -> Theme {
+        let mut merged = parent.clone();
+        merged.id = self.id.clone();
+        merged.name = self.name.clone();
+        merged.slug = self.slug.clone();
+        merged.parent_id = Some(parent.id.clone());
+
+        // Merge colors (self overrides parent)
+        merged.colors = self.colors.merge_with(&parent.colors);
+
+        // Merge typography
+        merged.typography = self.typography.merge_with(&parent.typography);
+
+        // Merge component overrides
+        for (key, style) in &self.components {
+            merged.components.insert(key.clone(), style.clone());
+        }
+
+        merged
+    }
+}
+
+/// Theme identifier
+type ThemeId = String;
+
+/// Theme type
+enum ThemeType {
+    /// Light theme
+    Light,
+    /// Dark theme
+    Dark,
+    /// High contrast for accessibility
+    HighContrast,
+    /// Auto (follows system preference)
+    Auto,
+    /// Custom
+    Custom
+}
+
+impl ThemeType {
+    fn to_string(&self) -> String {
+        match self {
+            ThemeType::Light => "light",
+            ThemeType::Dark => "dark",
+            ThemeType::HighContrast => "high_contrast",
+            ThemeType::Auto => "auto",
+            ThemeType::Custom => "custom"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<ThemeType> {
+        match s {
+            "light" => Some(ThemeType::Light),
+            "dark" => Some(ThemeType::Dark),
+            "high_contrast" => Some(ThemeType::HighContrast),
+            "auto" => Some(ThemeType::Auto),
+            "custom" => Some(ThemeType::Custom),
+            _ => None
+        }
+    }
+}
+
+// =============================================================================
+// THEME COLORS
+// =============================================================================
+
+/// Theme color definitions
+type ThemeColors {
+    /// Primary brand color
+    primary: ColorScale,
+
+    /// Secondary brand color
+    secondary: ColorScale,
+
+    /// Accent color
+    accent: ColorScale,
+
+    /// Neutral/gray colors
+    neutral: ColorScale,
+
+    /// Success color
+    success: ColorScale,
+
+    /// Warning color
+    warning: ColorScale,
+
+    /// Error/danger color
+    error: ColorScale,
+
+    /// Info color
+    info: ColorScale,
+
+    /// Background colors
+    background: BackgroundColors,
+
+    /// Text colors
+    text: TextColors,
+
+    /// Border colors
+    border: BorderColors
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        ThemeColors {
+            primary: ColorScale::from_hex("#2563eb"),
+            secondary: ColorScale::from_hex("#7c3aed"),
+            accent: ColorScale::from_hex("#f59e0b"),
+            neutral: ColorScale::from_hex("#6b7280"),
+            success: ColorScale::from_hex("#10b981"),
+            warning: ColorScale::from_hex("#f59e0b"),
+            error: ColorScale::from_hex("#ef4444"),
+            info: ColorScale::from_hex("#3b82f6"),
+            background: BackgroundColors::default(),
+            text: TextColors::default(),
+            border: BorderColors::default()
+        }
+    }
+}
+
+impl ThemeColors {
+    fn to_css_vars(&self) -> String {
+        let mut css = String::new();
+
+        css.push_str(&self.primary.to_css_vars("primary"));
+        css.push_str(&self.secondary.to_css_vars("secondary"));
+        css.push_str(&self.accent.to_css_vars("accent"));
+        css.push_str(&self.neutral.to_css_vars("neutral"));
+        css.push_str(&self.success.to_css_vars("success"));
+        css.push_str(&self.warning.to_css_vars("warning"));
+        css.push_str(&self.error.to_css_vars("error"));
+        css.push_str(&self.info.to_css_vars("info"));
+
+        css.push_str(&format!("  --bg-primary: {};\n", self.background.primary));
+        css.push_str(&format!("  --bg-secondary: {};\n", self.background.secondary));
+        css.push_str(&format!("  --bg-tertiary: {};\n", self.background.tertiary));
+        css.push_str(&format!("  --bg-surface: {};\n", self.background.surface));
+        css.push_str(&format!("  --bg-elevated: {};\n", self.background.elevated));
+
+        css.push_str(&format!("  --text-primary: {};\n", self.text.primary));
+        css.push_str(&format!("  --text-secondary: {};\n", self.text.secondary));
+        css.push_str(&format!("  --text-tertiary: {};\n", self.text.tertiary));
+        css.push_str(&format!("  --text-disabled: {};\n", self.text.disabled));
+        css.push_str(&format!("  --text-inverse: {};\n", self.text.inverse));
+
+        css.push_str(&format!("  --border-default: {};\n", self.border.default));
+        css.push_str(&format!("  --border-subtle: {};\n", self.border.subtle));
+        css.push_str(&format!("  --border-strong: {};\n", self.border.strong));
+
+        css
+    }
+
+    fn merge_with(&self, parent: &ThemeColors) -> ThemeColors {
+        ThemeColors {
+            primary: self.primary.clone(),
+            secondary: self.secondary.clone(),
+            accent: self.accent.clone(),
+            neutral: self.neutral.clone(),
+            success: self.success.clone(),
+            warning: self.warning.clone(),
+            error: self.error.clone(),
+            info: self.info.clone(),
+            background: self.background.clone(),
+            text: self.text.clone(),
+            border: self.border.clone()
+        }
+    }
+}
+
+/// Color scale (50-950)
+type ColorScale {
+    c50: String,
+    c100: String,
+    c200: String,
+    c300: String,
+    c400: String,
+    c500: String,
+    c600: String,
+    c700: String,
+    c800: String,
+    c900: String,
+    c950: String
+}
+
+impl ColorScale {
+    fn from_hex(base: &str) -> ColorScale {
+        // Generate color scale from base color
+        // Simplified - would use proper color manipulation
+        ColorScale {
+            c50: lighten(base, 0.95),
+            c100: lighten(base, 0.9),
+            c200: lighten(base, 0.8),
+            c300: lighten(base, 0.6),
+            c400: lighten(base, 0.4),
+            c500: base.to_string(),
+            c600: darken(base, 0.1),
+            c700: darken(base, 0.2),
+            c800: darken(base, 0.3),
+            c900: darken(base, 0.4),
+            c950: darken(base, 0.5)
+        }
+    }
+
+    fn to_css_vars(&self, name: &str) -> String {
+        format!(
+            r#"  --{}-50: {};
+  --{}-100: {};
+  --{}-200: {};
+  --{}-300: {};
+  --{}-400: {};
+  --{}-500: {};
+  --{}-600: {};
+  --{}-700: {};
+  --{}-800: {};
+  --{}-900: {};
+  --{}-950: {};
+"#,
+            name, self.c50,
+            name, self.c100,
+            name, self.c200,
+            name, self.c300,
+            name, self.c400,
+            name, self.c500,
+            name, self.c600,
+            name, self.c700,
+            name, self.c800,
+            name, self.c900,
+            name, self.c950
+        )
+    }
+}
+
+/// Background colors
+type BackgroundColors {
+    primary: String,
+    secondary: String,
+    tertiary: String,
+    surface: String,
+    elevated: String
+}
+
+impl Default for BackgroundColors {
+    fn default() -> Self {
+        BackgroundColors {
+            primary: "#ffffff".to_string(),
+            secondary: "#f9fafb".to_string(),
+            tertiary: "#f3f4f6".to_string(),
+            surface: "#ffffff".to_string(),
+            elevated: "#ffffff".to_string()
+        }
+    }
+}
+
+/// Text colors
+type TextColors {
+    primary: String,
+    secondary: String,
+    tertiary: String,
+    disabled: String,
+    inverse: String
+}
+
+impl Default for TextColors {
+    fn default() -> Self {
+        TextColors {
+            primary: "#111827".to_string(),
+            secondary: "#4b5563".to_string(),
+            tertiary: "#9ca3af".to_string(),
+            disabled: "#d1d5db".to_string(),
+            inverse: "#ffffff".to_string()
+        }
+    }
+}
+
+/// Border colors
+type BorderColors {
+    default: String,
+    subtle: String,
+    strong: String
+}
+
+impl Default for BorderColors {
+    fn default() -> Self {
+        BorderColors {
+            default: "#e5e7eb".to_string(),
+            subtle: "#f3f4f6".to_string(),
+            strong: "#d1d5db".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// THEME TYPOGRAPHY
+// =============================================================================
+
+/// Typography settings
+type ThemeTypography {
+    /// Font families
+    font_family: FontFamilies,
+
+    /// Font sizes
+    font_sizes: FontSizes,
+
+    /// Font weights
+    font_weights: FontWeights,
+
+    /// Line heights
+    line_heights: LineHeights,
+
+    /// Letter spacing
+    letter_spacing: LetterSpacing
+}
+
+impl Default for ThemeTypography {
+    fn default() -> Self {
+        ThemeTypography {
+            font_family: FontFamilies::default(),
+            font_sizes: FontSizes::default(),
+            font_weights: FontWeights::default(),
+            line_heights: LineHeights::default(),
+            letter_spacing: LetterSpacing::default()
+        }
+    }
+}
+
+impl ThemeTypography {
+    fn to_css_vars(&self) -> String {
+        let mut css = String::new();
+
+        css.push_str(&format!("  --font-sans: {};\n", self.font_family.sans));
+        css.push_str(&format!("  --font-serif: {};\n", self.font_family.serif));
+        css.push_str(&format!("  --font-mono: {};\n", self.font_family.mono));
+
+        css.push_str(&format!("  --text-xs: {};\n", self.font_sizes.xs));
+        css.push_str(&format!("  --text-sm: {};\n", self.font_sizes.sm));
+        css.push_str(&format!("  --text-base: {};\n", self.font_sizes.base));
+        css.push_str(&format!("  --text-lg: {};\n", self.font_sizes.lg));
+        css.push_str(&format!("  --text-xl: {};\n", self.font_sizes.xl));
+        css.push_str(&format!("  --text-2xl: {};\n", self.font_sizes.xl2));
+        css.push_str(&format!("  --text-3xl: {};\n", self.font_sizes.xl3));
+        css.push_str(&format!("  --text-4xl: {};\n", self.font_sizes.xl4));
+
+        css.push_str(&format!("  --font-thin: {};\n", self.font_weights.thin));
+        css.push_str(&format!("  --font-light: {};\n", self.font_weights.light));
+        css.push_str(&format!("  --font-normal: {};\n", self.font_weights.normal));
+        css.push_str(&format!("  --font-medium: {};\n", self.font_weights.medium));
+        css.push_str(&format!("  --font-semibold: {};\n", self.font_weights.semibold));
+        css.push_str(&format!("  --font-bold: {};\n", self.font_weights.bold));
+
+        css.push_str(&format!("  --leading-none: {};\n", self.line_heights.none));
+        css.push_str(&format!("  --leading-tight: {};\n", self.line_heights.tight));
+        css.push_str(&format!("  --leading-normal: {};\n", self.line_heights.normal));
+        css.push_str(&format!("  --leading-relaxed: {};\n", self.line_heights.relaxed));
+        css.push_str(&format!("  --leading-loose: {};\n", self.line_heights.loose));
+
+        css
+    }
+
+    fn merge_with(&self, _parent: &ThemeTypography) -> ThemeTypography {
+        self.clone()
+    }
+}
+
+/// Font families
+type FontFamilies {
+    sans: String,
+    serif: String,
+    mono: String
+}
+
+impl Default for FontFamilies {
+    fn default() -> Self {
+        FontFamilies {
+            sans: "Inter, ui-sans-serif, system-ui, -apple-system, sans-serif".to_string(),
+            serif: "ui-serif, Georgia, Cambria, serif".to_string(),
+            mono: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace".to_string()
+        }
+    }
+}
+
+/// Font sizes
+type FontSizes {
+    xs: String,
+    sm: String,
+    base: String,
+    lg: String,
+    xl: String,
+    xl2: String,
+    xl3: String,
+    xl4: String,
+    xl5: String,
+    xl6: String
+}
+
+impl Default for FontSizes {
+    fn default() -> Self {
+        FontSizes {
+            xs: "0.75rem".to_string(),
+            sm: "0.875rem".to_string(),
+            base: "1rem".to_string(),
+            lg: "1.125rem".to_string(),
+            xl: "1.25rem".to_string(),
+            xl2: "1.5rem".to_string(),
+            xl3: "1.875rem".to_string(),
+            xl4: "2.25rem".to_string(),
+            xl5: "3rem".to_string(),
+            xl6: "3.75rem".to_string()
+        }
+    }
+}
+
+/// Font weights
+type FontWeights {
+    thin: i32,
+    light: i32,
+    normal: i32,
+    medium: i32,
+    semibold: i32,
+    bold: i32,
+    extrabold: i32,
+    black: i32
+}
+
+impl Default for FontWeights {
+    fn default() -> Self {
+        FontWeights {
+            thin: 100,
+            light: 300,
+            normal: 400,
+            medium: 500,
+            semibold: 600,
+            bold: 700,
+            extrabold: 800,
+            black: 900
+        }
+    }
+}
+
+/// Line heights
+type LineHeights {
+    none: String,
+    tight: String,
+    snug: String,
+    normal: String,
+    relaxed: String,
+    loose: String
+}
+
+impl Default for LineHeights {
+    fn default() -> Self {
+        LineHeights {
+            none: "1".to_string(),
+            tight: "1.25".to_string(),
+            snug: "1.375".to_string(),
+            normal: "1.5".to_string(),
+            relaxed: "1.625".to_string(),
+            loose: "2".to_string()
+        }
+    }
+}
+
+/// Letter spacing
+type LetterSpacing {
+    tighter: String,
+    tight: String,
+    normal: String,
+    wide: String,
+    wider: String,
+    widest: String
+}
+
+impl Default for LetterSpacing {
+    fn default() -> Self {
+        LetterSpacing {
+            tighter: "-0.05em".to_string(),
+            tight: "-0.025em".to_string(),
+            normal: "0em".to_string(),
+            wide: "0.025em".to_string(),
+            wider: "0.05em".to_string(),
+            widest: "0.1em".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// THEME SPACING
+// =============================================================================
+
+/// Spacing scale
+type ThemeSpacing {
+    px: String,
+    s0: String,
+    s0_5: String,
+    s1: String,
+    s1_5: String,
+    s2: String,
+    s2_5: String,
+    s3: String,
+    s3_5: String,
+    s4: String,
+    s5: String,
+    s6: String,
+    s7: String,
+    s8: String,
+    s9: String,
+    s10: String,
+    s12: String,
+    s14: String,
+    s16: String,
+    s20: String,
+    s24: String,
+    s32: String
+}
+
+impl Default for ThemeSpacing {
+    fn default() -> Self {
+        ThemeSpacing {
+            px: "1px".to_string(),
+            s0: "0".to_string(),
+            s0_5: "0.125rem".to_string(),
+            s1: "0.25rem".to_string(),
+            s1_5: "0.375rem".to_string(),
+            s2: "0.5rem".to_string(),
+            s2_5: "0.625rem".to_string(),
+            s3: "0.75rem".to_string(),
+            s3_5: "0.875rem".to_string(),
+            s4: "1rem".to_string(),
+            s5: "1.25rem".to_string(),
+            s6: "1.5rem".to_string(),
+            s7: "1.75rem".to_string(),
+            s8: "2rem".to_string(),
+            s9: "2.25rem".to_string(),
+            s10: "2.5rem".to_string(),
+            s12: "3rem".to_string(),
+            s14: "3.5rem".to_string(),
+            s16: "4rem".to_string(),
+            s20: "5rem".to_string(),
+            s24: "6rem".to_string(),
+            s32: "8rem".to_string()
+        }
+    }
+}
+
+impl ThemeSpacing {
+    fn to_css_vars(&self) -> String {
+        format!(
+            r#"  --space-px: {};
+  --space-0: {};
+  --space-1: {};
+  --space-2: {};
+  --space-3: {};
+  --space-4: {};
+  --space-5: {};
+  --space-6: {};
+  --space-8: {};
+  --space-10: {};
+  --space-12: {};
+  --space-16: {};
+  --space-20: {};
+  --space-24: {};
+"#,
+            self.px, self.s0, self.s1, self.s2, self.s3, self.s4,
+            self.s5, self.s6, self.s8, self.s10, self.s12, self.s16,
+            self.s20, self.s24
+        )
+    }
+}
+
+// =============================================================================
+// THEME BORDERS
+// =============================================================================
+
+/// Border styles
+type ThemeBorders {
+    radius: BorderRadius,
+    width: BorderWidth
+}
+
+impl Default for ThemeBorders {
+    fn default() -> Self {
+        ThemeBorders {
+            radius: BorderRadius::default(),
+            width: BorderWidth::default()
+        }
+    }
+}
+
+impl ThemeBorders {
+    fn to_css_vars(&self) -> String {
+        format!(
+            r#"  --radius-none: {};
+  --radius-sm: {};
+  --radius-default: {};
+  --radius-md: {};
+  --radius-lg: {};
+  --radius-xl: {};
+  --radius-2xl: {};
+  --radius-full: {};
+  --border-width: {};
+  --border-width-2: {};
+"#,
+            self.radius.none, self.radius.sm, self.radius.default,
+            self.radius.md, self.radius.lg, self.radius.xl,
+            self.radius.xl2, self.radius.full,
+            self.width.default, self.width.w2
+        )
+    }
+}
+
+/// Border radius
+type BorderRadius {
+    none: String,
+    sm: String,
+    default: String,
+    md: String,
+    lg: String,
+    xl: String,
+    xl2: String,
+    xl3: String,
+    full: String
+}
+
+impl Default for BorderRadius {
+    fn default() -> Self {
+        BorderRadius {
+            none: "0".to_string(),
+            sm: "0.125rem".to_string(),
+            default: "0.25rem".to_string(),
+            md: "0.375rem".to_string(),
+            lg: "0.5rem".to_string(),
+            xl: "0.75rem".to_string(),
+            xl2: "1rem".to_string(),
+            xl3: "1.5rem".to_string(),
+            full: "9999px".to_string()
+        }
+    }
+}
+
+/// Border width
+type BorderWidth {
+    default: String,
+    w0: String,
+    w2: String,
+    w4: String,
+    w8: String
+}
+
+impl Default for BorderWidth {
+    fn default() -> Self {
+        BorderWidth {
+            default: "1px".to_string(),
+            w0: "0".to_string(),
+            w2: "2px".to_string(),
+            w4: "4px".to_string(),
+            w8: "8px".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// THEME SHADOWS
+// =============================================================================
+
+/// Shadow definitions
+type ThemeShadows {
+    sm: String,
+    default: String,
+    md: String,
+    lg: String,
+    xl: String,
+    xl2: String,
+    inner: String,
+    none: String
+}
+
+impl Default for ThemeShadows {
+    fn default() -> Self {
+        ThemeShadows {
+            sm: "0 1px 2px 0 rgb(0 0 0 / 0.05)".to_string(),
+            default: "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)".to_string(),
+            md: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)".to_string(),
+            lg: "0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)".to_string(),
+            xl: "0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)".to_string(),
+            xl2: "0 25px 50px -12px rgb(0 0 0 / 0.25)".to_string(),
+            inner: "inset 0 2px 4px 0 rgb(0 0 0 / 0.05)".to_string(),
+            none: "0 0 #0000".to_string()
+        }
+    }
+}
+
+impl ThemeShadows {
+    fn to_css_vars(&self) -> String {
+        format!(
+            r#"  --shadow-sm: {};
+  --shadow: {};
+  --shadow-md: {};
+  --shadow-lg: {};
+  --shadow-xl: {};
+  --shadow-2xl: {};
+  --shadow-inner: {};
+"#,
+            self.sm, self.default, self.md, self.lg, self.xl, self.xl2, self.inner
+        )
+    }
+}
+
+// =============================================================================
+// THEME ANIMATIONS
+// =============================================================================
+
+/// Animation settings
+type ThemeAnimations {
+    /// Enable animations
+    enabled: Bool,
+
+    /// Default duration
+    duration_default: String,
+
+    /// Durations
+    duration_75: String,
+    duration_100: String,
+    duration_150: String,
+    duration_200: String,
+    duration_300: String,
+    duration_500: String,
+    duration_700: String,
+    duration_1000: String,
+
+    /// Timing functions
+    ease_linear: String,
+    ease_in: String,
+    ease_out: String,
+    ease_in_out: String
+}
+
+impl Default for ThemeAnimations {
+    fn default() -> Self {
+        ThemeAnimations {
+            enabled: true,
+            duration_default: "150ms".to_string(),
+            duration_75: "75ms".to_string(),
+            duration_100: "100ms".to_string(),
+            duration_150: "150ms".to_string(),
+            duration_200: "200ms".to_string(),
+            duration_300: "300ms".to_string(),
+            duration_500: "500ms".to_string(),
+            duration_700: "700ms".to_string(),
+            duration_1000: "1000ms".to_string(),
+            ease_linear: "linear".to_string(),
+            ease_in: "cubic-bezier(0.4, 0, 1, 1)".to_string(),
+            ease_out: "cubic-bezier(0, 0, 0.2, 1)".to_string(),
+            ease_in_out: "cubic-bezier(0.4, 0, 0.2, 1)".to_string()
+        }
+    }
+}
+
+impl ThemeAnimations {
+    fn to_css_vars(&self) -> String {
+        format!(
+            r#"  --duration-default: {};
+  --duration-75: {};
+  --duration-100: {};
+  --duration-150: {};
+  --duration-200: {};
+  --duration-300: {};
+  --duration-500: {};
+  --ease-linear: {};
+  --ease-in: {};
+  --ease-out: {};
+  --ease-in-out: {};
+"#,
+            self.duration_default, self.duration_75, self.duration_100,
+            self.duration_150, self.duration_200, self.duration_300,
+            self.duration_500, self.ease_linear, self.ease_in,
+            self.ease_out, self.ease_in_out
+        )
+    }
+}
+
+// =============================================================================
+// COMPONENT STYLES
+// =============================================================================
+
+/// Component-specific style overrides
+type ComponentStyle {
+    /// CSS rules
+    css: String,
+
+    /// CSS variables
+    variables: Map<String, String>,
+
+    /// Variants
+    variants: Map<String, String>
+}
+
+impl ComponentStyle {
+    fn to_css(&self) -> String {
+        let mut css = self.css.clone();
+
+        for (variant, rules) in &self.variants {
+            css.push_str(&format!("\n.variant-{} {{\n{}\n}}\n", variant, rules));
+        }
+
+        css
+    }
+}
+
+// =============================================================================
+// THEME CONTEXT
+// =============================================================================
+
+/// Theme context for runtime
+type ThemeContext {
+    /// Active theme
+    theme: Theme,
+
+    /// User preference
+    user_preference: Option<ThemeType>,
+
+    /// System preference
+    system_preference: ThemeType,
+
+    /// Is dark mode active
+    is_dark_mode: Bool,
+
+    /// Resolved theme type
+    resolved_type: ThemeType
+}
+
+impl ThemeContext {
+    fn new(theme: Theme) -> ThemeContext {
+        ThemeContext {
+            theme,
+            user_preference: None,
+            system_preference: ThemeType::Light,
+            is_dark_mode: false,
+            resolved_type: ThemeType::Light
+        }
+    }
+
+    fn set_user_preference(&mut self, preference: ThemeType) {
+        self.user_preference = Some(preference.clone());
+        self.resolve_theme();
+    }
+
+    fn set_system_preference(&mut self, preference: ThemeType) {
+        self.system_preference = preference.clone();
+        self.resolve_theme();
+    }
+
+    fn resolve_theme(&mut self) {
+        self.resolved_type = if let Some(ref pref) = self.user_preference {
+            if matches!(pref, ThemeType::Auto) {
+                self.system_preference.clone()
+            } else {
+                pref.clone()
+            }
+        } else {
+            self.system_preference.clone()
+        };
+
+        self.is_dark_mode = matches!(self.resolved_type, ThemeType::Dark);
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn lighten(hex: &str, amount: f64) -> String {
+    // Simplified - would use proper color manipulation
+    hex.to_string()
+}
+
+fn darken(hex: &str, amount: f64) -> String {
+    // Simplified - would use proper color manipulation
+    hex.to_string()
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_theme_creation() {
+        let theme = Theme::new(
+            "Test Theme".to_string(),
+            "test-theme".to_string(),
+            ThemeType::Light
+        );
+
+        assert_eq!(theme.name, "Test Theme");
+        assert_eq!(theme.slug, "test-theme");
+        assert!(theme.is_active);
+    }
+
+    #[test]
+    fn test_color_scale() {
+        let scale = ColorScale::from_hex("#2563eb");
+        assert!(!scale.c500.is_empty());
+    }
+
+    #[test]
+    fn test_theme_to_css() {
+        let theme = Theme::new(
+            "Test".to_string(),
+            "test".to_string(),
+            ThemeType::Light
+        );
+
+        let css = theme.to_css();
+        assert!(css.contains(":root"));
+        assert!(css.contains("--primary-"));
+    }
+}

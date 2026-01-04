@@ -1,0 +1,512 @@
+/// Intelligo LMS - Category Taxonomy
+///
+/// Provides hierarchical categorization for learning content.
+
+module intelligo::taxonomy::categories
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock}
+use std::time::DateTime
+
+// =============================================================================
+// CATEGORY
+// =============================================================================
+
+/// A category in the taxonomy hierarchy
+pub type Category {
+    id: String,
+    tenant_id: String,
+    name: String,
+    slug: String,
+    description: Option<String>,
+    parent_id: Option<String>,
+    path: String,           // Full path like "/technology/programming/python"
+    depth: i32,
+    position: i32,
+    icon: Option<String>,
+    color: Option<String>,
+    image_url: Option<String>,
+    metadata: Map<String, String>,
+    is_visible: bool,
+    is_featured: bool,
+    course_count: i32,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+impl Category {
+    pub fn new(tenant_id: &str, name: &str) -> Category {
+        let slug = slugify(name);
+        Category {
+            id: generate_id(),
+            tenant_id: tenant_id.to_string(),
+            name: name.to_string(),
+            slug: slug.clone(),
+            description: None,
+            parent_id: None,
+            path: format!("/{}", slug),
+            depth: 0,
+            position: 0,
+            icon: None,
+            color: None,
+            image_url: None,
+            metadata: Map::new(),
+            is_visible: true,
+            is_featured: false,
+            course_count: 0,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn with_parent(mut self, parent: &Category) -> Self {
+        self.parent_id = Some(parent.id.clone());
+        self.path = format!("{}/{}", parent.path, self.slug);
+        self.depth = parent.depth + 1;
+        self
+    }
+
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+
+    pub fn with_icon(mut self, icon: &str) -> Self {
+        self.icon = Some(icon.to_string());
+        self
+    }
+
+    pub fn with_color(mut self, color: &str) -> Self {
+        self.color = Some(color.to_string());
+        self
+    }
+
+    /// Check if this category is ancestor of another
+    pub fn is_ancestor_of(&self, other: &Category) -> bool {
+        other.path.starts_with(&self.path) && other.path != self.path
+    }
+
+    /// Check if this category is descendant of another
+    pub fn is_descendant_of(&self, other: &Category) -> bool {
+        self.path.starts_with(&other.path) && self.path != other.path
+    }
+
+    /// Get breadcrumb parts
+    pub fn breadcrumb(&self) -> List<String> {
+        self.path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+}
+
+// =============================================================================
+// CATEGORY TREE
+// =============================================================================
+
+/// Category tree for hierarchical navigation
+pub type CategoryTree {
+    categories: Arc<RwLock<Map<String, Category>>>,
+    children_map: Arc<RwLock<Map<String, List<String>>>>
+}
+
+impl CategoryTree {
+    pub fn new() -> CategoryTree {
+        CategoryTree {
+            categories: Arc::new(RwLock::new(Map::new())),
+            children_map: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    /// Load categories from list
+    pub fn load(&self, categories: List<Category>) {
+        let mut cats = self.categories.write().unwrap();
+        let mut children = self.children_map.write().unwrap();
+
+        for category in categories {
+            let parent_id = category.parent_id.clone().unwrap_or_default();
+            children.entry(parent_id)
+                .or_insert_with(Vec::new)
+                .push(category.id.clone());
+            cats.insert(category.id.clone(), category);
+        }
+    }
+
+    /// Get category by ID
+    pub fn get(&self, id: &str) -> Option<Category> {
+        self.categories.read().unwrap().get(id).cloned()
+    }
+
+    /// Get category by path
+    pub fn get_by_path(&self, path: &str) -> Option<Category> {
+        self.categories.read().unwrap()
+            .values()
+            .find(|c| c.path == path)
+            .cloned()
+    }
+
+    /// Get root categories
+    pub fn roots(&self) -> List<Category> {
+        self.categories.read().unwrap()
+            .values()
+            .filter(|c| c.parent_id.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Get children of a category
+    pub fn children(&self, parent_id: &str) -> List<Category> {
+        let children_ids = self.children_map.read().unwrap()
+            .get(parent_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let cats = self.categories.read().unwrap();
+        children_ids.iter()
+            .filter_map(|id| cats.get(id).cloned())
+            .collect()
+    }
+
+    /// Get ancestors of a category
+    pub fn ancestors(&self, id: &str) -> List<Category> {
+        let mut ancestors = vec![];
+        let cats = self.categories.read().unwrap();
+
+        if let Some(category) = cats.get(id) {
+            let mut current_parent_id = category.parent_id.clone();
+            while let Some(parent_id) = current_parent_id {
+                if let Some(parent) = cats.get(&parent_id) {
+                    ancestors.push(parent.clone());
+                    current_parent_id = parent.parent_id.clone();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        ancestors.reverse();
+        ancestors
+    }
+
+    /// Get all descendants of a category
+    pub fn descendants(&self, id: &str) -> List<Category> {
+        let mut descendants = vec![];
+        let cats = self.categories.read().unwrap();
+
+        if let Some(category) = cats.get(id) {
+            for cat in cats.values() {
+                if cat.is_descendant_of(category) {
+                    descendants.push(cat.clone());
+                }
+            }
+        }
+
+        descendants.sort_by(|a, b| a.path.cmp(&b.path));
+        descendants
+    }
+
+    /// Get tree node for rendering
+    pub fn get_tree_node(&self, id: &str) -> Option<CategoryNode> {
+        let category = self.get(id)?;
+        let children = self.children(id)
+            .into_iter()
+            .filter_map(|c| self.get_tree_node(&c.id))
+            .collect();
+
+        Some(CategoryNode { category, children })
+    }
+
+    /// Get full tree
+    pub fn get_full_tree(&self) -> List<CategoryNode> {
+        self.roots()
+            .into_iter()
+            .filter_map(|c| self.get_tree_node(&c.id))
+            .collect()
+    }
+
+    /// Search categories
+    pub fn search(&self, query: &str) -> List<Category> {
+        let query_lower = query.to_lowercase();
+        self.categories.read().unwrap()
+            .values()
+            .filter(|c| {
+                c.name.to_lowercase().contains(&query_lower) ||
+                c.slug.contains(&query_lower) ||
+                c.description.as_ref().map(|d| d.to_lowercase().contains(&query_lower)).unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// Category tree node for rendering
+pub type CategoryNode {
+    category: Category,
+    children: List<CategoryNode>
+}
+
+// =============================================================================
+// CATEGORY SERVICE
+// =============================================================================
+
+/// Actor for managing categories
+pub actor CategoryService {
+    tree: CategoryTree,
+    tenant_id: String
+}
+
+impl CategoryService {
+    pub fn new(tenant_id: &str) -> CategoryService {
+        CategoryService {
+            tree: CategoryTree::new(),
+            tenant_id: tenant_id.to_string()
+        }
+    }
+
+    /// Create a new category
+    pub async fn create(&mut self, name: &str, parent_id: Option<&str>) -> Result<Category, String> {
+        // Check for duplicate slug at same level
+        let slug = slugify(name);
+        let siblings = match parent_id {
+            Some(pid) => self.tree.children(pid),
+            None => self.tree.roots()
+        };
+
+        if siblings.iter().any(|c| c.slug == slug) {
+            return Err(format!("Category with slug '{}' already exists at this level", slug));
+        }
+
+        let mut category = Category::new(&self.tenant_id, name);
+
+        if let Some(pid) = parent_id {
+            if let Some(parent) = self.tree.get(pid) {
+                category = category.with_parent(&parent);
+            } else {
+                return Err("Parent category not found".to_string());
+            }
+        }
+
+        // Set position
+        category.position = siblings.len() as i32;
+
+        self.tree.categories.write().unwrap().insert(category.id.clone(), category.clone());
+
+        // Update children map
+        let parent_key = parent_id.unwrap_or("").to_string();
+        self.tree.children_map.write().unwrap()
+            .entry(parent_key)
+            .or_insert_with(Vec::new)
+            .push(category.id.clone());
+
+        Ok(category)
+    }
+
+    /// Update a category
+    pub async fn update(&mut self, id: &str, updates: CategoryUpdate) -> Result<Category, String> {
+        let mut cats = self.tree.categories.write().unwrap();
+        let category = cats.get_mut(id).ok_or("Category not found")?;
+
+        if let Some(name) = updates.name {
+            category.name = name.clone();
+            // Only update slug if explicitly provided
+            if updates.slug.is_none() {
+                category.slug = slugify(&name);
+            }
+        }
+
+        if let Some(slug) = updates.slug {
+            category.slug = slug;
+        }
+
+        if let Some(description) = updates.description {
+            category.description = Some(description);
+        }
+
+        if let Some(icon) = updates.icon {
+            category.icon = Some(icon);
+        }
+
+        if let Some(color) = updates.color {
+            category.color = Some(color);
+        }
+
+        if let Some(visible) = updates.is_visible {
+            category.is_visible = visible;
+        }
+
+        if let Some(featured) = updates.is_featured {
+            category.is_featured = featured;
+        }
+
+        category.updated_at = DateTime::now();
+
+        Ok(category.clone())
+    }
+
+    /// Delete a category
+    pub async fn delete(&mut self, id: &str, reassign_to: Option<&str>) -> Result<(), String> {
+        // Check for children
+        let children = self.tree.children(id);
+        if !children.is_empty() && reassign_to.is_none() {
+            return Err("Cannot delete category with children. Provide reassign_to or delete children first.".to_string());
+        }
+
+        // Reassign children if specified
+        if let Some(new_parent_id) = reassign_to {
+            for child in children {
+                self.move_category(&child.id, Some(new_parent_id)).await?;
+            }
+        }
+
+        // Remove from parent's children
+        let category = self.tree.get(id).ok_or("Category not found")?;
+        let parent_key = category.parent_id.clone().unwrap_or_default();
+        if let Some(children_list) = self.tree.children_map.write().unwrap().get_mut(&parent_key) {
+            children_list.retain(|c| c != id);
+        }
+
+        // Remove category
+        self.tree.categories.write().unwrap().remove(id);
+
+        Ok(())
+    }
+
+    /// Move a category to a new parent
+    pub async fn move_category(&mut self, id: &str, new_parent_id: Option<&str>) -> Result<Category, String> {
+        let mut cats = self.tree.categories.write().unwrap();
+        let category = cats.get_mut(id).ok_or("Category not found")?;
+
+        // Prevent moving to self or descendant
+        if let Some(npid) = new_parent_id {
+            if npid == id {
+                return Err("Cannot move category to itself".to_string());
+            }
+            if let Some(new_parent) = cats.get(npid) {
+                if new_parent.is_descendant_of(category) {
+                    return Err("Cannot move category to its descendant".to_string());
+                }
+            }
+        }
+
+        // Remove from old parent
+        let old_parent_key = category.parent_id.clone().unwrap_or_default();
+        drop(cats); // Release lock
+
+        if let Some(children_list) = self.tree.children_map.write().unwrap().get_mut(&old_parent_key) {
+            children_list.retain(|c| c != id);
+        }
+
+        // Update category
+        let mut cats = self.tree.categories.write().unwrap();
+        let category = cats.get_mut(id).unwrap();
+
+        if let Some(npid) = new_parent_id {
+            if let Some(new_parent) = cats.get(npid).cloned() {
+                category.parent_id = Some(npid.to_string());
+                category.path = format!("{}/{}", new_parent.path, category.slug);
+                category.depth = new_parent.depth + 1;
+            }
+        } else {
+            category.parent_id = None;
+            category.path = format!("/{}", category.slug);
+            category.depth = 0;
+        }
+
+        category.updated_at = DateTime::now();
+        let updated = category.clone();
+
+        // Add to new parent
+        drop(cats);
+        let new_parent_key = new_parent_id.unwrap_or("").to_string();
+        self.tree.children_map.write().unwrap()
+            .entry(new_parent_key)
+            .or_insert_with(Vec::new)
+            .push(id.to_string());
+
+        Ok(updated)
+    }
+
+    /// Reorder categories at same level
+    pub async fn reorder(&mut self, parent_id: Option<&str>, category_ids: List<String>) -> Result<(), String> {
+        let mut cats = self.tree.categories.write().unwrap();
+
+        for (position, id) in category_ids.iter().enumerate() {
+            if let Some(category) = cats.get_mut(id) {
+                category.position = position as i32;
+                category.updated_at = DateTime::now();
+            }
+        }
+
+        // Update children order
+        let parent_key = parent_id.unwrap_or("").to_string();
+        self.tree.children_map.write().unwrap()
+            .insert(parent_key, category_ids);
+
+        Ok(())
+    }
+
+    /// Get category by ID
+    pub fn get(&self, id: &str) -> Option<Category> {
+        self.tree.get(id)
+    }
+
+    /// Get category by path
+    pub fn get_by_path(&self, path: &str) -> Option<Category> {
+        self.tree.get_by_path(path)
+    }
+
+    /// Get tree
+    pub fn get_tree(&self) -> List<CategoryNode> {
+        self.tree.get_full_tree()
+    }
+
+    /// Search categories
+    pub fn search(&self, query: &str) -> List<Category> {
+        self.tree.search(query)
+    }
+
+    /// Get featured categories
+    pub fn get_featured(&self) -> List<Category> {
+        self.tree.categories.read().unwrap()
+            .values()
+            .filter(|c| c.is_featured && c.is_visible)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Category update data
+pub type CategoryUpdate {
+    name: Option<String>,
+    slug: Option<String>,
+    description: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
+    image_url: Option<String>,
+    is_visible: Option<bool>,
+    is_featured: Option<bool>
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id() -> String {
+    use std::time::SystemTime;
+    format!("cat_{:x}", SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<&str>>()
+        .join("-")
+}

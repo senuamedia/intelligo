@@ -1,0 +1,895 @@
+// Kaltura Integration for Intelligo LMS
+// Enterprise video platform with advanced features
+
+module intelligo::integrations::video::kaltura
+
+use intelligo::integrations::video::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::crypto::{Sha1, Hmac}
+use std::json::{Json, JsonValue}
+
+/// Kaltura-specific configuration
+pub type KalturaConfig {
+    partner_id: u32,
+    admin_secret: String,
+    user_id: String,
+    service_url: String,
+    player_ui_conf_id: Option<u64>,
+
+    // Session settings
+    session_type: KalturaSessionType,
+    session_expiry: Duration,
+    privileges: Option<String>,
+
+    // Player settings
+    player_version: KalturaPlayerVersion,
+    auto_embed: bool,
+    lead_with_html5: bool,
+    cache_st: Option<u64>,
+}
+
+impl KalturaConfig {
+    pub fn new(partner_id: u32, admin_secret: String, user_id: String) -> Self {
+        KalturaConfig {
+            partner_id: partner_id,
+            admin_secret: admin_secret,
+            user_id: user_id,
+            service_url: "https://www.kaltura.com".to_string(),
+            player_ui_conf_id: None,
+            session_type: KalturaSessionType::User,
+            session_expiry: Duration::hours(24),
+            privileges: None,
+            player_version: KalturaPlayerVersion::V7,
+            auto_embed: true,
+            lead_with_html5: true,
+            cache_st: None,
+        }
+    }
+
+    pub fn with_service_url(mut self, url: String) -> Self {
+        self.service_url = url;
+        self
+    }
+}
+
+/// Kaltura session types
+pub enum KalturaSessionType {
+    User,
+    Admin,
+}
+
+impl KalturaSessionType {
+    pub fn to_int(self) -> u32 {
+        match self {
+            KalturaSessionType::User => 0,
+            KalturaSessionType::Admin => 2,
+        }
+    }
+}
+
+/// Kaltura player versions
+pub enum KalturaPlayerVersion {
+    V2,  // Legacy
+    V7,  // Current
+}
+
+/// Kaltura entry (media) types
+pub enum KalturaMediaType {
+    Video,
+    Audio,
+    Image,
+    LiveStream,
+}
+
+impl KalturaMediaType {
+    pub fn from_int(i: i32) -> Self {
+        match i {
+            1 => KalturaMediaType::Video,
+            5 => KalturaMediaType::Audio,
+            2 => KalturaMediaType::Image,
+            201 | 202 => KalturaMediaType::LiveStream,
+            _ => KalturaMediaType::Video,
+        }
+    }
+}
+
+/// Kaltura entry status
+pub enum KalturaEntryStatus {
+    ErrorImporting,
+    ErrorConverting,
+    ScanFailure,
+    Import,
+    Infected,
+    Preconvert,
+    Ready,
+    Deleted,
+    Pending,
+    Moderate,
+    Blocked,
+    NoContent,
+}
+
+impl KalturaEntryStatus {
+    pub fn from_int(i: i32) -> Self {
+        match i {
+            -2 => KalturaEntryStatus::ErrorImporting,
+            -1 => KalturaEntryStatus::ErrorConverting,
+            -4 => KalturaEntryStatus::ScanFailure,
+            0 => KalturaEntryStatus::Import,
+            -3 => KalturaEntryStatus::Infected,
+            1 => KalturaEntryStatus::Preconvert,
+            2 => KalturaEntryStatus::Ready,
+            3 => KalturaEntryStatus::Deleted,
+            4 => KalturaEntryStatus::Pending,
+            5 => KalturaEntryStatus::Moderate,
+            6 => KalturaEntryStatus::Blocked,
+            7 => KalturaEntryStatus::NoContent,
+            _ => KalturaEntryStatus::Ready,
+        }
+    }
+
+    pub fn to_video_status(self) -> VideoStatus {
+        match self {
+            KalturaEntryStatus::Ready => VideoStatus::Ready,
+            KalturaEntryStatus::Deleted => VideoStatus::Deleted,
+            KalturaEntryStatus::ErrorImporting |
+            KalturaEntryStatus::ErrorConverting |
+            KalturaEntryStatus::ScanFailure |
+            KalturaEntryStatus::Infected |
+            KalturaEntryStatus::Blocked => VideoStatus::Failed,
+            _ => VideoStatus::Processing,
+        }
+    }
+}
+
+/// Kaltura media entry response
+pub type KalturaMediaEntry {
+    id: String,
+    name: String,
+    description: Option<String>,
+    partner_id: u32,
+    user_id: String,
+    creator_id: Option<String>,
+    tags: String,
+    categories: String,
+    categories_ids: String,
+    status: i32,
+    moderation_status: i32,
+    moderation_count: i32,
+    media_type: i32,
+    source_type: String,
+    data_url: Option<String>,
+    flavor_params_ids: Option<String>,
+    duration: i32,
+    ms_duration: i64,
+    thumbnail_url: Option<String>,
+    width: Option<i32>,
+    height: Option<i32>,
+    plays: i64,
+    views: i64,
+    last_played_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+    download_url: Option<String>,
+}
+
+/// Kaltura list response
+pub type KalturaListResponse {
+    objects: Vec<JsonValue>,
+    total_count: u32,
+}
+
+/// Kaltura caption asset
+pub type KalturaCaptionAsset {
+    id: String,
+    entry_id: String,
+    partner_id: u32,
+    language: String,
+    language_code: String,
+    label: String,
+    format: String,
+    status: i32,
+    is_default: bool,
+}
+
+/// Kaltura flavor asset (quality/rendition)
+pub type KalturaFlavorAsset {
+    id: String,
+    entry_id: String,
+    partner_id: u32,
+    status: i32,
+    flavor_params_id: u32,
+    width: i32,
+    height: i32,
+    bitrate: i32,
+    frame_rate: f64,
+    size: i64,
+    is_original: bool,
+    file_ext: String,
+}
+
+/// Kaltura Provider implementation
+pub actor KalturaProvider {
+    config: VideoConfig,
+    kaltura_config: KalturaConfig,
+    ks: Option<String>, // Kaltura Session
+    ks_expires: Option<DateTime>,
+
+    pub fn new(config: VideoConfig) -> Self {
+        let kaltura_cfg = config.kaltura_config.clone()
+            .unwrap_or_else(|| KalturaConfig::new(
+                config.account_id.clone()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+                config.api_secret.clone().unwrap_or_default(),
+                "admin".to_string()
+            ));
+
+        KalturaProvider {
+            config: config,
+            kaltura_config: kaltura_cfg,
+            ks: None,
+            ks_expires: None,
+        }
+    }
+
+    /// Generate Kaltura Session (KS)
+    async fn get_session(mut self) -> Result<String, VideoError> {
+        // Check if we have a valid cached session
+        if let (Some(ref ks), Some(expires)) = (&self.ks, self.ks_expires) {
+            if DateTime::now() < expires {
+                return Ok(ks.clone());
+            }
+        }
+
+        // Generate new session
+        let ks = self.generate_ks().await?;
+        let expiry = DateTime::now() + self.kaltura_config.session_expiry;
+
+        self.ks = Some(ks.clone());
+        self.ks_expires = Some(expiry);
+
+        Ok(ks)
+    }
+
+    /// Generate KS using session.start API
+    async fn generate_ks(self) -> Result<String, VideoError> {
+        let url = format!(
+            "{}/api_v3/service/session/action/start",
+            self.kaltura_config.service_url
+        );
+
+        let client = std::http::Client::new();
+        let expiry = self.kaltura_config.session_expiry.as_secs() as u32;
+
+        let mut form_data = vec![
+            ("secret", self.kaltura_config.admin_secret.clone()),
+            ("userId", self.kaltura_config.user_id.clone()),
+            ("type", self.kaltura_config.session_type.to_int().to_string()),
+            ("partnerId", self.kaltura_config.partner_id.to_string()),
+            ("expiry", expiry.to_string()),
+            ("format", "1".to_string()), // JSON format
+        ];
+
+        if let Some(ref privileges) = self.kaltura_config.privileges {
+            form_data.push(("privileges", privileges.clone()));
+        }
+
+        let response = client.post(&url)
+            .form(&form_data)
+            .send()
+            .await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(VideoError::AuthenticationError {
+                message: "Failed to generate Kaltura session".to_string()
+            });
+        }
+
+        let text = response.text().await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        // Response is just the session string (with quotes)
+        let ks = text.trim().trim_matches('"').to_string();
+
+        if ks.is_empty() || ks.contains("error") {
+            return Err(VideoError::AuthenticationError {
+                message: format!("Invalid session response: {}", text)
+            });
+        }
+
+        Ok(ks)
+    }
+
+    /// Make API request
+    async fn api_request(
+        mut self,
+        service: &str,
+        action: &str,
+        params: Vec<(&str, String)>
+    ) -> Result<JsonValue, VideoError> {
+        let ks = self.get_session().await?;
+
+        let url = format!(
+            "{}/api_v3/service/{}/action/{}",
+            self.kaltura_config.service_url,
+            service,
+            action
+        );
+
+        let client = std::http::Client::new();
+
+        let mut form_data: Vec<(&str, String)> = vec![
+            ("ks", ks),
+            ("format", "1".to_string()),
+        ];
+        form_data.extend(params);
+
+        let response = client.post(&url)
+            .form(&form_data)
+            .send()
+            .await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(VideoError::ApiError {
+                status: response.status().as_u16(),
+                message: "API request failed".to_string()
+            });
+        }
+
+        let json: JsonValue = response.json().await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        // Check for API errors
+        if let Some(error_code) = json["code"].as_str() {
+            return Err(VideoError::ApiError {
+                status: 400,
+                message: format!("{}: {}",
+                    error_code,
+                    json["message"].as_str().unwrap_or("Unknown error"))
+            });
+        }
+
+        Ok(json)
+    }
+
+    /// Extract entry ID from Kaltura URL
+    fn parse_entry_id(self, url: &str) -> Option<String> {
+        // Handle various Kaltura URL formats
+
+        // entry_id parameter
+        if let Some(pos) = url.find("entry_id/") {
+            let start = pos + 9;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+
+        // entryId query parameter
+        if let Some(pos) = url.find("entryId=") {
+            let start = pos + 8;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+
+        // entry_id query parameter
+        if let Some(pos) = url.find("entry_id=") {
+            let start = pos + 9;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    /// Convert Kaltura entry to internal Video type
+    fn convert_entry(self, entry: KalturaMediaEntry) -> Video {
+        let status = KalturaEntryStatus::from_int(entry.status).to_video_status();
+
+        let thumbnail_url = entry.thumbnail_url.clone()
+            .or_else(|| Some(format!(
+                "{}/p/{}/thumbnail/entry_id/{}",
+                self.kaltura_config.service_url,
+                self.kaltura_config.partner_id,
+                entry.id
+            )));
+
+        let duration = Duration::milliseconds(entry.ms_duration);
+
+        Video {
+            id: entry.id.clone(),
+            provider_type: VideoProviderType::Kaltura,
+            external_id: entry.id.clone(),
+            title: entry.name,
+            description: entry.description,
+            duration: duration,
+            thumbnail_url: thumbnail_url,
+            embed_url: format!(
+                "{}/p/{}/embedPlaykitJs/uiconf_id/{}?iframeembed=true&entry_id={}",
+                self.kaltura_config.service_url,
+                self.kaltura_config.partner_id,
+                self.kaltura_config.player_ui_conf_id.unwrap_or(0),
+                entry.id
+            ),
+            watch_url: format!(
+                "{}/p/{}/sp/{}/playManifest/entryId/{}",
+                self.kaltura_config.service_url,
+                self.kaltura_config.partner_id,
+                self.kaltura_config.partner_id * 100,
+                entry.id
+            ),
+            width: entry.width.map(|w| w as u32),
+            height: entry.height.map(|h| h as u32),
+            available_qualities: vec![VideoQuality::Auto],
+            has_captions: false, // Would need separate API call
+            caption_languages: Vec::new(),
+            status: status,
+            privacy: VideoPrivacy::Private,
+            created_at: DateTime::from_timestamp(entry.created_at),
+            updated_at: DateTime::from_timestamp(entry.updated_at),
+            tags: entry.tags.split(',').map(|s| s.trim().to_string()).collect(),
+            categories: entry.categories.split(',').map(|s| s.trim().to_string()).collect(),
+            custom_fields: HashMap::new(),
+        }
+    }
+
+    /// Build embed URL with options
+    fn build_embed_url(mut self, entry_id: &str, options: &VideoEmbedOptions) -> String {
+        let ui_conf_id = self.kaltura_config.player_ui_conf_id.unwrap_or(0);
+
+        let mut url = format!(
+            "{}/p/{}/embedPlaykitJs/uiconf_id/{}",
+            self.kaltura_config.service_url,
+            self.kaltura_config.partner_id,
+            ui_conf_id
+        );
+
+        let mut params = vec![
+            format!("iframeembed=true"),
+            format!("entry_id={}", entry_id),
+        ];
+
+        if options.autoplay {
+            params.push("autoplay=true".to_string());
+        }
+        if options.muted {
+            params.push("muted=true".to_string());
+        }
+        if options.loop_video {
+            params.push("loop=true".to_string());
+        }
+
+        // Start time
+        if let Some(start) = options.start_time {
+            params.push(format!("mediaProxy.mediaPlayFrom={}", start.as_secs()));
+        }
+
+        if !params.is_empty() {
+            url = format!("{}?{}", url, params.join("&"));
+        }
+
+        url
+    }
+}
+
+impl VideoProvider for KalturaProvider {
+    fn get_config(self) -> VideoConfig {
+        self.config.clone()
+    }
+
+    async fn test_connection(mut self) -> Result<VideoConnectionTest, VideoError> {
+        let start = DateTime::now();
+
+        // Try to get a session
+        let _ks = self.get_session().await?;
+        let latency = (DateTime::now() - start).as_millis() as u64;
+
+        // Get partner info
+        let response = self.api_request(
+            "partner",
+            "getInfo",
+            Vec::new()
+        ).await?;
+
+        let account_name = response["name"].as_str().map(|s| s.to_string());
+
+        Ok(VideoConnectionTest {
+            success: true,
+            message: "Connected to Kaltura API".to_string(),
+            latency_ms: latency,
+            account_name: account_name,
+            quota_remaining: None,
+        })
+    }
+
+    fn can_handle_url(self, url: &str) -> bool {
+        url.contains("kaltura.com") ||
+        url.contains("mediaspace") ||
+        url.contains("cdnapi") ||
+        url.contains("cfvod")
+    }
+
+    fn extract_video_id(self, url: &str) -> Result<String, VideoError> {
+        self.parse_entry_id(url).ok_or(
+            VideoError::EmbedError {
+                message: "Could not extract Kaltura entry ID from URL".to_string()
+            }
+        )
+    }
+
+    async fn get_video(mut self, video_id: String) -> Result<Video, VideoError> {
+        let response = self.api_request(
+            "media",
+            "get",
+            vec![("entryId", video_id.clone())]
+        ).await?;
+
+        let entry = parse_kaltura_entry(&response)?;
+        Ok(self.convert_entry(entry))
+    }
+
+    async fn list_videos(mut self, options: VideoListOptions) -> Result<VideoList, VideoError> {
+        let page_size = options.limit;
+        let page_index = (options.offset / options.limit) + 1;
+
+        let mut params = vec![
+            ("pager[pageSize]", page_size.to_string()),
+            ("pager[pageIndex]", page_index.to_string()),
+        ];
+
+        // Add filter for media type (video)
+        params.push(("filter[mediaTypeEqual]", "1".to_string())); // Video type
+
+        // Add ordering
+        let order_by = match options.sort_by {
+            VideoSortField::Title => "+name",
+            VideoSortField::CreatedAt => "-createdAt",
+            VideoSortField::Duration => "-duration",
+            VideoSortField::Views => "-plays",
+        };
+
+        let order_by = match options.sort_order {
+            SortOrder::Ascending => order_by.replace("-", "+"),
+            SortOrder::Descending => order_by.replace("+", "-"),
+        };
+        params.push(("filter[orderBy]", order_by));
+
+        let response = self.api_request("media", "list", params).await?;
+
+        let mut videos = Vec::new();
+        if let Some(objects) = response["objects"].as_array() {
+            for item in objects {
+                if let Ok(entry) = parse_kaltura_entry(item) {
+                    videos.push(self.convert_entry(entry));
+                }
+            }
+        }
+
+        let total = response["totalCount"].as_u64().unwrap_or(0) as u32;
+
+        Ok(VideoList {
+            videos: videos,
+            total: total,
+            offset: options.offset,
+            limit: options.limit,
+            has_more: (options.offset + options.limit) < total,
+        })
+    }
+
+    async fn search_videos(
+        mut self,
+        query: String,
+        options: VideoListOptions
+    ) -> Result<VideoList, VideoError> {
+        let page_size = options.limit;
+        let page_index = (options.offset / options.limit) + 1;
+
+        let params = vec![
+            ("pager[pageSize]", page_size.to_string()),
+            ("pager[pageIndex]", page_index.to_string()),
+            ("filter[freeText]", query),
+            ("filter[mediaTypeEqual]", "1".to_string()),
+        ];
+
+        let response = self.api_request("media", "list", params).await?;
+
+        let mut videos = Vec::new();
+        if let Some(objects) = response["objects"].as_array() {
+            for item in objects {
+                if let Ok(entry) = parse_kaltura_entry(item) {
+                    videos.push(self.convert_entry(entry));
+                }
+            }
+        }
+
+        let total = response["totalCount"].as_u64().unwrap_or(0) as u32;
+
+        Ok(VideoList {
+            videos: videos,
+            total: total,
+            offset: options.offset,
+            limit: options.limit,
+            has_more: (options.offset + options.limit) < total,
+        })
+    }
+
+    async fn get_embed(
+        mut self,
+        video_id: String,
+        options: VideoEmbedOptions
+    ) -> Result<VideoEmbed, VideoError> {
+        let iframe_url = self.build_embed_url(&video_id, &options);
+
+        let width = options.width.unwrap_or(640);
+        let height = options.height.unwrap_or(360);
+
+        let html = if options.responsive {
+            generate_responsive_wrapper(
+                format!(
+                    r#"<iframe src="{}" width="100%" height="100%" frameborder="0" allowfullscreen webkitallowfullscreen mozAllowFullScreen allow="autoplay *; fullscreen *; encrypted-media *"></iframe>"#,
+                    iframe_url
+                ),
+                16.0 / 9.0
+            )
+        } else {
+            format!(
+                r#"<iframe src="{}" width="{}" height="{}" frameborder="0" allowfullscreen webkitallowfullscreen mozAllowFullScreen allow="autoplay *; fullscreen *; encrypted-media *"></iframe>"#,
+                iframe_url, width, height
+            )
+        };
+
+        Ok(VideoEmbed {
+            html: html,
+            iframe_url: iframe_url,
+            script_url: None,
+            width: width,
+            height: height,
+        })
+    }
+
+    fn get_player_script(self) -> Option<String> {
+        None // Kaltura V7 player is embedded in iframe
+    }
+
+    async fn get_analytics(mut self, video_id: String) -> Result<VideoAnalytics, VideoError> {
+        // Get basic stats from entry
+        let entry_response = self.api_request(
+            "media",
+            "get",
+            vec![("entryId", video_id.clone())]
+        ).await?;
+
+        let plays = entry_response["plays"].as_u64().unwrap_or(0);
+        let views = entry_response["views"].as_u64().unwrap_or(0);
+
+        Ok(VideoAnalytics {
+            video_id: video_id,
+            total_views: views,
+            unique_viewers: 0, // Would need analytics API
+            total_watch_time: Duration::zero(),
+            average_watch_time: Duration::zero(),
+            completion_rate: 0.0,
+            engagement_score: 0.0,
+            heatmap: Vec::new(),
+            top_dropoff_points: Vec::new(),
+            device_breakdown: HashMap::new(),
+            quality_breakdown: HashMap::new(),
+        })
+    }
+
+    async fn get_captions(mut self, video_id: String) -> Result<Vec<VideoCaption>, VideoError> {
+        let response = self.api_request(
+            "caption_captionasset",
+            "list",
+            vec![("filter[entryIdEqual]", video_id)]
+        ).await?;
+
+        let mut captions = Vec::new();
+        if let Some(objects) = response["objects"].as_array() {
+            for item in objects {
+                captions.push(VideoCaption {
+                    id: item["id"].as_str().unwrap_or_default().to_string(),
+                    language: item["languageCode"].as_str().unwrap_or("en").to_string(),
+                    language_name: item["label"].as_str().unwrap_or("").to_string(),
+                    is_auto_generated: false,
+                    format: match item["format"].as_str() {
+                        Some("srt") => CaptionFormat::Srt,
+                        Some("webvtt") => CaptionFormat::Vtt,
+                        Some("ttml") => CaptionFormat::Ttml,
+                        _ => CaptionFormat::Srt,
+                    },
+                    url: None,
+                    content: None,
+                });
+            }
+        }
+
+        Ok(captions)
+    }
+
+    async fn upload_video(mut self, upload: VideoUpload) -> Result<Video, VideoError> {
+        // Kaltura uses a multi-step upload process
+        // 1. Create upload token
+        // 2. Upload file to token
+        // 3. Create media entry with token
+
+        // Create upload token
+        let token_response = self.api_request(
+            "uploadToken",
+            "add",
+            Vec::new()
+        ).await?;
+
+        let token_id = token_response["id"].as_str()
+            .ok_or(VideoError::UploadError {
+                message: "Failed to get upload token".to_string()
+            })?
+            .to_string();
+
+        // Upload file to token using multipart form
+        if let Some(file_data) = &upload.file_data {
+            let upload_url = format!(
+                "{}/api_v3/service/uploadToken/action/upload",
+                self.kaltura_config.service_url
+            );
+
+            let ks = self.get_session().await?;
+
+            // Build multipart form
+            let client = std::http::Client::new();
+            let mut form = std::http::multipart::Form::new()
+                .text("ks", ks)
+                .text("uploadTokenId", token_id.clone())
+                .text("resume", "false")
+                .text("finalChunk", "true")
+                .text("resumeAt", "-1");
+
+            // Add file with proper MIME type
+            let mime_type = upload.mime_type.as_ref()
+                .unwrap_or(&"video/mp4".to_string())
+                .clone();
+            let filename = upload.filename.as_ref()
+                .unwrap_or(&"upload.mp4".to_string())
+                .clone();
+
+            form = form.part("fileData",
+                std::http::multipart::Part::bytes(file_data.clone())
+                    .file_name(filename)
+                    .mime_str(&mime_type)
+                    .map_err(|e| VideoError::UploadError {
+                        message: format!("Invalid MIME type: {}", e)
+                    })?
+            );
+
+            let upload_response = client.post(&upload_url)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+            if !upload_response.status().is_success() {
+                return Err(VideoError::UploadError {
+                    message: format!("File upload failed: {}", upload_response.status())
+                });
+            }
+
+            // Verify upload completed
+            let upload_result: JsonValue = upload_response.json().await
+                .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+            if let Some(error_code) = upload_result["code"].as_str() {
+                return Err(VideoError::UploadError {
+                    message: format!("Upload error: {} - {}",
+                        error_code,
+                        upload_result["message"].as_str().unwrap_or("Unknown"))
+                });
+            }
+        } else if let Some(file_url) = &upload.file_url {
+            // Upload from URL - use addFromUrl instead
+            let params = vec![
+                ("entry[name]", upload.title.clone()),
+                ("entry[description]", upload.description.clone().unwrap_or_default()),
+                ("entry[mediaType]", "1".to_string()),
+                ("url", file_url.clone()),
+            ];
+
+            let response = self.api_request("media", "addFromUrl", params).await?;
+            let entry = parse_kaltura_entry(&response)?;
+            return Ok(self.convert_entry(entry));
+        } else {
+            return Err(VideoError::UploadError {
+                message: "No file data or URL provided".to_string()
+            });
+        }
+
+        // Create media entry
+        let params = vec![
+            ("entry[name]", upload.title.clone()),
+            ("entry[description]", upload.description.unwrap_or_default()),
+            ("entry[mediaType]", "1".to_string()), // Video
+            ("uploadTokenId", token_id),
+        ];
+
+        let response = self.api_request("media", "addFromUploadedFile", params).await?;
+
+        let entry = parse_kaltura_entry(&response)?;
+        Ok(self.convert_entry(entry))
+    }
+
+    async fn delete_video(mut self, video_id: String) -> Result<(), VideoError> {
+        self.api_request(
+            "media",
+            "delete",
+            vec![("entryId", video_id)]
+        ).await?;
+
+        Ok(())
+    }
+
+    fn get_capabilities(self) -> Vec<VideoCapability> {
+        vec![
+            VideoCapability::Embed,
+            VideoCapability::Upload,
+            VideoCapability::Delete,
+            VideoCapability::Analytics,
+            VideoCapability::Captions,
+            VideoCapability::Chapters,
+            VideoCapability::Privacy,
+            VideoCapability::LiveStreaming,
+            VideoCapability::DomainRestriction,
+        ]
+    }
+}
+
+/// Parse Kaltura entry from JSON
+fn parse_kaltura_entry(json: &JsonValue) -> Result<KalturaMediaEntry, VideoError> {
+    Ok(KalturaMediaEntry {
+        id: json["id"].as_str()
+            .ok_or(VideoError::VideoNotFound { video_id: "unknown".to_string() })?
+            .to_string(),
+        name: json["name"].as_str().unwrap_or_default().to_string(),
+        description: json["description"].as_str().map(|s| s.to_string()),
+        partner_id: json["partnerId"].as_u64().unwrap_or(0) as u32,
+        user_id: json["userId"].as_str().unwrap_or_default().to_string(),
+        creator_id: json["creatorId"].as_str().map(|s| s.to_string()),
+        tags: json["tags"].as_str().unwrap_or_default().to_string(),
+        categories: json["categories"].as_str().unwrap_or_default().to_string(),
+        categories_ids: json["categoriesIds"].as_str().unwrap_or_default().to_string(),
+        status: json["status"].as_i64().unwrap_or(2) as i32,
+        moderation_status: json["moderationStatus"].as_i64().unwrap_or(0) as i32,
+        moderation_count: json["moderationCount"].as_i64().unwrap_or(0) as i32,
+        media_type: json["mediaType"].as_i64().unwrap_or(1) as i32,
+        source_type: json["sourceType"].as_str().unwrap_or_default().to_string(),
+        data_url: json["dataUrl"].as_str().map(|s| s.to_string()),
+        flavor_params_ids: json["flavorParamsIds"].as_str().map(|s| s.to_string()),
+        duration: json["duration"].as_i64().unwrap_or(0) as i32,
+        ms_duration: json["msDuration"].as_i64().unwrap_or(0),
+        thumbnail_url: json["thumbnailUrl"].as_str().map(|s| s.to_string()),
+        width: json["width"].as_i64().map(|n| n as i32),
+        height: json["height"].as_i64().map(|n| n as i32),
+        plays: json["plays"].as_i64().unwrap_or(0),
+        views: json["views"].as_i64().unwrap_or(0),
+        last_played_at: json["lastPlayedAt"].as_i64(),
+        created_at: json["createdAt"].as_i64().unwrap_or(0),
+        updated_at: json["updatedAt"].as_i64().unwrap_or(0),
+        download_url: json["downloadUrl"].as_str().map(|s| s.to_string()),
+    })
+}

@@ -1,0 +1,717 @@
+/// Intelligo LMS - Lightweight Hydration System
+///
+/// Progressive hydration following Aether CMS patterns.
+/// Minimal JavaScript footprint with selective component activation.
+
+module intelligo::frontend::hydration
+
+use intelligo::frontend::*
+use intelligo::core::*
+
+// ============================================================================
+// Hydration Manager
+// ============================================================================
+
+/// Central hydration manager for progressive component activation
+pub actor HydrationManager {
+    config: HydrationConfig,
+    components: Map<String, HydratableComponent>,
+    hydrated: Map<String, bool>,
+    observers: Map<String, IntersectionObserver>,
+    pending_hydration: Vec<String>,
+
+    pub fn new(config: HydrationConfig) -> Self {
+        HydrationManager {
+            config,
+            components: Map::new(),
+            hydrated: Map::new(),
+            observers: Map::new(),
+            pending_hydration: vec![],
+        }
+    }
+
+    // ========================================================================
+    // Component Registration
+    // ========================================================================
+
+    /// Register a component for hydration
+    pub fn register(mut self, component: HydratableComponent) {
+        let id = component.id.clone();
+        self.components.insert(id.clone(), component);
+        self.hydrated.insert(id, false);
+    }
+
+    /// Register multiple components
+    pub fn register_all(mut self, components: Vec<HydratableComponent>) {
+        for component in components {
+            self.register(component);
+        }
+    }
+
+    // ========================================================================
+    // Hydration Control
+    // ========================================================================
+
+    /// Initialize hydration based on strategy
+    pub fn init(mut self) -> Result<(), FrontendError> {
+        match self.config.strategy {
+            HydrationStrategy::Eager => self.hydrate_all(),
+            HydrationStrategy::Progressive => self.hydrate_progressive(),
+            HydrationStrategy::Lazy => self.setup_lazy_hydration(),
+            HydrationStrategy::Idle => self.setup_idle_hydration(),
+            HydrationStrategy::Interaction => self.setup_interaction_hydration(),
+            HydrationStrategy::MediaQuery { ref query } => self.setup_media_query_hydration(query),
+        }
+    }
+
+    /// Hydrate all components immediately
+    fn hydrate_all(mut self) -> Result<(), FrontendError> {
+        let component_ids: Vec<String> = self.components.keys().cloned().collect();
+
+        for id in component_ids {
+            self.hydrate_component(&id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Progressive hydration based on priority
+    fn hydrate_progressive(mut self) -> Result<(), FrontendError> {
+        // First, hydrate priority components immediately
+        for id in &self.config.priority_components {
+            if self.components.contains_key(id) {
+                self.hydrate_component(id)?;
+            }
+        }
+
+        // Setup lazy hydration for the rest
+        self.setup_lazy_hydration()?;
+
+        Ok(())
+    }
+
+    /// Setup intersection observer for lazy hydration
+    fn setup_lazy_hydration(mut self) -> Result<(), FrontendError> {
+        let threshold = self.config.lazy_threshold;
+
+        for (id, component) in &self.components {
+            // Skip already hydrated and static components
+            if self.hydrated.get(id) == Some(&true) {
+                continue;
+            }
+            if self.config.static_components.contains(id) {
+                continue;
+            }
+
+            // Create intersection observer for this component
+            let observer = IntersectionObserver::new(
+                id.clone(),
+                threshold,
+                Box::new(move |entries| {
+                    for entry in entries {
+                        if entry.is_intersecting {
+                            // Queue for hydration
+                            // In real JS, this would trigger hydration
+                        }
+                    }
+                })
+            );
+
+            self.observers.insert(id.clone(), observer);
+        }
+
+        Ok(())
+    }
+
+    /// Setup idle-time hydration
+    fn setup_idle_hydration(mut self) -> Result<(), FrontendError> {
+        let timeout = self.config.idle_timeout;
+
+        // In real JS, would use requestIdleCallback
+        // Queue non-priority components for idle-time hydration
+        for (id, _) in &self.components {
+            if !self.config.priority_components.contains(id) &&
+               !self.config.static_components.contains(id) {
+                self.pending_hydration.push(id.clone());
+            }
+        }
+
+        // Hydrate priority components first
+        for id in &self.config.priority_components {
+            if self.components.contains_key(id) {
+                self.hydrate_component(id)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Setup interaction-based hydration
+    fn setup_interaction_hydration(mut self) -> Result<(), FrontendError> {
+        // In real JS, would add event listeners for click/focus/hover
+        // For now, just hydrate priority components
+        for id in &self.config.priority_components {
+            if self.components.contains_key(id) {
+                self.hydrate_component(id)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Setup media query-based hydration
+    fn setup_media_query_hydration(mut self, query: &str) -> Result<(), FrontendError> {
+        // In real JS, would use matchMedia API
+        // For SSR, hydrate based on assumed viewport
+        self.hydrate_progressive()
+    }
+
+    // ========================================================================
+    // Component Hydration
+    // ========================================================================
+
+    /// Hydrate a specific component by ID
+    pub fn hydrate_component(mut self, component_id: &str) -> Result<(), FrontendError> {
+        // Check if already hydrated
+        if self.hydrated.get(component_id) == Some(&true) {
+            return Ok(());
+        }
+
+        // Check if component exists
+        let component = self.components.get(component_id).ok_or(
+            FrontendError::HydrationError {
+                component: component_id.to_string(),
+                message: "Component not registered".to_string(),
+            }
+        )?;
+
+        // Check if it's a static component (should not hydrate)
+        if self.config.static_components.contains(&component_id.to_string()) {
+            return Ok(());
+        }
+
+        // Execute hydration
+        if self.config.debug {
+            println!("Hydrating component: {}", component_id);
+        }
+
+        // Mark as hydrated
+        self.hydrated.insert(component_id.to_string(), true);
+
+        // Cleanup observer if any
+        self.observers.remove(component_id);
+
+        Ok(())
+    }
+
+    /// Check if a component is hydrated
+    pub fn is_hydrated(self, component_id: &str) -> bool {
+        self.hydrated.get(component_id) == Some(&true)
+    }
+
+    /// Get hydration status for all components
+    pub fn get_status(self) -> HydrationStatus {
+        let total = self.components.len();
+        let hydrated = self.hydrated.values().filter(|v| **v).count();
+
+        HydrationStatus {
+            total_components: total,
+            hydrated_components: hydrated,
+            pending_components: total - hydrated,
+            components: self.hydrated.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Hydratable Component
+// ============================================================================
+
+/// A component that can be hydrated on the client
+pub type HydratableComponent = type {
+    // Unique component identifier
+    id: String,
+
+    // Component type (e.g., "video-player", "quiz-widget")
+    component_type: String,
+
+    // DOM selector for the component root
+    selector: String,
+
+    // Initial props/state from server
+    initial_state: Map<String, Value>,
+
+    // Hydration priority (lower = higher priority)
+    priority: i32,
+
+    // Dependencies on other components
+    dependencies: Vec<String>,
+
+    // Event handlers to attach
+    events: Vec<EventBinding>,
+
+    // Whether to preserve server-rendered content
+    preserve_content: bool,
+}
+
+impl HydratableComponent {
+    pub fn new(id: &str, component_type: &str, selector: &str) -> Self {
+        HydratableComponent {
+            id: id.to_string(),
+            component_type: component_type.to_string(),
+            selector: selector.to_string(),
+            initial_state: Map::new(),
+            priority: 50,
+            dependencies: vec![],
+            events: vec![],
+            preserve_content: true,
+        }
+    }
+
+    pub fn with_state(mut self, state: Map<String, Value>) -> Self {
+        self.initial_state = state;
+        self
+    }
+
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_events(mut self, events: Vec<EventBinding>) -> Self {
+        self.events = events;
+        self
+    }
+}
+
+/// Event binding for hydration
+pub type EventBinding = type {
+    event_type: String,
+    selector: Option<String>,  // Optional sub-selector
+    handler: String,           // Handler function name
+    options: EventOptions,
+}
+
+/// Event listener options
+pub type EventOptions = type {
+    capture: bool,
+    passive: bool,
+    once: bool,
+}
+
+impl EventOptions {
+    pub fn default() -> Self {
+        EventOptions {
+            capture: false,
+            passive: true,
+            once: false,
+        }
+    }
+}
+
+// ============================================================================
+// Hydration State
+// ============================================================================
+
+/// Hydration state to be serialized and embedded in HTML
+pub type HydrationState = type {
+    // Component states
+    components: Map<String, ComponentState>,
+
+    // Global application state
+    app_state: Map<String, Value>,
+
+    // User context
+    user: Option<UserContextState>,
+
+    // Feature flags
+    features: Map<String, bool>,
+
+    // API endpoints
+    endpoints: ApiEndpoints,
+
+    // CSP nonce for dynamic scripts
+    nonce: String,
+}
+
+impl HydrationState {
+    pub fn new() -> Self {
+        HydrationState {
+            components: Map::new(),
+            app_state: Map::new(),
+            user: None,
+            features: Map::new(),
+            endpoints: ApiEndpoints::default(),
+            nonce: generate_nonce(),
+        }
+    }
+
+    /// Serialize to JSON for embedding in HTML
+    pub fn to_json(self) -> String {
+        // Serialize to JSON string
+        serde_json::to_string(&self).unwrap_or("{}".to_string())
+    }
+
+    /// Generate the script tag for hydration data
+    pub fn to_script_tag(self) -> String {
+        format!(
+            r#"<script type="application/json" id="__HYDRATION_DATA__" nonce="{}">{}</script>"#,
+            self.nonce,
+            self.to_json()
+        )
+    }
+}
+
+/// Component state for hydration
+pub type ComponentState = type {
+    id: String,
+    component_type: String,
+    props: Map<String, Value>,
+    state: Map<String, Value>,
+}
+
+/// User context state for hydration
+pub type UserContextState = type {
+    id: String,
+    role: String,
+    permissions: Vec<String>,
+    tenant_id: String,
+}
+
+/// API endpoints configuration
+pub type ApiEndpoints = type {
+    base: String,
+    auth: String,
+    courses: String,
+    enrollments: String,
+    progress: String,
+    submissions: String,
+    notifications: String,
+}
+
+impl ApiEndpoints {
+    pub fn default() -> Self {
+        ApiEndpoints {
+            base: "/api/v1".to_string(),
+            auth: "/api/v1/auth".to_string(),
+            courses: "/api/v1/courses".to_string(),
+            enrollments: "/api/v1/enrollments".to_string(),
+            progress: "/api/v1/progress".to_string(),
+            submissions: "/api/v1/submissions".to_string(),
+            notifications: "/api/v1/notifications".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// Hydration Status
+// ============================================================================
+
+/// Status of hydration process
+pub type HydrationStatus = type {
+    total_components: i64,
+    hydrated_components: i64,
+    pending_components: i64,
+    components: Map<String, bool>,
+}
+
+// ============================================================================
+// Intersection Observer (Mock for SSR)
+// ============================================================================
+
+/// Mock intersection observer for SSR
+pub type IntersectionObserver = type {
+    component_id: String,
+    threshold: f64,
+    callback: Box<dyn Fn(Vec<IntersectionEntry>)>,
+}
+
+impl IntersectionObserver {
+    pub fn new(
+        component_id: String,
+        threshold: f64,
+        callback: Box<dyn Fn(Vec<IntersectionEntry>)>
+    ) -> Self {
+        IntersectionObserver {
+            component_id,
+            threshold,
+            callback,
+        }
+    }
+}
+
+/// Intersection entry
+pub type IntersectionEntry = type {
+    target_id: String,
+    is_intersecting: bool,
+    intersection_ratio: f64,
+}
+
+// ============================================================================
+// Hydration Script Generator
+// ============================================================================
+
+/// Generates the minimal JavaScript for client-side hydration
+pub actor HydrationScriptGenerator {
+    config: HydrationConfig,
+
+    pub fn new(config: HydrationConfig) -> Self {
+        HydrationScriptGenerator { config }
+    }
+
+    /// Generate the hydration bootstrap script
+    pub fn generate_bootstrap(self) -> String {
+        let strategy_code = match self.config.strategy {
+            HydrationStrategy::Eager => self.generate_eager_strategy(),
+            HydrationStrategy::Progressive => self.generate_progressive_strategy(),
+            HydrationStrategy::Lazy => self.generate_lazy_strategy(),
+            HydrationStrategy::Idle => self.generate_idle_strategy(),
+            HydrationStrategy::Interaction => self.generate_interaction_strategy(),
+            HydrationStrategy::MediaQuery { ref query } => self.generate_media_query_strategy(query),
+        };
+
+        format!(r#"
+(function() {{
+  'use strict';
+
+  // Hydration configuration
+  const config = {{
+    progressive: {progressive},
+    lazyThreshold: {lazy_threshold},
+    idleTimeout: {idle_timeout},
+    priorityComponents: {priority_components},
+    staticComponents: {static_components},
+    debug: {debug}
+  }};
+
+  // Get hydration data from embedded JSON
+  const hydrationData = JSON.parse(
+    document.getElementById('__HYDRATION_DATA__')?.textContent || '{{}}'
+  );
+
+  // Component registry
+  const components = new Map();
+  const hydrated = new Set();
+
+  // Register a component for hydration
+  window.__registerComponent = function(id, hydrateFn) {{
+    components.set(id, hydrateFn);
+  }};
+
+  // Hydrate a single component
+  function hydrateComponent(id) {{
+    if (hydrated.has(id)) return;
+    if (config.staticComponents.includes(id)) return;
+
+    const hydrateFn = components.get(id);
+    if (!hydrateFn) return;
+
+    const state = hydrationData.components?.[id];
+    const element = document.querySelector(`[data-hydrate="${{id}}"]`);
+
+    if (element) {{
+      if (config.debug) console.log('Hydrating:', id);
+      hydrateFn(element, state);
+      hydrated.add(id);
+      element.setAttribute('data-hydrated', 'true');
+    }}
+  }}
+
+  // Hydration strategies
+  {strategy_code}
+
+  // Initialize on DOM ready
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', init);
+  }} else {{
+    init();
+  }}
+}})();
+"#,
+            progressive = self.config.progressive,
+            lazy_threshold = self.config.lazy_threshold,
+            idle_timeout = self.config.idle_timeout,
+            priority_components = format!("{:?}", self.config.priority_components),
+            static_components = format!("{:?}", self.config.static_components),
+            debug = self.config.debug,
+            strategy_code = strategy_code
+        )
+    }
+
+    fn generate_eager_strategy(self) -> String {
+        r#"
+  function init() {
+    components.forEach((_, id) => hydrateComponent(id));
+  }
+"#.to_string()
+    }
+
+    fn generate_progressive_strategy(self) -> String {
+        r#"
+  function init() {
+    // Hydrate priority components immediately
+    config.priorityComponents.forEach(id => hydrateComponent(id));
+
+    // Setup lazy hydration for the rest
+    setupLazyHydration();
+  }
+
+  function setupLazyHydration() {
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const id = entry.target.dataset.hydrate;
+          if (id) {
+            hydrateComponent(id);
+            observer.unobserve(entry.target);
+          }
+        }
+      });
+    }, { threshold: config.lazyThreshold });
+
+    document.querySelectorAll('[data-hydrate]:not([data-hydrated])').forEach(el => {
+      const id = el.dataset.hydrate;
+      if (!config.priorityComponents.includes(id)) {
+        observer.observe(el);
+      }
+    });
+  }
+"#.to_string()
+    }
+
+    fn generate_lazy_strategy(self) -> String {
+        r#"
+  function init() {
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const id = entry.target.dataset.hydrate;
+          if (id) {
+            hydrateComponent(id);
+            observer.unobserve(entry.target);
+          }
+        }
+      });
+    }, { threshold: config.lazyThreshold });
+
+    document.querySelectorAll('[data-hydrate]').forEach(el => {
+      observer.observe(el);
+    });
+  }
+"#.to_string()
+    }
+
+    fn generate_idle_strategy(self) -> String {
+        format!(r#"
+  function init() {{
+    // Hydrate priority components immediately
+    config.priorityComponents.forEach(id => hydrateComponent(id));
+
+    // Schedule rest for idle time
+    const pending = Array.from(components.keys())
+      .filter(id => !config.priorityComponents.includes(id));
+
+    if ('requestIdleCallback' in window) {{
+      function hydrateIdle(deadline) {{
+        while (pending.length > 0 && deadline.timeRemaining() > 0) {{
+          hydrateComponent(pending.shift());
+        }}
+        if (pending.length > 0) {{
+          requestIdleCallback(hydrateIdle, {{ timeout: {timeout} }});
+        }}
+      }}
+      requestIdleCallback(hydrateIdle, {{ timeout: {timeout} }});
+    }} else {{
+      // Fallback for browsers without requestIdleCallback
+      setTimeout(() => pending.forEach(id => hydrateComponent(id)), {timeout});
+    }}
+  }}
+"#, timeout = self.config.idle_timeout)
+    }
+
+    fn generate_interaction_strategy(self) -> String {
+        r#"
+  function init() {
+    document.querySelectorAll('[data-hydrate]').forEach(el => {
+      const id = el.dataset.hydrate;
+      if (config.priorityComponents.includes(id)) {
+        hydrateComponent(id);
+      } else {
+        const trigger = () => {
+          hydrateComponent(id);
+          el.removeEventListener('mouseenter', trigger);
+          el.removeEventListener('focus', trigger);
+          el.removeEventListener('click', trigger);
+        };
+        el.addEventListener('mouseenter', trigger, { passive: true, once: true });
+        el.addEventListener('focus', trigger, { passive: true, once: true });
+        el.addEventListener('click', trigger, { passive: true, once: true });
+      }
+    });
+  }
+"#.to_string()
+    }
+
+    fn generate_media_query_strategy(self, query: &str) -> String {
+        format!(r#"
+  function init() {{
+    const mq = window.matchMedia('{query}');
+
+    function handleMediaChange(e) {{
+      if (e.matches) {{
+        components.forEach((_, id) => hydrateComponent(id));
+        mq.removeEventListener('change', handleMediaChange);
+      }}
+    }}
+
+    if (mq.matches) {{
+      components.forEach((_, id) => hydrateComponent(id));
+    }} else {{
+      mq.addEventListener('change', handleMediaChange);
+    }}
+  }}
+"#, query = query)
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn generate_nonce() -> String {
+    // Generate a random nonce for CSP
+    use std::random::random_bytes;
+    let bytes = random_bytes(16);
+    base64_encode(&bytes)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    // Base64 encoding implementation
+    const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+
+    for chunk in data.chunks(3) {
+        let b1 = chunk[0] as u32;
+        let b2 = chunk.get(1).map(|&b| b as u32).unwrap_or(0);
+        let b3 = chunk.get(2).map(|&b| b as u32).unwrap_or(0);
+
+        let combined = (b1 << 16) | (b2 << 8) | b3;
+
+        result.push(ALPHABET.chars().nth(((combined >> 18) & 0x3F) as usize).unwrap());
+        result.push(ALPHABET.chars().nth(((combined >> 12) & 0x3F) as usize).unwrap());
+
+        if chunk.len() > 1 {
+            result.push(ALPHABET.chars().nth(((combined >> 6) & 0x3F) as usize).unwrap());
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(ALPHABET.chars().nth((combined & 0x3F) as usize).unwrap());
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
+}

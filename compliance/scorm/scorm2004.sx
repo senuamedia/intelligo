@@ -1,0 +1,2032 @@
+/// Intelligo LMS - SCORM 2004 Runtime
+///
+/// Implementation of the SCORM 2004 Run-Time Environment (RTE) specification.
+/// Supports SCORM 2004 2nd, 3rd, and 4th Editions with the API_1484_11 interface.
+
+module intelligo::compliance::scorm::scorm2004
+
+use intelligo::core::types::*
+use intelligo::compliance::scorm::scorm12::{parse_timespan, format_timespan}
+use std::time::{DateTime, Duration, Instant}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// SCORM 2004 IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for a SCORM 2004 session
+type Scorm2004SessionId = String
+
+/// Unique identifier for an activity
+type ActivityId = String
+
+/// Unique identifier for an objective
+type ObjectiveId = String
+
+/// Unique identifier for an interaction
+type InteractionId = String
+
+/// Unique identifier for a learner
+type LearnerId = String
+
+// =============================================================================
+// SCORM 2004 ERROR CODES
+// =============================================================================
+
+/// SCORM 2004 Error Codes (per specification)
+enum Scorm2004Error {
+    /// No error
+    NoError,                            // 0
+    /// General exception
+    GeneralException,                   // 101
+    /// General initialization failure
+    GeneralInitializationFailure,       // 102
+    /// Already initialized
+    AlreadyInitialized,                 // 103
+    /// Content instance terminated
+    ContentInstanceTerminated,          // 104
+    /// General termination failure
+    GeneralTerminationFailure,          // 111
+    /// Termination before initialization
+    TerminationBeforeInitialization,    // 112
+    /// Termination after termination
+    TerminationAfterTermination,        // 113
+    /// Retrieve data before initialization
+    RetrieveBeforeInitialization,       // 122
+    /// Retrieve data after termination
+    RetrieveAfterTermination,           // 123
+    /// Store data before initialization
+    StoreBeforeInitialization,          // 132
+    /// Store data after termination
+    StoreAfterTermination,              // 133
+    /// Commit before initialization
+    CommitBeforeInitialization,         // 142
+    /// Commit after termination
+    CommitAfterTermination,             // 143
+    /// General argument error
+    GeneralArgumentError,               // 201
+    /// General get failure
+    GeneralGetFailure,                  // 301
+    /// General set failure
+    GeneralSetFailure,                  // 351
+    /// General commit failure
+    GeneralCommitFailure,               // 391
+    /// Undefined data model element
+    UndefinedDataModelElement,          // 401
+    /// Unimplemented data model element
+    UnimplementedDataModelElement,      // 402
+    /// Data model element value not initialized
+    DataModelElementValueNotInitialized, // 403
+    /// Data model element is read only
+    DataModelElementIsReadOnly,         // 404
+    /// Data model element is write only
+    DataModelElementIsWriteOnly,        // 405
+    /// Data model element type mismatch
+    DataModelElementTypeMismatch,       // 406
+    /// Data model element value out of range
+    DataModelElementValueOutOfRange,    // 407
+    /// Data model dependency not established
+    DataModelDependencyNotEstablished   // 408
+}
+
+impl Scorm2004Error {
+    /// Get numeric error code
+    fn code(&self) -> String {
+        match self {
+            Scorm2004Error::NoError => "0",
+            Scorm2004Error::GeneralException => "101",
+            Scorm2004Error::GeneralInitializationFailure => "102",
+            Scorm2004Error::AlreadyInitialized => "103",
+            Scorm2004Error::ContentInstanceTerminated => "104",
+            Scorm2004Error::GeneralTerminationFailure => "111",
+            Scorm2004Error::TerminationBeforeInitialization => "112",
+            Scorm2004Error::TerminationAfterTermination => "113",
+            Scorm2004Error::RetrieveBeforeInitialization => "122",
+            Scorm2004Error::RetrieveAfterTermination => "123",
+            Scorm2004Error::StoreBeforeInitialization => "132",
+            Scorm2004Error::StoreAfterTermination => "133",
+            Scorm2004Error::CommitBeforeInitialization => "142",
+            Scorm2004Error::CommitAfterTermination => "143",
+            Scorm2004Error::GeneralArgumentError => "201",
+            Scorm2004Error::GeneralGetFailure => "301",
+            Scorm2004Error::GeneralSetFailure => "351",
+            Scorm2004Error::GeneralCommitFailure => "391",
+            Scorm2004Error::UndefinedDataModelElement => "401",
+            Scorm2004Error::UnimplementedDataModelElement => "402",
+            Scorm2004Error::DataModelElementValueNotInitialized => "403",
+            Scorm2004Error::DataModelElementIsReadOnly => "404",
+            Scorm2004Error::DataModelElementIsWriteOnly => "405",
+            Scorm2004Error::DataModelElementTypeMismatch => "406",
+            Scorm2004Error::DataModelElementValueOutOfRange => "407",
+            Scorm2004Error::DataModelDependencyNotEstablished => "408"
+        }.to_string()
+    }
+
+    /// Get error description
+    fn description(&self) -> String {
+        match self {
+            Scorm2004Error::NoError => "No Error",
+            Scorm2004Error::GeneralException => "General Exception",
+            Scorm2004Error::GeneralInitializationFailure => "General Initialization Failure",
+            Scorm2004Error::AlreadyInitialized => "Already Initialized",
+            Scorm2004Error::ContentInstanceTerminated => "Content Instance Terminated",
+            Scorm2004Error::GeneralTerminationFailure => "General Termination Failure",
+            Scorm2004Error::TerminationBeforeInitialization => "Termination Before Initialization",
+            Scorm2004Error::TerminationAfterTermination => "Termination After Termination",
+            Scorm2004Error::RetrieveBeforeInitialization => "Retrieve Data Before Initialization",
+            Scorm2004Error::RetrieveAfterTermination => "Retrieve Data After Termination",
+            Scorm2004Error::StoreBeforeInitialization => "Store Data Before Initialization",
+            Scorm2004Error::StoreAfterTermination => "Store Data After Termination",
+            Scorm2004Error::CommitBeforeInitialization => "Commit Before Initialization",
+            Scorm2004Error::CommitAfterTermination => "Commit After Termination",
+            Scorm2004Error::GeneralArgumentError => "General Argument Error",
+            Scorm2004Error::GeneralGetFailure => "General Get Failure",
+            Scorm2004Error::GeneralSetFailure => "General Set Failure",
+            Scorm2004Error::GeneralCommitFailure => "General Commit Failure",
+            Scorm2004Error::UndefinedDataModelElement => "Undefined Data Model Element",
+            Scorm2004Error::UnimplementedDataModelElement => "Unimplemented Data Model Element",
+            Scorm2004Error::DataModelElementValueNotInitialized => "Data Model Element Value Not Initialized",
+            Scorm2004Error::DataModelElementIsReadOnly => "Data Model Element Is Read Only",
+            Scorm2004Error::DataModelElementIsWriteOnly => "Data Model Element Is Write Only",
+            Scorm2004Error::DataModelElementTypeMismatch => "Data Model Element Type Mismatch",
+            Scorm2004Error::DataModelElementValueOutOfRange => "Data Model Element Value Out Of Range",
+            Scorm2004Error::DataModelDependencyNotEstablished => "Data Model Dependency Not Established"
+        }.to_string()
+    }
+}
+
+// =============================================================================
+// SCORM 2004 DATA MODEL
+// =============================================================================
+
+/// SCORM 2004 Completion Status
+enum Cmi2004CompletionStatus {
+    Completed,
+    Incomplete,
+    NotAttempted,
+    Unknown
+}
+
+impl Cmi2004CompletionStatus {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004CompletionStatus::Completed => "completed",
+            Cmi2004CompletionStatus::Incomplete => "incomplete",
+            Cmi2004CompletionStatus::NotAttempted => "not attempted",
+            Cmi2004CompletionStatus::Unknown => "unknown"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<Cmi2004CompletionStatus> {
+        match s {
+            "completed" => Some(Cmi2004CompletionStatus::Completed),
+            "incomplete" => Some(Cmi2004CompletionStatus::Incomplete),
+            "not attempted" => Some(Cmi2004CompletionStatus::NotAttempted),
+            "unknown" => Some(Cmi2004CompletionStatus::Unknown),
+            _ => None
+        }
+    }
+}
+
+/// SCORM 2004 Success Status
+enum Cmi2004SuccessStatus {
+    Passed,
+    Failed,
+    Unknown
+}
+
+impl Cmi2004SuccessStatus {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004SuccessStatus::Passed => "passed",
+            Cmi2004SuccessStatus::Failed => "failed",
+            Cmi2004SuccessStatus::Unknown => "unknown"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<Cmi2004SuccessStatus> {
+        match s {
+            "passed" => Some(Cmi2004SuccessStatus::Passed),
+            "failed" => Some(Cmi2004SuccessStatus::Failed),
+            "unknown" => Some(Cmi2004SuccessStatus::Unknown),
+            _ => None
+        }
+    }
+}
+
+/// SCORM 2004 Entry type
+enum Cmi2004Entry {
+    AbInitio,
+    Resume,
+    Empty
+}
+
+impl Cmi2004Entry {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004Entry::AbInitio => "ab-initio",
+            Cmi2004Entry::Resume => "resume",
+            Cmi2004Entry::Empty => ""
+        }.to_string()
+    }
+}
+
+/// SCORM 2004 Exit type
+enum Cmi2004Exit {
+    Timeout,
+    Suspend,
+    Logout,
+    Normal,
+    Empty
+}
+
+impl Cmi2004Exit {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004Exit::Timeout => "time-out",
+            Cmi2004Exit::Suspend => "suspend",
+            Cmi2004Exit::Logout => "logout",
+            Cmi2004Exit::Normal => "normal",
+            Cmi2004Exit::Empty => ""
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Cmi2004Exit {
+        match s {
+            "time-out" => Cmi2004Exit::Timeout,
+            "suspend" => Cmi2004Exit::Suspend,
+            "logout" => Cmi2004Exit::Logout,
+            "normal" => Cmi2004Exit::Normal,
+            _ => Cmi2004Exit::Empty
+        }
+    }
+}
+
+/// SCORM 2004 Mode
+enum Cmi2004Mode {
+    Browse,
+    Normal,
+    Review
+}
+
+impl Cmi2004Mode {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004Mode::Browse => "browse",
+            Cmi2004Mode::Normal => "normal",
+            Cmi2004Mode::Review => "review"
+        }.to_string()
+    }
+}
+
+/// SCORM 2004 Credit type
+enum Cmi2004Credit {
+    Credit,
+    NoCredit
+}
+
+impl Cmi2004Credit {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004Credit::Credit => "credit",
+            Cmi2004Credit::NoCredit => "no-credit"
+        }.to_string()
+    }
+}
+
+/// SCORM 2004 Time limit action
+enum Cmi2004TimeLimitAction {
+    ExitMessage,
+    ExitNoMessage,
+    ContinueMessage,
+    ContinueNoMessage
+}
+
+impl Cmi2004TimeLimitAction {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004TimeLimitAction::ExitMessage => "exit,message",
+            Cmi2004TimeLimitAction::ExitNoMessage => "exit,no message",
+            Cmi2004TimeLimitAction::ContinueMessage => "continue,message",
+            Cmi2004TimeLimitAction::ContinueNoMessage => "continue,no message"
+        }.to_string()
+    }
+}
+
+/// SCORM 2004 Score
+type Cmi2004Score {
+    /// Scaled score (-1 to 1)
+    scaled: Option<f32>,
+
+    /// Raw score
+    raw: Option<f32>,
+
+    /// Minimum possible score
+    min: Option<f32>,
+
+    /// Maximum possible score
+    max: Option<f32>
+}
+
+impl Cmi2004Score {
+    fn new() -> Cmi2004Score {
+        Cmi2004Score {
+            scaled: None,
+            raw: None,
+            min: None,
+            max: None
+        }
+    }
+
+    /// Validate scaled score range
+    fn validate_scaled(value: f32) -> Bool {
+        value >= -1.0 && value <= 1.0
+    }
+}
+
+/// SCORM 2004 Learner preference
+type Cmi2004LearnerPreference {
+    /// Audio captioning preference (-1, 0, 1)
+    audio_captioning: Option<i32>,
+
+    /// Audio level (0-100)
+    audio_level: Option<f32>,
+
+    /// Delivery speed (0-infinite)
+    delivery_speed: Option<f32>,
+
+    /// Language preference
+    language: Option<String>
+}
+
+impl Cmi2004LearnerPreference {
+    fn new() -> Cmi2004LearnerPreference {
+        Cmi2004LearnerPreference {
+            audio_captioning: None,
+            audio_level: Some(1.0),
+            delivery_speed: Some(1.0),
+            language: None
+        }
+    }
+}
+
+/// SCORM 2004 Comments from learner
+type Cmi2004Comment {
+    /// Comment text
+    comment: String,
+
+    /// Location in content
+    location: Option<String>,
+
+    /// Timestamp (ISO 8601)
+    timestamp: Option<String>
+}
+
+/// SCORM 2004 Objective
+type Cmi2004Objective {
+    /// Objective identifier
+    id: ObjectiveId,
+
+    /// Completion status
+    completion_status: Cmi2004CompletionStatus,
+
+    /// Success status
+    success_status: Cmi2004SuccessStatus,
+
+    /// Score
+    score: Cmi2004Score,
+
+    /// Progress measure (0 to 1)
+    progress_measure: Option<f32>,
+
+    /// Description
+    description: Option<String>
+}
+
+impl Cmi2004Objective {
+    fn new(id: ObjectiveId) -> Cmi2004Objective {
+        Cmi2004Objective {
+            id,
+            completion_status: Cmi2004CompletionStatus::Unknown,
+            success_status: Cmi2004SuccessStatus::Unknown,
+            score: Cmi2004Score::new(),
+            progress_measure: None,
+            description: None
+        }
+    }
+}
+
+/// SCORM 2004 Interaction type
+enum Cmi2004InteractionType {
+    TrueFalse,
+    Choice,
+    FillIn,
+    LongFillIn,
+    Matching,
+    Performance,
+    Sequencing,
+    Likert,
+    Numeric,
+    Other
+}
+
+impl Cmi2004InteractionType {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004InteractionType::TrueFalse => "true-false",
+            Cmi2004InteractionType::Choice => "choice",
+            Cmi2004InteractionType::FillIn => "fill-in",
+            Cmi2004InteractionType::LongFillIn => "long-fill-in",
+            Cmi2004InteractionType::Matching => "matching",
+            Cmi2004InteractionType::Performance => "performance",
+            Cmi2004InteractionType::Sequencing => "sequencing",
+            Cmi2004InteractionType::Likert => "likert",
+            Cmi2004InteractionType::Numeric => "numeric",
+            Cmi2004InteractionType::Other => "other"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<Cmi2004InteractionType> {
+        match s {
+            "true-false" => Some(Cmi2004InteractionType::TrueFalse),
+            "choice" => Some(Cmi2004InteractionType::Choice),
+            "fill-in" => Some(Cmi2004InteractionType::FillIn),
+            "long-fill-in" => Some(Cmi2004InteractionType::LongFillIn),
+            "matching" => Some(Cmi2004InteractionType::Matching),
+            "performance" => Some(Cmi2004InteractionType::Performance),
+            "sequencing" => Some(Cmi2004InteractionType::Sequencing),
+            "likert" => Some(Cmi2004InteractionType::Likert),
+            "numeric" => Some(Cmi2004InteractionType::Numeric),
+            "other" => Some(Cmi2004InteractionType::Other),
+            _ => None
+        }
+    }
+}
+
+/// SCORM 2004 Interaction result
+enum Cmi2004InteractionResult {
+    Correct,
+    Incorrect,
+    Unanticipated,
+    Neutral,
+    Numeric { value: f32 }
+}
+
+impl Cmi2004InteractionResult {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004InteractionResult::Correct => "correct".to_string(),
+            Cmi2004InteractionResult::Incorrect => "incorrect".to_string(),
+            Cmi2004InteractionResult::Unanticipated => "unanticipated".to_string(),
+            Cmi2004InteractionResult::Neutral => "neutral".to_string(),
+            Cmi2004InteractionResult::Numeric { value } => value.to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> Cmi2004InteractionResult {
+        match s {
+            "correct" => Cmi2004InteractionResult::Correct,
+            "incorrect" => Cmi2004InteractionResult::Incorrect,
+            "unanticipated" => Cmi2004InteractionResult::Unanticipated,
+            "neutral" => Cmi2004InteractionResult::Neutral,
+            _ => {
+                if let Ok(value) = s.parse::<f32>() {
+                    Cmi2004InteractionResult::Numeric { value }
+                } else {
+                    Cmi2004InteractionResult::Neutral
+                }
+            }
+        }
+    }
+}
+
+/// SCORM 2004 Correct response
+type Cmi2004CorrectResponse {
+    /// Pattern
+    pattern: String
+}
+
+/// SCORM 2004 Interaction
+type Cmi2004Interaction {
+    /// Unique identifier
+    id: InteractionId,
+
+    /// Type of interaction
+    interaction_type: Option<Cmi2004InteractionType>,
+
+    /// Objectives this interaction relates to
+    objectives: List<ObjectiveId>,
+
+    /// Timestamp (ISO 8601)
+    timestamp: Option<String>,
+
+    /// Correct response patterns
+    correct_responses: List<Cmi2004CorrectResponse>,
+
+    /// Weighting factor
+    weighting: Option<f32>,
+
+    /// Learner's response
+    learner_response: Option<String>,
+
+    /// Result
+    result: Option<Cmi2004InteractionResult>,
+
+    /// Latency (ISO 8601 duration)
+    latency: Option<String>,
+
+    /// Description
+    description: Option<String>
+}
+
+impl Cmi2004Interaction {
+    fn new(id: InteractionId) -> Cmi2004Interaction {
+        Cmi2004Interaction {
+            id,
+            interaction_type: None,
+            objectives: vec![],
+            timestamp: None,
+            correct_responses: vec![],
+            weighting: None,
+            learner_response: None,
+            result: None,
+            latency: None,
+            description: None
+        }
+    }
+}
+
+/// SCORM 2004 ADL Navigation Request
+enum Cmi2004NavRequest {
+    Continue,
+    Previous,
+    Choice { target: ActivityId },
+    Jump { target: ActivityId },
+    Exit,
+    ExitAll,
+    Abandon,
+    AbandonAll,
+    SuspendAll,
+    None
+}
+
+impl Cmi2004NavRequest {
+    fn to_string(&self) -> String {
+        match self {
+            Cmi2004NavRequest::Continue => "continue",
+            Cmi2004NavRequest::Previous => "previous",
+            Cmi2004NavRequest::Choice { target } => format!("{{target={}}}", target),
+            Cmi2004NavRequest::Jump { target } => format!("{{target={}}}", target),
+            Cmi2004NavRequest::Exit => "exit",
+            Cmi2004NavRequest::ExitAll => "exitAll",
+            Cmi2004NavRequest::Abandon => "abandon",
+            Cmi2004NavRequest::AbandonAll => "abandonAll",
+            Cmi2004NavRequest::SuspendAll => "suspendAll",
+            Cmi2004NavRequest::None => "_none_"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Cmi2004NavRequest {
+        match s {
+            "continue" => Cmi2004NavRequest::Continue,
+            "previous" => Cmi2004NavRequest::Previous,
+            "exit" => Cmi2004NavRequest::Exit,
+            "exitAll" => Cmi2004NavRequest::ExitAll,
+            "abandon" => Cmi2004NavRequest::Abandon,
+            "abandonAll" => Cmi2004NavRequest::AbandonAll,
+            "suspendAll" => Cmi2004NavRequest::SuspendAll,
+            "_none_" => Cmi2004NavRequest::None,
+            _ => {
+                // Parse choice/jump targets
+                if s.starts_with("{target=") && s.ends_with("}") {
+                    let target = s[8..s.len()-1].to_string();
+                    Cmi2004NavRequest::Choice { target }
+                } else {
+                    Cmi2004NavRequest::None
+                }
+            }
+        }
+    }
+}
+
+/// SCORM 2004 ADL Data
+type Cmi2004AdlData {
+    /// Navigation request
+    nav_request: Cmi2004NavRequest,
+
+    /// Navigation request valid flags
+    nav_request_valid: NavRequestValid
+}
+
+/// Navigation request validity flags
+type NavRequestValid {
+    continue_valid: Bool,
+    previous_valid: Bool,
+    choice: Map<ActivityId, Bool>,
+    jump: Map<ActivityId, Bool>
+}
+
+impl NavRequestValid {
+    fn new() -> NavRequestValid {
+        NavRequestValid {
+            continue_valid: true,
+            previous_valid: true,
+            choice: Map::new(),
+            jump: Map::new()
+        }
+    }
+}
+
+/// Complete SCORM 2004 CMI Data Model
+type Cmi2004DataModel {
+    /// SCORM version
+    version: String,
+
+    // =========================================================================
+    // Learner Info (read-only)
+    // =========================================================================
+
+    /// Learner ID
+    learner_id: LearnerId,
+
+    /// Learner name
+    learner_name: String,
+
+    // =========================================================================
+    // Runtime data
+    // =========================================================================
+
+    /// Completion status
+    completion_status: Cmi2004CompletionStatus,
+
+    /// Completion threshold (read-only)
+    completion_threshold: Option<f32>,
+
+    /// Credit mode (read-only)
+    credit: Cmi2004Credit,
+
+    /// Entry state (read-only)
+    entry: Cmi2004Entry,
+
+    /// Exit state (write-only)
+    exit: Cmi2004Exit,
+
+    /// Launch data (read-only)
+    launch_data: Option<String>,
+
+    /// Learner preference
+    learner_preference: Cmi2004LearnerPreference,
+
+    /// Location bookmark
+    location: Option<String>,
+
+    /// Maximum time allowed (read-only, ISO 8601 duration)
+    max_time_allowed: Option<String>,
+
+    /// Mode (read-only)
+    mode: Cmi2004Mode,
+
+    /// Progress measure (0 to 1)
+    progress_measure: Option<f32>,
+
+    /// Scaled passing score (read-only, -1 to 1)
+    scaled_passing_score: Option<f32>,
+
+    /// Score
+    score: Cmi2004Score,
+
+    /// Session time (write-only, ISO 8601 duration)
+    session_time: Option<String>,
+
+    /// Success status
+    success_status: Cmi2004SuccessStatus,
+
+    /// Suspend data (max 64000 chars)
+    suspend_data: Option<String>,
+
+    /// Time limit action (read-only)
+    time_limit_action: Option<Cmi2004TimeLimitAction>,
+
+    /// Total time (read-only, ISO 8601 duration)
+    total_time: Option<String>,
+
+    // =========================================================================
+    // Collections
+    // =========================================================================
+
+    /// Comments from learner
+    comments_from_learner: List<Cmi2004Comment>,
+
+    /// Comments from LMS (read-only)
+    comments_from_lms: List<Cmi2004Comment>,
+
+    /// Objectives
+    objectives: List<Cmi2004Objective>,
+
+    /// Interactions
+    interactions: List<Cmi2004Interaction>,
+
+    // =========================================================================
+    // ADL Extensions
+    // =========================================================================
+
+    /// ADL data
+    adl: Cmi2004AdlData
+}
+
+impl Cmi2004DataModel {
+    fn new(learner_id: LearnerId, learner_name: String) -> Cmi2004DataModel {
+        Cmi2004DataModel {
+            version: "1.0".to_string(),
+            learner_id,
+            learner_name,
+            completion_status: Cmi2004CompletionStatus::Unknown,
+            completion_threshold: None,
+            credit: Cmi2004Credit::Credit,
+            entry: Cmi2004Entry::AbInitio,
+            exit: Cmi2004Exit::Empty,
+            launch_data: None,
+            learner_preference: Cmi2004LearnerPreference::new(),
+            location: None,
+            max_time_allowed: None,
+            mode: Cmi2004Mode::Normal,
+            progress_measure: None,
+            scaled_passing_score: None,
+            score: Cmi2004Score::new(),
+            session_time: None,
+            success_status: Cmi2004SuccessStatus::Unknown,
+            suspend_data: None,
+            time_limit_action: None,
+            total_time: Some("PT0S".to_string()),
+            comments_from_learner: vec![],
+            comments_from_lms: vec![],
+            objectives: vec![],
+            interactions: vec![],
+            adl: Cmi2004AdlData {
+                nav_request: Cmi2004NavRequest::None,
+                nav_request_valid: NavRequestValid::new()
+            }
+        }
+    }
+
+    /// Initialize for resume session
+    fn init_for_resume(&mut self, previous: &Cmi2004DataModel) {
+        self.entry = Cmi2004Entry::Resume;
+        self.location = previous.location.clone();
+        self.total_time = previous.total_time.clone();
+        self.suspend_data = previous.suspend_data.clone();
+        self.objectives = previous.objectives.clone();
+        self.completion_status = previous.completion_status.clone();
+        self.success_status = previous.success_status.clone();
+        self.score = previous.score.clone();
+        self.progress_measure = previous.progress_measure;
+    }
+}
+
+// =============================================================================
+// SCORM 2004 SESSION
+// =============================================================================
+
+/// Session state
+enum Scorm2004SessionState {
+    NotInitialized,
+    Running,
+    Terminated
+}
+
+/// SCORM 2004 Session
+type Scorm2004Session {
+    /// Session ID
+    id: Scorm2004SessionId,
+
+    /// User ID
+    user_id: UserId,
+
+    /// Activity ID
+    activity_id: ActivityId,
+
+    /// Package ID
+    package_id: ScormPackageId,
+
+    /// Enrollment ID
+    enrollment_id: EnrollmentId,
+
+    /// CMI data model
+    cmi: Cmi2004DataModel,
+
+    /// Session state
+    state: Scorm2004SessionState,
+
+    /// Last error
+    last_error: Scorm2004Error,
+
+    /// Error diagnostic
+    error_diagnostic: Option<String>,
+
+    /// Session start time
+    started_at: DateTime,
+
+    /// Last activity time
+    last_activity_at: DateTime,
+
+    /// API call count
+    api_call_count: i64,
+
+    /// Dirty flag
+    is_dirty: Bool
+}
+
+impl Scorm2004Session {
+    fn new(
+        user_id: UserId,
+        learner_name: String,
+        activity_id: ActivityId,
+        package_id: ScormPackageId,
+        enrollment_id: EnrollmentId,
+        mode: Cmi2004Mode,
+        credit: Cmi2004Credit
+    ) -> Scorm2004Session {
+        let now = DateTime::now();
+        Scorm2004Session {
+            id: format!("scorm2004_session_{}", generate_uuid()),
+            user_id: user_id.clone(),
+            activity_id,
+            package_id,
+            enrollment_id,
+            cmi: Cmi2004DataModel::new(user_id, learner_name),
+            state: Scorm2004SessionState::NotInitialized,
+            last_error: Scorm2004Error::NoError,
+            error_diagnostic: None,
+            started_at: now,
+            last_activity_at: now,
+            api_call_count: 0,
+            is_dirty: false
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 2004 API RESULT
+// =============================================================================
+
+/// API call result
+type Scorm2004ApiResult {
+    /// Return value
+    value: String,
+
+    /// Error code
+    error: Scorm2004Error,
+
+    /// Diagnostic message
+    diagnostic: Option<String>
+}
+
+impl Scorm2004ApiResult {
+    fn success() -> Scorm2004ApiResult {
+        Scorm2004ApiResult {
+            value: "true".to_string(),
+            error: Scorm2004Error::NoError,
+            diagnostic: None
+        }
+    }
+
+    fn success_value(value: String) -> Scorm2004ApiResult {
+        Scorm2004ApiResult {
+            value,
+            error: Scorm2004Error::NoError,
+            diagnostic: None
+        }
+    }
+
+    fn error(error: Scorm2004Error, diagnostic: Option<String>) -> Scorm2004ApiResult {
+        Scorm2004ApiResult {
+            value: "false".to_string(),
+            error,
+            diagnostic
+        }
+    }
+
+    fn empty_error(error: Scorm2004Error, diagnostic: Option<String>) -> Scorm2004ApiResult {
+        Scorm2004ApiResult {
+            value: "".to_string(),
+            error,
+            diagnostic
+        }
+    }
+}
+
+// =============================================================================
+// ISO 8601 DURATION UTILITIES
+// =============================================================================
+
+/// Parse ISO 8601 duration (PT#H#M#S format)
+fn parse_iso8601_duration(duration: &str) -> Option<Duration> {
+    if !duration.starts_with("PT") && !duration.starts_with("P") {
+        return None
+    }
+
+    let mut total_seconds: f64 = 0.0;
+    let mut current_num = String::new();
+    let mut in_time = duration.starts_with("PT");
+
+    for (i, c) in duration.chars().enumerate() {
+        if i == 0 && c == 'P' { continue }
+        if c == 'T' { in_time = true; continue }
+
+        if c.is_digit(10) || c == '.' {
+            current_num.push(c);
+        } else {
+            if !current_num.is_empty() {
+                let num: f64 = current_num.parse().unwrap_or(0.0);
+                current_num.clear();
+
+                match c {
+                    'Y' => total_seconds += num * 365.0 * 24.0 * 3600.0,
+                    'M' if !in_time => total_seconds += num * 30.0 * 24.0 * 3600.0,
+                    'D' => total_seconds += num * 24.0 * 3600.0,
+                    'H' => total_seconds += num * 3600.0,
+                    'M' if in_time => total_seconds += num * 60.0,
+                    'S' => total_seconds += num,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Some(Duration::from_secs_f64(total_seconds))
+}
+
+/// Format duration as ISO 8601 (PT#H#M#S)
+fn format_iso8601_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    let millis = duration.subsec_millis();
+
+    if millis > 0 {
+        format!("PT{}H{}M{}.{}S", hours, minutes, seconds, millis)
+    } else {
+        format!("PT{}H{}M{}S", hours, minutes, seconds)
+    }
+}
+
+/// Add two ISO 8601 durations
+fn add_iso8601_durations(d1: &str, d2: &str) -> Option<String> {
+    let dur1 = parse_iso8601_duration(d1)?;
+    let dur2 = parse_iso8601_duration(d2)?;
+    Some(format_iso8601_duration(dur1 + dur2))
+}
+
+// =============================================================================
+// SCORM 2004 RUNTIME ACTOR MESSAGES
+// =============================================================================
+
+/// Messages for ScormRuntime2004 actor
+enum Scorm2004Message {
+    /// Create a new session
+    CreateSession {
+        user_id: UserId,
+        learner_name: String,
+        activity_id: ActivityId,
+        package_id: ScormPackageId,
+        enrollment_id: EnrollmentId,
+        mode: Cmi2004Mode,
+        credit: Cmi2004Credit,
+        reply_to: Actor<Scorm2004SessionId>
+    },
+
+    /// Initialize (API_1484_11)
+    Initialize {
+        session_id: Scorm2004SessionId,
+        param: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// Terminate (API_1484_11)
+    Terminate {
+        session_id: Scorm2004SessionId,
+        param: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// GetValue (API_1484_11)
+    GetValue {
+        session_id: Scorm2004SessionId,
+        element: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// SetValue (API_1484_11)
+    SetValue {
+        session_id: Scorm2004SessionId,
+        element: String,
+        value: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// Commit (API_1484_11)
+    Commit {
+        session_id: Scorm2004SessionId,
+        param: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// GetLastError (API_1484_11)
+    GetLastError {
+        session_id: Scorm2004SessionId,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// GetErrorString (API_1484_11)
+    GetErrorString {
+        error_code: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// GetDiagnostic (API_1484_11)
+    GetDiagnostic {
+        session_id: Scorm2004SessionId,
+        param: String,
+        reply_to: Actor<Scorm2004ApiResult>
+    },
+
+    /// Get session
+    GetSession {
+        session_id: Scorm2004SessionId,
+        reply_to: Actor<Option<Scorm2004Session>>
+    },
+
+    /// Get navigation request
+    GetNavigationRequest {
+        session_id: Scorm2004SessionId,
+        reply_to: Actor<Option<Cmi2004NavRequest>>
+    },
+
+    /// Set navigation validity
+    SetNavigationValidity {
+        session_id: Scorm2004SessionId,
+        validity: NavRequestValid,
+        reply_to: Actor<Bool>
+    },
+
+    /// Persist session
+    PersistSession {
+        session_id: Scorm2004SessionId,
+        reply_to: Actor<Result<(), String>>
+    }
+}
+
+// =============================================================================
+// SCORM 2004 RUNTIME ACTOR
+// =============================================================================
+
+/// SCORM 2004 Runtime state
+type Scorm2004RuntimeState {
+    /// Active sessions
+    sessions: Map<Scorm2004SessionId, Scorm2004Session>,
+
+    /// Persisted data for resume
+    persisted_data: Map<String, Cmi2004DataModel> // key: user_id + activity_id
+}
+
+/// SCORM 2004 Runtime actor
+actor ScormRuntime2004 {
+    state: Scorm2004RuntimeState,
+
+    /// Initialize runtime
+    fn init() -> ScormRuntime2004 {
+        ScormRuntime2004 {
+            state: Scorm2004RuntimeState {
+                sessions: Map::new(),
+                persisted_data: Map::new()
+            }
+        }
+    }
+
+    /// Handle messages
+    fn receive(&mut self, msg: Scorm2004Message) {
+        match msg {
+            Scorm2004Message::CreateSession {
+                user_id, learner_name, activity_id, package_id,
+                enrollment_id, mode, credit, reply_to
+            } => {
+                let mut session = Scorm2004Session::new(
+                    user_id.clone(),
+                    learner_name,
+                    activity_id.clone(),
+                    package_id,
+                    enrollment_id,
+                    mode,
+                    credit
+                );
+
+                // Check for previous data
+                let persist_key = format!("{}_{}", user_id, activity_id);
+                if let Some(previous) = self.state.persisted_data.get(&persist_key) {
+                    session.cmi.init_for_resume(previous);
+                }
+
+                let session_id = session.id.clone();
+                self.state.sessions.insert(session_id.clone(), session);
+                reply_to.send(session_id);
+            },
+
+            Scorm2004Message::Initialize { session_id, param, reply_to } => {
+                let result = self.api_initialize(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::Terminate { session_id, param, reply_to } => {
+                let result = self.api_terminate(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::GetValue { session_id, element, reply_to } => {
+                let result = self.api_get_value(&session_id, &element);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::SetValue { session_id, element, value, reply_to } => {
+                let result = self.api_set_value(&session_id, &element, &value);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::Commit { session_id, param, reply_to } => {
+                let result = self.api_commit(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::GetLastError { session_id, reply_to } => {
+                let result = self.api_get_last_error(&session_id);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::GetErrorString { error_code, reply_to } => {
+                let result = self.api_get_error_string(&error_code);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::GetDiagnostic { session_id, param, reply_to } => {
+                let result = self.api_get_diagnostic(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm2004Message::GetSession { session_id, reply_to } => {
+                reply_to.send(self.state.sessions.get(&session_id).cloned());
+            },
+
+            Scorm2004Message::GetNavigationRequest { session_id, reply_to } => {
+                let nav = self.state.sessions.get(&session_id)
+                    .map(|s| s.cmi.adl.nav_request.clone());
+                reply_to.send(nav);
+            },
+
+            Scorm2004Message::SetNavigationValidity { session_id, validity, reply_to } => {
+                if let Some(session) = self.state.sessions.get_mut(&session_id) {
+                    session.cmi.adl.nav_request_valid = validity;
+                    reply_to.send(true);
+                } else {
+                    reply_to.send(false);
+                }
+            },
+
+            Scorm2004Message::PersistSession { session_id, reply_to } => {
+                let result = self.persist_session(&session_id);
+                reply_to.send(result);
+            }
+        }
+    }
+
+    // =========================================================================
+    // API_1484_11 IMPLEMENTATIONS
+    // =========================================================================
+
+    /// Initialize("") - Begin communication session
+    fn api_initialize(&mut self, session_id: &Scorm2004SessionId, param: &str) -> Scorm2004ApiResult {
+        if !param.is_empty() {
+            return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralArgumentError,
+                Some("Initialize parameter must be empty string".to_string())
+            )
+        }
+
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm2004SessionState::Running => {
+                session.last_error = Scorm2004Error::AlreadyInitialized;
+                Scorm2004ApiResult::error(Scorm2004Error::AlreadyInitialized, None)
+            },
+            Scorm2004SessionState::Terminated => {
+                session.last_error = Scorm2004Error::ContentInstanceTerminated;
+                Scorm2004ApiResult::error(Scorm2004Error::ContentInstanceTerminated, None)
+            },
+            Scorm2004SessionState::NotInitialized => {
+                session.state = Scorm2004SessionState::Running;
+                session.last_error = Scorm2004Error::NoError;
+                Scorm2004ApiResult::success()
+            }
+        }
+    }
+
+    /// Terminate("") - End communication session
+    fn api_terminate(&mut self, session_id: &Scorm2004SessionId, param: &str) -> Scorm2004ApiResult {
+        if !param.is_empty() {
+            return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralArgumentError,
+                Some("Terminate parameter must be empty string".to_string())
+            )
+        }
+
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm2004SessionState::NotInitialized => {
+                session.last_error = Scorm2004Error::TerminationBeforeInitialization;
+                Scorm2004ApiResult::error(Scorm2004Error::TerminationBeforeInitialization, None)
+            },
+            Scorm2004SessionState::Terminated => {
+                session.last_error = Scorm2004Error::TerminationAfterTermination;
+                Scorm2004ApiResult::error(Scorm2004Error::TerminationAfterTermination, None)
+            },
+            Scorm2004SessionState::Running => {
+                // Update total time
+                if let Some(session_time) = &session.cmi.session_time {
+                    if let Some(total) = &session.cmi.total_time {
+                        session.cmi.total_time = add_iso8601_durations(total, session_time);
+                    }
+                }
+
+                // Persist if suspend
+                if matches!(session.cmi.exit, Cmi2004Exit::Suspend) {
+                    let persist_key = format!("{}_{}", session.user_id, session.activity_id);
+                    self.state.persisted_data.insert(persist_key, session.cmi.clone());
+                }
+
+                session.state = Scorm2004SessionState::Terminated;
+                session.last_error = Scorm2004Error::NoError;
+                Scorm2004ApiResult::success()
+            }
+        }
+    }
+
+    /// GetValue(element) - Retrieve data model element
+    fn api_get_value(&mut self, session_id: &Scorm2004SessionId, element: &str) -> Scorm2004ApiResult {
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm2004ApiResult::empty_error(
+                Scorm2004Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm2004SessionState::NotInitialized => {
+                session.last_error = Scorm2004Error::RetrieveBeforeInitialization;
+                Scorm2004ApiResult::empty_error(Scorm2004Error::RetrieveBeforeInitialization, None)
+            },
+            Scorm2004SessionState::Terminated => {
+                session.last_error = Scorm2004Error::RetrieveAfterTermination;
+                Scorm2004ApiResult::empty_error(Scorm2004Error::RetrieveAfterTermination, None)
+            },
+            Scorm2004SessionState::Running => {
+                match self.get_cmi_value(&session.cmi, element) {
+                    Ok(value) => {
+                        session.last_error = Scorm2004Error::NoError;
+                        Scorm2004ApiResult::success_value(value)
+                    },
+                    Err(error) => {
+                        session.last_error = error.clone();
+                        session.error_diagnostic = Some(format!("Element: {}", element));
+                        Scorm2004ApiResult::empty_error(error, Some(element.to_string()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// SetValue(element, value) - Store data model element
+    fn api_set_value(&mut self, session_id: &Scorm2004SessionId, element: &str, value: &str) -> Scorm2004ApiResult {
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm2004SessionState::NotInitialized => {
+                session.last_error = Scorm2004Error::StoreBeforeInitialization;
+                Scorm2004ApiResult::error(Scorm2004Error::StoreBeforeInitialization, None)
+            },
+            Scorm2004SessionState::Terminated => {
+                session.last_error = Scorm2004Error::StoreAfterTermination;
+                Scorm2004ApiResult::error(Scorm2004Error::StoreAfterTermination, None)
+            },
+            Scorm2004SessionState::Running => {
+                match self.set_cmi_value(&mut session.cmi, element, value) {
+                    Ok(()) => {
+                        session.last_error = Scorm2004Error::NoError;
+                        session.is_dirty = true;
+                        Scorm2004ApiResult::success()
+                    },
+                    Err(error) => {
+                        session.last_error = error.clone();
+                        session.error_diagnostic = Some(format!("Element: {}, Value: {}", element, value));
+                        Scorm2004ApiResult::error(error, Some(element.to_string()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commit("") - Persist data
+    fn api_commit(&mut self, session_id: &Scorm2004SessionId, param: &str) -> Scorm2004ApiResult {
+        if !param.is_empty() {
+            return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralArgumentError,
+                Some("Commit parameter must be empty string".to_string())
+            )
+        }
+
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm2004ApiResult::error(
+                Scorm2004Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm2004SessionState::NotInitialized => {
+                session.last_error = Scorm2004Error::CommitBeforeInitialization;
+                Scorm2004ApiResult::error(Scorm2004Error::CommitBeforeInitialization, None)
+            },
+            Scorm2004SessionState::Terminated => {
+                session.last_error = Scorm2004Error::CommitAfterTermination;
+                Scorm2004ApiResult::error(Scorm2004Error::CommitAfterTermination, None)
+            },
+            Scorm2004SessionState::Running => {
+                let persist_key = format!("{}_{}", session.user_id, session.activity_id);
+                self.state.persisted_data.insert(persist_key, session.cmi.clone());
+                session.is_dirty = false;
+                session.last_error = Scorm2004Error::NoError;
+                Scorm2004ApiResult::success()
+            }
+        }
+    }
+
+    /// GetLastError() - Get last error code
+    fn api_get_last_error(&self, session_id: &Scorm2004SessionId) -> Scorm2004ApiResult {
+        match self.state.sessions.get(session_id) {
+            Some(session) => Scorm2004ApiResult::success_value(session.last_error.code()),
+            None => Scorm2004ApiResult::success_value("0".to_string())
+        }
+    }
+
+    /// GetErrorString(errorCode) - Get error description
+    fn api_get_error_string(&self, error_code: &str) -> Scorm2004ApiResult {
+        let desc = match error_code {
+            "0" => Scorm2004Error::NoError.description(),
+            "101" => Scorm2004Error::GeneralException.description(),
+            "102" => Scorm2004Error::GeneralInitializationFailure.description(),
+            "103" => Scorm2004Error::AlreadyInitialized.description(),
+            "104" => Scorm2004Error::ContentInstanceTerminated.description(),
+            "111" => Scorm2004Error::GeneralTerminationFailure.description(),
+            "112" => Scorm2004Error::TerminationBeforeInitialization.description(),
+            "113" => Scorm2004Error::TerminationAfterTermination.description(),
+            "122" => Scorm2004Error::RetrieveBeforeInitialization.description(),
+            "123" => Scorm2004Error::RetrieveAfterTermination.description(),
+            "132" => Scorm2004Error::StoreBeforeInitialization.description(),
+            "133" => Scorm2004Error::StoreAfterTermination.description(),
+            "142" => Scorm2004Error::CommitBeforeInitialization.description(),
+            "143" => Scorm2004Error::CommitAfterTermination.description(),
+            "201" => Scorm2004Error::GeneralArgumentError.description(),
+            "301" => Scorm2004Error::GeneralGetFailure.description(),
+            "351" => Scorm2004Error::GeneralSetFailure.description(),
+            "391" => Scorm2004Error::GeneralCommitFailure.description(),
+            "401" => Scorm2004Error::UndefinedDataModelElement.description(),
+            "402" => Scorm2004Error::UnimplementedDataModelElement.description(),
+            "403" => Scorm2004Error::DataModelElementValueNotInitialized.description(),
+            "404" => Scorm2004Error::DataModelElementIsReadOnly.description(),
+            "405" => Scorm2004Error::DataModelElementIsWriteOnly.description(),
+            "406" => Scorm2004Error::DataModelElementTypeMismatch.description(),
+            "407" => Scorm2004Error::DataModelElementValueOutOfRange.description(),
+            "408" => Scorm2004Error::DataModelDependencyNotEstablished.description(),
+            _ => "Unknown Error".to_string()
+        };
+        Scorm2004ApiResult::success_value(desc)
+    }
+
+    /// GetDiagnostic(param) - Get diagnostic info
+    fn api_get_diagnostic(&self, session_id: &Scorm2004SessionId, param: &str) -> Scorm2004ApiResult {
+        match self.state.sessions.get(session_id) {
+            Some(session) => {
+                let diagnostic = session.error_diagnostic.clone()
+                    .unwrap_or_else(|| session.last_error.description());
+                Scorm2004ApiResult::success_value(diagnostic)
+            },
+            None => Scorm2004ApiResult::success_value("No session".to_string())
+        }
+    }
+
+    // =========================================================================
+    // CMI DATA MODEL ACCESS
+    // =========================================================================
+
+    /// Get CMI value
+    fn get_cmi_value(&self, cmi: &Cmi2004DataModel, element: &str) -> Result<String, Scorm2004Error> {
+        match element {
+            // Version
+            "cmi._version" => Ok(cmi.version.clone()),
+
+            // Learner info
+            "cmi.learner_id" => Ok(cmi.learner_id.clone()),
+            "cmi.learner_name" => Ok(cmi.learner_name.clone()),
+
+            // Completion/success status
+            "cmi.completion_status" => Ok(cmi.completion_status.to_string()),
+            "cmi.completion_threshold" => Ok(cmi.completion_threshold.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.success_status" => Ok(cmi.success_status.to_string()),
+
+            // Credit/mode/entry
+            "cmi.credit" => Ok(cmi.credit.to_string()),
+            "cmi.mode" => Ok(cmi.mode.to_string()),
+            "cmi.entry" => Ok(cmi.entry.to_string()),
+            "cmi.exit" => Err(Scorm2004Error::DataModelElementIsWriteOnly),
+
+            // Launch/location/suspend
+            "cmi.launch_data" => Ok(cmi.launch_data.clone().unwrap_or_default()),
+            "cmi.location" => Ok(cmi.location.clone().unwrap_or_default()),
+            "cmi.suspend_data" => Ok(cmi.suspend_data.clone().unwrap_or_default()),
+
+            // Time
+            "cmi.max_time_allowed" => Ok(cmi.max_time_allowed.clone().unwrap_or_default()),
+            "cmi.total_time" => Ok(cmi.total_time.clone().unwrap_or_default()),
+            "cmi.session_time" => Err(Scorm2004Error::DataModelElementIsWriteOnly),
+            "cmi.time_limit_action" => Ok(cmi.time_limit_action.as_ref().map(|t| t.to_string()).unwrap_or_default()),
+
+            // Score
+            "cmi.score.scaled" => Ok(cmi.score.scaled.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.score.raw" => Ok(cmi.score.raw.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.score.min" => Ok(cmi.score.min.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.score.max" => Ok(cmi.score.max.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.score._children" => Ok("scaled,raw,min,max".to_string()),
+            "cmi.scaled_passing_score" => Ok(cmi.scaled_passing_score.map(|v| v.to_string()).unwrap_or_default()),
+
+            // Progress
+            "cmi.progress_measure" => Ok(cmi.progress_measure.map(|v| v.to_string()).unwrap_or_default()),
+
+            // Learner preference
+            "cmi.learner_preference.audio_captioning" => Ok(cmi.learner_preference.audio_captioning.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.learner_preference.audio_level" => Ok(cmi.learner_preference.audio_level.map(|v| v.to_string()).unwrap_or("1".to_string())),
+            "cmi.learner_preference.delivery_speed" => Ok(cmi.learner_preference.delivery_speed.map(|v| v.to_string()).unwrap_or("1".to_string())),
+            "cmi.learner_preference.language" => Ok(cmi.learner_preference.language.clone().unwrap_or_default()),
+            "cmi.learner_preference._children" => Ok("audio_captioning,audio_level,delivery_speed,language".to_string()),
+
+            // Comments
+            "cmi.comments_from_learner._count" => Ok(cmi.comments_from_learner.len().to_string()),
+            "cmi.comments_from_learner._children" => Ok("comment,location,timestamp".to_string()),
+            "cmi.comments_from_lms._count" => Ok(cmi.comments_from_lms.len().to_string()),
+            "cmi.comments_from_lms._children" => Ok("comment,location,timestamp".to_string()),
+
+            // Objectives
+            "cmi.objectives._count" => Ok(cmi.objectives.len().to_string()),
+            "cmi.objectives._children" => Ok("id,completion_status,success_status,score,progress_measure,description".to_string()),
+
+            // Interactions
+            "cmi.interactions._count" => Ok(cmi.interactions.len().to_string()),
+            "cmi.interactions._children" => Ok("id,type,objectives,timestamp,correct_responses,weighting,learner_response,result,latency,description".to_string()),
+
+            // ADL navigation
+            "adl.nav.request" => Ok(cmi.adl.nav_request.to_string()),
+            "adl.nav.request_valid.continue" => Ok(cmi.adl.nav_request_valid.continue_valid.to_string()),
+            "adl.nav.request_valid.previous" => Ok(cmi.adl.nav_request_valid.previous_valid.to_string()),
+
+            // Children keywords
+            "cmi._children" => Ok("_version,comments_from_learner,comments_from_lms,completion_status,completion_threshold,credit,entry,exit,interactions,launch_data,learner_id,learner_name,learner_preference,location,max_time_allowed,mode,objectives,progress_measure,scaled_passing_score,score,session_time,success_status,suspend_data,time_limit_action,total_time".to_string()),
+
+            _ => {
+                // Handle indexed elements
+                if element.starts_with("cmi.objectives.") {
+                    return self.get_objective_value(cmi, element)
+                }
+                if element.starts_with("cmi.interactions.") {
+                    return self.get_interaction_value(cmi, element)
+                }
+                if element.starts_with("cmi.comments_from_learner.") {
+                    return self.get_comment_value(&cmi.comments_from_learner, element)
+                }
+                if element.starts_with("cmi.comments_from_lms.") {
+                    return self.get_comment_value(&cmi.comments_from_lms, element)
+                }
+                if element.starts_with("adl.nav.request_valid.choice.") {
+                    let target = element.strip_prefix("adl.nav.request_valid.choice.").unwrap();
+                    return Ok(cmi.adl.nav_request_valid.choice.get(target).map(|v| v.to_string()).unwrap_or("unknown".to_string()))
+                }
+                if element.starts_with("adl.nav.request_valid.jump.") {
+                    let target = element.strip_prefix("adl.nav.request_valid.jump.").unwrap();
+                    return Ok(cmi.adl.nav_request_valid.jump.get(target).map(|v| v.to_string()).unwrap_or("unknown".to_string()))
+                }
+                Err(Scorm2004Error::UndefinedDataModelElement)
+            }
+        }
+    }
+
+    /// Get objective value
+    fn get_objective_value(&self, cmi: &Cmi2004DataModel, element: &str) -> Result<String, Scorm2004Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+        if index >= cmi.objectives.len() {
+            return Err(Scorm2004Error::GeneralArgumentError)
+        }
+
+        let obj = &cmi.objectives[index];
+        match parts[3] {
+            "id" => Ok(obj.id.clone()),
+            "completion_status" => Ok(obj.completion_status.to_string()),
+            "success_status" => Ok(obj.success_status.to_string()),
+            "progress_measure" => Ok(obj.progress_measure.map(|v| v.to_string()).unwrap_or_default()),
+            "description" => Ok(obj.description.clone().unwrap_or_default()),
+            "score" if parts.len() > 4 => match parts[4] {
+                "scaled" => Ok(obj.score.scaled.map(|v| v.to_string()).unwrap_or_default()),
+                "raw" => Ok(obj.score.raw.map(|v| v.to_string()).unwrap_or_default()),
+                "min" => Ok(obj.score.min.map(|v| v.to_string()).unwrap_or_default()),
+                "max" => Ok(obj.score.max.map(|v| v.to_string()).unwrap_or_default()),
+                "_children" => Ok("scaled,raw,min,max".to_string()),
+                _ => Err(Scorm2004Error::UndefinedDataModelElement)
+            },
+            _ => Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+    }
+
+    /// Get interaction value
+    fn get_interaction_value(&self, cmi: &Cmi2004DataModel, element: &str) -> Result<String, Scorm2004Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+        if index >= cmi.interactions.len() {
+            return Err(Scorm2004Error::GeneralArgumentError)
+        }
+
+        let interaction = &cmi.interactions[index];
+        match parts[3] {
+            "id" => Ok(interaction.id.clone()),
+            "type" => Ok(interaction.interaction_type.as_ref().map(|t| t.to_string()).unwrap_or_default()),
+            "timestamp" => Ok(interaction.timestamp.clone().unwrap_or_default()),
+            "weighting" => Ok(interaction.weighting.map(|w| w.to_string()).unwrap_or_default()),
+            "learner_response" => Ok(interaction.learner_response.clone().unwrap_or_default()),
+            "result" => Ok(interaction.result.as_ref().map(|r| r.to_string()).unwrap_or_default()),
+            "latency" => Ok(interaction.latency.clone().unwrap_or_default()),
+            "description" => Ok(interaction.description.clone().unwrap_or_default()),
+            "objectives" if parts.len() > 4 => {
+                if parts[4] == "_count" {
+                    Ok(interaction.objectives.len().to_string())
+                } else {
+                    let obj_index: usize = parts[4].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+                    if obj_index >= interaction.objectives.len() {
+                        Err(Scorm2004Error::GeneralArgumentError)
+                    } else if parts.len() > 5 && parts[5] == "id" {
+                        Ok(interaction.objectives[obj_index].clone())
+                    } else {
+                        Err(Scorm2004Error::UndefinedDataModelElement)
+                    }
+                }
+            },
+            "correct_responses" if parts.len() > 4 => {
+                if parts[4] == "_count" {
+                    Ok(interaction.correct_responses.len().to_string())
+                } else {
+                    let cr_index: usize = parts[4].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+                    if cr_index >= interaction.correct_responses.len() {
+                        Err(Scorm2004Error::GeneralArgumentError)
+                    } else if parts.len() > 5 && parts[5] == "pattern" {
+                        Ok(interaction.correct_responses[cr_index].pattern.clone())
+                    } else {
+                        Err(Scorm2004Error::UndefinedDataModelElement)
+                    }
+                }
+            },
+            _ => Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+    }
+
+    /// Get comment value
+    fn get_comment_value(&self, comments: &List<Cmi2004Comment>, element: &str) -> Result<String, Scorm2004Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+        if index >= comments.len() {
+            return Err(Scorm2004Error::GeneralArgumentError)
+        }
+
+        let comment = &comments[index];
+        match parts[3] {
+            "comment" => Ok(comment.comment.clone()),
+            "location" => Ok(comment.location.clone().unwrap_or_default()),
+            "timestamp" => Ok(comment.timestamp.clone().unwrap_or_default()),
+            _ => Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+    }
+
+    /// Set CMI value
+    fn set_cmi_value(&self, cmi: &mut Cmi2004DataModel, element: &str, value: &str) -> Result<(), Scorm2004Error> {
+        match element {
+            // Read-only elements
+            "cmi._version" |
+            "cmi.learner_id" |
+            "cmi.learner_name" |
+            "cmi.completion_threshold" |
+            "cmi.credit" |
+            "cmi.mode" |
+            "cmi.entry" |
+            "cmi.launch_data" |
+            "cmi.max_time_allowed" |
+            "cmi.total_time" |
+            "cmi.time_limit_action" |
+            "cmi.scaled_passing_score" => Err(Scorm2004Error::DataModelElementIsReadOnly),
+
+            // Writable elements
+            "cmi.completion_status" => {
+                cmi.completion_status = Cmi2004CompletionStatus::from_string(value)
+                    .ok_or(Scorm2004Error::DataModelElementTypeMismatch)?;
+                Ok(())
+            },
+            "cmi.success_status" => {
+                cmi.success_status = Cmi2004SuccessStatus::from_string(value)
+                    .ok_or(Scorm2004Error::DataModelElementTypeMismatch)?;
+                Ok(())
+            },
+            "cmi.exit" => {
+                cmi.exit = Cmi2004Exit::from_string(value);
+                Ok(())
+            },
+            "cmi.location" => {
+                if value.len() > 1000 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.location = Some(value.to_string());
+                Ok(())
+            },
+            "cmi.suspend_data" => {
+                if value.len() > 64000 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.suspend_data = Some(value.to_string());
+                Ok(())
+            },
+            "cmi.session_time" => {
+                // Validate ISO 8601 duration
+                if parse_iso8601_duration(value).is_none() {
+                    return Err(Scorm2004Error::DataModelElementTypeMismatch)
+                }
+                cmi.session_time = Some(value.to_string());
+                Ok(())
+            },
+            "cmi.progress_measure" => {
+                let pm: f32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                if pm < 0.0 || pm > 1.0 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.progress_measure = Some(pm);
+                Ok(())
+            },
+
+            // Score
+            "cmi.score.scaled" => {
+                let scaled: f32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                if !Cmi2004Score::validate_scaled(scaled) {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.score.scaled = Some(scaled);
+                Ok(())
+            },
+            "cmi.score.raw" => {
+                cmi.score.raw = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                Ok(())
+            },
+            "cmi.score.min" => {
+                cmi.score.min = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                Ok(())
+            },
+            "cmi.score.max" => {
+                cmi.score.max = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                Ok(())
+            },
+
+            // Learner preference
+            "cmi.learner_preference.audio_captioning" => {
+                let ac: i32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                if ac < -1 || ac > 1 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.learner_preference.audio_captioning = Some(ac);
+                Ok(())
+            },
+            "cmi.learner_preference.audio_level" => {
+                let al: f32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                if al < 0.0 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.learner_preference.audio_level = Some(al);
+                Ok(())
+            },
+            "cmi.learner_preference.delivery_speed" => {
+                let ds: f32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                if ds < 0.0 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.learner_preference.delivery_speed = Some(ds);
+                Ok(())
+            },
+            "cmi.learner_preference.language" => {
+                if value.len() > 250 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                cmi.learner_preference.language = Some(value.to_string());
+                Ok(())
+            },
+
+            // ADL navigation
+            "adl.nav.request" => {
+                cmi.adl.nav_request = Cmi2004NavRequest::from_string(value);
+                Ok(())
+            },
+
+            _ => {
+                // Handle indexed elements
+                if element.starts_with("cmi.objectives.") {
+                    return self.set_objective_value(cmi, element, value)
+                }
+                if element.starts_with("cmi.interactions.") {
+                    return self.set_interaction_value(cmi, element, value)
+                }
+                if element.starts_with("cmi.comments_from_learner.") {
+                    return self.set_comment_value(&mut cmi.comments_from_learner, element, value)
+                }
+                if element.starts_with("cmi.comments_from_lms.") {
+                    return Err(Scorm2004Error::DataModelElementIsReadOnly)
+                }
+                Err(Scorm2004Error::UndefinedDataModelElement)
+            }
+        }
+    }
+
+    /// Set objective value
+    fn set_objective_value(&self, cmi: &mut Cmi2004DataModel, element: &str, value: &str) -> Result<(), Scorm2004Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+
+        // Auto-expand
+        while cmi.objectives.len() <= index {
+            cmi.objectives.push(Cmi2004Objective::new(format!("obj_{}", cmi.objectives.len())));
+        }
+
+        let obj = &mut cmi.objectives[index];
+        match parts[3] {
+            "id" => {
+                obj.id = value.to_string();
+                Ok(())
+            },
+            "completion_status" => {
+                obj.completion_status = Cmi2004CompletionStatus::from_string(value)
+                    .ok_or(Scorm2004Error::DataModelElementTypeMismatch)?;
+                Ok(())
+            },
+            "success_status" => {
+                obj.success_status = Cmi2004SuccessStatus::from_string(value)
+                    .ok_or(Scorm2004Error::DataModelElementTypeMismatch)?;
+                Ok(())
+            },
+            "progress_measure" => {
+                let pm: f32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                if pm < 0.0 || pm > 1.0 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                obj.progress_measure = Some(pm);
+                Ok(())
+            },
+            "description" => {
+                if value.len() > 250 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                obj.description = Some(value.to_string());
+                Ok(())
+            },
+            "score" if parts.len() > 4 => match parts[4] {
+                "scaled" => {
+                    let scaled: f32 = value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?;
+                    if !Cmi2004Score::validate_scaled(scaled) {
+                        return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                    }
+                    obj.score.scaled = Some(scaled);
+                    Ok(())
+                },
+                "raw" => {
+                    obj.score.raw = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                    Ok(())
+                },
+                "min" => {
+                    obj.score.min = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                    Ok(())
+                },
+                "max" => {
+                    obj.score.max = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                    Ok(())
+                },
+                _ => Err(Scorm2004Error::UndefinedDataModelElement)
+            },
+            _ => Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+    }
+
+    /// Set interaction value
+    fn set_interaction_value(&self, cmi: &mut Cmi2004DataModel, element: &str, value: &str) -> Result<(), Scorm2004Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+
+        // Auto-expand
+        while cmi.interactions.len() <= index {
+            cmi.interactions.push(Cmi2004Interaction::new(format!("int_{}", cmi.interactions.len())));
+        }
+
+        let interaction = &mut cmi.interactions[index];
+        match parts[3] {
+            "id" => {
+                interaction.id = value.to_string();
+                Ok(())
+            },
+            "type" => {
+                interaction.interaction_type = Some(Cmi2004InteractionType::from_string(value)
+                    .ok_or(Scorm2004Error::DataModelElementTypeMismatch)?);
+                Ok(())
+            },
+            "timestamp" => {
+                interaction.timestamp = Some(value.to_string());
+                Ok(())
+            },
+            "weighting" => {
+                interaction.weighting = Some(value.parse().map_err(|_| Scorm2004Error::DataModelElementTypeMismatch)?);
+                Ok(())
+            },
+            "learner_response" => {
+                interaction.learner_response = Some(value.to_string());
+                Ok(())
+            },
+            "result" => {
+                interaction.result = Some(Cmi2004InteractionResult::from_string(value));
+                Ok(())
+            },
+            "latency" => {
+                interaction.latency = Some(value.to_string());
+                Ok(())
+            },
+            "description" => {
+                if value.len() > 250 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                interaction.description = Some(value.to_string());
+                Ok(())
+            },
+            "objectives" if parts.len() > 4 => {
+                let obj_index: usize = parts[4].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+                if parts.len() > 5 && parts[5] == "id" {
+                    while interaction.objectives.len() <= obj_index {
+                        interaction.objectives.push(String::new());
+                    }
+                    interaction.objectives[obj_index] = value.to_string();
+                    Ok(())
+                } else {
+                    Err(Scorm2004Error::UndefinedDataModelElement)
+                }
+            },
+            "correct_responses" if parts.len() > 4 => {
+                let cr_index: usize = parts[4].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+                if parts.len() > 5 && parts[5] == "pattern" {
+                    while interaction.correct_responses.len() <= cr_index {
+                        interaction.correct_responses.push(Cmi2004CorrectResponse { pattern: String::new() });
+                    }
+                    interaction.correct_responses[cr_index].pattern = value.to_string();
+                    Ok(())
+                } else {
+                    Err(Scorm2004Error::UndefinedDataModelElement)
+                }
+            },
+            _ => Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+    }
+
+    /// Set comment value
+    fn set_comment_value(&self, comments: &mut List<Cmi2004Comment>, element: &str, value: &str) -> Result<(), Scorm2004Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm2004Error::GeneralArgumentError)?;
+
+        // Auto-expand
+        while comments.len() <= index {
+            comments.push(Cmi2004Comment {
+                comment: String::new(),
+                location: None,
+                timestamp: None
+            });
+        }
+
+        let comment = &mut comments[index];
+        match parts[3] {
+            "comment" => {
+                if value.len() > 4000 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                comment.comment = value.to_string();
+                Ok(())
+            },
+            "location" => {
+                if value.len() > 250 {
+                    return Err(Scorm2004Error::DataModelElementValueOutOfRange)
+                }
+                comment.location = Some(value.to_string());
+                Ok(())
+            },
+            "timestamp" => {
+                comment.timestamp = Some(value.to_string());
+                Ok(())
+            },
+            _ => Err(Scorm2004Error::UndefinedDataModelElement)
+        }
+    }
+
+    /// Persist session
+    fn persist_session(&mut self, session_id: &Scorm2004SessionId) -> Result<(), String> {
+        let session = self.state.sessions.get(session_id)
+            .ok_or("Session not found")?;
+
+        let persist_key = format!("{}_{}", session.user_id, session.activity_id);
+        self.state.persisted_data.insert(persist_key, session.cmi.clone());
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+/// Create SCORM 2004 runtime
+fn create_scorm2004_runtime() -> ScormRuntime2004 {
+    ScormRuntime2004::init()
+}

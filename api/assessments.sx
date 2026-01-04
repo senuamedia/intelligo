@@ -1,0 +1,1983 @@
+/// Intelligo LMS - Assessments API
+///
+/// This module provides assessment management endpoints:
+/// - Assessment CRUD operations
+/// - Question management
+/// - Assessment configuration
+/// - Assessment taking and submission
+
+module intelligo::api::assessments
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::entities::assessment::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the assessments router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Assessment CRUD
+        .get("/", move |req| list_assessments(req, db.clone()))
+        .get("/:assessment_id", move |req| get_assessment(req, db.clone()))
+        .post("/", move |req| create_assessment(req, db.clone()))
+        .patch("/:assessment_id", move |req| update_assessment(req, db.clone()))
+        .delete("/:assessment_id", move |req| delete_assessment(req, db.clone()))
+
+        // Assessment publishing
+        .post("/:assessment_id/publish", move |req| publish_assessment(req, db.clone()))
+        .post("/:assessment_id/unpublish", move |req| unpublish_assessment(req, db.clone()))
+
+        // Questions
+        .get("/:assessment_id/questions", move |req| get_questions(req, db.clone()))
+        .post("/:assessment_id/questions", move |req| add_question(req, db.clone()))
+        .put("/:assessment_id/questions/order", move |req| reorder_questions(req, db.clone()))
+        .patch("/:assessment_id/questions/:question_id", move |req| update_question(req, db.clone()))
+        .delete("/:assessment_id/questions/:question_id", move |req| delete_question(req, db.clone()))
+
+        // Question banks
+        .get("/:assessment_id/question-bank", move |req| get_from_question_bank(req, db.clone()))
+        .post("/:assessment_id/questions/import", move |req| import_questions(req, db.clone()))
+
+        // Rubrics
+        .get("/:assessment_id/rubric", move |req| get_rubric(req, db.clone()))
+        .put("/:assessment_id/rubric", move |req| update_rubric(req, db.clone()))
+
+        // Assessment settings
+        .get("/:assessment_id/settings", move |req| get_settings(req, db.clone()))
+        .patch("/:assessment_id/settings", move |req| update_settings(req, db.clone()))
+
+        // Taking assessment (student)
+        .post("/:assessment_id/start", move |req| start_attempt(req, db.clone()))
+        .get("/:assessment_id/attempt", move |req| get_current_attempt(req, db.clone()))
+        .post("/:assessment_id/submit", move |req| submit_assessment(req, db.clone()))
+
+        // Assessment results
+        .get("/:assessment_id/results", move |req| get_results(req, db.clone()))
+        .get("/:assessment_id/statistics", move |req| get_statistics(req, db.clone()))
+
+        // Submissions (instructor view)
+        .get("/:assessment_id/submissions", move |req| get_submissions(req, db.clone()))
+
+        // Duplication
+        .post("/:assessment_id/duplicate", move |req| duplicate_assessment(req, db.clone()))
+
+        // Preview
+        .get("/:assessment_id/preview", move |req| preview_assessment(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Assessment response type
+type AssessmentResponse {
+    id: AssessmentId,
+    module_id: ModuleId,
+    course_id: CourseId,
+    title: String,
+    description: Option<String>,
+    instructions: Option<String>,
+    assessment_type: AssessmentType,
+    position: i32,
+    max_points: f32,
+    passing_score: Option<f32>,
+    is_published: Bool,
+    due_date: Option<DateTime>,
+    available_from: Option<DateTime>,
+    available_until: Option<DateTime>,
+    time_limit_minutes: Option<i32>,
+    attempts_allowed: Option<i32>,
+    question_count: i32,
+    submission_count: i32,
+    grading_type: GradingType,
+    has_rubric: Bool,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Assessment type enum
+enum AssessmentType {
+    Quiz,
+    Exam,
+    Assignment,
+    Discussion,
+    Project,
+    Survey,
+    PeerReview
+}
+
+/// Grading type
+enum GradingType {
+    AutoGraded,
+    ManualGraded,
+    RubricBased,
+    PassFail,
+    PeerGraded,
+    AiAssisted
+}
+
+/// Create assessment request
+type CreateAssessmentRequest {
+    module_id: ModuleId,
+    title: String,
+    assessment_type: String,
+    description: Option<String>,
+    instructions: Option<String>,
+    max_points: Option<f32>,
+    due_date: Option<DateTime>,
+    time_limit_minutes: Option<i32>,
+    attempts_allowed: Option<i32>,
+    position: Option<i32>
+}
+
+/// Update assessment request
+type UpdateAssessmentRequest {
+    title: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
+    max_points: Option<f32>,
+    passing_score: Option<f32>,
+    due_date: Option<DateTime>,
+    available_from: Option<DateTime>,
+    available_until: Option<DateTime>,
+    time_limit_minutes: Option<i32>,
+    attempts_allowed: Option<i32>,
+    position: Option<i32>
+}
+
+/// Question types
+enum QuestionType {
+    MultipleChoice,
+    MultipleSelect,
+    TrueFalse,
+    ShortAnswer,
+    Essay,
+    Matching,
+    Ordering,
+    FillInBlank,
+    Numeric,
+    FileUpload,
+    Hotspot,
+    Likert
+}
+
+/// Question response type
+type QuestionResponse {
+    id: String,
+    assessment_id: AssessmentId,
+    question_type: QuestionType,
+    position: i32,
+    points: f32,
+    content: QuestionContent,
+    is_required: Bool,
+    hint: Option<String>,
+    feedback: Option<QuestionFeedback>,
+    settings: QuestionSettings,
+    tags: List<String>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Question content (varies by type)
+type QuestionContent {
+    text: String,
+    text_format: TextFormat,
+    media: Option<MediaAttachment>,
+    options: Option<List<QuestionOption>>,
+    correct_answer: Option<CorrectAnswer>,
+    matching_pairs: Option<List<MatchingPair>>,
+    blanks: Option<List<BlankDefinition>>
+}
+
+/// Question option (for multiple choice, etc.)
+type QuestionOption {
+    id: String,
+    text: String,
+    is_correct: Bool,
+    feedback: Option<String>,
+    position: i32
+}
+
+/// Correct answer (for auto-graded questions)
+enum CorrectAnswer {
+    SingleOption { option_id: String },
+    MultipleOptions { option_ids: List<String> },
+    Boolean { value: Bool },
+    Text { patterns: List<String>, case_sensitive: Bool },
+    Numeric { value: f64, tolerance: Option<f64>, units: Option<String> },
+    Range { min: f64, max: f64 }
+}
+
+/// Matching pair
+type MatchingPair {
+    id: String,
+    premise: String,
+    response: String
+}
+
+/// Blank definition for fill-in-blank
+type BlankDefinition {
+    id: String,
+    position: i32,
+    correct_answers: List<String>,
+    case_sensitive: Bool
+}
+
+/// Question feedback
+type QuestionFeedback {
+    correct: Option<String>,
+    incorrect: Option<String>,
+    partial: Option<String>
+}
+
+/// Question settings
+type QuestionSettings {
+    shuffle_options: Bool,
+    allow_partial_credit: Bool,
+    partial_credit_method: Option<String>,
+    time_limit_seconds: Option<i32>
+}
+
+/// Media attachment
+type MediaAttachment {
+    media_id: MediaId,
+    media_type: String,
+    url: String,
+    alt_text: Option<String>
+}
+
+/// Create question request
+type CreateQuestionRequest {
+    question_type: String,
+    content: QuestionContent,
+    points: f32,
+    is_required: Option<Bool>,
+    hint: Option<String>,
+    feedback: Option<QuestionFeedback>,
+    settings: Option<QuestionSettings>,
+    tags: Option<List<String>>,
+    position: Option<i32>
+}
+
+/// Rubric type
+type Rubric {
+    id: String,
+    assessment_id: AssessmentId,
+    title: String,
+    description: Option<String>,
+    criteria: List<RubricCriterion>,
+    total_points: f32
+}
+
+/// Rubric criterion
+type RubricCriterion {
+    id: String,
+    title: String,
+    description: Option<String>,
+    position: i32,
+    points: f32,
+    levels: List<RubricLevel>
+}
+
+/// Rubric level
+type RubricLevel {
+    id: String,
+    label: String,
+    description: String,
+    points: f32,
+    position: i32
+}
+
+/// Assessment settings
+type AssessmentSettings {
+    assessment_id: AssessmentId,
+    availability: AvailabilitySettings,
+    timing: TimingSettings,
+    attempts: AttemptSettings,
+    presentation: PresentationSettings,
+    security: SecuritySettings,
+    grading: GradingSettings,
+    feedback: FeedbackSettings
+}
+
+/// Availability settings
+type AvailabilitySettings {
+    available_from: Option<DateTime>,
+    available_until: Option<DateTime>,
+    require_access_code: Bool,
+    access_code: Option<String>,
+    ip_restrictions: List<String>
+}
+
+/// Timing settings
+type TimingSettings {
+    time_limit_minutes: Option<i32>,
+    grace_period_minutes: i32,
+    auto_submit: Bool,
+    show_time_remaining: Bool
+}
+
+/// Attempt settings
+type AttemptSettings {
+    attempts_allowed: Option<i32>,
+    score_to_keep: ScoreKeepingMethod,
+    cooldown_minutes: i32,
+    resume_in_progress: Bool
+}
+
+/// Score keeping method
+enum ScoreKeepingMethod {
+    Highest,
+    Latest,
+    Average,
+    First
+}
+
+/// Presentation settings
+type PresentationSettings {
+    shuffle_questions: Bool,
+    shuffle_options: Bool,
+    one_question_per_page: Bool,
+    show_question_count: Bool,
+    allow_backtracking: Bool,
+    show_correct_answers: ShowCorrectAnswersOption
+}
+
+/// When to show correct answers
+enum ShowCorrectAnswersOption {
+    Never,
+    AfterSubmission,
+    AfterDueDate,
+    AfterAttempts { count: i32 }
+}
+
+/// Security settings
+type SecuritySettings {
+    require_lockdown_browser: Bool,
+    proctoring_enabled: Bool,
+    proctoring_provider: Option<String>,
+    webcam_required: Bool,
+    prevent_copy_paste: Bool,
+    disable_right_click: Bool
+}
+
+/// Grading settings (assessment-level)
+type GradingSettings {
+    grading_type: GradingType,
+    auto_release_grades: Bool,
+    anonymous_grading: Bool,
+    late_submission_policy: LateSubmissionPolicy
+}
+
+/// Late submission policy
+type LateSubmissionPolicy {
+    accept_late: Bool,
+    penalty_type: String,
+    penalty_per_day: f32,
+    max_penalty: f32,
+    hard_cutoff: Option<DateTime>
+}
+
+/// Feedback settings
+type FeedbackSettings {
+    show_score: Bool,
+    show_points_per_question: Bool,
+    show_correct_answers: ShowCorrectAnswersOption,
+    show_feedback: Bool,
+    allow_review: Bool
+}
+
+/// Attempt response
+type AttemptResponse {
+    attempt_id: String,
+    assessment_id: AssessmentId,
+    student_id: StudentId,
+    attempt_number: i32,
+    status: AttemptStatus,
+    started_at: DateTime,
+    time_remaining_seconds: Option<i64>,
+    questions: List<AttemptQuestion>,
+    progress: AttemptProgress
+}
+
+/// Attempt status
+enum AttemptStatus {
+    InProgress,
+    Submitted,
+    TimedOut,
+    Abandoned
+}
+
+/// Question in an attempt (with student's perspective)
+type AttemptQuestion {
+    question_id: String,
+    position: i32,
+    content: QuestionContent,
+    points: f32,
+    response: Option<StudentResponse>,
+    is_flagged: Bool,
+    time_spent_seconds: i64
+}
+
+/// Student response to a question
+type StudentResponse {
+    selected_options: Option<List<String>>,
+    text: Option<String>,
+    file_ids: Option<List<MediaId>>,
+    numeric_value: Option<f64>,
+    ordering: Option<List<String>>,
+    matches: Option<Map<String, String>>
+}
+
+/// Attempt progress
+type AttemptProgress {
+    answered_count: i32,
+    total_count: i32,
+    flagged_count: i32
+}
+
+/// Assessment results (for student)
+type AssessmentResults {
+    assessment_id: AssessmentId,
+    attempt_id: String,
+    attempt_number: i32,
+    score: f32,
+    max_score: f32,
+    percentage: f32,
+    passed: Option<Bool>,
+    submitted_at: DateTime,
+    graded_at: Option<DateTime>,
+    time_spent_seconds: i64,
+    question_results: List<QuestionResult>
+}
+
+/// Result for a single question
+type QuestionResult {
+    question_id: String,
+    points_earned: f32,
+    max_points: f32,
+    is_correct: Option<Bool>,
+    response: StudentResponse,
+    correct_answer: Option<CorrectAnswer>,
+    feedback: Option<String>
+}
+
+/// Assessment statistics (for instructor)
+type AssessmentStatistics {
+    assessment_id: AssessmentId,
+    submission_count: i32,
+    average_score: f32,
+    median_score: f32,
+    high_score: f32,
+    low_score: f32,
+    standard_deviation: f32,
+    average_time_minutes: f32,
+    completion_rate: f32,
+    passing_rate: f32,
+    score_distribution: List<ScoreBucket>,
+    question_analytics: List<QuestionAnalytics>
+}
+
+/// Score distribution bucket
+type ScoreBucket {
+    label: String,
+    min_percent: f32,
+    max_percent: f32,
+    count: i32
+}
+
+/// Analytics for a question
+type QuestionAnalytics {
+    question_id: String,
+    correct_rate: f32,
+    average_time_seconds: i32,
+    discrimination_index: f32,
+    option_distribution: Map<String, i32>
+}
+
+// =============================================================================
+// LIST ASSESSMENTS
+// =============================================================================
+
+/// List assessments
+async fn list_assessments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let pagination = PaginationParams::from_request(&req);
+    let module_id = req.query_param("module_id");
+    let course_id = req.query_param("course_id");
+    let assessment_type = req.query_param("type");
+
+    let (assessments, total) = if let Some(mid) = module_id {
+        let module = db.modules()
+            .find_by_id(&mid)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                resource: "Module".to_string(),
+                id: mid.clone()
+            })?;
+
+        verify_course_access(&db, &module.course_id, &ctx).await?;
+
+        let assessments = db.assessments()
+            .find_by_module(&mid)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?;
+
+        (assessments.clone(), assessments.len() as i64)
+    } else if let Some(cid) = course_id {
+        verify_course_access(&db, &cid, &ctx).await?;
+
+        db.assessments()
+            .find_by_course(&cid, pagination.limit(), pagination.offset())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    } else {
+        ctx.require_permission(Permission::ViewAllCourses)?;
+
+        db.assessments()
+            .list_all(ctx.tenant_id().as_ref(), pagination.limit(), pagination.offset())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    };
+
+    let filtered = filter_unpublished(&db, assessments, &ctx).await;
+    let items: List<AssessmentResponse> = filtered.iter().map(|a| assessment_to_response(a, 0)).collect();
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(items, meta, &ctx)))
+}
+
+// =============================================================================
+// GET ASSESSMENT
+// =============================================================================
+
+/// Get a specific assessment
+async fn get_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let assessment = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let question_count = db.questions()
+        .count_by_assessment(&assessment_id)
+        .await
+        .unwrap_or(0) as i32;
+
+    let response = assessment_to_response(&assessment, question_count);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// CREATE ASSESSMENT
+// =============================================================================
+
+/// Create a new assessment
+async fn create_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: CreateAssessmentRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let module = db.modules()
+        .find_by_id(&body.module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: body.module_id.clone()
+        })?;
+
+    verify_course_edit_access(&db, &module.course_id, &ctx).await?;
+
+    if body.title.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "title".to_string(),
+            message: "Assessment title is required".to_string(),
+            errors: vec![]
+        })
+    }
+
+    let assessment_type = parse_assessment_type(&body.assessment_type)?;
+
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.assessments()
+            .get_next_position(&body.module_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let assessment = db.assessments()
+        .create(CreateAssessmentInput {
+            module_id: body.module_id,
+            course_id: module.course_id,
+            title: body.title,
+            assessment_type,
+            description: body.description,
+            instructions: body.instructions,
+            max_points: body.max_points.unwrap_or(100.0),
+            due_date: body.due_date,
+            time_limit_minutes: body.time_limit_minutes,
+            attempts_allowed: body.attempts_allowed,
+            position,
+            tenant_id: ctx.tenant_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = assessment_to_response(&assessment, 0);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// UPDATE ASSESSMENT
+// =============================================================================
+
+/// Update an assessment
+async fn update_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let assessment = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let body: UpdateAssessmentRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let updated = db.assessments()
+        .update(&assessment_id, UpdateAssessmentInput {
+            title: body.title,
+            description: body.description,
+            instructions: body.instructions,
+            max_points: body.max_points,
+            passing_score: body.passing_score,
+            due_date: body.due_date,
+            available_from: body.available_from,
+            available_until: body.available_until,
+            time_limit_minutes: body.time_limit_minutes,
+            attempts_allowed: body.attempts_allowed,
+            position: body.position
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let question_count = db.questions()
+        .count_by_assessment(&assessment_id)
+        .await
+        .unwrap_or(0) as i32;
+
+    let response = assessment_to_response(&updated, question_count);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// DELETE ASSESSMENT
+// =============================================================================
+
+/// Delete an assessment
+async fn delete_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let submission_count = db.submissions()
+        .count_by_assessment(&assessment_id)
+        .await
+        .unwrap_or(0);
+
+    if submission_count > 0 {
+        let force = req.query_param("force").map(|v| v == "true").unwrap_or(false);
+        if !force {
+            return Err(ApiError::Conflict {
+                message: format!("Assessment has {} submissions. Use ?force=true to delete.", submission_count)
+            })
+        }
+    }
+
+    db.questions().delete_by_assessment(&assessment_id).await.ok();
+    db.assessments()
+        .delete(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Assessment deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// PUBLISH/UNPUBLISH
+// =============================================================================
+
+/// Publish an assessment
+async fn publish_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let question_count = db.questions()
+        .count_by_assessment(&assessment_id)
+        .await
+        .unwrap_or(0);
+
+    if question_count == 0 {
+        return Err(ApiError::ValidationError {
+            field: "questions".to_string(),
+            message: "Assessment must have at least one question to publish".to_string(),
+            errors: vec![]
+        })
+    }
+
+    db.assessments()
+        .publish(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Assessment published".to_string()))
+    ])))
+}
+
+/// Unpublish an assessment
+async fn unpublish_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    db.assessments()
+        .unpublish(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Assessment unpublished".to_string()))
+    ])))
+}
+
+// =============================================================================
+// QUESTIONS
+// =============================================================================
+
+/// Get assessment questions
+async fn get_questions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let assessment = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let can_edit = can_edit_course_content(&db, &assessment.course_id, &ctx).await;
+
+    let questions = db.questions()
+        .find_by_assessment(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let responses: List<QuestionResponse> = if can_edit {
+        questions.iter().map(question_to_response_full).collect()
+    } else {
+        questions.iter().map(question_to_response_student).collect()
+    };
+
+    Ok(Response::json(ApiResponse::success(responses, &ctx)))
+}
+
+/// Add question to assessment
+async fn add_question(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let body: CreateQuestionRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let question_type = parse_question_type(&body.question_type)?;
+
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.questions()
+            .get_next_position(&assessment_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let question = db.questions()
+        .create(CreateQuestionInput {
+            assessment_id: assessment_id.clone(),
+            question_type,
+            content: body.content,
+            points: body.points,
+            is_required: body.is_required.unwrap_or(true),
+            hint: body.hint,
+            feedback: body.feedback,
+            settings: body.settings.unwrap_or_else(QuestionSettings::default),
+            tags: body.tags.unwrap_or_default(),
+            position
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    recalculate_assessment_points(&db, &assessment_id).await.ok();
+
+    Ok(Response::json(ApiResponse::success(question_to_response_full(&question), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Reorder questions
+async fn reorder_questions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct ReorderRequest {
+        question_ids: List<String>
+    }
+
+    let body: ReorderRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    for (position, question_id) in body.question_ids.iter().enumerate() {
+        db.questions()
+            .update_position(question_id, position as i32)
+            .await
+            .ok();
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Questions reordered".to_string()))
+    ])))
+}
+
+/// Update a question
+async fn update_question(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let question_id = req.param("question_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Question ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let body: CreateQuestionRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let question_type = parse_question_type(&body.question_type)?;
+
+    let updated = db.questions()
+        .update(&question_id, UpdateQuestionInput {
+            question_type: Some(question_type),
+            content: Some(body.content),
+            points: Some(body.points),
+            is_required: body.is_required,
+            hint: body.hint,
+            feedback: body.feedback,
+            settings: body.settings,
+            tags: body.tags,
+            position: body.position
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    recalculate_assessment_points(&db, &assessment_id).await.ok();
+
+    Ok(Response::json(ApiResponse::success(question_to_response_full(&updated), &ctx)))
+}
+
+/// Delete a question
+async fn delete_question(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let question_id = req.param("question_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Question ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    db.questions()
+        .delete(&question_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    recalculate_assessment_points(&db, &assessment_id).await.ok();
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Question deleted".to_string()))
+    ])))
+}
+
+/// Get questions from question bank
+async fn get_from_question_bank(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let assessment = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let tags = req.query_param("tags");
+    let question_type = req.query_param("type");
+    let limit = req.query_param("limit")
+        .and_then(|l| l.parse::<i64>().ok())
+        .unwrap_or(50);
+
+    let questions = db.question_bank()
+        .search(&assessment.course_id, tags.as_deref(), question_type.as_deref(), limit)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(questions, &ctx)))
+}
+
+/// Import questions from question bank
+async fn import_questions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct ImportRequest {
+        question_ids: List<String>
+    }
+
+    let body: ImportRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let mut imported = 0;
+    for qid in body.question_ids {
+        match db.questions().copy_from_bank(&qid, &assessment_id).await {
+            Ok(_) => imported += 1,
+            Err(_) => {}
+        }
+    }
+
+    recalculate_assessment_points(&db, &assessment_id).await.ok();
+
+    Ok(Response::json(Map::from([
+        ("imported".to_string(), Dynamic::Int(imported))
+    ])))
+}
+
+// =============================================================================
+// RUBRIC
+// =============================================================================
+
+/// Get assessment rubric
+async fn get_rubric(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let rubric = db.rubrics()
+        .find_by_assessment(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(rubric, &ctx)))
+}
+
+/// Update assessment rubric
+async fn update_rubric(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let body: Rubric = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let rubric = db.rubrics()
+        .upsert(&assessment_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(rubric, &ctx)))
+}
+
+// =============================================================================
+// SETTINGS
+// =============================================================================
+
+/// Get assessment settings
+async fn get_settings(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let settings = db.assessment_settings()
+        .find_by_assessment(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .unwrap_or_else(|| AssessmentSettings::default_for(&assessment_id));
+
+    Ok(Response::json(ApiResponse::success(settings, &ctx)))
+}
+
+/// Update assessment settings
+async fn update_settings(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let body: AssessmentSettings = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let settings = db.assessment_settings()
+        .upsert(&assessment_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(settings, &ctx)))
+}
+
+// =============================================================================
+// TAKING ASSESSMENT
+// =============================================================================
+
+/// Start an assessment attempt
+async fn start_attempt(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let assessment = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    // Check if published
+    if !assessment.is_published {
+        return Err(ApiError::Forbidden {
+            message: "Assessment is not available".to_string(),
+            required_permission: None
+        })
+    }
+
+    // Check enrollment
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &assessment.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled in this course".to_string(),
+            required_permission: None
+        })?;
+
+    // Check availability
+    check_assessment_availability(&assessment)?;
+
+    // Check access code if required
+    #[derive(Deserialize)]
+    struct StartRequest {
+        access_code: Option<String>
+    }
+
+    let body: StartRequest = req.json().await.unwrap_or(StartRequest { access_code: None });
+
+    let settings = db.assessment_settings()
+        .find_by_assessment(&assessment_id)
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(s) = &settings {
+        if s.availability.require_access_code {
+            let code = body.access_code.ok_or_else(|| ApiError::Forbidden {
+                message: "Access code required".to_string(),
+                required_permission: None
+            })?;
+
+            if s.availability.access_code.as_ref() != Some(&code) {
+                return Err(ApiError::Forbidden {
+                    message: "Invalid access code".to_string(),
+                    required_permission: None
+                })
+            }
+        }
+    }
+
+    // Check attempt limits
+    let attempt_count = db.submissions()
+        .count_attempts(&enrollment.id, &assessment_id)
+        .await
+        .unwrap_or(0);
+
+    if let Some(max_attempts) = assessment.attempts_allowed {
+        if attempt_count >= max_attempts as i64 {
+            return Err(ApiError::Forbidden {
+                message: "Maximum attempts exceeded".to_string(),
+                required_permission: None
+            })
+        }
+    }
+
+    // Check for existing in-progress attempt
+    let existing = db.submissions()
+        .find_in_progress(&enrollment.id, &assessment_id)
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(existing_attempt) = existing {
+        // Resume existing attempt
+        let response = build_attempt_response(&db, &existing_attempt, &assessment).await?;
+        return Ok(Response::json(ApiResponse::success(response, &ctx)))
+    }
+
+    // Create new attempt
+    let attempt = db.submissions()
+        .create_attempt(&enrollment.id, &assessment_id, (attempt_count + 1) as i32)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = build_attempt_response(&db, &attempt, &assessment).await?;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Get current attempt
+async fn get_current_attempt(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let assessment = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &assessment.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled".to_string(),
+            required_permission: None
+        })?;
+
+    let attempt = db.submissions()
+        .find_in_progress(&enrollment.id, &assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Attempt".to_string(),
+            id: assessment_id.clone()
+        })?;
+
+    let response = build_attempt_response(&db, &attempt, &assessment).await?;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Submit assessment
+async fn submit_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let assessment = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &assessment.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled".to_string(),
+            required_permission: None
+        })?;
+
+    let attempt = db.submissions()
+        .find_in_progress(&enrollment.id, &assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Attempt".to_string(),
+            id: assessment_id.clone()
+        })?;
+
+    #[derive(Deserialize)]
+    struct SubmitRequest {
+        responses: Map<String, StudentResponse>
+    }
+
+    let body: SubmitRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Save responses
+    for (question_id, response) in body.responses {
+        db.question_responses()
+            .save(&attempt.id, &question_id, &response)
+            .await
+            .ok();
+    }
+
+    // Submit the attempt
+    let submission = db.submissions()
+        .submit(&attempt.id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Auto-grade if applicable
+    if assessment.grading_type == GradingType::AutoGraded {
+        auto_grade_submission(&db, &submission.id, &assessment_id).await.ok();
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Assessment submitted".to_string())),
+        ("submission_id".to_string(), Dynamic::String(submission.id))
+    ])))
+}
+
+// =============================================================================
+// RESULTS
+// =============================================================================
+
+/// Get assessment results for current user
+async fn get_results(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let assessment = get_viewable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &assessment.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled".to_string(),
+            required_permission: None
+        })?;
+
+    let results = db.submissions()
+        .get_results(&enrollment.id, &assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(results, &ctx)))
+}
+
+/// Get assessment statistics (instructor)
+async fn get_statistics(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let statistics = db.assessment_analytics()
+        .get_statistics(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(statistics, &ctx)))
+}
+
+/// Get submissions (instructor)
+async fn get_submissions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let pagination = PaginationParams::from_request(&req);
+    let status = req.query_param("status");
+    let needs_grading = req.query_param("needs_grading").map(|v| v == "true");
+
+    let (submissions, total) = db.submissions()
+        .list_by_assessment(&assessment_id, status.as_deref(), needs_grading, pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(submissions, meta, &ctx)))
+}
+
+// =============================================================================
+// DUPLICATION & PREVIEW
+// =============================================================================
+
+/// Duplicate assessment
+async fn duplicate_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let assessment = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct DuplicateRequest {
+        new_title: Option<String>,
+        target_module_id: Option<ModuleId>
+    }
+
+    let body: DuplicateRequest = req.json().await.unwrap_or(DuplicateRequest {
+        new_title: None,
+        target_module_id: None
+    });
+
+    let target_module = body.target_module_id.clone().unwrap_or(assessment.module_id.clone());
+    if target_module != assessment.module_id {
+        let module = db.modules()
+            .find_by_id(&target_module)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                resource: "Module".to_string(),
+                id: target_module.clone()
+            })?;
+
+        verify_course_edit_access(&db, &module.course_id, &ctx).await?;
+    }
+
+    let new_assessment = db.assessments()
+        .duplicate(&assessment_id, body.new_title.as_deref(), Some(&target_module))
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = assessment_to_response(&new_assessment, 0);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Preview assessment
+async fn preview_assessment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let assessment_id = req.param("assessment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Assessment ID required".to_string()
+    })?;
+
+    let _ = get_editable_assessment(&db, &assessment_id, &ctx).await?;
+
+    let questions = db.questions()
+        .find_by_assessment(&assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let preview = questions.iter().map(question_to_response_student).collect::<List<_>>();
+
+    Ok(Response::json(ApiResponse::success(preview, &ctx)))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn assessment_to_response(assessment: &Assessment, question_count: i32) -> AssessmentResponse {
+    AssessmentResponse {
+        id: assessment.id.clone(),
+        module_id: assessment.module_id.clone(),
+        course_id: assessment.course_id.clone(),
+        title: assessment.title.clone(),
+        description: assessment.description.clone(),
+        instructions: assessment.instructions.clone(),
+        assessment_type: assessment.assessment_type.clone(),
+        position: assessment.position,
+        max_points: assessment.max_points,
+        passing_score: assessment.passing_score,
+        is_published: assessment.is_published,
+        due_date: assessment.due_date,
+        available_from: assessment.available_from,
+        available_until: assessment.available_until,
+        time_limit_minutes: assessment.time_limit_minutes,
+        attempts_allowed: assessment.attempts_allowed,
+        question_count,
+        submission_count: 0,
+        grading_type: assessment.grading_type.clone(),
+        has_rubric: false,
+        created_at: assessment.created_at,
+        updated_at: assessment.updated_at
+    }
+}
+
+fn question_to_response_full(question: &Question) -> QuestionResponse {
+    QuestionResponse {
+        id: question.id.clone(),
+        assessment_id: question.assessment_id.clone(),
+        question_type: question.question_type.clone(),
+        position: question.position,
+        points: question.points,
+        content: question.content.clone(),
+        is_required: question.is_required,
+        hint: question.hint.clone(),
+        feedback: question.feedback.clone(),
+        settings: question.settings.clone(),
+        tags: question.tags.clone(),
+        created_at: question.created_at,
+        updated_at: question.updated_at
+    }
+}
+
+fn question_to_response_student(question: &Question) -> QuestionResponse {
+    let mut content = question.content.clone();
+    content.correct_answer = None;
+
+    QuestionResponse {
+        id: question.id.clone(),
+        assessment_id: question.assessment_id.clone(),
+        question_type: question.question_type.clone(),
+        position: question.position,
+        points: question.points,
+        content,
+        is_required: question.is_required,
+        hint: question.hint.clone(),
+        feedback: None,
+        settings: question.settings.clone(),
+        tags: vec![],
+        created_at: question.created_at,
+        updated_at: question.updated_at
+    }
+}
+
+async fn filter_unpublished(db: &Database, assessments: List<Assessment>, ctx: &RequestContext) -> List<Assessment> {
+    if assessments.is_empty() {
+        return assessments
+    }
+
+    let course_id = &assessments[0].course_id;
+    let can_edit = can_edit_course_content(db, course_id, ctx).await;
+
+    if can_edit {
+        assessments
+    } else {
+        assessments.into_iter().filter(|a| a.is_published).collect()
+    }
+}
+
+async fn verify_course_access(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Result<(), ApiError> {
+    if ctx.has_permission(Permission::ViewAllCourses) {
+        return Ok(())
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        if db.enrollments().is_enrolled(&user_id, course_id).await.unwrap_or(false) {
+            return Ok(())
+        }
+    }
+
+    Err(ApiError::Forbidden {
+        message: "Access denied".to_string(),
+        required_permission: None
+    })
+}
+
+async fn verify_course_edit_access(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Result<(), ApiError> {
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return Ok(())
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, course_id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            if e.can_edit_content() {
+                return Ok(())
+            }
+        }
+    }
+
+    Err(ApiError::Forbidden {
+        message: "Edit access required".to_string(),
+        required_permission: Some("EditCourses".to_string())
+    })
+}
+
+async fn can_edit_course_content(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Bool {
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return true
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, course_id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            return e.can_edit_content()
+        }
+    }
+
+    false
+}
+
+async fn get_viewable_assessment(db: &Database, assessment_id: &str, ctx: &RequestContext) -> Result<Assessment, ApiError> {
+    let assessment = db.assessments()
+        .find_by_id(assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Assessment".to_string(),
+            id: assessment_id.to_string()
+        })?;
+
+    verify_course_access(db, &assessment.course_id, ctx).await?;
+
+    if !assessment.is_published && !can_edit_course_content(db, &assessment.course_id, ctx).await {
+        return Err(ApiError::NotFound {
+            resource: "Assessment".to_string(),
+            id: assessment_id.to_string()
+        })
+    }
+
+    Ok(assessment)
+}
+
+async fn get_editable_assessment(db: &Database, assessment_id: &str, ctx: &RequestContext) -> Result<Assessment, ApiError> {
+    let assessment = db.assessments()
+        .find_by_id(assessment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Assessment".to_string(),
+            id: assessment_id.to_string()
+        })?;
+
+    verify_course_edit_access(db, &assessment.course_id, ctx).await?;
+
+    Ok(assessment)
+}
+
+fn check_assessment_availability(assessment: &Assessment) -> Result<(), ApiError> {
+    let now = DateTime::now();
+
+    if let Some(from) = assessment.available_from {
+        if now < from {
+            return Err(ApiError::Forbidden {
+                message: "Assessment is not yet available".to_string(),
+                required_permission: None
+            })
+        }
+    }
+
+    if let Some(until) = assessment.available_until {
+        if now > until {
+            return Err(ApiError::Forbidden {
+                message: "Assessment is no longer available".to_string(),
+                required_permission: None
+            })
+        }
+    }
+
+    Ok(())
+}
+
+async fn build_attempt_response(db: &Database, attempt: &Submission, assessment: &Assessment) -> Result<AttemptResponse, ApiError> {
+    let questions = db.questions()
+        .find_by_assessment(&assessment.id)
+        .await
+        .unwrap_or_default();
+
+    let responses = db.question_responses()
+        .find_by_submission(&attempt.id)
+        .await
+        .unwrap_or_default();
+
+    let time_remaining = if let Some(limit) = assessment.time_limit_minutes {
+        let elapsed = DateTime::now() - attempt.started_at;
+        let limit_secs = (limit * 60) as i64;
+        Some((limit_secs - elapsed.as_seconds()).max(0))
+    } else {
+        None
+    };
+
+    let attempt_questions: List<AttemptQuestion> = questions.iter().map(|q| {
+        let response = responses.get(&q.id);
+        AttemptQuestion {
+            question_id: q.id.clone(),
+            position: q.position,
+            content: QuestionContent {
+                text: q.content.text.clone(),
+                text_format: q.content.text_format.clone(),
+                media: q.content.media.clone(),
+                options: q.content.options.clone(),
+                correct_answer: None,
+                matching_pairs: q.content.matching_pairs.clone(),
+                blanks: q.content.blanks.clone()
+            },
+            points: q.points,
+            response: response.cloned(),
+            is_flagged: false,
+            time_spent_seconds: 0
+        }
+    }).collect();
+
+    let answered_count = responses.len() as i32;
+    let total_count = questions.len() as i32;
+
+    Ok(AttemptResponse {
+        attempt_id: attempt.id.clone(),
+        assessment_id: assessment.id.clone(),
+        student_id: attempt.student_id.clone(),
+        attempt_number: attempt.attempt_number,
+        status: AttemptStatus::InProgress,
+        started_at: attempt.started_at,
+        time_remaining_seconds: time_remaining,
+        questions: attempt_questions,
+        progress: AttemptProgress {
+            answered_count,
+            total_count,
+            flagged_count: 0
+        }
+    })
+}
+
+async fn recalculate_assessment_points(db: &Database, assessment_id: &AssessmentId) -> Result<(), String> {
+    let questions = db.questions()
+        .find_by_assessment(assessment_id)
+        .await?;
+
+    let total_points: f32 = questions.iter().map(|q| q.points).sum();
+
+    db.assessments()
+        .update_max_points(assessment_id, total_points)
+        .await
+}
+
+async fn auto_grade_submission(db: &Database, submission_id: &SubmissionId, assessment_id: &AssessmentId) -> Result<(), String> {
+    db.grading()
+        .auto_grade_submission(submission_id, assessment_id)
+        .await
+}
+
+fn parse_assessment_type(s: &str) -> Result<AssessmentType, ApiError> {
+    match s.to_lowercase().as_str() {
+        "quiz" => Ok(AssessmentType::Quiz),
+        "exam" => Ok(AssessmentType::Exam),
+        "assignment" => Ok(AssessmentType::Assignment),
+        "discussion" => Ok(AssessmentType::Discussion),
+        "project" => Ok(AssessmentType::Project),
+        "survey" => Ok(AssessmentType::Survey),
+        "peer_review" => Ok(AssessmentType::PeerReview),
+        _ => Err(ApiError::ValidationError {
+            field: "assessment_type".to_string(),
+            message: format!("Unknown assessment type: {}", s),
+            errors: vec![]
+        })
+    }
+}
+
+fn parse_question_type(s: &str) -> Result<QuestionType, ApiError> {
+    match s.to_lowercase().as_str() {
+        "multiple_choice" | "multiplechoice" => Ok(QuestionType::MultipleChoice),
+        "multiple_select" | "multipleselect" => Ok(QuestionType::MultipleSelect),
+        "true_false" | "truefalse" => Ok(QuestionType::TrueFalse),
+        "short_answer" | "shortanswer" => Ok(QuestionType::ShortAnswer),
+        "essay" => Ok(QuestionType::Essay),
+        "matching" => Ok(QuestionType::Matching),
+        "ordering" => Ok(QuestionType::Ordering),
+        "fill_in_blank" | "fillinblank" => Ok(QuestionType::FillInBlank),
+        "numeric" => Ok(QuestionType::Numeric),
+        "file_upload" | "fileupload" => Ok(QuestionType::FileUpload),
+        "hotspot" => Ok(QuestionType::Hotspot),
+        "likert" => Ok(QuestionType::Likert),
+        _ => Err(ApiError::ValidationError {
+            field: "question_type".to_string(),
+            message: format!("Unknown question type: {}", s),
+            errors: vec![]
+        })
+    }
+}
+
+impl QuestionSettings {
+    fn default() -> QuestionSettings {
+        QuestionSettings {
+            shuffle_options: false,
+            allow_partial_credit: false,
+            partial_credit_method: None,
+            time_limit_seconds: None
+        }
+    }
+}
+
+impl AssessmentSettings {
+    fn default_for(assessment_id: &AssessmentId) -> AssessmentSettings {
+        AssessmentSettings {
+            assessment_id: assessment_id.clone(),
+            availability: AvailabilitySettings {
+                available_from: None,
+                available_until: None,
+                require_access_code: false,
+                access_code: None,
+                ip_restrictions: vec![]
+            },
+            timing: TimingSettings {
+                time_limit_minutes: None,
+                grace_period_minutes: 0,
+                auto_submit: true,
+                show_time_remaining: true
+            },
+            attempts: AttemptSettings {
+                attempts_allowed: None,
+                score_to_keep: ScoreKeepingMethod::Highest,
+                cooldown_minutes: 0,
+                resume_in_progress: true
+            },
+            presentation: PresentationSettings {
+                shuffle_questions: false,
+                shuffle_options: false,
+                one_question_per_page: false,
+                show_question_count: true,
+                allow_backtracking: true,
+                show_correct_answers: ShowCorrectAnswersOption::AfterSubmission
+            },
+            security: SecuritySettings {
+                require_lockdown_browser: false,
+                proctoring_enabled: false,
+                proctoring_provider: None,
+                webcam_required: false,
+                prevent_copy_paste: false,
+                disable_right_click: false
+            },
+            grading: GradingSettings {
+                grading_type: GradingType::AutoGraded,
+                auto_release_grades: true,
+                anonymous_grading: false,
+                late_submission_policy: LateSubmissionPolicy {
+                    accept_late: true,
+                    penalty_type: "none".to_string(),
+                    penalty_per_day: 0.0,
+                    max_penalty: 0.0,
+                    hard_cutoff: None
+                }
+            },
+            feedback: FeedbackSettings {
+                show_score: true,
+                show_points_per_question: true,
+                show_correct_answers: ShowCorrectAnswersOption::AfterSubmission,
+                show_feedback: true,
+                allow_review: true
+            }
+        }
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use AssessmentResponse;
+pub use QuestionResponse;
+pub use AttemptResponse;
+pub use AssessmentResults;
+pub use AssessmentStatistics;

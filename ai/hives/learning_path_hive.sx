@@ -1,0 +1,1975 @@
+// =============================================================================
+// INTELLIGO LMS - Learning Path Hive
+// =============================================================================
+// AI-powered adaptive learning system following CHAI patterns.
+// Provides prerequisite analysis, skill gap identification, content
+// recommendation, pace optimization, learning style adaptation, and
+// competency tracking for personalized learning experiences.
+// =============================================================================
+
+module intelligo::ai::hives::learning_path_hive
+
+use intelligo::core::types::*
+use simplex_inference::{Model, Prompt, EmbeddingModel}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set, PriorityQueue}
+use std::sync::{Arc, RwLock}
+
+// =============================================================================
+// Learning Path Hive Types
+// =============================================================================
+
+type PathNodeId = String
+type KnowledgeGraphId = String
+type RecommendationId = String
+type LearnerProfileId = String
+
+/// Learning Path Hive Configuration
+pub struct LearningPathConfig {
+    /// Default model for analysis
+    default_model: ModelConfig,
+    /// Embedding model for content similarity
+    embedding_model: EmbeddingModelConfig,
+    /// Update learner profile after N interactions
+    profile_update_frequency: i32,
+    /// Recommendation cache TTL
+    cache_ttl: Duration,
+    /// Minimum mastery threshold for progression
+    mastery_threshold: f64,
+    /// Enable adaptive pacing
+    adaptive_pacing_enabled: bool,
+    /// Enable learning style detection
+    learning_style_detection: bool,
+    /// Knowledge graph depth for prerequisite analysis
+    prerequisite_depth: i32,
+}
+
+impl Default for LearningPathConfig {
+    fn default() -> Self {
+        LearningPathConfig {
+            default_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.3,
+                max_tokens: 4096,
+                top_p: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            embedding_model: EmbeddingModelConfig {
+                provider: ModelProvider::OpenAI,
+                model_id: "text-embedding-3-large".to_string(),
+                dimensions: 1536,
+                input_cost_per_1k: 0.00013,
+            },
+            profile_update_frequency: 5,
+            cache_ttl: Duration::hours(1),
+            mastery_threshold: 0.8,
+            adaptive_pacing_enabled: true,
+            learning_style_detection: true,
+            prerequisite_depth: 3,
+        }
+    }
+}
+
+/// Model configuration
+pub struct ModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    temperature: f64,
+    max_tokens: i32,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    stop_sequences: List<String>,
+    input_cost_per_1k: f64,
+    output_cost_per_1k: f64,
+}
+
+/// Embedding model configuration
+pub struct EmbeddingModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    dimensions: i32,
+    input_cost_per_1k: f64,
+}
+
+/// Model provider
+pub enum ModelProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+    Local { endpoint: String },
+}
+
+// =============================================================================
+// Knowledge Graph Types
+// =============================================================================
+
+/// Knowledge graph representing learning domain
+pub struct KnowledgeGraph {
+    id: KnowledgeGraphId,
+    name: String,
+    description: Option<String>,
+    /// All concepts/skills in the graph
+    nodes: Map<PathNodeId, KnowledgeNode>,
+    /// Prerequisite relationships
+    edges: List<KnowledgeEdge>,
+    /// Metadata
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// A node in the knowledge graph
+pub struct KnowledgeNode {
+    id: PathNodeId,
+    /// Type of knowledge
+    node_type: KnowledgeNodeType,
+    /// Name/title
+    name: String,
+    /// Description
+    description: String,
+    /// Bloom's taxonomy level
+    bloom_level: BloomLevel,
+    /// Estimated time to master (minutes)
+    estimated_time: i32,
+    /// Difficulty level
+    difficulty: SkillLevel,
+    /// Tags for categorization
+    tags: List<String>,
+    /// Linked content items
+    content_ids: List<ContentLink>,
+    /// Linked assessments
+    assessment_ids: List<AssessmentId>,
+    /// Embedding for similarity matching
+    embedding: Option<Vec<f64>>,
+}
+
+/// Type of knowledge node
+pub enum KnowledgeNodeType {
+    /// Core concept
+    Concept,
+    /// Skill/ability
+    Skill,
+    /// Competency (cluster of skills)
+    Competency,
+    /// Learning objective
+    Objective,
+    /// Topic area
+    Topic,
+}
+
+/// Link to content
+pub struct ContentLink {
+    content_id: String,
+    content_type: ContentType,
+    primary: bool,
+}
+
+/// Edge representing prerequisite relationship
+pub struct KnowledgeEdge {
+    /// Source node (prerequisite)
+    from_id: PathNodeId,
+    /// Target node (dependent)
+    to_id: PathNodeId,
+    /// Relationship type
+    relationship: PrerequisiteType,
+    /// Strength of relationship (0.0 - 1.0)
+    strength: f64,
+}
+
+/// Type of prerequisite relationship
+pub enum PrerequisiteType {
+    /// Must complete before
+    Required,
+    /// Recommended before
+    Recommended,
+    /// Helpful but optional
+    Optional,
+    /// Co-requisite (can be taken together)
+    Corequisite,
+}
+
+// =============================================================================
+// Learner Profile Types
+// =============================================================================
+
+/// Comprehensive learner profile
+pub struct LearnerProfile {
+    id: LearnerProfileId,
+    student_id: StudentId,
+    /// Knowledge state for each node
+    knowledge_state: Map<PathNodeId, KnowledgeState>,
+    /// Detected learning style
+    learning_style: LearningStyleProfile,
+    /// Learning preferences
+    preferences: LearningPreferences,
+    /// Performance history
+    performance_history: List<PerformanceRecord>,
+    /// Current learning velocity
+    learning_velocity: f64,
+    /// Engagement patterns
+    engagement_patterns: EngagementPatterns,
+    /// Goals and targets
+    goals: List<LearningGoal>,
+    /// Strengths
+    strengths: List<PathNodeId>,
+    /// Areas needing improvement
+    weaknesses: List<PathNodeId>,
+    /// Last updated
+    updated_at: DateTime,
+}
+
+/// Knowledge state for a concept
+pub struct KnowledgeState {
+    node_id: PathNodeId,
+    /// Mastery level (0.0 - 1.0)
+    mastery: f64,
+    /// Confidence in mastery estimate
+    confidence: f64,
+    /// Number of attempts
+    attempts: i32,
+    /// Time spent learning (minutes)
+    time_spent: i32,
+    /// Last interaction
+    last_interaction: Option<DateTime>,
+    /// History of mastery changes
+    mastery_history: List<MasteryRecord>,
+    /// Current status
+    status: KnowledgeStatus,
+}
+
+/// Mastery record
+pub struct MasteryRecord {
+    timestamp: DateTime,
+    mastery: f64,
+    source: MasterySource,
+}
+
+/// Source of mastery update
+pub enum MasterySource {
+    Assessment { assessment_id: AssessmentId, score: f32 },
+    Practice { activity_id: String },
+    ContentCompletion { content_id: String },
+    TimeDecay,
+    InstructorOverride { instructor_id: UserId },
+}
+
+/// Knowledge status
+pub enum KnowledgeStatus {
+    /// Not started
+    NotStarted,
+    /// Currently learning
+    InProgress,
+    /// Needs review (mastery declining)
+    NeedsReview,
+    /// Mastered
+    Mastered,
+    /// Struggling (low progress)
+    Struggling,
+}
+
+/// Learning style profile (VARK model plus extensions)
+pub struct LearningStyleProfile {
+    /// Visual learning preference
+    visual: f64,
+    /// Auditory learning preference
+    auditory: f64,
+    /// Reading/writing preference
+    reading_writing: f64,
+    /// Kinesthetic preference
+    kinesthetic: f64,
+    /// Social learning preference
+    social: f64,
+    /// Solitary learning preference
+    solitary: f64,
+    /// Confidence in this profile
+    confidence: f64,
+    /// Evidence supporting this profile
+    evidence: List<StyleEvidence>,
+}
+
+impl Default for LearningStyleProfile {
+    fn default() -> Self {
+        LearningStyleProfile {
+            visual: 0.25,
+            auditory: 0.25,
+            reading_writing: 0.25,
+            kinesthetic: 0.25,
+            social: 0.5,
+            solitary: 0.5,
+            confidence: 0.0,
+            evidence: vec![],
+        }
+    }
+}
+
+/// Evidence for learning style
+pub struct StyleEvidence {
+    source: String,
+    dimension: String,
+    value: f64,
+    timestamp: DateTime,
+}
+
+/// Learning preferences
+pub struct LearningPreferences {
+    /// Preferred content types
+    preferred_content_types: List<ContentType>,
+    /// Preferred session length (minutes)
+    preferred_session_length: i32,
+    /// Preferred time of day
+    preferred_time_of_day: Option<TimeOfDay>,
+    /// Pace preference
+    pace_preference: PacePreference,
+    /// Feedback frequency preference
+    feedback_frequency: FeedbackFrequency,
+    /// Challenge level preference
+    challenge_preference: ChallengePreference,
+}
+
+impl Default for LearningPreferences {
+    fn default() -> Self {
+        LearningPreferences {
+            preferred_content_types: vec![],
+            preferred_session_length: 30,
+            preferred_time_of_day: None,
+            pace_preference: PacePreference::Moderate,
+            feedback_frequency: FeedbackFrequency::Regular,
+            challenge_preference: ChallengePreference::Balanced,
+        }
+    }
+}
+
+/// Time of day preference
+pub enum TimeOfDay {
+    Morning,
+    Afternoon,
+    Evening,
+    Night,
+}
+
+/// Pace preference
+pub enum PacePreference {
+    Slow,
+    Moderate,
+    Fast,
+    SelfDirected,
+}
+
+/// Feedback frequency
+pub enum FeedbackFrequency {
+    Minimal,
+    Regular,
+    Frequent,
+    Immediate,
+}
+
+/// Challenge level preference
+pub enum ChallengePreference {
+    Conservative,
+    Balanced,
+    Challenging,
+    Adaptive,
+}
+
+/// Performance record
+pub struct PerformanceRecord {
+    timestamp: DateTime,
+    activity_type: ActivityType,
+    activity_id: String,
+    node_id: Option<PathNodeId>,
+    score: Option<f32>,
+    time_spent: i32,
+    completed: bool,
+}
+
+/// Type of learning activity
+pub enum ActivityType {
+    Assessment,
+    Lesson,
+    Practice,
+    Video,
+    Reading,
+    Discussion,
+    Project,
+}
+
+/// Engagement patterns
+pub struct EngagementPatterns {
+    /// Average session duration
+    avg_session_duration: i32,
+    /// Sessions per week
+    sessions_per_week: f64,
+    /// Content completion rate
+    completion_rate: f64,
+    /// Peak activity hours
+    peak_hours: List<i32>,
+    /// Most active days
+    active_days: List<i32>,
+    /// Dropout signals
+    dropout_risk: f64,
+}
+
+/// Learning goal
+pub struct LearningGoal {
+    id: String,
+    goal_type: GoalType,
+    target_node_id: Option<PathNodeId>,
+    target_value: f64,
+    deadline: Option<DateTime>,
+    progress: f64,
+    created_at: DateTime,
+}
+
+/// Type of learning goal
+pub enum GoalType {
+    MasterConcept { node_id: PathNodeId },
+    CompleteCourse { course_id: CourseId },
+    AchieveCompetency { competency_id: CompetencyId },
+    ImproveSkill { skill_id: SkillId, target_level: SkillLevel },
+    TimeGoal { weekly_hours: i32 },
+}
+
+// =============================================================================
+// Recommendation Types
+// =============================================================================
+
+/// Content recommendation
+pub struct ContentRecommendation {
+    id: RecommendationId,
+    /// Recommended content
+    content_id: String,
+    content_type: ContentType,
+    /// Title
+    title: String,
+    /// Why this is recommended
+    rationale: String,
+    /// Relevance score
+    relevance_score: f64,
+    /// Readiness score
+    readiness_score: f64,
+    /// Priority
+    priority: i32,
+    /// Related knowledge nodes
+    node_ids: List<PathNodeId>,
+    /// Estimated time to complete
+    estimated_time: i32,
+    /// Difficulty match
+    difficulty_match: f64,
+    /// Generated at
+    generated_at: DateTime,
+}
+
+/// Learning path recommendation
+pub struct PathRecommendation {
+    id: RecommendationId,
+    /// Goal this path achieves
+    goal: LearningGoal,
+    /// Ordered sequence of nodes
+    path: List<PathStep>,
+    /// Total estimated time
+    total_time: i32,
+    /// Difficulty progression
+    difficulty_curve: List<f64>,
+    /// Prerequisites met
+    prerequisites_met: bool,
+    /// Missing prerequisites
+    missing_prerequisites: List<PathNodeId>,
+    /// Confidence in recommendation
+    confidence: f64,
+    /// Generated at
+    generated_at: DateTime,
+}
+
+/// Step in a learning path
+pub struct PathStep {
+    order: i32,
+    node_id: PathNodeId,
+    content_ids: List<String>,
+    assessment_id: Option<AssessmentId>,
+    estimated_time: i32,
+    mastery_target: f64,
+    is_optional: bool,
+}
+
+/// Pace recommendation
+pub struct PaceRecommendation {
+    /// Recommended items per week
+    items_per_week: i32,
+    /// Recommended session length
+    session_length: i32,
+    /// Recommended sessions per week
+    sessions_per_week: i32,
+    /// Total estimated weeks
+    estimated_weeks: i32,
+    /// Rationale
+    rationale: String,
+    /// Adjustment from current pace
+    adjustment: PaceAdjustment,
+}
+
+/// Pace adjustment
+pub enum PaceAdjustment {
+    SlowDown { percent: f64, reason: String },
+    Maintain { reason: String },
+    SpeedUp { percent: f64, reason: String },
+}
+
+// =============================================================================
+// Diagnostic Assessment Types
+// =============================================================================
+
+/// Diagnostic assessment result
+pub struct DiagnosticResult {
+    student_id: StudentId,
+    assessment_type: DiagnosticType,
+    /// Skill gaps identified
+    skill_gaps: List<SkillGap>,
+    /// Strengths identified
+    strengths: List<SkillStrength>,
+    /// Recommended starting point
+    starting_point: Option<PathNodeId>,
+    /// Nodes that can be skipped
+    skip_nodes: List<PathNodeId>,
+    /// Overall readiness level
+    readiness_level: SkillLevel,
+    /// Confidence in diagnosis
+    confidence: f64,
+    /// Completed at
+    completed_at: DateTime,
+}
+
+/// Type of diagnostic
+pub enum DiagnosticType {
+    Initial,
+    Placement,
+    Checkpoint,
+    Remedial,
+}
+
+/// Identified skill gap
+pub struct SkillGap {
+    node_id: PathNodeId,
+    name: String,
+    current_level: f64,
+    required_level: f64,
+    gap_size: f64,
+    priority: GapPriority,
+    recommended_content: List<String>,
+}
+
+/// Gap priority
+pub enum GapPriority {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+/// Identified strength
+pub struct SkillStrength {
+    node_id: PathNodeId,
+    name: String,
+    mastery_level: f64,
+    evidence: String,
+}
+
+// =============================================================================
+// Learning Path Hive Specialists
+// =============================================================================
+
+/// Prerequisite Analyzer Specialist
+pub struct PrerequisiteAnalyzer {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl PrerequisiteAnalyzer {
+    pub fn new(config: ModelConfig) -> Self {
+        PrerequisiteAnalyzer {
+            config,
+            system_prompt: r#"You are an expert in curriculum design and knowledge mapping. Your role is to:
+
+1. Analyze learning content and identify prerequisite relationships
+2. Map concepts to their foundational dependencies
+3. Identify optimal learning sequences
+4. Detect circular dependencies and resolve them
+5. Suggest missing links in the knowledge graph
+
+When analyzing:
+- Consider cognitive load and learning progression
+- Apply Bloom's taxonomy levels appropriately
+- Identify both hard prerequisites and soft recommendations
+- Consider transfer learning between related domains"#.to_string(),
+        }
+    }
+
+    pub async fn analyze_prerequisites(&self, content: &str, existing_graph: &KnowledgeGraph) -> Result<List<KnowledgeEdge>, LearningPathError> {
+        let prompt = format!(
+            r#"Analyze the following learning content and identify prerequisite relationships.
+
+## Content to Analyze
+{}
+
+## Existing Knowledge Graph Nodes
+{}
+
+Identify what knowledge/skills are required before learning this content.
+Output as JSON:
+{{
+  "edges": [
+    {{
+      "from_id": "<prerequisite node id>",
+      "to_id": "<dependent node id>",
+      "relationship": "required|recommended|optional|corequisite",
+      "strength": <0.0-1.0>,
+      "rationale": "<why this is a prerequisite>"
+    }}
+  ],
+  "new_nodes_suggested": [
+    {{
+      "name": "<concept name>",
+      "description": "<description>",
+      "bloom_level": "<remember|understand|apply|analyze|evaluate|create>"
+    }}
+  ]
+}}"#,
+            content,
+            self.format_existing_nodes(existing_graph)
+        );
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| LearningPathError::ModelError { message: e.to_string() })?;
+
+        self.parse_prerequisite_response(&response.content)
+    }
+
+    pub fn build_dependency_graph(&self, graph: &KnowledgeGraph, target_node: &PathNodeId) -> Result<List<PathNodeId>, LearningPathError> {
+        // Topological sort of prerequisites
+        let mut visited: Set<PathNodeId> = Set::new();
+        let mut result: List<PathNodeId> = vec![];
+        let mut temp_mark: Set<PathNodeId> = Set::new();
+
+        self.visit_node(graph, target_node, &mut visited, &mut temp_mark, &mut result)?;
+
+        Ok(result)
+    }
+
+    fn visit_node(
+        &self,
+        graph: &KnowledgeGraph,
+        node_id: &PathNodeId,
+        visited: &mut Set<PathNodeId>,
+        temp_mark: &mut Set<PathNodeId>,
+        result: &mut List<PathNodeId>
+    ) -> Result<(), LearningPathError> {
+        if visited.contains(node_id) {
+            return Ok(());
+        }
+
+        if temp_mark.contains(node_id) {
+            return Err(LearningPathError::CircularDependency { node_id: node_id.clone() });
+        }
+
+        temp_mark.insert(node_id.clone());
+
+        // Find all prerequisites
+        for edge in &graph.edges {
+            if &edge.to_id == node_id && matches!(edge.relationship, PrerequisiteType::Required | PrerequisiteType::Recommended) {
+                self.visit_node(graph, &edge.from_id, visited, temp_mark, result)?;
+            }
+        }
+
+        temp_mark.remove(node_id);
+        visited.insert(node_id.clone());
+        result.push(node_id.clone());
+
+        Ok(())
+    }
+
+    fn format_existing_nodes(&self, graph: &KnowledgeGraph) -> String {
+        graph.nodes.values()
+            .map(|n| format!("- {} ({}): {}", n.id, n.name, n.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn parse_prerequisite_response(&self, response: &str) -> Result<List<KnowledgeEdge>, LearningPathError> {
+        let parsed: PrerequisiteResponseJson = parse_json(response)
+            .map_err(|e| LearningPathError::ParseError { message: e.to_string() })?;
+
+        Ok(parsed.edges.into_iter().map(|e| KnowledgeEdge {
+            from_id: PathNodeId(e.from_id),
+            to_id: PathNodeId(e.to_id),
+            relationship: match e.relationship.as_str() {
+                "required" => PrerequisiteType::Required,
+                "recommended" => PrerequisiteType::Recommended,
+                "corequisite" => PrerequisiteType::Corequisite,
+                _ => PrerequisiteType::Optional,
+            },
+            strength: e.strength,
+        }).collect())
+    }
+}
+
+/// Skill Gap Identifier Specialist
+pub struct SkillGapIdentifier {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl SkillGapIdentifier {
+    pub fn new(config: ModelConfig) -> Self {
+        SkillGapIdentifier {
+            config,
+            system_prompt: r#"You are an expert educational diagnostician. Your role is to:
+
+1. Analyze learner performance data to identify knowledge gaps
+2. Prioritize gaps based on impact on learning goals
+3. Distinguish between missing prerequisites and struggling with new material
+4. Identify patterns indicating misconceptions vs. lack of exposure
+5. Recommend targeted remediation strategies
+
+When diagnosing:
+- Look for patterns across multiple assessments
+- Consider the prerequisite chain when identifying root causes
+- Differentiate between conceptual misunderstandings and procedural errors
+- Account for test anxiety and situational factors"#.to_string(),
+        }
+    }
+
+    pub async fn identify_gaps(&self, profile: &LearnerProfile, graph: &KnowledgeGraph, target_competency: Option<&CompetencyId>) -> Result<List<SkillGap>, LearningPathError> {
+        let mut gaps = vec![];
+
+        // Find nodes below mastery threshold
+        for (node_id, state) in &profile.knowledge_state {
+            if state.mastery < 0.8 {
+                if let Some(node) = graph.nodes.get(node_id) {
+                    // Calculate required level based on dependents
+                    let required_level = self.calculate_required_level(node_id, graph, target_competency);
+
+                    if state.mastery < required_level {
+                        let gap_size = required_level - state.mastery;
+                        let priority = self.calculate_gap_priority(gap_size, node, graph);
+
+                        gaps.push(SkillGap {
+                            node_id: node_id.clone(),
+                            name: node.name.clone(),
+                            current_level: state.mastery,
+                            required_level,
+                            gap_size,
+                            priority,
+                            recommended_content: node.content_ids.iter()
+                                .map(|c| c.content_id.clone())
+                                .collect(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Find missing prerequisites
+        let missing = self.find_missing_prerequisites(profile, graph);
+        for node_id in missing {
+            if let Some(node) = graph.nodes.get(&node_id) {
+                if !gaps.iter().any(|g| g.node_id == node_id) {
+                    gaps.push(SkillGap {
+                        node_id: node_id.clone(),
+                        name: node.name.clone(),
+                        current_level: 0.0,
+                        required_level: 0.8,
+                        gap_size: 0.8,
+                        priority: GapPriority::High,
+                        recommended_content: node.content_ids.iter()
+                            .map(|c| c.content_id.clone())
+                            .collect(),
+                    });
+                }
+            }
+        }
+
+        // Sort by priority
+        gaps.sort_by(|a, b| {
+            let priority_order = |p: &GapPriority| match p {
+                GapPriority::Critical => 0,
+                GapPriority::High => 1,
+                GapPriority::Medium => 2,
+                GapPriority::Low => 3,
+            };
+            priority_order(&a.priority).cmp(&priority_order(&b.priority))
+        });
+
+        Ok(gaps)
+    }
+
+    fn calculate_required_level(&self, node_id: &PathNodeId, graph: &KnowledgeGraph, target: Option<&CompetencyId>) -> f64 {
+        // Higher requirement if this is a prerequisite for target
+        let is_on_critical_path = graph.edges.iter()
+            .any(|e| &e.from_id == node_id && matches!(e.relationship, PrerequisiteType::Required));
+
+        if is_on_critical_path {
+            0.85
+        } else {
+            0.7
+        }
+    }
+
+    fn calculate_gap_priority(&self, gap_size: f64, node: &KnowledgeNode, graph: &KnowledgeGraph) -> GapPriority {
+        // Count dependents
+        let dependent_count = graph.edges.iter()
+            .filter(|e| e.from_id == node.id && matches!(e.relationship, PrerequisiteType::Required))
+            .count();
+
+        if gap_size > 0.6 && dependent_count > 2 {
+            GapPriority::Critical
+        } else if gap_size > 0.4 || dependent_count > 1 {
+            GapPriority::High
+        } else if gap_size > 0.2 {
+            GapPriority::Medium
+        } else {
+            GapPriority::Low
+        }
+    }
+
+    fn find_missing_prerequisites(&self, profile: &LearnerProfile, graph: &KnowledgeGraph) -> List<PathNodeId> {
+        let mut missing = vec![];
+
+        for (node_id, state) in &profile.knowledge_state {
+            if state.status == KnowledgeStatus::InProgress || state.status == KnowledgeStatus::Struggling {
+                // Check prerequisites
+                for edge in &graph.edges {
+                    if &edge.to_id == node_id && matches!(edge.relationship, PrerequisiteType::Required) {
+                        let prereq_state = profile.knowledge_state.get(&edge.from_id);
+                        match prereq_state {
+                            None => missing.push(edge.from_id.clone()),
+                            Some(s) if s.mastery < 0.7 => missing.push(edge.from_id.clone()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        missing
+    }
+
+    pub async fn run_diagnostic(&self, profile: &LearnerProfile, assessment_results: &List<PerformanceRecord>, graph: &KnowledgeGraph) -> Result<DiagnosticResult, LearningPathError> {
+        let gaps = self.identify_gaps(profile, graph, None).await?;
+        let strengths = self.identify_strengths(profile, graph);
+
+        // Find optimal starting point
+        let starting_point = self.find_starting_point(&gaps, graph);
+
+        // Identify nodes that can be skipped
+        let skip_nodes = self.find_skip_candidates(profile, graph);
+
+        // Calculate overall readiness
+        let readiness_level = self.calculate_readiness(profile, graph);
+
+        Ok(DiagnosticResult {
+            student_id: profile.student_id.clone(),
+            assessment_type: DiagnosticType::Checkpoint,
+            skill_gaps: gaps,
+            strengths,
+            starting_point,
+            skip_nodes,
+            readiness_level,
+            confidence: 0.85,
+            completed_at: DateTime::now(),
+        })
+    }
+
+    fn identify_strengths(&self, profile: &LearnerProfile, graph: &KnowledgeGraph) -> List<SkillStrength> {
+        let mut strengths = vec![];
+
+        for (node_id, state) in &profile.knowledge_state {
+            if state.mastery >= 0.9 && state.confidence >= 0.8 {
+                if let Some(node) = graph.nodes.get(node_id) {
+                    strengths.push(SkillStrength {
+                        node_id: node_id.clone(),
+                        name: node.name.clone(),
+                        mastery_level: state.mastery,
+                        evidence: format!("{} successful attempts", state.attempts),
+                    });
+                }
+            }
+        }
+
+        strengths
+    }
+
+    fn find_starting_point(&self, gaps: &List<SkillGap>, graph: &KnowledgeGraph) -> Option<PathNodeId> {
+        // Find the gap with fewest unmet prerequisites
+        gaps.iter()
+            .filter(|g| matches!(g.priority, GapPriority::Critical | GapPriority::High))
+            .min_by_key(|g| {
+                graph.edges.iter()
+                    .filter(|e| e.to_id == g.node_id && matches!(e.relationship, PrerequisiteType::Required))
+                    .count()
+            })
+            .map(|g| g.node_id.clone())
+    }
+
+    fn find_skip_candidates(&self, profile: &LearnerProfile, graph: &KnowledgeGraph) -> List<PathNodeId> {
+        profile.knowledge_state.iter()
+            .filter(|(_, state)| state.mastery >= 0.9 && state.status == KnowledgeStatus::Mastered)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn calculate_readiness(&self, profile: &LearnerProfile, graph: &KnowledgeGraph) -> SkillLevel {
+        let avg_mastery: f64 = profile.knowledge_state.values()
+            .map(|s| s.mastery)
+            .sum::<f64>() / profile.knowledge_state.len().max(1) as f64;
+
+        if avg_mastery >= 0.9 {
+            SkillLevel::Advanced
+        } else if avg_mastery >= 0.7 {
+            SkillLevel::Intermediate
+        } else if avg_mastery >= 0.5 {
+            SkillLevel::Beginner
+        } else {
+            SkillLevel::Novice
+        }
+    }
+}
+
+/// Content Recommender Specialist
+pub struct ContentRecommender {
+    config: ModelConfig,
+    embedding_config: EmbeddingModelConfig,
+    content_embeddings: Map<String, Vec<f64>>,
+    system_prompt: String,
+}
+
+impl ContentRecommender {
+    pub fn new(config: ModelConfig, embedding_config: EmbeddingModelConfig) -> Self {
+        ContentRecommender {
+            config,
+            embedding_config,
+            content_embeddings: Map::new(),
+            system_prompt: r#"You are an expert learning content curator. Your role is to:
+
+1. Match content to learner needs and preferences
+2. Consider learning style, pace, and current knowledge
+3. Sequence content for optimal learning progression
+4. Balance challenge with achievability
+5. Diversify content types for engagement
+
+When recommending:
+- Prioritize content that addresses skill gaps
+- Match content complexity to learner level
+- Consider time constraints and availability
+- Include variety to prevent fatigue"#.to_string(),
+        }
+    }
+
+    pub async fn recommend(&self, profile: &LearnerProfile, graph: &KnowledgeGraph, count: i32) -> Result<List<ContentRecommendation>, LearningPathError> {
+        let mut recommendations = vec![];
+
+        // Get skill gaps
+        let gaps: List<&PathNodeId> = profile.knowledge_state.iter()
+            .filter(|(_, state)| state.status == KnowledgeStatus::InProgress || state.status == KnowledgeStatus::Struggling)
+            .map(|(id, _)| id)
+            .collect();
+
+        // Find content for each gap
+        for node_id in gaps.iter().take(count as usize) {
+            if let Some(node) = graph.nodes.get(*node_id) {
+                for content_link in &node.content_ids {
+                    let relevance = self.calculate_relevance(content_link, node, profile);
+                    let readiness = self.calculate_readiness(content_link, profile, graph);
+
+                    recommendations.push(ContentRecommendation {
+                        id: RecommendationId(generate_uuid()),
+                        content_id: content_link.content_id.clone(),
+                        content_type: content_link.content_type.clone(),
+                        title: node.name.clone(),
+                        rationale: self.generate_rationale(node, profile, &content_link.content_type),
+                        relevance_score: relevance,
+                        readiness_score: readiness,
+                        priority: if content_link.primary { 1 } else { 2 },
+                        node_ids: vec![node_id.clone()],
+                        estimated_time: node.estimated_time,
+                        difficulty_match: self.calculate_difficulty_match(node, profile),
+                        generated_at: DateTime::now(),
+                    });
+                }
+            }
+        }
+
+        // Sort by combined score
+        recommendations.sort_by(|a, b| {
+            let score_a = a.relevance_score * 0.6 + a.readiness_score * 0.4;
+            let score_b = b.relevance_score * 0.6 + b.readiness_score * 0.4;
+            score_b.partial_cmp(&score_a).unwrap()
+        });
+
+        Ok(recommendations.into_iter().take(count as usize).collect())
+    }
+
+    fn calculate_relevance(&self, content: &ContentLink, node: &KnowledgeNode, profile: &LearnerProfile) -> f64 {
+        let mut score = 0.5;
+
+        // Boost if content type matches preference
+        if profile.preferences.preferred_content_types.contains(&content.content_type) {
+            score += 0.2;
+        }
+
+        // Boost if primary content
+        if content.primary {
+            score += 0.2;
+        }
+
+        // Check learning style alignment
+        score += self.style_alignment(&content.content_type, &profile.learning_style) * 0.1;
+
+        score.min(1.0)
+    }
+
+    fn style_alignment(&self, content_type: &ContentType, style: &LearningStyleProfile) -> f64 {
+        match content_type {
+            ContentType::Video => style.visual * 0.7 + style.auditory * 0.3,
+            ContentType::Audio => style.auditory,
+            ContentType::Document => style.reading_writing,
+            ContentType::Interactive => style.kinesthetic,
+            ContentType::Presentation => style.visual,
+            _ => 0.5,
+        }
+    }
+
+    fn calculate_readiness(&self, content: &ContentLink, profile: &LearnerProfile, graph: &KnowledgeGraph) -> f64 {
+        // Check if prerequisites are met
+        // Simplified - would check actual prerequisite chain
+        0.8
+    }
+
+    fn calculate_difficulty_match(&self, node: &KnowledgeNode, profile: &LearnerProfile) -> f64 {
+        // Compare node difficulty to learner level
+        let learner_level = self.estimate_learner_level(profile);
+        let node_level = match node.difficulty {
+            SkillLevel::Novice => 1.0,
+            SkillLevel::Beginner => 2.0,
+            SkillLevel::Intermediate => 3.0,
+            SkillLevel::Advanced => 4.0,
+            SkillLevel::Expert => 5.0,
+        };
+
+        let diff = (learner_level - node_level).abs();
+        (1.0 - diff * 0.2).max(0.0)
+    }
+
+    fn estimate_learner_level(&self, profile: &LearnerProfile) -> f64 {
+        let avg_mastery: f64 = profile.knowledge_state.values()
+            .map(|s| s.mastery)
+            .sum::<f64>() / profile.knowledge_state.len().max(1) as f64;
+
+        1.0 + avg_mastery * 4.0  // Maps 0-1 mastery to 1-5 level
+    }
+
+    fn generate_rationale(&self, node: &KnowledgeNode, profile: &LearnerProfile, content_type: &ContentType) -> String {
+        if let Some(state) = profile.knowledge_state.get(&node.id) {
+            if state.status == KnowledgeStatus::Struggling {
+                format!("This {} will help reinforce {} concepts you're working on.", content_type_name(content_type), node.name)
+            } else if state.status == KnowledgeStatus::NeedsReview {
+                format!("Time to refresh your knowledge of {}.", node.name)
+            } else {
+                format!("Continue building your understanding of {}.", node.name)
+            }
+        } else {
+            format!("Start learning about {} with this {}.", node.name, content_type_name(content_type))
+        }
+    }
+
+    pub fn store_embedding(&mut self, content_id: String, embedding: Vec<f64>) {
+        self.content_embeddings.insert(content_id, embedding);
+    }
+}
+
+fn content_type_name(ct: &ContentType) -> &str {
+    match ct {
+        ContentType::Video => "video",
+        ContentType::Audio => "audio",
+        ContentType::Document => "document",
+        ContentType::Presentation => "presentation",
+        ContentType::Interactive => "interactive content",
+        ContentType::Html => "article",
+        _ => "content",
+    }
+}
+
+/// Pace Optimizer Specialist
+pub struct PaceOptimizer {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl PaceOptimizer {
+    pub fn new(config: ModelConfig) -> Self {
+        PaceOptimizer {
+            config,
+            system_prompt: r#"You are an expert in learning science and pace optimization. Your role is to:
+
+1. Analyze learner performance and engagement patterns
+2. Recommend optimal pacing to maximize retention
+3. Balance challenge with preventing burnout
+4. Adapt to individual learning velocities
+5. Account for spaced repetition principles
+
+When optimizing pace:
+- Consider cognitive load and attention spans
+- Apply spaced practice principles
+- Account for the forgetting curve
+- Adjust for personal circumstances"#.to_string(),
+        }
+    }
+
+    pub async fn optimize_pace(&self, profile: &LearnerProfile, remaining_content: i32, deadline: Option<DateTime>) -> Result<PaceRecommendation, LearningPathError> {
+        // Calculate current learning velocity
+        let velocity = self.calculate_velocity(profile);
+
+        // Analyze engagement patterns
+        let engagement = &profile.engagement_patterns;
+
+        // Calculate optimal pace
+        let (items_per_week, sessions_per_week, session_length) = self.calculate_optimal_pace(
+            velocity,
+            engagement,
+            remaining_content,
+            deadline
+        );
+
+        // Determine adjustment
+        let current_sessions = engagement.sessions_per_week;
+        let adjustment = if sessions_per_week as f64 > current_sessions * 1.2 {
+            PaceAdjustment::SpeedUp {
+                percent: ((sessions_per_week as f64 / current_sessions) - 1.0) * 100.0,
+                reason: "You're making great progress! You can handle a bit more.".to_string(),
+            }
+        } else if sessions_per_week as f64 < current_sessions * 0.8 {
+            PaceAdjustment::SlowDown {
+                percent: (1.0 - (sessions_per_week as f64 / current_sessions)) * 100.0,
+                reason: "Take your time to ensure solid understanding.".to_string(),
+            }
+        } else {
+            PaceAdjustment::Maintain {
+                reason: "Your current pace is working well.".to_string(),
+            }
+        };
+
+        let estimated_weeks = if items_per_week > 0 {
+            (remaining_content as f64 / items_per_week as f64).ceil() as i32
+        } else {
+            remaining_content
+        };
+
+        Ok(PaceRecommendation {
+            items_per_week,
+            session_length,
+            sessions_per_week,
+            estimated_weeks,
+            rationale: self.generate_pace_rationale(&adjustment, engagement, deadline),
+            adjustment,
+        })
+    }
+
+    fn calculate_velocity(&self, profile: &LearnerProfile) -> f64 {
+        // Items completed per day over last 30 days
+        let recent_records: List<_> = profile.performance_history.iter()
+            .filter(|r| r.timestamp > DateTime::now() - Duration::days(30))
+            .filter(|r| r.completed)
+            .collect();
+
+        if recent_records.is_empty() {
+            0.5  // Default velocity
+        } else {
+            recent_records.len() as f64 / 30.0
+        }
+    }
+
+    fn calculate_optimal_pace(
+        &self,
+        velocity: f64,
+        engagement: &EngagementPatterns,
+        remaining: i32,
+        deadline: Option<DateTime>
+    ) -> (i32, i32, i32) {
+        let base_sessions = engagement.sessions_per_week.max(3.0) as i32;
+        let base_length = engagement.avg_session_duration.max(20);
+
+        // Adjust for deadline if present
+        if let Some(dl) = deadline {
+            let days_remaining = (dl - DateTime::now()).as_days() as i32;
+            let weeks_remaining = (days_remaining / 7).max(1);
+            let required_per_week = (remaining as f64 / weeks_remaining as f64).ceil() as i32;
+
+            // Don't exceed 2x current pace
+            let items_per_week = required_per_week.min((velocity * 7.0 * 2.0) as i32).max(1);
+            let sessions_per_week = (items_per_week as f64 / 2.0).ceil() as i32;
+
+            (items_per_week, sessions_per_week.min(7), base_length)
+        } else {
+            // No deadline - optimize for retention
+            let items_per_week = (velocity * 7.0 * 1.1) as i32;  // Slight stretch
+            let sessions_per_week = base_sessions;
+
+            (items_per_week.max(3), sessions_per_week, base_length)
+        }
+    }
+
+    fn generate_pace_rationale(&self, adjustment: &PaceAdjustment, engagement: &EngagementPatterns, deadline: Option<DateTime>) -> String {
+        let base = match adjustment {
+            PaceAdjustment::SlowDown { reason, .. } => reason.clone(),
+            PaceAdjustment::Maintain { reason } => reason.clone(),
+            PaceAdjustment::SpeedUp { reason, .. } => reason.clone(),
+        };
+
+        if let Some(dl) = deadline {
+            let days = (dl - DateTime::now()).as_days();
+            format!("{} You have {} days until your deadline.", base, days)
+        } else {
+            base
+        }
+    }
+}
+
+/// Learning Style Adapter Specialist
+pub struct LearningStyleAdapter {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl LearningStyleAdapter {
+    pub fn new(config: ModelConfig) -> Self {
+        LearningStyleAdapter {
+            config,
+            system_prompt: r#"You are an expert in learning science and educational psychology. Your role is to:
+
+1. Analyze learner behavior to infer learning style preferences
+2. Adapt content presentation to match individual styles
+3. Recommend content formats that align with preferences
+4. Balance preferred styles with developing weaker modalities
+5. Track style evolution over time
+
+When adapting:
+- Use VARK model as foundation
+- Consider multimodal learning benefits
+- Account for context-dependent preferences
+- Recommend stretching comfort zones occasionally"#.to_string(),
+        }
+    }
+
+    pub async fn detect_style(&self, profile: &LearnerProfile) -> Result<LearningStyleProfile, LearningPathError> {
+        let mut style = LearningStyleProfile::default();
+        let mut evidence = vec![];
+
+        // Analyze content type performance
+        for record in &profile.performance_history {
+            let weight = if record.completed { 1.0 } else { 0.5 };
+            let score_weight = record.score.unwrap_or(0.5) as f64;
+
+            match record.activity_type {
+                ActivityType::Video => {
+                    style.visual += weight * score_weight * 0.1;
+                    style.auditory += weight * score_weight * 0.05;
+                    evidence.push(StyleEvidence {
+                        source: format!("Video activity {}", record.activity_id),
+                        dimension: "visual/auditory".to_string(),
+                        value: score_weight,
+                        timestamp: record.timestamp.clone(),
+                    });
+                },
+                ActivityType::Reading => {
+                    style.reading_writing += weight * score_weight * 0.1;
+                    evidence.push(StyleEvidence {
+                        source: format!("Reading activity {}", record.activity_id),
+                        dimension: "reading_writing".to_string(),
+                        value: score_weight,
+                        timestamp: record.timestamp.clone(),
+                    });
+                },
+                ActivityType::Practice => {
+                    style.kinesthetic += weight * score_weight * 0.1;
+                    evidence.push(StyleEvidence {
+                        source: format!("Practice activity {}", record.activity_id),
+                        dimension: "kinesthetic".to_string(),
+                        value: score_weight,
+                        timestamp: record.timestamp.clone(),
+                    });
+                },
+                ActivityType::Discussion => {
+                    style.social += weight * score_weight * 0.1;
+                    evidence.push(StyleEvidence {
+                        source: format!("Discussion {}", record.activity_id),
+                        dimension: "social".to_string(),
+                        value: score_weight,
+                        timestamp: record.timestamp.clone(),
+                    });
+                },
+                _ => {}
+            }
+        }
+
+        // Normalize
+        let total = style.visual + style.auditory + style.reading_writing + style.kinesthetic;
+        if total > 0.0 {
+            style.visual /= total;
+            style.auditory /= total;
+            style.reading_writing /= total;
+            style.kinesthetic /= total;
+        }
+
+        style.confidence = (evidence.len() as f64 / 20.0).min(1.0);
+        style.evidence = evidence;
+
+        Ok(style)
+    }
+
+    pub fn adapt_content_order(&self, content: &List<ContentRecommendation>, style: &LearningStyleProfile) -> List<ContentRecommendation> {
+        let mut adapted = content.clone();
+
+        // Sort by style match
+        adapted.sort_by(|a, b| {
+            let score_a = self.style_score(&a.content_type, style);
+            let score_b = self.style_score(&b.content_type, style);
+            score_b.partial_cmp(&score_a).unwrap()
+        });
+
+        adapted
+    }
+
+    fn style_score(&self, content_type: &ContentType, style: &LearningStyleProfile) -> f64 {
+        match content_type {
+            ContentType::Video => style.visual * 0.6 + style.auditory * 0.4,
+            ContentType::Audio => style.auditory,
+            ContentType::Document | ContentType::Html => style.reading_writing,
+            ContentType::Interactive => style.kinesthetic,
+            ContentType::Presentation => style.visual,
+            _ => 0.5,
+        }
+    }
+
+    pub fn recommend_content_types(&self, style: &LearningStyleProfile) -> List<ContentType> {
+        let mut types = vec![
+            (ContentType::Video, style.visual * 0.6 + style.auditory * 0.4),
+            (ContentType::Audio, style.auditory),
+            (ContentType::Document, style.reading_writing),
+            (ContentType::Interactive, style.kinesthetic),
+        ];
+
+        types.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        types.into_iter().map(|(t, _)| t).collect()
+    }
+}
+
+/// Competency Tracker Specialist
+pub struct CompetencyTracker {
+    config: ModelConfig,
+    mastery_threshold: f64,
+}
+
+impl CompetencyTracker {
+    pub fn new(config: ModelConfig, threshold: f64) -> Self {
+        CompetencyTracker {
+            config,
+            mastery_threshold: threshold,
+        }
+    }
+
+    pub fn update_mastery(&self, profile: &mut LearnerProfile, node_id: &PathNodeId, source: MasterySource) {
+        let delta = match &source {
+            MasterySource::Assessment { score, .. } => {
+                // Larger impact from assessments
+                (*score as f64 - 0.5) * 0.3
+            },
+            MasterySource::Practice { .. } => {
+                // Moderate impact from practice
+                0.05
+            },
+            MasterySource::ContentCompletion { .. } => {
+                // Small impact from content completion
+                0.02
+            },
+            MasterySource::TimeDecay => {
+                // Decay if not practiced recently
+                -0.01
+            },
+            MasterySource::InstructorOverride { .. } => {
+                0.0  // Handled separately
+            }
+        };
+
+        if let Some(state) = profile.knowledge_state.get_mut(node_id) {
+            // Apply delta with bounds
+            state.mastery = (state.mastery + delta).max(0.0).min(1.0);
+            state.attempts += 1;
+            state.last_interaction = Some(DateTime::now());
+
+            // Update status
+            state.status = if state.mastery >= self.mastery_threshold {
+                KnowledgeStatus::Mastered
+            } else if delta < 0.0 && state.mastery < 0.5 {
+                KnowledgeStatus::Struggling
+            } else if state.attempts > 0 {
+                KnowledgeStatus::InProgress
+            } else {
+                KnowledgeStatus::NotStarted
+            };
+
+            // Record history
+            state.mastery_history.push(MasteryRecord {
+                timestamp: DateTime::now(),
+                mastery: state.mastery,
+                source,
+            });
+        } else {
+            // Create new state
+            let initial_mastery = match &source {
+                MasterySource::Assessment { score, .. } => *score as f64 * 0.5,
+                _ => 0.1,
+            };
+
+            profile.knowledge_state.insert(node_id.clone(), KnowledgeState {
+                node_id: node_id.clone(),
+                mastery: initial_mastery,
+                confidence: 0.3,
+                attempts: 1,
+                time_spent: 0,
+                last_interaction: Some(DateTime::now()),
+                mastery_history: vec![MasteryRecord {
+                    timestamp: DateTime::now(),
+                    mastery: initial_mastery,
+                    source,
+                }],
+                status: KnowledgeStatus::InProgress,
+            });
+        }
+    }
+
+    pub fn check_competency_completion(&self, profile: &LearnerProfile, competency_nodes: &List<PathNodeId>) -> (bool, f64) {
+        let mut total_mastery = 0.0;
+        let mut count = 0;
+
+        for node_id in competency_nodes {
+            if let Some(state) = profile.knowledge_state.get(node_id) {
+                total_mastery += state.mastery;
+                count += 1;
+            }
+        }
+
+        let avg_mastery = if count > 0 { total_mastery / count as f64 } else { 0.0 };
+        let completed = avg_mastery >= self.mastery_threshold;
+
+        (completed, avg_mastery)
+    }
+
+    pub fn apply_time_decay(&self, profile: &mut LearnerProfile, decay_rate: f64) {
+        let now = DateTime::now();
+
+        for (node_id, state) in profile.knowledge_state.iter_mut() {
+            if let Some(last) = &state.last_interaction {
+                let days_since = (now - *last).as_days() as f64;
+                if days_since > 7.0 && state.status != KnowledgeStatus::Mastered {
+                    // Apply decay
+                    let decay = decay_rate * (days_since / 7.0).min(4.0);
+                    state.mastery = (state.mastery - decay).max(0.0);
+
+                    if state.mastery < 0.5 {
+                        state.status = KnowledgeStatus::NeedsReview;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_progress_report(&self, profile: &LearnerProfile, graph: &KnowledgeGraph) -> ProgressReport {
+        let total_nodes = graph.nodes.len();
+        let mastered = profile.knowledge_state.values()
+            .filter(|s| s.status == KnowledgeStatus::Mastered)
+            .count();
+        let in_progress = profile.knowledge_state.values()
+            .filter(|s| s.status == KnowledgeStatus::InProgress)
+            .count();
+        let struggling = profile.knowledge_state.values()
+            .filter(|s| s.status == KnowledgeStatus::Struggling)
+            .count();
+
+        let avg_mastery: f64 = profile.knowledge_state.values()
+            .map(|s| s.mastery)
+            .sum::<f64>() / profile.knowledge_state.len().max(1) as f64;
+
+        ProgressReport {
+            total_nodes,
+            mastered,
+            in_progress,
+            struggling,
+            not_started: total_nodes - mastered - in_progress - struggling,
+            overall_progress: mastered as f64 / total_nodes as f64,
+            average_mastery: avg_mastery,
+            estimated_completion: self.estimate_completion(profile, graph),
+        }
+    }
+
+    fn estimate_completion(&self, profile: &LearnerProfile, graph: &KnowledgeGraph) -> Option<DateTime> {
+        let remaining = graph.nodes.len() - profile.knowledge_state.values()
+            .filter(|s| s.status == KnowledgeStatus::Mastered)
+            .count();
+
+        if remaining == 0 {
+            return Some(DateTime::now());
+        }
+
+        // Estimate based on velocity
+        let recent_completions = profile.performance_history.iter()
+            .filter(|r| r.completed && r.timestamp > DateTime::now() - Duration::days(14))
+            .count();
+
+        if recent_completions > 0 {
+            let days_per_item = 14.0 / recent_completions as f64;
+            let days_remaining = remaining as f64 * days_per_item;
+            Some(DateTime::now() + Duration::days(days_remaining as i64))
+        } else {
+            None
+        }
+    }
+}
+
+/// Progress report
+pub struct ProgressReport {
+    total_nodes: usize,
+    mastered: usize,
+    in_progress: usize,
+    struggling: usize,
+    not_started: usize,
+    overall_progress: f64,
+    average_mastery: f64,
+    estimated_completion: Option<DateTime>,
+}
+
+// =============================================================================
+// Learning Path Hive Actor
+// =============================================================================
+
+/// Main Learning Path Hive actor
+pub actor LearningPathHive {
+    var config: LearningPathConfig = LearningPathConfig::default()
+    var prerequisite_analyzer: PrerequisiteAnalyzer
+    var skill_gap_identifier: SkillGapIdentifier
+    var content_recommender: ContentRecommender
+    var pace_optimizer: PaceOptimizer
+    var learning_style_adapter: LearningStyleAdapter
+    var competency_tracker: CompetencyTracker
+
+    var knowledge_graphs: Map<KnowledgeGraphId, KnowledgeGraph> = Map::new()
+    var learner_profiles: Map<StudentId, LearnerProfile> = Map::new()
+    var recommendation_cache: Map<String, List<ContentRecommendation>> = Map::new()
+
+    var metrics: LearningPathMetrics = LearningPathMetrics::default()
+    var is_running: bool = false
+
+    pub fn new() -> Self {
+        let config = LearningPathConfig::default();
+
+        LearningPathHive {
+            config: config.clone(),
+            prerequisite_analyzer: PrerequisiteAnalyzer::new(config.default_model.clone()),
+            skill_gap_identifier: SkillGapIdentifier::new(config.default_model.clone()),
+            content_recommender: ContentRecommender::new(config.default_model.clone(), config.embedding_model.clone()),
+            pace_optimizer: PaceOptimizer::new(config.default_model.clone()),
+            learning_style_adapter: LearningStyleAdapter::new(config.default_model.clone()),
+            competency_tracker: CompetencyTracker::new(config.default_model.clone(), config.mastery_threshold),
+            ..Default::default()
+        }
+    }
+
+    /// Start the learning path hive
+    pub receive Start() -> Result<(), LearningPathError> {
+        if self.is_running {
+            return Err(LearningPathError::AlreadyRunning);
+        }
+
+        self.is_running = true;
+        println!("[LearningPathHive] Started");
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Stop the learning path hive
+    pub receive Stop() {
+        self.is_running = false;
+        println!("[LearningPathHive] Stopped");
+        checkpoint();
+    }
+
+    /// Create or update knowledge graph
+    pub receive CreateKnowledgeGraph(
+        id: KnowledgeGraphId,
+        name: String,
+        nodes: List<KnowledgeNode>,
+        edges: List<KnowledgeEdge>
+    ) -> Result<KnowledgeGraph, LearningPathError> {
+        let graph = KnowledgeGraph {
+            id: id.clone(),
+            name,
+            description: None,
+            nodes: nodes.into_iter().map(|n| (n.id.clone(), n)).collect(),
+            edges,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+
+        self.knowledge_graphs.insert(id, graph.clone());
+        self.metrics.graphs_created += 1;
+
+        checkpoint();
+        Ok(graph)
+    }
+
+    /// Get personalized learning path
+    pub receive GetLearningPath(
+        student_id: StudentId,
+        graph_id: KnowledgeGraphId,
+        goal: LearningGoal
+    ) -> Result<PathRecommendation, LearningPathError> {
+        let graph = self.knowledge_graphs.get(&graph_id)
+            .ok_or(LearningPathError::GraphNotFound { id: graph_id.clone() })?;
+
+        let profile = self.get_or_create_profile(&student_id);
+
+        // Identify skill gaps
+        let gaps = self.skill_gap_identifier.identify_gaps(&profile, graph, None).await?;
+
+        // Build path to goal
+        let target_node = match &goal.goal_type {
+            GoalType::MasterConcept { node_id } => Some(node_id.clone()),
+            _ => None,
+        };
+
+        let path = if let Some(target) = target_node {
+            self.prerequisite_analyzer.build_dependency_graph(graph, &target)?
+        } else {
+            vec![]
+        };
+
+        // Convert to steps
+        let steps: List<PathStep> = path.iter().enumerate().map(|(i, node_id)| {
+            let node = graph.nodes.get(node_id);
+            PathStep {
+                order: i as i32,
+                node_id: node_id.clone(),
+                content_ids: node.map(|n| n.content_ids.iter().map(|c| c.content_id.clone()).collect()).unwrap_or_default(),
+                assessment_id: node.and_then(|n| n.assessment_ids.first().cloned()),
+                estimated_time: node.map(|n| n.estimated_time).unwrap_or(30),
+                mastery_target: 0.8,
+                is_optional: false,
+            }
+        }).collect();
+
+        let total_time: i32 = steps.iter().map(|s| s.estimated_time).sum();
+
+        Ok(PathRecommendation {
+            id: RecommendationId(generate_uuid()),
+            goal,
+            path: steps,
+            total_time,
+            difficulty_curve: vec![],
+            prerequisites_met: gaps.iter().all(|g| !matches!(g.priority, GapPriority::Critical)),
+            missing_prerequisites: gaps.iter()
+                .filter(|g| matches!(g.priority, GapPriority::Critical))
+                .map(|g| g.node_id.clone())
+                .collect(),
+            confidence: 0.85,
+            generated_at: DateTime::now(),
+        })
+    }
+
+    /// Get content recommendations
+    pub receive GetContentRecommendations(
+        student_id: StudentId,
+        graph_id: KnowledgeGraphId,
+        count: i32
+    ) -> Result<List<ContentRecommendation>, LearningPathError> {
+        let graph = self.knowledge_graphs.get(&graph_id)
+            .ok_or(LearningPathError::GraphNotFound { id: graph_id.clone() })?;
+
+        let profile = self.get_or_create_profile(&student_id);
+
+        let recommendations = self.content_recommender.recommend(&profile, graph, count).await?;
+
+        // Adapt to learning style
+        let adapted = self.learning_style_adapter.adapt_content_order(&recommendations, &profile.learning_style);
+
+        self.metrics.recommendations_generated += 1;
+
+        checkpoint();
+        Ok(adapted)
+    }
+
+    /// Run diagnostic assessment
+    pub receive RunDiagnostic(
+        student_id: StudentId,
+        graph_id: KnowledgeGraphId
+    ) -> Result<DiagnosticResult, LearningPathError> {
+        let graph = self.knowledge_graphs.get(&graph_id)
+            .ok_or(LearningPathError::GraphNotFound { id: graph_id.clone() })?;
+
+        let profile = self.get_or_create_profile(&student_id);
+
+        let result = self.skill_gap_identifier.run_diagnostic(&profile, &profile.performance_history, graph).await?;
+
+        self.metrics.diagnostics_run += 1;
+
+        checkpoint();
+        Ok(result)
+    }
+
+    /// Update learner mastery
+    pub receive UpdateMastery(
+        student_id: StudentId,
+        node_id: PathNodeId,
+        source: MasterySource
+    ) {
+        let profile = self.learner_profiles.get_mut(&student_id);
+        if let Some(p) = profile {
+            self.competency_tracker.update_mastery(p, &node_id, source);
+        }
+        checkpoint();
+    }
+
+    /// Get pace recommendation
+    pub receive GetPaceRecommendation(
+        student_id: StudentId,
+        remaining_content: i32,
+        deadline: Option<DateTime>
+    ) -> Result<PaceRecommendation, LearningPathError> {
+        let profile = self.get_or_create_profile(&student_id);
+        self.pace_optimizer.optimize_pace(&profile, remaining_content, deadline).await
+    }
+
+    /// Detect learning style
+    pub receive DetectLearningStyle(
+        student_id: StudentId
+    ) -> Result<LearningStyleProfile, LearningPathError> {
+        let profile = self.get_or_create_profile(&student_id);
+        self.learning_style_adapter.detect_style(&profile).await
+    }
+
+    /// Record learning activity
+    pub receive RecordActivity(
+        student_id: StudentId,
+        activity: PerformanceRecord
+    ) {
+        if let Some(profile) = self.learner_profiles.get_mut(&student_id) {
+            profile.performance_history.push(activity);
+            profile.updated_at = DateTime::now();
+        }
+        checkpoint();
+    }
+
+    /// Get progress report
+    pub receive GetProgressReport(
+        student_id: StudentId,
+        graph_id: KnowledgeGraphId
+    ) -> Result<ProgressReport, LearningPathError> {
+        let graph = self.knowledge_graphs.get(&graph_id)
+            .ok_or(LearningPathError::GraphNotFound { id: graph_id.clone() })?;
+
+        let profile = self.get_or_create_profile(&student_id);
+
+        Ok(self.competency_tracker.get_progress_report(&profile, graph))
+    }
+
+    /// Get learner profile
+    pub receive GetLearnerProfile(student_id: StudentId) -> Option<LearnerProfile> {
+        self.learner_profiles.get(&student_id).cloned()
+    }
+
+    /// Get metrics
+    pub receive GetMetrics() -> LearningPathMetrics {
+        self.metrics.clone()
+    }
+
+    // Internal methods
+    fn get_or_create_profile(&mut self, student_id: &StudentId) -> LearnerProfile {
+        if !self.learner_profiles.contains_key(student_id) {
+            let profile = LearnerProfile {
+                id: LearnerProfileId(generate_uuid()),
+                student_id: student_id.clone(),
+                knowledge_state: Map::new(),
+                learning_style: LearningStyleProfile::default(),
+                preferences: LearningPreferences::default(),
+                performance_history: vec![],
+                learning_velocity: 0.5,
+                engagement_patterns: EngagementPatterns {
+                    avg_session_duration: 30,
+                    sessions_per_week: 3.0,
+                    completion_rate: 0.0,
+                    peak_hours: vec![],
+                    active_days: vec![],
+                    dropout_risk: 0.0,
+                },
+                goals: vec![],
+                strengths: vec![],
+                weaknesses: vec![],
+                updated_at: DateTime::now(),
+            };
+            self.learner_profiles.insert(student_id.clone(), profile);
+            self.metrics.profiles_created += 1;
+        }
+
+        self.learner_profiles.get(student_id).unwrap().clone()
+    }
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+#[derive(Clone, Default)]
+pub struct LearningPathMetrics {
+    pub graphs_created: i64,
+    pub profiles_created: i64,
+    pub recommendations_generated: i64,
+    pub diagnostics_run: i64,
+    pub mastery_updates: i64,
+    pub paths_generated: i64,
+}
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+pub enum LearningPathError {
+    AlreadyRunning,
+    NotRunning,
+    GraphNotFound { id: KnowledgeGraphId },
+    ProfileNotFound { id: StudentId },
+    NodeNotFound { id: PathNodeId },
+    CircularDependency { node_id: PathNodeId },
+    ModelError { message: String },
+    ParseError { message: String },
+}
+
+// =============================================================================
+// JSON Helper Types
+// =============================================================================
+
+struct PrerequisiteResponseJson {
+    edges: List<EdgeJson>,
+    new_nodes_suggested: List<NodeSuggestionJson>,
+}
+
+struct EdgeJson {
+    from_id: String,
+    to_id: String,
+    relationship: String,
+    strength: f64,
+    rationale: String,
+}
+
+struct NodeSuggestionJson {
+    name: String,
+    description: String,
+    bloom_level: String,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn parse_json<T>(json_str: &str) -> Result<T, String> {
+    std::json::parse(json_str)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_learning_path_hive_creation() {
+        let hive = LearningPathHive::new();
+        assert!(!hive.is_running);
+    }
+
+    #[test]
+    fn test_competency_tracker() {
+        let tracker = CompetencyTracker::new(ModelConfig::default(), 0.8);
+
+        let mut profile = LearnerProfile {
+            id: LearnerProfileId("test".to_string()),
+            student_id: StudentId("student1".to_string()),
+            knowledge_state: Map::new(),
+            learning_style: LearningStyleProfile::default(),
+            preferences: LearningPreferences::default(),
+            performance_history: vec![],
+            learning_velocity: 0.5,
+            engagement_patterns: EngagementPatterns::default(),
+            goals: vec![],
+            strengths: vec![],
+            weaknesses: vec![],
+            updated_at: DateTime::now(),
+        };
+
+        let node_id = PathNodeId("concept1".to_string());
+        tracker.update_mastery(&mut profile, &node_id, MasterySource::Assessment {
+            assessment_id: AssessmentId("test".to_string()),
+            score: 0.9,
+        });
+
+        assert!(profile.knowledge_state.contains_key(&node_id));
+    }
+
+    #[test]
+    fn test_topological_sort() {
+        let analyzer = PrerequisiteAnalyzer::new(ModelConfig::default());
+
+        let mut graph = KnowledgeGraph {
+            id: KnowledgeGraphId("test".to_string()),
+            name: "Test Graph".to_string(),
+            description: None,
+            nodes: Map::new(),
+            edges: vec![
+                KnowledgeEdge {
+                    from_id: PathNodeId("A".to_string()),
+                    to_id: PathNodeId("B".to_string()),
+                    relationship: PrerequisiteType::Required,
+                    strength: 1.0,
+                },
+                KnowledgeEdge {
+                    from_id: PathNodeId("B".to_string()),
+                    to_id: PathNodeId("C".to_string()),
+                    relationship: PrerequisiteType::Required,
+                    strength: 1.0,
+                },
+            ],
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+
+        let result = analyzer.build_dependency_graph(&graph, &PathNodeId("C".to_string()));
+        assert!(result.is_ok());
+
+        let path = result.unwrap();
+        assert_eq!(path.len(), 3);
+    }
+}

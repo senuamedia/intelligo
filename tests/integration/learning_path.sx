@@ -1,0 +1,255 @@
+/// Intelligo LMS - Learning Path Integration Tests
+///
+/// Tests AI-driven learning path generation and adaptation.
+
+module intelligo::tests::integration::learning_path
+
+use intelligo::chai::*
+use intelligo::ai::hives::learning_path_hive::*
+use intelligo::entities::activity::*
+
+pub fn register_tests() {
+    describe("Learning Path Integration", || {
+        describe("path generation", || {
+            it("generates path based on learning goal", || {
+                let hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Python Programming".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 40,
+                    preferred_formats: vec![ContentFormat::Video, ContentFormat::Interactive]
+                });
+
+                expect(&path.is_ok()).to().be_true();
+                let path = path.unwrap();
+                expect(&path.activities.len()).to().be_greater_than(&0);
+            });
+
+            it("orders activities by prerequisites", || {
+                let hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Web Development".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 80,
+                    preferred_formats: vec![]
+                });
+
+                let path = path.unwrap();
+
+                // HTML should come before CSS, CSS before JavaScript
+                let html_pos = path.activities.iter().position(|a| a.tags.contains(&"html".to_string()));
+                let css_pos = path.activities.iter().position(|a| a.tags.contains(&"css".to_string()));
+                let js_pos = path.activities.iter().position(|a| a.tags.contains(&"javascript".to_string()));
+
+                if let (Some(h), Some(c), Some(j)) = (html_pos, css_pos, js_pos) {
+                    expect(&(h < c)).to().be_true();
+                    expect(&(c < j)).to().be_true();
+                }
+            });
+
+            it("respects time constraints", || {
+                let hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Data Science".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 10,  // Very limited time
+                    preferred_formats: vec![]
+                });
+
+                let path = path.unwrap();
+                let total_time: i32 = path.activities.iter()
+                    .map(|a| a.estimated_duration_minutes)
+                    .sum();
+
+                expect(&(total_time <= 600)).to().be_true();  // 10 hours = 600 minutes
+            });
+        });
+
+        describe("path adaptation", || {
+            it("accelerates path for high performers", || {
+                let mut hive = LearningPathHive::new();
+
+                // Generate initial path
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Programming".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 40,
+                    preferred_formats: vec![]
+                }).unwrap();
+
+                let original_count = path.activities.len();
+
+                // Record excellent performance
+                for activity in path.activities.iter().take(3) {
+                    hive.record_progress(&path.id, &activity.id, ProgressData {
+                        score: Some(95.0),
+                        time_spent: Duration::from_secs(900),  // Faster than expected
+                        completed: true
+                    });
+                }
+
+                // Adapt path
+                let adapted = hive.adapt_path(&path.id).unwrap();
+
+                // May skip some easier content
+                expect(&adapted.activities.len()).to().be_less_than_or_equal(&original_count);
+            });
+
+            it("adds remediation for struggling learners", || {
+                let mut hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Programming".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 40,
+                    preferred_formats: vec![]
+                }).unwrap();
+
+                let original_count = path.activities.len();
+
+                // Record poor performance
+                hive.record_progress(&path.id, &path.activities[0].id, ProgressData {
+                    score: Some(35.0),
+                    time_spent: Duration::from_secs(7200),  // Much longer than expected
+                    completed: true
+                });
+
+                // Adapt path
+                let adapted = hive.adapt_path(&path.id).unwrap();
+
+                // May add supplementary content
+                expect(&adapted.activities.len()).to().be_greater_than_or_equal(&original_count);
+            });
+        });
+
+        describe("path progress tracking", || {
+            it("calculates overall progress", || {
+                let mut hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Testing".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 20,
+                    preferred_formats: vec![]
+                }).unwrap();
+
+                let total = path.activities.len();
+
+                // Complete half
+                for activity in path.activities.iter().take(total / 2) {
+                    hive.record_progress(&path.id, &activity.id, ProgressData {
+                        score: Some(80.0),
+                        time_spent: Duration::from_secs(1800),
+                        completed: true
+                    });
+                }
+
+                let progress = hive.get_progress(&path.id);
+                expect(&progress.percentage).to().be_close_to(50.0, 5.0);
+            });
+
+            it("tracks time spent", || {
+                let mut hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::SkillAcquisition("Design".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 20,
+                    preferred_formats: vec![]
+                }).unwrap();
+
+                // Record some progress
+                hive.record_progress(&path.id, &path.activities[0].id, ProgressData {
+                    score: Some(75.0),
+                    time_spent: Duration::from_secs(3600),  // 1 hour
+                    completed: true
+                });
+
+                let progress = hive.get_progress(&path.id);
+                expect(&progress.time_spent.as_secs()).to().equal(&3600);
+            });
+        });
+
+        describe("recommendations", || {
+            it("recommends next activities", || {
+                let hive = LearningPathHive::new();
+
+                let recommendations = hive.recommend_next(
+                    "learner_1",
+                    RecommendationContext {
+                        recent_activities: vec!["intro_python".to_string()],
+                        current_skills: {
+                            let mut m = Map::new();
+                            m.insert("python_basics".to_string(), 2);
+                            m
+                        },
+                        available_time_minutes: 30
+                    }
+                );
+
+                expect(&recommendations.len()).to().be_greater_than(&0);
+            });
+
+            it("considers available time", || {
+                let hive = LearningPathHive::new();
+
+                // Short time available
+                let short_recs = hive.recommend_next(
+                    "learner_1",
+                    RecommendationContext {
+                        recent_activities: vec![],
+                        current_skills: Map::new(),
+                        available_time_minutes: 15
+                    }
+                );
+
+                // All recommendations should fit in 15 minutes
+                for rec in &short_recs {
+                    expect(&rec.estimated_duration_minutes).to().be_less_than_or_equal(&15);
+                }
+            });
+        });
+
+        describe("milestone tracking", || {
+            it("identifies milestone completion", || {
+                let mut hive = LearningPathHive::new();
+
+                let path = hive.generate_path(PathRequest {
+                    learner_id: "learner_1".to_string(),
+                    goal: LearningGoal::Certification("python_cert".to_string()),
+                    current_skills: Map::new(),
+                    time_available_hours: 100,
+                    preferred_formats: vec![]
+                }).unwrap();
+
+                // Path should have milestones
+                expect(&path.milestones.len()).to().be_greater_than(&0);
+
+                // Complete activities until first milestone
+                for activity in &path.activities {
+                    if activity.is_milestone {
+                        break;
+                    }
+                    hive.record_progress(&path.id, &activity.id, ProgressData {
+                        score: Some(80.0),
+                        time_spent: Duration::from_secs(1800),
+                        completed: true
+                    });
+                }
+
+                let progress = hive.get_progress(&path.id);
+                expect(&progress.milestones_completed).to().be_greater_than(&0);
+            });
+        });
+    });
+}

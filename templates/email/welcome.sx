@@ -1,0 +1,204 @@
+// Welcome Email Template for Intelligo LMS
+// Sent to new users upon account creation
+
+module intelligo::templates::email::welcome
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Welcome email template ID
+pub const TEMPLATE_ID: &str = "email.welcome";
+
+/// Create the welcome email template configuration
+pub fn get_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Welcome Email".to_string(),
+        description: Some("Sent to new users when their account is created".to_string()),
+        category: "onboarding".to_string(),
+
+        subject: Some("Welcome to {{organization_name}}!".to_string()),
+        body_html: WELCOME_HTML.to_string(),
+        body_text: Some(WELCOME_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "user_email".to_string(),
+            "organization_name".to_string(),
+            "login_url".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "temporary_password".to_string(),
+            "activation_url".to_string(),
+            "support_email".to_string(),
+            "getting_started_url".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Build context for welcome email
+pub fn build_context(
+    user_name: String,
+    user_email: String,
+    user_first_name: Option<String>,
+    organization_name: String,
+    login_url: String,
+    activation_url: Option<String>,
+    temporary_password: Option<String>,
+    support_email: Option<String>,
+    getting_started_url: Option<String>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name)
+        .set_string("user_email", user_email)
+        .set_string("organization_name", organization_name.clone())
+        .set_string("login_url", login_url)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(first_name) = user_first_name {
+        ctx = ctx.set_string("user_first_name", first_name);
+    }
+
+    if let Some(activation) = activation_url {
+        ctx = ctx.set_string("activation_url", activation);
+        ctx = ctx.set_bool("requires_activation", true);
+    } else {
+        ctx = ctx.set_bool("requires_activation", false);
+    }
+
+    if let Some(password) = temporary_password {
+        ctx = ctx.set_string("temporary_password", password);
+        ctx = ctx.set_bool("has_temporary_password", true);
+    } else {
+        ctx = ctx.set_bool("has_temporary_password", false);
+    }
+
+    if let Some(support) = support_email {
+        ctx = ctx.set_string("support_email", support);
+    }
+
+    if let Some(getting_started) = getting_started_url {
+        ctx = ctx.set_string("getting_started_url", getting_started);
+    }
+
+    ctx
+}
+
+const WELCOME_HTML: &str = r#"
+<h1>Welcome to {{organization_name}}!</h1>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+<p>Your account has been created and you're ready to start learning! We're excited to have you join our learning community.</p>
+
+{{#if requires_activation}}
+<div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0;"><strong>Action Required:</strong> Please activate your account to get started.</p>
+</div>
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{activation_url}}" class="button">Activate Your Account</a>
+</p>
+{{else}}
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{login_url}}" class="button">Log In to Your Account</a>
+</p>
+{{/if}}
+
+<h2>Your Account Details</h2>
+<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Email:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{user_email}}</td>
+    </tr>
+    {{#if has_temporary_password}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Temporary Password:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px;">{{temporary_password}}</code></td>
+    </tr>
+    {{/if}}
+</table>
+
+{{#if has_temporary_password}}
+<div style="background-color: #d4edda; border: 1px solid #28a745; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0;"><strong>Security Tip:</strong> Please change your password after your first login.</p>
+</div>
+{{/if}}
+
+<h2>Getting Started</h2>
+<p>Here are a few things you can do to get started:</p>
+<ul>
+    <li>Complete your profile</li>
+    <li>Browse available courses</li>
+    <li>Explore learning paths</li>
+    {{#if getting_started_url}}
+    <li><a href="{{getting_started_url}}">View our Getting Started Guide</a></li>
+    {{/if}}
+</ul>
+
+{{#if support_email}}
+<p>If you have any questions or need assistance, feel free to reach out to our support team at <a href="mailto:{{support_email}}">{{support_email}}</a>.</p>
+{{/if}}
+
+<p>Happy learning!</p>
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+"#;
+
+const WELCOME_TEXT: &str = r#"
+Welcome to {{organization_name}}!
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+Your account has been created and you're ready to start learning! We're excited to have you join our learning community.
+
+{{#if requires_activation}}
+ACTION REQUIRED: Please activate your account to get started.
+Activation Link: {{activation_url}}
+{{else}}
+Log in to your account: {{login_url}}
+{{/if}}
+
+YOUR ACCOUNT DETAILS
+--------------------
+Email: {{user_email}}
+{{#if has_temporary_password}}
+Temporary Password: {{temporary_password}}
+
+SECURITY TIP: Please change your password after your first login.
+{{/if}}
+
+GETTING STARTED
+---------------
+Here are a few things you can do to get started:
+- Complete your profile
+- Browse available courses
+- Explore learning paths
+{{#if getting_started_url}}
+- View our Getting Started Guide: {{getting_started_url}}
+{{/if}}
+
+{{#if support_email}}
+If you have any questions or need assistance, feel free to reach out to our support team at {{support_email}}.
+{{/if}}
+
+Happy learning!
+
+Best regards,
+The {{organization_name}} Team
+"#;

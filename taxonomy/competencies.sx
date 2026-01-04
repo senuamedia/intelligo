@@ -1,0 +1,651 @@
+/// Intelligo LMS - Competency Framework
+///
+/// Provides competency definitions, frameworks, and assessment.
+
+module intelligo::taxonomy::competencies
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock}
+use std::time::DateTime
+
+// =============================================================================
+// COMPETENCY
+// =============================================================================
+
+/// A competency in the framework
+pub type Competency {
+    id: String,
+    tenant_id: String,
+    framework_id: String,
+    code: String,                   // Short code like "COMM-001"
+    name: String,
+    description: String,
+    category: CompetencyCategory,
+    levels: List<CompetencyLevel>,
+    skills: List<String>,           // Related skill IDs
+    behaviors: List<BehaviorIndicator>,
+    assessment_methods: List<AssessmentMethod>,
+    weight: f64,                    // Importance weight in framework
+    parent_id: Option<String>,
+    is_core: bool,
+    is_role_specific: bool,
+    target_roles: List<String>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Competency category
+#[derive(Clone, PartialEq)]
+pub enum CompetencyCategory {
+    Core,               // Core organizational competencies
+    Functional,         // Job function specific
+    Leadership,         // Leadership and management
+    Technical,          // Technical domain expertise
+    Behavioral,         // Behavioral/soft competencies
+    Strategic,          // Strategic thinking
+    Custom(String)
+}
+
+/// Competency level definition
+#[derive(Clone)]
+pub type CompetencyLevel {
+    level: i32,
+    name: String,
+    description: String,
+    behaviors: List<String>,
+    knowledge_requirements: List<String>,
+    skill_requirements: List<(String, i32)>,  // (skill_id, min_level)
+    experience_months: Option<i32>
+}
+
+impl CompetencyLevel {
+    pub fn level_1(name: &str, description: &str) -> CompetencyLevel {
+        CompetencyLevel {
+            level: 1,
+            name: name.to_string(),
+            description: description.to_string(),
+            behaviors: vec![],
+            knowledge_requirements: vec![],
+            skill_requirements: vec![],
+            experience_months: None
+        }
+    }
+
+    pub fn with_behaviors(mut self, behaviors: Vec<&str>) -> Self {
+        self.behaviors = behaviors.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_experience(mut self, months: i32) -> Self {
+        self.experience_months = Some(months);
+        self
+    }
+}
+
+/// Behavioral indicator for a competency
+#[derive(Clone)]
+pub type BehaviorIndicator {
+    id: String,
+    description: String,
+    level: i32,
+    is_observable: bool,
+    measurement_method: Option<String>
+}
+
+/// Assessment method for competency
+#[derive(Clone)]
+pub enum AssessmentMethod {
+    SelfAssessment,
+    ManagerAssessment,
+    Peer360,
+    Assessment,
+    ProjectReview,
+    Interview,
+    Simulation,
+    Observation,
+    Certification
+}
+
+impl Competency {
+    pub fn new(tenant_id: &str, framework_id: &str, code: &str, name: &str) -> Competency {
+        Competency {
+            id: generate_id("comp"),
+            tenant_id: tenant_id.to_string(),
+            framework_id: framework_id.to_string(),
+            code: code.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            category: CompetencyCategory::Core,
+            levels: vec![],
+            skills: vec![],
+            behaviors: vec![],
+            assessment_methods: vec![AssessmentMethod::SelfAssessment],
+            weight: 1.0,
+            parent_id: None,
+            is_core: false,
+            is_role_specific: false,
+            target_roles: vec![],
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.description = description.to_string();
+        self
+    }
+
+    pub fn with_category(mut self, category: CompetencyCategory) -> Self {
+        self.category = category;
+        self
+    }
+
+    pub fn with_levels(mut self, levels: List<CompetencyLevel>) -> Self {
+        self.levels = levels;
+        self
+    }
+
+    pub fn add_skill(&mut self, skill_id: &str) {
+        self.skills.push(skill_id.to_string());
+    }
+
+    pub fn add_behavior(&mut self, behavior: BehaviorIndicator) {
+        self.behaviors.push(behavior);
+    }
+
+    pub fn mark_as_core(mut self) -> Self {
+        self.is_core = true;
+        self
+    }
+
+    pub fn for_roles(mut self, roles: Vec<&str>) -> Self {
+        self.is_role_specific = true;
+        self.target_roles = roles.iter().map(|s| s.to_string()).collect();
+        self
+    }
+}
+
+// =============================================================================
+// COMPETENCY FRAMEWORK
+// =============================================================================
+
+/// A competency framework
+pub type CompetencyFramework {
+    id: String,
+    tenant_id: String,
+    name: String,
+    description: String,
+    version: String,
+    competencies: List<String>,     // Competency IDs
+    structure: FrameworkStructure,
+    is_active: bool,
+    valid_from: DateTime,
+    valid_until: Option<DateTime>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Structure of the framework
+#[derive(Clone)]
+pub type FrameworkStructure {
+    hierarchy: List<FrameworkNode>,
+    cross_cutting: List<String>     // Competencies that span multiple areas
+}
+
+#[derive(Clone)]
+pub type FrameworkNode {
+    competency_id: String,
+    children: List<FrameworkNode>
+}
+
+impl CompetencyFramework {
+    pub fn new(tenant_id: &str, name: &str) -> CompetencyFramework {
+        CompetencyFramework {
+            id: generate_id("framework"),
+            tenant_id: tenant_id.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            version: "1.0".to_string(),
+            competencies: vec![],
+            structure: FrameworkStructure {
+                hierarchy: vec![],
+                cross_cutting: vec![]
+            },
+            is_active: false,
+            valid_from: DateTime::now(),
+            valid_until: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn add_competency(&mut self, competency_id: &str) {
+        self.competencies.push(competency_id.to_string());
+    }
+
+    pub fn activate(&mut self) {
+        self.is_active = true;
+        self.valid_from = DateTime::now();
+    }
+}
+
+// =============================================================================
+// ROLE COMPETENCY PROFILE
+// =============================================================================
+
+/// Competency requirements for a role
+pub type RoleCompetencyProfile {
+    id: String,
+    tenant_id: String,
+    role_id: String,
+    role_name: String,
+    framework_id: String,
+    required_competencies: List<CompetencyRequirement>,
+    nice_to_have: List<CompetencyRequirement>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// A competency requirement
+#[derive(Clone)]
+pub type CompetencyRequirement {
+    competency_id: String,
+    minimum_level: i32,
+    target_level: i32,
+    is_mandatory: bool,
+    timeline_months: Option<i32>    // Time to achieve if not mandatory at hire
+}
+
+impl RoleCompetencyProfile {
+    pub fn new(tenant_id: &str, role_id: &str, role_name: &str, framework_id: &str) -> RoleCompetencyProfile {
+        RoleCompetencyProfile {
+            id: generate_id("role_profile"),
+            tenant_id: tenant_id.to_string(),
+            role_id: role_id.to_string(),
+            role_name: role_name.to_string(),
+            framework_id: framework_id.to_string(),
+            required_competencies: vec![],
+            nice_to_have: vec![],
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn require(&mut self, competency_id: &str, min_level: i32, target_level: i32) {
+        self.required_competencies.push(CompetencyRequirement {
+            competency_id: competency_id.to_string(),
+            minimum_level: min_level,
+            target_level,
+            is_mandatory: true,
+            timeline_months: None
+        });
+    }
+
+    pub fn prefer(&mut self, competency_id: &str, level: i32) {
+        self.nice_to_have.push(CompetencyRequirement {
+            competency_id: competency_id.to_string(),
+            minimum_level: level,
+            target_level: level,
+            is_mandatory: false,
+            timeline_months: None
+        });
+    }
+}
+
+// =============================================================================
+// LEARNER COMPETENCY PROFILE
+// =============================================================================
+
+/// A learner's competency profile
+pub type LearnerCompetencyProfile {
+    learner_id: String,
+    tenant_id: String,
+    framework_id: String,
+    competencies: Map<String, LearnerCompetency>,
+    assessments: List<CompetencyAssessment>,
+    gaps: List<CompetencyGap>,
+    last_assessment: Option<DateTime>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// A competency held by a learner
+pub type LearnerCompetency {
+    competency_id: String,
+    current_level: i32,
+    target_level: Option<i32>,
+    confidence: f64,
+    assessment_history: List<AssessmentResult>,
+    development_plan: Option<DevelopmentPlan>,
+    validated: bool,
+    validated_by: Option<String>,
+    validated_at: Option<DateTime>
+}
+
+/// A competency assessment
+#[derive(Clone)]
+pub type CompetencyAssessment {
+    id: String,
+    competency_id: String,
+    assessment_type: AssessmentMethod,
+    assessor_id: Option<String>,
+    assessed_level: i32,
+    confidence: f64,
+    evidence: List<String>,
+    notes: Option<String>,
+    assessed_at: DateTime
+}
+
+/// Result of an assessment
+#[derive(Clone)]
+pub type AssessmentResult {
+    assessment_id: String,
+    level: i32,
+    score: Option<f64>,
+    feedback: Option<String>,
+    assessed_at: DateTime
+}
+
+/// Development plan for a competency
+#[derive(Clone)]
+pub type DevelopmentPlan {
+    competency_id: String,
+    current_level: i32,
+    target_level: i32,
+    activities: List<DevelopmentActivity>,
+    timeline_weeks: i32,
+    progress: f64,
+    created_at: DateTime,
+    due_date: Option<DateTime>
+}
+
+#[derive(Clone)]
+pub type DevelopmentActivity {
+    activity_type: DevelopmentActivityType,
+    description: String,
+    resource_id: Option<String>,
+    duration_hours: i32,
+    completed: bool,
+    completed_at: Option<DateTime>
+}
+
+#[derive(Clone)]
+pub enum DevelopmentActivityType {
+    Course,
+    Mentoring,
+    OnTheJob,
+    Project,
+    Reading,
+    Workshop,
+    Coaching,
+    Shadowing,
+    Certification
+}
+
+/// Gap in competencies
+pub type CompetencyGap {
+    competency_id: String,
+    current_level: i32,
+    required_level: i32,
+    gap_size: i32,
+    priority: GapPriority,
+    impact: String,
+    development_recommendations: List<String>
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GapPriority {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+impl LearnerCompetencyProfile {
+    pub fn new(tenant_id: &str, learner_id: &str, framework_id: &str) -> LearnerCompetencyProfile {
+        LearnerCompetencyProfile {
+            learner_id: learner_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            framework_id: framework_id.to_string(),
+            competencies: Map::new(),
+            assessments: vec![],
+            gaps: vec![],
+            last_assessment: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn set_level(&mut self, competency_id: &str, level: i32) {
+        let entry = self.competencies.entry(competency_id.to_string())
+            .or_insert(LearnerCompetency {
+                competency_id: competency_id.to_string(),
+                current_level: 0,
+                target_level: None,
+                confidence: 0.5,
+                assessment_history: vec![],
+                development_plan: None,
+                validated: false,
+                validated_by: None,
+                validated_at: None
+            });
+        entry.current_level = level;
+        self.updated_at = DateTime::now();
+    }
+
+    pub fn get_level(&self, competency_id: &str) -> Option<i32> {
+        self.competencies.get(competency_id).map(|c| c.current_level)
+    }
+
+    pub fn add_assessment(&mut self, assessment: CompetencyAssessment) {
+        let level = assessment.assessed_level;
+        let result = AssessmentResult {
+            assessment_id: assessment.id.clone(),
+            level,
+            score: None,
+            feedback: assessment.notes.clone(),
+            assessed_at: assessment.assessed_at
+        };
+
+        if let Some(competency) = self.competencies.get_mut(&assessment.competency_id) {
+            competency.current_level = level;
+            competency.confidence = assessment.confidence;
+            competency.assessment_history.push(result);
+        }
+
+        self.assessments.push(assessment);
+        self.last_assessment = Some(DateTime::now());
+        self.updated_at = DateTime::now();
+    }
+}
+
+// =============================================================================
+// COMPETENCY SERVICE
+// =============================================================================
+
+/// Actor for managing competencies
+pub actor CompetencyService {
+    frameworks: Arc<RwLock<Map<String, CompetencyFramework>>>,
+    competencies: Arc<RwLock<Map<String, Competency>>>,
+    role_profiles: Arc<RwLock<Map<String, RoleCompetencyProfile>>>,
+    learner_profiles: Arc<RwLock<Map<String, LearnerCompetencyProfile>>>,
+    tenant_id: String
+}
+
+impl CompetencyService {
+    pub fn new(tenant_id: &str) -> CompetencyService {
+        CompetencyService {
+            frameworks: Arc::new(RwLock::new(Map::new())),
+            competencies: Arc::new(RwLock::new(Map::new())),
+            role_profiles: Arc::new(RwLock::new(Map::new())),
+            learner_profiles: Arc::new(RwLock::new(Map::new())),
+            tenant_id: tenant_id.to_string()
+        }
+    }
+
+    /// Create a framework
+    pub async fn create_framework(&mut self, framework: CompetencyFramework) -> Result<CompetencyFramework, String> {
+        self.frameworks.write().unwrap().insert(framework.id.clone(), framework.clone());
+        Ok(framework)
+    }
+
+    /// Create a competency
+    pub async fn create_competency(&mut self, competency: Competency) -> Result<Competency, String> {
+        // Validate framework exists
+        if !self.frameworks.read().unwrap().contains_key(&competency.framework_id) {
+            return Err("Framework not found".to_string());
+        }
+
+        // Add to framework
+        if let Some(framework) = self.frameworks.write().unwrap().get_mut(&competency.framework_id) {
+            framework.competencies.push(competency.id.clone());
+        }
+
+        self.competencies.write().unwrap().insert(competency.id.clone(), competency.clone());
+        Ok(competency)
+    }
+
+    /// Get competency by ID
+    pub fn get_competency(&self, id: &str) -> Option<Competency> {
+        self.competencies.read().unwrap().get(id).cloned()
+    }
+
+    /// Get framework competencies
+    pub fn get_framework_competencies(&self, framework_id: &str) -> List<Competency> {
+        let comps = self.competencies.read().unwrap();
+        comps.values()
+            .filter(|c| c.framework_id == framework_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Create role profile
+    pub async fn create_role_profile(&mut self, profile: RoleCompetencyProfile) -> Result<RoleCompetencyProfile, String> {
+        self.role_profiles.write().unwrap().insert(profile.role_id.clone(), profile.clone());
+        Ok(profile)
+    }
+
+    /// Get learner profile
+    pub fn get_learner_profile(&self, learner_id: &str) -> Option<LearnerCompetencyProfile> {
+        self.learner_profiles.read().unwrap().get(learner_id).cloned()
+    }
+
+    /// Assess learner competency
+    pub async fn assess(
+        &mut self,
+        learner_id: &str,
+        assessment: CompetencyAssessment
+    ) -> Result<LearnerCompetencyProfile, String> {
+        let mut profiles = self.learner_profiles.write().unwrap();
+        let profile = profiles.entry(learner_id.to_string())
+            .or_insert_with(|| {
+                let comp = self.competencies.read().unwrap()
+                    .get(&assessment.competency_id)
+                    .map(|c| c.framework_id.clone())
+                    .unwrap_or_default();
+                LearnerCompetencyProfile::new(&self.tenant_id, learner_id, &comp)
+            });
+
+        profile.add_assessment(assessment);
+        Ok(profile.clone())
+    }
+
+    /// Identify gaps against role
+    pub async fn identify_role_gaps(
+        &self,
+        learner_id: &str,
+        role_id: &str
+    ) -> List<CompetencyGap> {
+        let role_profile = match self.role_profiles.read().unwrap().get(role_id).cloned() {
+            Some(p) => p,
+            None => return vec![]
+        };
+
+        let learner_profile = self.learner_profiles.read().unwrap()
+            .get(learner_id)
+            .cloned();
+
+        let mut gaps = vec![];
+
+        for req in &role_profile.required_competencies {
+            let current_level = learner_profile.as_ref()
+                .and_then(|p| p.get_level(&req.competency_id))
+                .unwrap_or(0);
+
+            if current_level < req.minimum_level {
+                let gap_size = req.minimum_level - current_level;
+                let priority = if req.is_mandatory && gap_size >= 2 {
+                    GapPriority::Critical
+                } else if req.is_mandatory {
+                    GapPriority::High
+                } else {
+                    GapPriority::Medium
+                };
+
+                gaps.push(CompetencyGap {
+                    competency_id: req.competency_id.clone(),
+                    current_level,
+                    required_level: req.minimum_level,
+                    gap_size,
+                    priority,
+                    impact: format!("Required for role: {}", role_profile.role_name),
+                    development_recommendations: vec![]
+                });
+            }
+        }
+
+        gaps.sort_by(|a, b| b.priority.cmp(&a.priority));
+        gaps
+    }
+
+    /// Generate development plan
+    pub async fn create_development_plan(
+        &mut self,
+        learner_id: &str,
+        competency_id: &str,
+        target_level: i32
+    ) -> Result<DevelopmentPlan, String> {
+        let mut profiles = self.learner_profiles.write().unwrap();
+        let profile = profiles.get_mut(learner_id)
+            .ok_or("Learner profile not found")?;
+
+        let current_level = profile.get_level(competency_id).unwrap_or(0);
+
+        if current_level >= target_level {
+            return Err("Already at or above target level".to_string());
+        }
+
+        let levels_to_gain = target_level - current_level;
+        let weeks_per_level = 8;
+
+        let plan = DevelopmentPlan {
+            competency_id: competency_id.to_string(),
+            current_level,
+            target_level,
+            activities: vec![], // Would be populated by AI recommendations
+            timeline_weeks: levels_to_gain * weeks_per_level,
+            progress: 0.0,
+            created_at: DateTime::now(),
+            due_date: None
+        };
+
+        if let Some(competency) = profile.competencies.get_mut(competency_id) {
+            competency.target_level = Some(target_level);
+            competency.development_plan = Some(plan.clone());
+        }
+
+        Ok(plan)
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id(prefix: &str) -> String {
+    use std::time::SystemTime;
+    format!("{}_{:x}", prefix, SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}

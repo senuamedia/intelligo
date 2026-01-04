@@ -1,0 +1,2155 @@
+/// Intelligo LMS - PayPal Payment Integration
+///
+/// Complete PayPal integration for payment processing including:
+/// - Orders API for one-time purchases
+/// - Subscriptions API for recurring billing
+/// - Webhook handling for payment events
+/// - Payout to instructors
+
+module intelligo::integrations::payments::paypal
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+use std::http::{HttpClient, Request, Response, Headers}
+use std::json::{Json, to_json, from_json}
+use std::crypto::{sha256, hmac_sha256}
+use std::base64
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+/// PayPal configuration
+type PayPalConfig {
+    /// Client ID
+    client_id: String,
+
+    /// Client secret
+    client_secret: String,
+
+    /// Webhook ID (for signature verification)
+    webhook_id: String,
+
+    /// API base URL
+    base_url: String,
+
+    /// Sandbox mode
+    sandbox: Bool,
+
+    /// Default currency
+    default_currency: String,
+
+    /// App fee percentage for marketplace
+    app_fee_percentage: f64
+}
+
+impl PayPalConfig {
+    fn default() -> PayPalConfig {
+        PayPalConfig {
+            client_id: "",
+            client_secret: "",
+            webhook_id: "",
+            base_url: "https://api-m.sandbox.paypal.com",
+            sandbox: true,
+            default_currency: "USD",
+            app_fee_percentage: 10.0
+        }
+    }
+
+    fn from_env() -> Result<PayPalConfig, PayPalError> {
+        let client_id = std::env::get("PAYPAL_CLIENT_ID")
+            .ok_or(PayPalError::ConfigurationError { message: "PAYPAL_CLIENT_ID not set".to_string() })?;
+        let client_secret = std::env::get("PAYPAL_CLIENT_SECRET")
+            .ok_or(PayPalError::ConfigurationError { message: "PAYPAL_CLIENT_SECRET not set".to_string() })?;
+        let webhook_id = std::env::get("PAYPAL_WEBHOOK_ID")
+            .ok_or(PayPalError::ConfigurationError { message: "PAYPAL_WEBHOOK_ID not set".to_string() })?;
+
+        let sandbox = std::env::get("PAYPAL_SANDBOX")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(true);
+
+        let base_url = if sandbox {
+            "https://api-m.sandbox.paypal.com"
+        } else {
+            "https://api-m.paypal.com"
+        }.to_string();
+
+        Ok(PayPalConfig {
+            client_id,
+            client_secret,
+            webhook_id,
+            base_url,
+            sandbox,
+            default_currency: std::env::get("PAYPAL_DEFAULT_CURRENCY").unwrap_or("USD".to_string()),
+            app_fee_percentage: std::env::get("PAYPAL_APP_FEE_PERCENT")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10.0)
+        })
+    }
+
+    fn production() -> PayPalConfig {
+        PayPalConfig {
+            base_url: "https://api-m.paypal.com".to_string(),
+            sandbox: false,
+            ..PayPalConfig::default()
+        }
+    }
+}
+
+// =============================================================================
+// PAYPAL TYPES
+// =============================================================================
+
+/// PayPal access token
+type AccessToken {
+    token: String,
+    token_type: String,
+    expires_at: DateTime
+}
+
+/// PayPal order
+type PayPalOrder {
+    id: String,
+    status: OrderStatus,
+    intent: OrderIntent,
+    purchase_units: List<PurchaseUnit>,
+    payer: Option<Payer>,
+    create_time: String,
+    update_time: Option<String>,
+    links: List<HateoasLink>
+}
+
+/// Order status
+enum OrderStatus {
+    Created,
+    Saved,
+    Approved,
+    Voided,
+    Completed,
+    PayerActionRequired
+}
+
+impl OrderStatus {
+    fn from_string(s: &str) -> OrderStatus {
+        match s.to_uppercase().as_str() {
+            "CREATED" => OrderStatus::Created,
+            "SAVED" => OrderStatus::Saved,
+            "APPROVED" => OrderStatus::Approved,
+            "VOIDED" => OrderStatus::Voided,
+            "COMPLETED" => OrderStatus::Completed,
+            "PAYER_ACTION_REQUIRED" => OrderStatus::PayerActionRequired,
+            _ => OrderStatus::Created
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            OrderStatus::Created => "CREATED",
+            OrderStatus::Saved => "SAVED",
+            OrderStatus::Approved => "APPROVED",
+            OrderStatus::Voided => "VOIDED",
+            OrderStatus::Completed => "COMPLETED",
+            OrderStatus::PayerActionRequired => "PAYER_ACTION_REQUIRED"
+        }.to_string()
+    }
+}
+
+/// Order intent
+enum OrderIntent {
+    Capture,
+    Authorize
+}
+
+impl OrderIntent {
+    fn to_string(&self) -> String {
+        match self {
+            OrderIntent::Capture => "CAPTURE",
+            OrderIntent::Authorize => "AUTHORIZE"
+        }.to_string()
+    }
+}
+
+/// Purchase unit (item in order)
+type PurchaseUnit {
+    reference_id: Option<String>,
+    description: Option<String>,
+    custom_id: Option<String>,
+    invoice_id: Option<String>,
+    amount: MoneyAmount,
+    payee: Option<Payee>,
+    payment_instruction: Option<PaymentInstruction>,
+    items: Option<List<Item>>,
+    shipping: Option<ShippingInfo>,
+    payments: Option<PaymentCollection>
+}
+
+/// Money amount
+type MoneyAmount {
+    currency_code: String,
+    value: String,
+    breakdown: Option<AmountBreakdown>
+}
+
+/// Amount breakdown
+type AmountBreakdown {
+    item_total: Option<Money>,
+    shipping: Option<Money>,
+    handling: Option<Money>,
+    tax_total: Option<Money>,
+    discount: Option<Money>
+}
+
+/// Simple money type
+type Money {
+    currency_code: String,
+    value: String
+}
+
+/// Payee (recipient)
+type Payee {
+    email_address: Option<String>,
+    merchant_id: Option<String>
+}
+
+/// Payment instruction for platform fees
+type PaymentInstruction {
+    platform_fees: Option<List<PlatformFee>>,
+    disbursement_mode: Option<DisbursementMode>
+}
+
+/// Platform fee
+type PlatformFee {
+    amount: Money,
+    payee: Option<Payee>
+}
+
+/// Disbursement mode
+enum DisbursementMode {
+    Instant,
+    Delayed
+}
+
+/// Item in purchase unit
+type Item {
+    name: String,
+    unit_amount: Money,
+    quantity: String,
+    description: Option<String>,
+    sku: Option<String>,
+    category: Option<ItemCategory>
+}
+
+/// Item category
+enum ItemCategory {
+    DigitalGoods,
+    PhysicalGoods,
+    Donation
+}
+
+impl ItemCategory {
+    fn to_string(&self) -> String {
+        match self {
+            ItemCategory::DigitalGoods => "DIGITAL_GOODS",
+            ItemCategory::PhysicalGoods => "PHYSICAL_GOODS",
+            ItemCategory::Donation => "DONATION"
+        }.to_string()
+    }
+}
+
+/// Shipping info
+type ShippingInfo {
+    name: Option<ShippingName>,
+    address: Option<Address>
+}
+
+/// Shipping name
+type ShippingName {
+    full_name: String
+}
+
+/// Address
+type Address {
+    address_line_1: Option<String>,
+    address_line_2: Option<String>,
+    admin_area_1: Option<String>,
+    admin_area_2: Option<String>,
+    postal_code: Option<String>,
+    country_code: String
+}
+
+/// Payment collection (captures, refunds, etc)
+type PaymentCollection {
+    captures: Option<List<Capture>>,
+    refunds: Option<List<PayPalRefund>>,
+    authorizations: Option<List<Authorization>>
+}
+
+/// Payment capture
+type Capture {
+    id: String,
+    status: CaptureStatus,
+    amount: Money,
+    final_capture: Bool,
+    seller_protection: Option<SellerProtection>,
+    create_time: String,
+    update_time: Option<String>
+}
+
+/// Capture status
+enum CaptureStatus {
+    Completed,
+    Declined,
+    PartiallyRefunded,
+    Pending,
+    Refunded,
+    Failed
+}
+
+impl CaptureStatus {
+    fn from_string(s: &str) -> CaptureStatus {
+        match s.to_uppercase().as_str() {
+            "COMPLETED" => CaptureStatus::Completed,
+            "DECLINED" => CaptureStatus::Declined,
+            "PARTIALLY_REFUNDED" => CaptureStatus::PartiallyRefunded,
+            "PENDING" => CaptureStatus::Pending,
+            "REFUNDED" => CaptureStatus::Refunded,
+            "FAILED" => CaptureStatus::Failed,
+            _ => CaptureStatus::Pending
+        }
+    }
+}
+
+/// Seller protection
+type SellerProtection {
+    status: String,
+    dispute_categories: Option<List<String>>
+}
+
+/// Authorization
+type Authorization {
+    id: String,
+    status: AuthorizationStatus,
+    amount: Money,
+    create_time: String,
+    expiration_time: Option<String>
+}
+
+/// Authorization status
+enum AuthorizationStatus {
+    Created,
+    Captured,
+    Denied,
+    Expired,
+    PartiallyCaptured,
+    Voided,
+    Pending
+}
+
+/// PayPal refund
+type PayPalRefund {
+    id: String,
+    status: RefundStatus,
+    amount: Money,
+    note_to_payer: Option<String>,
+    create_time: String,
+    update_time: Option<String>
+}
+
+/// Refund status
+enum RefundStatus {
+    Cancelled,
+    Failed,
+    Pending,
+    Completed
+}
+
+impl RefundStatus {
+    fn from_string(s: &str) -> RefundStatus {
+        match s.to_uppercase().as_str() {
+            "CANCELLED" => RefundStatus::Cancelled,
+            "FAILED" => RefundStatus::Failed,
+            "PENDING" => RefundStatus::Pending,
+            "COMPLETED" => RefundStatus::Completed,
+            _ => RefundStatus::Pending
+        }
+    }
+}
+
+/// Payer information
+type Payer {
+    payer_id: Option<String>,
+    email_address: Option<String>,
+    name: Option<PayerName>,
+    address: Option<Address>
+}
+
+/// Payer name
+type PayerName {
+    given_name: Option<String>,
+    surname: Option<String>
+}
+
+/// HATEOAS link
+type HateoasLink {
+    href: String,
+    rel: String,
+    method: Option<String>
+}
+
+// =============================================================================
+// SUBSCRIPTION TYPES
+// =============================================================================
+
+/// PayPal product (for subscriptions)
+type PayPalProduct {
+    id: String,
+    name: String,
+    description: Option<String>,
+    type_: ProductType,
+    category: Option<String>,
+    image_url: Option<String>,
+    home_url: Option<String>,
+    create_time: String,
+    update_time: Option<String>,
+    links: List<HateoasLink>
+}
+
+/// Product type
+enum ProductType {
+    Physical,
+    Digital,
+    Service
+}
+
+impl ProductType {
+    fn to_string(&self) -> String {
+        match self {
+            ProductType::Physical => "PHYSICAL",
+            ProductType::Digital => "DIGITAL",
+            ProductType::Service => "SERVICE"
+        }.to_string()
+    }
+}
+
+/// PayPal billing plan
+type BillingPlan {
+    id: String,
+    product_id: String,
+    name: String,
+    description: Option<String>,
+    status: PlanStatus,
+    billing_cycles: List<BillingCycle>,
+    payment_preferences: PaymentPreferences,
+    taxes: Option<Taxes>,
+    quantity_supported: Bool,
+    create_time: String,
+    update_time: Option<String>,
+    links: List<HateoasLink>
+}
+
+/// Plan status
+enum PlanStatus {
+    Created,
+    Active,
+    Inactive
+}
+
+impl PlanStatus {
+    fn from_string(s: &str) -> PlanStatus {
+        match s.to_uppercase().as_str() {
+            "CREATED" => PlanStatus::Created,
+            "ACTIVE" => PlanStatus::Active,
+            "INACTIVE" => PlanStatus::Inactive,
+            _ => PlanStatus::Created
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            PlanStatus::Created => "CREATED",
+            PlanStatus::Active => "ACTIVE",
+            PlanStatus::Inactive => "INACTIVE"
+        }.to_string()
+    }
+}
+
+/// Billing cycle
+type BillingCycle {
+    frequency: Frequency,
+    tenure_type: TenureType,
+    sequence: i32,
+    total_cycles: Option<i32>,
+    pricing_scheme: PricingScheme
+}
+
+/// Frequency
+type Frequency {
+    interval_unit: IntervalUnit,
+    interval_count: i32
+}
+
+/// Interval unit
+enum IntervalUnit {
+    Day,
+    Week,
+    Month,
+    Year
+}
+
+impl IntervalUnit {
+    fn to_string(&self) -> String {
+        match self {
+            IntervalUnit::Day => "DAY",
+            IntervalUnit::Week => "WEEK",
+            IntervalUnit::Month => "MONTH",
+            IntervalUnit::Year => "YEAR"
+        }.to_string()
+    }
+}
+
+/// Tenure type
+enum TenureType {
+    Regular,
+    Trial
+}
+
+impl TenureType {
+    fn to_string(&self) -> String {
+        match self {
+            TenureType::Regular => "REGULAR",
+            TenureType::Trial => "TRIAL"
+        }.to_string()
+    }
+}
+
+/// Pricing scheme
+type PricingScheme {
+    version: Option<i32>,
+    fixed_price: Money
+}
+
+/// Payment preferences
+type PaymentPreferences {
+    auto_bill_outstanding: Bool,
+    setup_fee: Option<Money>,
+    setup_fee_failure_action: Option<SetupFeeFailureAction>,
+    payment_failure_threshold: i32
+}
+
+/// Setup fee failure action
+enum SetupFeeFailureAction {
+    Continue,
+    Cancel
+}
+
+/// Taxes
+type Taxes {
+    percentage: String,
+    inclusive: Bool
+}
+
+/// PayPal subscription
+type PayPalSubscription {
+    id: String,
+    plan_id: String,
+    status: SubscriptionStatus,
+    status_change_note: Option<String>,
+    status_update_time: Option<String>,
+    start_time: String,
+    quantity: Option<String>,
+    shipping_amount: Option<Money>,
+    subscriber: Option<Subscriber>,
+    billing_info: Option<BillingInfo>,
+    create_time: String,
+    update_time: Option<String>,
+    custom_id: Option<String>,
+    plan_overridden: Bool,
+    links: List<HateoasLink>
+}
+
+/// Subscription status
+enum SubscriptionStatus {
+    ApprovalPending,
+    Approved,
+    Active,
+    Suspended,
+    Cancelled,
+    Expired
+}
+
+impl SubscriptionStatus {
+    fn from_string(s: &str) -> SubscriptionStatus {
+        match s.to_uppercase().as_str() {
+            "APPROVAL_PENDING" => SubscriptionStatus::ApprovalPending,
+            "APPROVED" => SubscriptionStatus::Approved,
+            "ACTIVE" => SubscriptionStatus::Active,
+            "SUSPENDED" => SubscriptionStatus::Suspended,
+            "CANCELLED" => SubscriptionStatus::Cancelled,
+            "EXPIRED" => SubscriptionStatus::Expired,
+            _ => SubscriptionStatus::ApprovalPending
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            SubscriptionStatus::ApprovalPending => "APPROVAL_PENDING",
+            SubscriptionStatus::Approved => "APPROVED",
+            SubscriptionStatus::Active => "ACTIVE",
+            SubscriptionStatus::Suspended => "SUSPENDED",
+            SubscriptionStatus::Cancelled => "CANCELLED",
+            SubscriptionStatus::Expired => "EXPIRED"
+        }.to_string()
+    }
+}
+
+/// Subscriber
+type Subscriber {
+    name: Option<PayerName>,
+    email_address: Option<String>,
+    payer_id: Option<String>,
+    shipping_address: Option<ShippingInfo>
+}
+
+/// Billing info
+type BillingInfo {
+    outstanding_balance: Money,
+    cycle_executions: List<CycleExecution>,
+    last_payment: Option<LastPayment>,
+    next_billing_time: Option<String>,
+    final_payment_time: Option<String>,
+    failed_payments_count: i32
+}
+
+/// Cycle execution
+type CycleExecution {
+    tenure_type: String,
+    sequence: i32,
+    cycles_completed: i32,
+    cycles_remaining: Option<i32>,
+    current_pricing_scheme_version: Option<i32>,
+    total_cycles: Option<i32>
+}
+
+/// Last payment
+type LastPayment {
+    amount: Money,
+    time: String
+}
+
+// =============================================================================
+// PAYOUT TYPES
+// =============================================================================
+
+/// Payout batch
+type PayoutBatch {
+    batch_header: BatchHeader,
+    items: Option<List<PayoutItem>>,
+    links: List<HateoasLink>
+}
+
+/// Batch header
+type BatchHeader {
+    payout_batch_id: String,
+    batch_status: BatchStatus,
+    sender_batch_header: SenderBatchHeader,
+    time_created: Option<String>,
+    time_completed: Option<String>,
+    amount: Option<Money>,
+    fees: Option<Money>
+}
+
+/// Batch status
+enum BatchStatus {
+    Denied,
+    Pending,
+    Processing,
+    Success,
+    Canceled
+}
+
+impl BatchStatus {
+    fn from_string(s: &str) -> BatchStatus {
+        match s.to_uppercase().as_str() {
+            "DENIED" => BatchStatus::Denied,
+            "PENDING" => BatchStatus::Pending,
+            "PROCESSING" => BatchStatus::Processing,
+            "SUCCESS" => BatchStatus::Success,
+            "CANCELED" => BatchStatus::Canceled,
+            _ => BatchStatus::Pending
+        }
+    }
+}
+
+/// Sender batch header
+type SenderBatchHeader {
+    sender_batch_id: String,
+    email_subject: Option<String>,
+    email_message: Option<String>,
+    recipient_type: Option<RecipientType>
+}
+
+/// Recipient type
+enum RecipientType {
+    Email,
+    Phone,
+    PaypalId
+}
+
+impl RecipientType {
+    fn to_string(&self) -> String {
+        match self {
+            RecipientType::Email => "EMAIL",
+            RecipientType::Phone => "PHONE",
+            RecipientType::PaypalId => "PAYPAL_ID"
+        }.to_string()
+    }
+}
+
+/// Payout item
+type PayoutItem {
+    payout_item_id: String,
+    transaction_id: Option<String>,
+    transaction_status: PayoutItemStatus,
+    payout_item_fee: Option<Money>,
+    payout_batch_id: String,
+    sender_item_id: Option<String>,
+    recipient_type: String,
+    amount: Money,
+    note: Option<String>,
+    receiver: String,
+    time_processed: Option<String>
+}
+
+/// Payout item status
+enum PayoutItemStatus {
+    Success,
+    Failed,
+    Pending,
+    Unclaimed,
+    Returned,
+    Onhold,
+    Blocked,
+    Refunded,
+    Reversed
+}
+
+impl PayoutItemStatus {
+    fn from_string(s: &str) -> PayoutItemStatus {
+        match s.to_uppercase().as_str() {
+            "SUCCESS" => PayoutItemStatus::Success,
+            "FAILED" => PayoutItemStatus::Failed,
+            "PENDING" => PayoutItemStatus::Pending,
+            "UNCLAIMED" => PayoutItemStatus::Unclaimed,
+            "RETURNED" => PayoutItemStatus::Returned,
+            "ONHOLD" => PayoutItemStatus::Onhold,
+            "BLOCKED" => PayoutItemStatus::Blocked,
+            "REFUNDED" => PayoutItemStatus::Refunded,
+            "REVERSED" => PayoutItemStatus::Reversed,
+            _ => PayoutItemStatus::Pending
+        }
+    }
+}
+
+// =============================================================================
+// WEBHOOK TYPES
+// =============================================================================
+
+/// PayPal webhook event
+type PayPalWebhookEvent {
+    id: String,
+    event_version: String,
+    create_time: String,
+    resource_type: String,
+    event_type: String,
+    summary: String,
+    resource: Json,
+    links: List<HateoasLink>
+}
+
+/// Webhook event types
+enum PayPalEventType {
+    /// Checkout order approved
+    CheckoutOrderApproved,
+    /// Checkout order completed
+    CheckoutOrderCompleted,
+    /// Payment capture completed
+    PaymentCaptureCompleted,
+    /// Payment capture denied
+    PaymentCaptureDenied,
+    /// Payment capture refunded
+    PaymentCaptureRefunded,
+    /// Subscription activated
+    BillingSubscriptionActivated,
+    /// Subscription cancelled
+    BillingSubscriptionCancelled,
+    /// Subscription suspended
+    BillingSubscriptionSuspended,
+    /// Subscription payment failed
+    BillingSubscriptionPaymentFailed,
+    /// Payout batch success
+    PaymentPayoutsBatchSuccess,
+    /// Unknown event
+    Unknown { event_type: String }
+}
+
+impl PayPalEventType {
+    fn from_string(s: &str) -> PayPalEventType {
+        match s {
+            "CHECKOUT.ORDER.APPROVED" => PayPalEventType::CheckoutOrderApproved,
+            "CHECKOUT.ORDER.COMPLETED" => PayPalEventType::CheckoutOrderCompleted,
+            "PAYMENT.CAPTURE.COMPLETED" => PayPalEventType::PaymentCaptureCompleted,
+            "PAYMENT.CAPTURE.DENIED" => PayPalEventType::PaymentCaptureDenied,
+            "PAYMENT.CAPTURE.REFUNDED" => PayPalEventType::PaymentCaptureRefunded,
+            "BILLING.SUBSCRIPTION.ACTIVATED" => PayPalEventType::BillingSubscriptionActivated,
+            "BILLING.SUBSCRIPTION.CANCELLED" => PayPalEventType::BillingSubscriptionCancelled,
+            "BILLING.SUBSCRIPTION.SUSPENDED" => PayPalEventType::BillingSubscriptionSuspended,
+            "BILLING.SUBSCRIPTION.PAYMENT.FAILED" => PayPalEventType::BillingSubscriptionPaymentFailed,
+            "PAYMENT.PAYOUTSBATCH.SUCCESS" => PayPalEventType::PaymentPayoutsBatchSuccess,
+            _ => PayPalEventType::Unknown { event_type: s.to_string() }
+        }
+    }
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// PayPal-specific errors
+enum PayPalError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// Authentication error
+    AuthenticationError { message: String },
+    /// API error
+    ApiError { name: String, message: String, debug_id: Option<String> },
+    /// Invalid request
+    InvalidRequest { message: String, details: Option<List<ErrorDetail>> },
+    /// Resource not found
+    NotFound { resource_type: String, resource_id: String },
+    /// Unprocessable entity
+    UnprocessableEntity { message: String, details: Option<List<ErrorDetail>> },
+    /// Rate limit exceeded
+    RateLimitError { retry_after: Option<i64> },
+    /// Webhook verification failed
+    WebhookError { message: String },
+    /// Network error
+    NetworkError { message: String },
+    /// Serialization error
+    SerializationError { message: String }
+}
+
+/// Error detail
+type ErrorDetail {
+    field: String,
+    value: Option<String>,
+    location: Option<String>,
+    issue: String,
+    description: Option<String>
+}
+
+impl PayPalError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            PayPalError::ConfigurationError { message } =>
+                LmsError::IntegrationError { provider: "paypal".to_string(), message: message.clone() },
+            PayPalError::AuthenticationError { message } =>
+                LmsError::AccessDenied { reason: message.clone() },
+            PayPalError::ApiError { message, .. } =>
+                LmsError::IntegrationError { provider: "paypal".to_string(), message: message.clone() },
+            PayPalError::NotFound { resource_type, resource_id } =>
+                LmsError::NotFound { entity_type: resource_type.clone(), id: resource_id.clone() },
+            PayPalError::RateLimitError { retry_after } =>
+                LmsError::RateLimitExceeded { retry_after: Duration::seconds(retry_after.unwrap_or(60)) },
+            _ => LmsError::IntegrationError { provider: "paypal".to_string(), message: format!("{:?}", self) }
+        }
+    }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating an order
+type CreateOrderInput {
+    /// Course being purchased
+    course_id: CourseId,
+    /// Course name
+    course_name: String,
+    /// Course description
+    course_description: Option<String>,
+    /// Price amount
+    amount: f64,
+    /// Currency code
+    currency: String,
+    /// User purchasing
+    user_id: UserId,
+    /// Return URL after approval
+    return_url: String,
+    /// Cancel URL
+    cancel_url: String,
+    /// Instructor's PayPal merchant ID (for marketplace)
+    instructor_merchant_id: Option<String>,
+    /// Custom metadata
+    metadata: Map<String, String>
+}
+
+/// Input for creating a product
+type CreateProductInput {
+    name: String,
+    description: Option<String>,
+    course_id: CourseId,
+    image_url: Option<String>,
+    home_url: Option<String>
+}
+
+/// Input for creating a billing plan
+type CreatePlanInput {
+    product_id: String,
+    name: String,
+    description: Option<String>,
+    /// Monthly amount
+    monthly_price: f64,
+    /// Annual amount (optional)
+    annual_price: Option<f64>,
+    currency: String,
+    /// Trial period days
+    trial_days: Option<i32>,
+    /// Auto bill outstanding
+    auto_bill: Bool
+}
+
+/// Input for creating a subscription
+type CreateSubscriptionInput {
+    plan_id: String,
+    user_id: UserId,
+    course_id: CourseId,
+    return_url: String,
+    cancel_url: String,
+    custom_id: Option<String>,
+    start_time: Option<DateTime>
+}
+
+/// Input for creating a payout
+type CreatePayoutInput {
+    /// Unique batch ID
+    batch_id: String,
+    /// Email subject
+    email_subject: String,
+    /// Email message
+    email_message: Option<String>,
+    /// Payout items
+    items: List<PayoutItemInput>
+}
+
+/// Payout item input
+type PayoutItemInput {
+    /// Unique item ID
+    item_id: String,
+    /// Recipient email or PayPal ID
+    receiver: String,
+    /// Recipient type
+    receiver_type: RecipientType,
+    /// Amount
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Note to recipient
+    note: Option<String>
+}
+
+/// Input for creating a refund
+type CreateRefundInput {
+    /// Capture ID to refund
+    capture_id: String,
+    /// Amount to refund (partial refund if less than capture)
+    amount: Option<f64>,
+    /// Currency
+    currency: Option<String>,
+    /// Note to payer
+    note_to_payer: Option<String>,
+    /// Invoice ID
+    invoice_id: Option<String>
+}
+
+// =============================================================================
+// PAYPAL ACTOR
+// =============================================================================
+
+/// Actor for PayPal payment processing
+actor PayPalActor {
+    /// Configuration
+    config: PayPalConfig,
+
+    /// HTTP client
+    client: HttpClient,
+
+    /// Current access token
+    access_token: Option<AccessToken>,
+
+    /// Processed webhook events (event_id -> timestamp)
+    processed_events: Map<String, i64>,
+
+    /// Product cache (course_id -> paypal_product_id)
+    product_cache: Map<CourseId, String>,
+
+    /// Plan cache (product_id -> plan_id)
+    plan_cache: Map<String, String>
+}
+
+impl PayPalActor {
+    /// Create new PayPal actor
+    pub fn new(config: PayPalConfig) -> PayPalActor {
+        PayPalActor {
+            config,
+            client: HttpClient::new(),
+            access_token: None,
+            processed_events: Map::new(),
+            product_cache: Map::new(),
+            plan_cache: Map::new()
+        }
+    }
+
+    /// Create from environment
+    pub fn from_env() -> Result<PayPalActor, PayPalError> {
+        let config = PayPalConfig::from_env()?;
+        Ok(PayPalActor::new(config))
+    }
+
+    // =========================================================================
+    // AUTHENTICATION
+    // =========================================================================
+
+    /// Get valid access token (refreshing if needed)
+    async fn get_access_token(&mut self) -> Result<String, PayPalError> {
+        // Check if current token is still valid
+        if let Some(ref token) = self.access_token {
+            if token.expires_at > DateTime::now() + Duration::minutes(1) {
+                return Ok(token.token.clone())
+            }
+        }
+
+        // Request new token
+        let credentials = format!("{}:{}", self.config.client_id, self.config.client_secret);
+        let encoded_credentials = base64::encode(credentials.as_bytes());
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Basic {}", encoded_credentials));
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+
+        let url = format!("{}/v1/oauth2/token", self.config.base_url);
+        let body = "grant_type=client_credentials";
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| PayPalError::NetworkError { message: e.to_string() })?;
+
+        if response.status() != 200 {
+            return Err(PayPalError::AuthenticationError {
+                message: "Failed to obtain access token".to_string()
+            })
+        }
+
+        let json: Json = response.json().await
+            .map_err(|e| PayPalError::SerializationError { message: e.to_string() })?;
+
+        let token = json.get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or(PayPalError::AuthenticationError { message: "No access_token in response".to_string() })?
+            .to_string();
+
+        let expires_in = json.get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+
+        let access_token = AccessToken {
+            token: token.clone(),
+            token_type: "Bearer".to_string(),
+            expires_at: DateTime::now() + Duration::seconds(expires_in)
+        };
+
+        self.access_token = Some(access_token);
+
+        Ok(token)
+    }
+
+    /// Build authorization header
+    async fn auth_header(&mut self) -> Result<String, PayPalError> {
+        let token = self.get_access_token().await?;
+        Ok(format!("Bearer {}", token))
+    }
+
+    // =========================================================================
+    // HTTP HELPERS
+    // =========================================================================
+
+    /// Make POST request
+    async fn post(&mut self, endpoint: &str, body: &Json, request_id: Option<String>) -> Result<Json, PayPalError> {
+        let auth = self.auth_header().await?;
+        let url = format!("{}{}", self.config.base_url, endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &auth);
+        headers.set("Content-Type", "application/json");
+
+        if let Some(id) = request_id {
+            headers.set("PayPal-Request-Id", &id);
+        }
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&to_json(body))
+            .send()
+            .await
+            .map_err(|e| PayPalError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make GET request
+    async fn get(&mut self, endpoint: &str) -> Result<Json, PayPalError> {
+        let auth = self.auth_header().await?;
+        let url = format!("{}{}", self.config.base_url, endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &auth);
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| PayPalError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make PATCH request
+    async fn patch(&mut self, endpoint: &str, body: &Json) -> Result<Json, PayPalError> {
+        let auth = self.auth_header().await?;
+        let url = format!("{}{}", self.config.base_url, endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &auth);
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.patch(&url)
+            .headers(headers)
+            .body(&to_json(body))
+            .send()
+            .await
+            .map_err(|e| PayPalError::NetworkError { message: e.to_string() })?;
+
+        // PATCH often returns 204 No Content
+        if response.status() == 204 {
+            return Ok(Json::Null)
+        }
+
+        self.handle_response(response).await
+    }
+
+    /// Handle API response
+    async fn handle_response(&self, response: Response) -> Result<Json, PayPalError> {
+        let status = response.status();
+        let body = response.text().await
+            .map_err(|e| PayPalError::NetworkError { message: e.to_string() })?;
+
+        // Empty body (204 No Content)
+        if body.is_empty() {
+            return Ok(Json::Null)
+        }
+
+        let json: Json = from_json(&body)
+            .map_err(|e| PayPalError::SerializationError { message: e.to_string() })?;
+
+        if status >= 200 && status < 300 {
+            return Ok(json)
+        }
+
+        // Parse error response
+        let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("UNKNOWN_ERROR").to_string();
+        let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error").to_string();
+        let debug_id = json.get("debug_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        match status {
+            401 => Err(PayPalError::AuthenticationError { message }),
+            404 => Err(PayPalError::NotFound {
+                resource_type: "resource".to_string(),
+                resource_id: "unknown".to_string()
+            }),
+            422 => {
+                let details = self.parse_error_details(&json);
+                Err(PayPalError::UnprocessableEntity { message, details })
+            },
+            429 => {
+                let retry_after = json.get("retry_after").and_then(|v| v.as_i64());
+                Err(PayPalError::RateLimitError { retry_after })
+            },
+            _ => Err(PayPalError::ApiError { name, message, debug_id })
+        }
+    }
+
+    fn parse_error_details(&self, json: &Json) -> Option<List<ErrorDetail>> {
+        json.get("details")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().map(|d| ErrorDetail {
+                    field: d.get("field").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    value: d.get("value").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    location: d.get("location").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    issue: d.get("issue").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    description: d.get("description").and_then(|v| v.as_str()).map(|s| s.to_string())
+                }).collect()
+            })
+    }
+
+    // =========================================================================
+    // ORDERS API
+    // =========================================================================
+
+    /// Create an order for course purchase
+    pub async fn create_order(&mut self, input: CreateOrderInput) -> Result<PayPalOrder, PayPalError> {
+        let mut purchase_units = vec![
+            Json::object([
+                ("reference_id", Json::String(input.course_id.clone())),
+                ("description", Json::String(input.course_description.clone().unwrap_or(input.course_name.clone()))),
+                ("custom_id", Json::String(format!("{}:{}", input.user_id, input.course_id))),
+                ("amount", Json::object([
+                    ("currency_code", Json::String(input.currency.clone())),
+                    ("value", Json::String(format!("{:.2}", input.amount))),
+                    ("breakdown", Json::object([
+                        ("item_total", Json::object([
+                            ("currency_code", Json::String(input.currency.clone())),
+                            ("value", Json::String(format!("{:.2}", input.amount)))
+                        ]))
+                    ]))
+                ])),
+                ("items", Json::Array(vec![
+                    Json::object([
+                        ("name", Json::String(input.course_name.clone())),
+                        ("unit_amount", Json::object([
+                            ("currency_code", Json::String(input.currency.clone())),
+                            ("value", Json::String(format!("{:.2}", input.amount)))
+                        ])),
+                        ("quantity", Json::String("1".to_string())),
+                        ("category", Json::String("DIGITAL_GOODS".to_string()))
+                    ])
+                ]))
+            ])
+        ];
+
+        // Add platform fee if instructor merchant is specified (marketplace)
+        if let Some(merchant_id) = &input.instructor_merchant_id {
+            let platform_fee = input.amount * (self.config.app_fee_percentage / 100.0);
+
+            // Add payee (instructor)
+            if let Some(unit) = purchase_units.get_mut(0) {
+                unit.as_object_mut().map(|obj| {
+                    obj.insert("payee".to_string(), Json::object([
+                        ("merchant_id", Json::String(merchant_id.clone()))
+                    ]));
+
+                    obj.insert("payment_instruction".to_string(), Json::object([
+                        ("platform_fees", Json::Array(vec![
+                            Json::object([
+                                ("amount", Json::object([
+                                    ("currency_code", Json::String(input.currency.clone())),
+                                    ("value", Json::String(format!("{:.2}", platform_fee)))
+                                ]))
+                            ])
+                        ])),
+                        ("disbursement_mode", Json::String("INSTANT".to_string()))
+                    ]));
+                });
+            }
+        }
+
+        let body = Json::object([
+            ("intent", Json::String("CAPTURE".to_string())),
+            ("purchase_units", Json::Array(purchase_units)),
+            ("application_context", Json::object([
+                ("return_url", Json::String(input.return_url)),
+                ("cancel_url", Json::String(input.cancel_url)),
+                ("brand_name", Json::String("Intelligo".to_string())),
+                ("landing_page", Json::String("NO_PREFERENCE".to_string())),
+                ("shipping_preference", Json::String("NO_SHIPPING".to_string())),
+                ("user_action", Json::String("PAY_NOW".to_string()))
+            ]))
+        ]);
+
+        let request_id = format!("order-{}-{}", input.user_id, input.course_id);
+        let json = self.post("/v2/checkout/orders", &body, Some(request_id)).await?;
+        self.parse_order(json)
+    }
+
+    /// Get order by ID
+    pub async fn get_order(&mut self, order_id: &str) -> Result<PayPalOrder, PayPalError> {
+        let json = self.get(&format!("/v2/checkout/orders/{}", order_id)).await?;
+        self.parse_order(json)
+    }
+
+    /// Capture approved order
+    pub async fn capture_order(&mut self, order_id: &str) -> Result<PayPalOrder, PayPalError> {
+        let body = Json::object([]);
+        let request_id = format!("capture-{}", order_id);
+        let json = self.post(&format!("/v2/checkout/orders/{}/capture", order_id), &body, Some(request_id)).await?;
+        self.parse_order(json)
+    }
+
+    /// Authorize order (instead of capture)
+    pub async fn authorize_order(&mut self, order_id: &str) -> Result<PayPalOrder, PayPalError> {
+        let body = Json::object([]);
+        let request_id = format!("authorize-{}", order_id);
+        let json = self.post(&format!("/v2/checkout/orders/{}/authorize", order_id), &body, Some(request_id)).await?;
+        self.parse_order(json)
+    }
+
+    fn parse_order(&self, json: Json) -> Result<PayPalOrder, PayPalError> {
+        let links = self.parse_links(&json);
+
+        Ok(PayPalOrder {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: OrderStatus::from_string(json.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+            intent: if json.get("intent").and_then(|v| v.as_str()).unwrap_or("") == "AUTHORIZE" {
+                OrderIntent::Authorize
+            } else {
+                OrderIntent::Capture
+            },
+            purchase_units: self.parse_purchase_units(&json),
+            payer: self.parse_payer(&json),
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            update_time: json.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            links
+        })
+    }
+
+    fn parse_purchase_units(&self, json: &Json) -> List<PurchaseUnit> {
+        json.get("purchase_units")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().map(|pu| {
+                    PurchaseUnit {
+                        reference_id: pu.get("reference_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        description: pu.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        custom_id: pu.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        invoice_id: pu.get("invoice_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        amount: self.parse_amount(pu.get("amount").cloned().unwrap_or(Json::Null)),
+                        payee: pu.get("payee").map(|p| Payee {
+                            email_address: p.get("email_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            merchant_id: p.get("merchant_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        }),
+                        payment_instruction: None,
+                        items: None,
+                        shipping: None,
+                        payments: self.parse_payments(pu)
+                    }
+                }).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn parse_amount(&self, json: Json) -> MoneyAmount {
+        MoneyAmount {
+            currency_code: json.get("currency_code").and_then(|v| v.as_str()).unwrap_or("USD").to_string(),
+            value: json.get("value").and_then(|v| v.as_str()).unwrap_or("0.00").to_string(),
+            breakdown: None
+        }
+    }
+
+    fn parse_payer(&self, json: &Json) -> Option<Payer> {
+        json.get("payer").map(|p| Payer {
+            payer_id: p.get("payer_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email_address: p.get("email_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            name: p.get("name").map(|n| PayerName {
+                given_name: n.get("given_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                surname: n.get("surname").and_then(|v| v.as_str()).map(|s| s.to_string())
+            }),
+            address: None
+        })
+    }
+
+    fn parse_payments(&self, json: &Json) -> Option<PaymentCollection> {
+        json.get("payments").map(|p| PaymentCollection {
+            captures: p.get("captures").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().map(|c| Capture {
+                    id: c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    status: CaptureStatus::from_string(c.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+                    amount: self.parse_money(c.get("amount").cloned().unwrap_or(Json::Null)),
+                    final_capture: c.get("final_capture").and_then(|v| v.as_bool()).unwrap_or(true),
+                    seller_protection: None,
+                    create_time: c.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    update_time: c.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string())
+                }).collect()
+            }),
+            refunds: None,
+            authorizations: None
+        })
+    }
+
+    fn parse_money(&self, json: Json) -> Money {
+        Money {
+            currency_code: json.get("currency_code").and_then(|v| v.as_str()).unwrap_or("USD").to_string(),
+            value: json.get("value").and_then(|v| v.as_str()).unwrap_or("0.00").to_string()
+        }
+    }
+
+    fn parse_links(&self, json: &Json) -> List<HateoasLink> {
+        json.get("links")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().map(|l| HateoasLink {
+                    href: l.get("href").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    rel: l.get("rel").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    method: l.get("method").and_then(|v| v.as_str()).map(|s| s.to_string())
+                }).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get approval URL from order
+    pub fn get_approval_url(&self, order: &PayPalOrder) -> Option<String> {
+        order.links.iter()
+            .find(|l| l.rel == "approve")
+            .map(|l| l.href.clone())
+    }
+
+    // =========================================================================
+    // REFUNDS
+    // =========================================================================
+
+    /// Create a refund for a capture
+    pub async fn create_refund(&mut self, input: CreateRefundInput) -> Result<PayPalRefund, PayPalError> {
+        let mut body = Json::object([]);
+
+        if let Some(amount) = input.amount {
+            let currency = input.currency.unwrap_or(self.config.default_currency.clone());
+            body.as_object_mut().map(|obj| {
+                obj.insert("amount".to_string(), Json::object([
+                    ("value", Json::String(format!("{:.2}", amount))),
+                    ("currency_code", Json::String(currency))
+                ]));
+            });
+        }
+
+        if let Some(note) = input.note_to_payer {
+            body.as_object_mut().map(|obj| {
+                obj.insert("note_to_payer".to_string(), Json::String(note));
+            });
+        }
+
+        if let Some(invoice_id) = input.invoice_id {
+            body.as_object_mut().map(|obj| {
+                obj.insert("invoice_id".to_string(), Json::String(invoice_id));
+            });
+        }
+
+        let request_id = format!("refund-{}", input.capture_id);
+        let json = self.post(&format!("/v2/payments/captures/{}/refund", input.capture_id), &body, Some(request_id)).await?;
+
+        Ok(PayPalRefund {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: RefundStatus::from_string(json.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+            amount: self.parse_money(json.get("amount").cloned().unwrap_or(Json::Null)),
+            note_to_payer: json.get("note_to_payer").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            update_time: json.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    }
+
+    /// Get refund details
+    pub async fn get_refund(&mut self, refund_id: &str) -> Result<PayPalRefund, PayPalError> {
+        let json = self.get(&format!("/v2/payments/refunds/{}", refund_id)).await?;
+
+        Ok(PayPalRefund {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: RefundStatus::from_string(json.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+            amount: self.parse_money(json.get("amount").cloned().unwrap_or(Json::Null)),
+            note_to_payer: json.get("note_to_payer").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            update_time: json.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    }
+
+    // =========================================================================
+    // SUBSCRIPTIONS API
+    // =========================================================================
+
+    /// Create a product for subscriptions
+    pub async fn create_product(&mut self, input: CreateProductInput) -> Result<PayPalProduct, PayPalError> {
+        let mut body = Json::object([
+            ("name", Json::String(input.name)),
+            ("type", Json::String("DIGITAL".to_string())),
+            ("category", Json::String("EDUCATIONAL_AND_TEXTBOOKS".to_string()))
+        ]);
+
+        if let Some(desc) = input.description {
+            body.as_object_mut().map(|obj| {
+                obj.insert("description".to_string(), Json::String(desc));
+            });
+        }
+
+        if let Some(image) = input.image_url {
+            body.as_object_mut().map(|obj| {
+                obj.insert("image_url".to_string(), Json::String(image));
+            });
+        }
+
+        if let Some(home) = input.home_url {
+            body.as_object_mut().map(|obj| {
+                obj.insert("home_url".to_string(), Json::String(home));
+            });
+        }
+
+        let request_id = format!("product-{}", input.course_id);
+        let json = self.post("/v1/catalogs/products", &body, Some(request_id)).await?;
+
+        let product = self.parse_product(json)?;
+        self.product_cache.insert(input.course_id, product.id.clone());
+
+        Ok(product)
+    }
+
+    /// Get product by ID
+    pub async fn get_product(&mut self, product_id: &str) -> Result<PayPalProduct, PayPalError> {
+        let json = self.get(&format!("/v1/catalogs/products/{}", product_id)).await?;
+        self.parse_product(json)
+    }
+
+    fn parse_product(&self, json: Json) -> Result<PayPalProduct, PayPalError> {
+        Ok(PayPalProduct {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            description: json.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            type_: match json.get("type").and_then(|v| v.as_str()).unwrap_or("DIGITAL") {
+                "PHYSICAL" => ProductType::Physical,
+                "SERVICE" => ProductType::Service,
+                _ => ProductType::Digital
+            },
+            category: json.get("category").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            image_url: json.get("image_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            home_url: json.get("home_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            update_time: json.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            links: self.parse_links(&json)
+        })
+    }
+
+    /// Create a billing plan
+    pub async fn create_plan(&mut self, input: CreatePlanInput) -> Result<BillingPlan, PayPalError> {
+        let mut billing_cycles = vec![
+            Json::object([
+                ("frequency", Json::object([
+                    ("interval_unit", Json::String("MONTH".to_string())),
+                    ("interval_count", Json::Number(1.into()))
+                ])),
+                ("tenure_type", Json::String("REGULAR".to_string())),
+                ("sequence", Json::Number(1.into())),
+                ("total_cycles", Json::Number(0.into())), // Infinite
+                ("pricing_scheme", Json::object([
+                    ("fixed_price", Json::object([
+                        ("value", Json::String(format!("{:.2}", input.monthly_price))),
+                        ("currency_code", Json::String(input.currency.clone()))
+                    ]))
+                ]))
+            ])
+        ];
+
+        // Add trial if specified
+        if let Some(trial_days) = input.trial_days {
+            billing_cycles.insert(0, Json::object([
+                ("frequency", Json::object([
+                    ("interval_unit", Json::String("DAY".to_string())),
+                    ("interval_count", Json::Number(trial_days.into()))
+                ])),
+                ("tenure_type", Json::String("TRIAL".to_string())),
+                ("sequence", Json::Number(1.into())),
+                ("total_cycles", Json::Number(1.into())),
+                ("pricing_scheme", Json::object([
+                    ("fixed_price", Json::object([
+                        ("value", Json::String("0.00".to_string())),
+                        ("currency_code", Json::String(input.currency.clone()))
+                    ]))
+                ]))
+            ]));
+
+            // Adjust sequence of regular cycle
+            if let Some(regular) = billing_cycles.get_mut(1) {
+                regular.as_object_mut().map(|obj| {
+                    obj.insert("sequence".to_string(), Json::Number(2.into()));
+                });
+            }
+        }
+
+        let body = Json::object([
+            ("product_id", Json::String(input.product_id.clone())),
+            ("name", Json::String(input.name)),
+            ("description", Json::String(input.description.unwrap_or_default())),
+            ("status", Json::String("ACTIVE".to_string())),
+            ("billing_cycles", Json::Array(billing_cycles)),
+            ("payment_preferences", Json::object([
+                ("auto_bill_outstanding", Json::Bool(input.auto_bill)),
+                ("payment_failure_threshold", Json::Number(3.into()))
+            ]))
+        ]);
+
+        let request_id = format!("plan-{}", input.product_id);
+        let json = self.post("/v1/billing/plans", &body, Some(request_id)).await?;
+
+        let plan = self.parse_plan(json)?;
+        self.plan_cache.insert(input.product_id, plan.id.clone());
+
+        Ok(plan)
+    }
+
+    /// Get plan by ID
+    pub async fn get_plan(&mut self, plan_id: &str) -> Result<BillingPlan, PayPalError> {
+        let json = self.get(&format!("/v1/billing/plans/{}", plan_id)).await?;
+        self.parse_plan(json)
+    }
+
+    /// Deactivate plan
+    pub async fn deactivate_plan(&mut self, plan_id: &str) -> Result<(), PayPalError> {
+        self.post(&format!("/v1/billing/plans/{}/deactivate", plan_id), &Json::object([]), None).await?;
+        Ok(())
+    }
+
+    /// Activate plan
+    pub async fn activate_plan(&mut self, plan_id: &str) -> Result<(), PayPalError> {
+        self.post(&format!("/v1/billing/plans/{}/activate", plan_id), &Json::object([]), None).await?;
+        Ok(())
+    }
+
+    fn parse_plan(&self, json: Json) -> Result<BillingPlan, PayPalError> {
+        Ok(BillingPlan {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            product_id: json.get("product_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            description: json.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            status: PlanStatus::from_string(json.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+            billing_cycles: vec![], // Parse if needed
+            payment_preferences: PaymentPreferences {
+                auto_bill_outstanding: true,
+                setup_fee: None,
+                setup_fee_failure_action: None,
+                payment_failure_threshold: 3
+            },
+            taxes: None,
+            quantity_supported: false,
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            update_time: json.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            links: self.parse_links(&json)
+        })
+    }
+
+    /// Create a subscription
+    pub async fn create_subscription(&mut self, input: CreateSubscriptionInput) -> Result<PayPalSubscription, PayPalError> {
+        let mut body = Json::object([
+            ("plan_id", Json::String(input.plan_id)),
+            ("application_context", Json::object([
+                ("brand_name", Json::String("Intelligo".to_string())),
+                ("locale", Json::String("en-US".to_string())),
+                ("shipping_preference", Json::String("NO_SHIPPING".to_string())),
+                ("user_action", Json::String("SUBSCRIBE_NOW".to_string())),
+                ("return_url", Json::String(input.return_url)),
+                ("cancel_url", Json::String(input.cancel_url))
+            ]))
+        ]);
+
+        if let Some(custom_id) = input.custom_id {
+            body.as_object_mut().map(|obj| {
+                obj.insert("custom_id".to_string(), Json::String(custom_id));
+            });
+        } else {
+            body.as_object_mut().map(|obj| {
+                obj.insert("custom_id".to_string(), Json::String(format!("{}:{}", input.user_id, input.course_id)));
+            });
+        }
+
+        if let Some(start) = input.start_time {
+            body.as_object_mut().map(|obj| {
+                obj.insert("start_time".to_string(), Json::String(start.to_rfc3339()));
+            });
+        }
+
+        let request_id = format!("subscription-{}-{}", input.user_id, input.course_id);
+        let json = self.post("/v1/billing/subscriptions", &body, Some(request_id)).await?;
+        self.parse_subscription(json)
+    }
+
+    /// Get subscription by ID
+    pub async fn get_subscription(&mut self, subscription_id: &str) -> Result<PayPalSubscription, PayPalError> {
+        let json = self.get(&format!("/v1/billing/subscriptions/{}", subscription_id)).await?;
+        self.parse_subscription(json)
+    }
+
+    /// Suspend subscription
+    pub async fn suspend_subscription(&mut self, subscription_id: &str, reason: &str) -> Result<(), PayPalError> {
+        let body = Json::object([
+            ("reason", Json::String(reason.to_string()))
+        ]);
+
+        self.post(&format!("/v1/billing/subscriptions/{}/suspend", subscription_id), &body, None).await?;
+        Ok(())
+    }
+
+    /// Cancel subscription
+    pub async fn cancel_subscription(&mut self, subscription_id: &str, reason: &str) -> Result<(), PayPalError> {
+        let body = Json::object([
+            ("reason", Json::String(reason.to_string()))
+        ]);
+
+        self.post(&format!("/v1/billing/subscriptions/{}/cancel", subscription_id), &body, None).await?;
+        Ok(())
+    }
+
+    /// Activate subscription
+    pub async fn activate_subscription(&mut self, subscription_id: &str, reason: &str) -> Result<(), PayPalError> {
+        let body = Json::object([
+            ("reason", Json::String(reason.to_string()))
+        ]);
+
+        self.post(&format!("/v1/billing/subscriptions/{}/activate", subscription_id), &body, None).await?;
+        Ok(())
+    }
+
+    /// Get approval URL from subscription
+    pub fn get_subscription_approval_url(&self, subscription: &PayPalSubscription) -> Option<String> {
+        subscription.links.iter()
+            .find(|l| l.rel == "approve")
+            .map(|l| l.href.clone())
+    }
+
+    fn parse_subscription(&self, json: Json) -> Result<PayPalSubscription, PayPalError> {
+        Ok(PayPalSubscription {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            plan_id: json.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: SubscriptionStatus::from_string(json.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+            status_change_note: json.get("status_change_note").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            status_update_time: json.get("status_update_time").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            start_time: json.get("start_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            quantity: json.get("quantity").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            shipping_amount: None,
+            subscriber: json.get("subscriber").map(|s| Subscriber {
+                name: s.get("name").map(|n| PayerName {
+                    given_name: n.get("given_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    surname: n.get("surname").and_then(|v| v.as_str()).map(|s| s.to_string())
+                }),
+                email_address: s.get("email_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                payer_id: s.get("payer_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                shipping_address: None
+            }),
+            billing_info: None,
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            update_time: json.get("update_time").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            custom_id: json.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            plan_overridden: json.get("plan_overridden").and_then(|v| v.as_bool()).unwrap_or(false),
+            links: self.parse_links(&json)
+        })
+    }
+
+    // =========================================================================
+    // PAYOUTS API
+    // =========================================================================
+
+    /// Create a payout batch (for instructor payments)
+    pub async fn create_payout(&mut self, input: CreatePayoutInput) -> Result<PayoutBatch, PayPalError> {
+        let items: Vec<Json> = input.items.iter().map(|item| {
+            Json::object([
+                ("recipient_type", Json::String(item.receiver_type.to_string())),
+                ("amount", Json::object([
+                    ("value", Json::String(format!("{:.2}", item.amount))),
+                    ("currency", Json::String(item.currency.clone()))
+                ])),
+                ("receiver", Json::String(item.receiver.clone())),
+                ("sender_item_id", Json::String(item.item_id.clone())),
+                ("note", Json::String(item.note.clone().unwrap_or_default()))
+            ])
+        }).collect();
+
+        let mut sender_batch_header = Json::object([
+            ("sender_batch_id", Json::String(input.batch_id)),
+            ("email_subject", Json::String(input.email_subject))
+        ]);
+
+        if let Some(message) = input.email_message {
+            sender_batch_header.as_object_mut().map(|obj| {
+                obj.insert("email_message".to_string(), Json::String(message));
+            });
+        }
+
+        let body = Json::object([
+            ("sender_batch_header", sender_batch_header),
+            ("items", Json::Array(items))
+        ]);
+
+        let json = self.post("/v1/payments/payouts", &body, None).await?;
+        self.parse_payout_batch(json)
+    }
+
+    /// Get payout batch details
+    pub async fn get_payout(&mut self, payout_batch_id: &str) -> Result<PayoutBatch, PayPalError> {
+        let json = self.get(&format!("/v1/payments/payouts/{}", payout_batch_id)).await?;
+        self.parse_payout_batch(json)
+    }
+
+    /// Get payout item details
+    pub async fn get_payout_item(&mut self, payout_item_id: &str) -> Result<PayoutItem, PayPalError> {
+        let json = self.get(&format!("/v1/payments/payouts-item/{}", payout_item_id)).await?;
+        self.parse_payout_item(json)
+    }
+
+    /// Cancel unclaimed payout item
+    pub async fn cancel_payout_item(&mut self, payout_item_id: &str) -> Result<PayoutItem, PayPalError> {
+        let json = self.post(&format!("/v1/payments/payouts-item/{}/cancel", payout_item_id), &Json::object([]), None).await?;
+        self.parse_payout_item(json)
+    }
+
+    fn parse_payout_batch(&self, json: Json) -> Result<PayoutBatch, PayPalError> {
+        let batch_header = json.get("batch_header").cloned().unwrap_or(Json::Null);
+        let sender_batch_header = batch_header.get("sender_batch_header").cloned().unwrap_or(Json::Null);
+
+        Ok(PayoutBatch {
+            batch_header: BatchHeader {
+                payout_batch_id: batch_header.get("payout_batch_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                batch_status: BatchStatus::from_string(batch_header.get("batch_status").and_then(|v| v.as_str()).unwrap_or("")),
+                sender_batch_header: SenderBatchHeader {
+                    sender_batch_id: sender_batch_header.get("sender_batch_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    email_subject: sender_batch_header.get("email_subject").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    email_message: sender_batch_header.get("email_message").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    recipient_type: None
+                },
+                time_created: batch_header.get("time_created").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                time_completed: batch_header.get("time_completed").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                amount: batch_header.get("amount").map(|a| self.parse_money(a.clone())),
+                fees: batch_header.get("fees").map(|f| self.parse_money(f.clone()))
+            },
+            items: json.get("items").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|item| self.parse_payout_item(item.clone()).ok()).collect()
+            }),
+            links: self.parse_links(&json)
+        })
+    }
+
+    fn parse_payout_item(&self, json: Json) -> Result<PayoutItem, PayPalError> {
+        Ok(PayoutItem {
+            payout_item_id: json.get("payout_item_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            transaction_id: json.get("transaction_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            transaction_status: PayoutItemStatus::from_string(json.get("transaction_status").and_then(|v| v.as_str()).unwrap_or("")),
+            payout_item_fee: json.get("payout_item_fee").map(|f| self.parse_money(f.clone())),
+            payout_batch_id: json.get("payout_batch_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            sender_item_id: json.get("sender_item_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            recipient_type: json.get("recipient_type").and_then(|v| v.as_str()).unwrap_or("EMAIL").to_string(),
+            amount: self.parse_money(json.get("amount").cloned().unwrap_or(Json::Null)),
+            note: json.get("note").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            receiver: json.get("receiver").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            time_processed: json.get("time_processed").and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    }
+
+    // =========================================================================
+    // WEBHOOK HANDLING
+    // =========================================================================
+
+    /// Verify webhook signature
+    pub async fn verify_webhook_signature(
+        &mut self,
+        headers: &Headers,
+        body: &str
+    ) -> Result<Bool, PayPalError> {
+        let transmission_id = headers.get("paypal-transmission-id")
+            .ok_or(PayPalError::WebhookError { message: "Missing transmission ID".to_string() })?;
+        let timestamp = headers.get("paypal-transmission-time")
+            .ok_or(PayPalError::WebhookError { message: "Missing timestamp".to_string() })?;
+        let cert_url = headers.get("paypal-cert-url")
+            .ok_or(PayPalError::WebhookError { message: "Missing cert URL".to_string() })?;
+        let signature = headers.get("paypal-transmission-sig")
+            .ok_or(PayPalError::WebhookError { message: "Missing signature".to_string() })?;
+        let auth_algo = headers.get("paypal-auth-algo")
+            .ok_or(PayPalError::WebhookError { message: "Missing auth algorithm".to_string() })?;
+
+        // Verify via PayPal API
+        let verify_body = Json::object([
+            ("transmission_id", Json::String(transmission_id.to_string())),
+            ("transmission_time", Json::String(timestamp.to_string())),
+            ("cert_url", Json::String(cert_url.to_string())),
+            ("auth_algo", Json::String(auth_algo.to_string())),
+            ("transmission_sig", Json::String(signature.to_string())),
+            ("webhook_id", Json::String(self.config.webhook_id.clone())),
+            ("webhook_event", from_json(body).unwrap_or(Json::Null))
+        ]);
+
+        let json = self.post("/v1/notifications/verify-webhook-signature", &verify_body, None).await?;
+
+        let status = json.get("verification_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        Ok(status == "SUCCESS")
+    }
+
+    /// Parse webhook event
+    pub fn parse_webhook_event(&self, body: &str) -> Result<PayPalWebhookEvent, PayPalError> {
+        let json: Json = from_json(body)
+            .map_err(|e| PayPalError::SerializationError { message: e.to_string() })?;
+
+        Ok(PayPalWebhookEvent {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            event_version: json.get("event_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            create_time: json.get("create_time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            resource_type: json.get("resource_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            event_type: json.get("event_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            summary: json.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            resource: json.get("resource").cloned().unwrap_or(Json::Null),
+            links: self.parse_links(&json)
+        })
+    }
+
+    /// Handle webhook event (idempotent)
+    pub async fn handle_webhook(
+        &mut self,
+        headers: &Headers,
+        body: &str
+    ) -> Result<WebhookResult, PayPalError> {
+        // Verify signature
+        let verified = self.verify_webhook_signature(headers, body).await?;
+        if !verified {
+            return Err(PayPalError::WebhookError { message: "Invalid signature".to_string() })
+        }
+
+        // Parse event
+        let event = self.parse_webhook_event(body)?;
+
+        // Check for duplicate processing
+        if self.processed_events.contains_key(&event.id) {
+            return Ok(WebhookResult::AlreadyProcessed { event_id: event.id })
+        }
+
+        // Process event
+        let event_type = PayPalEventType::from_string(&event.event_type);
+        let action = match event_type {
+            PayPalEventType::CheckoutOrderCompleted => {
+                self.handle_order_completed(&event.resource).await
+            },
+            PayPalEventType::PaymentCaptureCompleted => {
+                self.handle_capture_completed(&event.resource).await
+            },
+            PayPalEventType::PaymentCaptureRefunded => {
+                self.handle_capture_refunded(&event.resource).await
+            },
+            PayPalEventType::BillingSubscriptionActivated => {
+                self.handle_subscription_activated(&event.resource).await
+            },
+            PayPalEventType::BillingSubscriptionCancelled => {
+                self.handle_subscription_cancelled(&event.resource).await
+            },
+            PayPalEventType::BillingSubscriptionSuspended => {
+                self.handle_subscription_suspended(&event.resource).await
+            },
+            PayPalEventType::BillingSubscriptionPaymentFailed => {
+                self.handle_subscription_payment_failed(&event.resource).await
+            },
+            PayPalEventType::PaymentPayoutsBatchSuccess => {
+                self.handle_payout_success(&event.resource).await
+            },
+            _ => Ok(WebhookAction::Ignored)
+        };
+
+        // Mark as processed
+        self.processed_events.insert(event.id.clone(), DateTime::now().timestamp());
+        self.clean_processed_events();
+
+        action.map(|a| WebhookResult::Processed { event_id: event.id, action: a })
+    }
+
+    fn clean_processed_events(&mut self) {
+        let now = DateTime::now().timestamp();
+        let day_ago = now - 86400;
+        self.processed_events.retain(|_, &mut ts| ts > day_ago);
+    }
+
+    async fn handle_order_completed(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let order_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let custom_id = resource.get("purchase_units")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.get(0))
+            .and_then(|pu| pu.get("custom_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Parse user_id:course_id from custom_id
+        let parts: Vec<&str> = custom_id.split(':').collect();
+        let (user_id, course_id) = if parts.len() == 2 {
+            (Some(parts[0].to_string()), Some(parts[1].to_string()))
+        } else {
+            (None, None)
+        };
+
+        let payer_email = resource.get("payer")
+            .and_then(|p| p.get("email_address"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(WebhookAction::EnrollUser {
+            order_id,
+            user_id,
+            course_id,
+            payer_email
+        })
+    }
+
+    async fn handle_capture_completed(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let capture_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let amount = resource.get("amount")
+            .and_then(|a| a.get("value"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let currency = resource.get("amount")
+            .and_then(|a| a.get("currency_code"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("USD")
+            .to_string();
+
+        Ok(WebhookAction::RecordPayment {
+            capture_id,
+            amount,
+            currency
+        })
+    }
+
+    async fn handle_capture_refunded(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let capture_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let amount_refunded = resource.get("amount")
+            .and_then(|a| a.get("value"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        Ok(WebhookAction::Refunded {
+            capture_id,
+            amount_refunded
+        })
+    }
+
+    async fn handle_subscription_activated(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let subscription_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let custom_id = resource.get("custom_id").and_then(|v| v.as_str()).unwrap_or("");
+
+        let parts: Vec<&str> = custom_id.split(':').collect();
+        let (user_id, course_id) = if parts.len() == 2 {
+            (Some(parts[0].to_string()), Some(parts[1].to_string()))
+        } else {
+            (None, None)
+        };
+
+        Ok(WebhookAction::SubscriptionActivated {
+            subscription_id,
+            user_id,
+            course_id
+        })
+    }
+
+    async fn handle_subscription_cancelled(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let subscription_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let custom_id = resource.get("custom_id").and_then(|v| v.as_str()).unwrap_or("");
+
+        let parts: Vec<&str> = custom_id.split(':').collect();
+        let course_id = if parts.len() == 2 { Some(parts[1].to_string()) } else { None };
+
+        Ok(WebhookAction::RevokeAccess {
+            subscription_id,
+            course_id
+        })
+    }
+
+    async fn handle_subscription_suspended(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let subscription_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        Ok(WebhookAction::SubscriptionSuspended { subscription_id })
+    }
+
+    async fn handle_subscription_payment_failed(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let subscription_id = resource.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let failed_count = resource.get("billing_info")
+            .and_then(|b| b.get("failed_payments_count"))
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32)
+            .unwrap_or(1);
+
+        Ok(WebhookAction::SubscriptionPaymentFailed {
+            subscription_id,
+            failed_count
+        })
+    }
+
+    async fn handle_payout_success(&self, resource: &Json) -> Result<WebhookAction, PayPalError> {
+        let batch_id = resource.get("batch_header")
+            .and_then(|bh| bh.get("payout_batch_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(WebhookAction::PayoutCompleted { batch_id })
+    }
+}
+
+// =============================================================================
+// WEBHOOK RESULT TYPES
+// =============================================================================
+
+/// Result of webhook processing
+enum WebhookResult {
+    Processed { event_id: String, action: WebhookAction },
+    AlreadyProcessed { event_id: String }
+}
+
+/// Action to take based on webhook
+enum WebhookAction {
+    /// Enroll user in course
+    EnrollUser {
+        order_id: String,
+        user_id: Option<String>,
+        course_id: Option<String>,
+        payer_email: Option<String>
+    },
+    /// Record successful payment
+    RecordPayment {
+        capture_id: String,
+        amount: f64,
+        currency: String
+    },
+    /// Handle refund
+    Refunded {
+        capture_id: String,
+        amount_refunded: f64
+    },
+    /// Subscription activated
+    SubscriptionActivated {
+        subscription_id: String,
+        user_id: Option<String>,
+        course_id: Option<String>
+    },
+    /// Revoke course access
+    RevokeAccess {
+        subscription_id: String,
+        course_id: Option<String>
+    },
+    /// Subscription suspended
+    SubscriptionSuspended {
+        subscription_id: String
+    },
+    /// Subscription payment failed
+    SubscriptionPaymentFailed {
+        subscription_id: String,
+        failed_count: i32
+    },
+    /// Payout completed
+    PayoutCompleted {
+        batch_id: String
+    },
+    /// Event ignored
+    Ignored
+}

@@ -1,0 +1,28 @@
+/// Intelligo LMS - Admin Module
+///
+/// Exports administration functionality for course and user management.
+
+module intelligo::admin
+
+pub use intelligo::admin::core::*
+pub use intelligo::admin::dashboard::*
+pub use intelligo::admin::reports::*
+pub use intelligo::admin::gradebook::*
+pub use intelligo::admin::users::*
+
+// Re-export commonly used types
+pub use AdminDashboard
+pub use AdminStats
+pub use ReportGenerator
+pub use ReportType
+pub use Gradebook
+pub use GradeEntry
+
+// User management
+pub use UserManagementService
+pub use User
+pub use UserRole
+pub use UserStatus
+pub use Group
+pub use CreateUserRequest
+pub use UpdateUserRequest

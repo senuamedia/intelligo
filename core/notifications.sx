@@ -1,0 +1,1070 @@
+/// Intelligo LMS - Notification Service
+///
+/// Multi-channel notification delivery with preferences and templates.
+
+module intelligo::core::notifications
+
+use intelligo::core::*
+use intelligo::runtime::*
+use intelligo::templates::email::*
+
+// ============================================================================
+// Notification Service
+// ============================================================================
+
+/// Central notification service for all channels
+pub actor NotificationService {
+    tenant_id: String,
+    channels: Map<String, Box<dyn NotificationChannel>>,
+    preferences_store: PreferencesStore,
+    template_registry: EmailTemplateRegistry,
+    queue: MessageQueue<NotificationJob>,
+    batch_processor: BatchProcessor,
+
+    pub fn new(tenant_id: &str) -> Self {
+        let mut service = NotificationService {
+            tenant_id: tenant_id.to_string(),
+            channels: Map::new(),
+            preferences_store: PreferencesStore::new(),
+            template_registry: EmailTemplateRegistry::new(),
+            queue: MessageQueue::new("notifications"),
+            batch_processor: BatchProcessor::new()
+        };
+
+        // Register default channels
+        service.register_channel("email", Box::new(EmailChannel::new()));
+        service.register_channel("in_app", Box::new(InAppChannel::new()));
+        service.register_channel("push", Box::new(PushChannel::new()));
+        service.register_channel("sms", Box::new(SmsChannel::new()));
+        service.register_channel("slack", Box::new(SlackChannel::new()));
+
+        service
+    }
+
+    // ========================================================================
+    // Channel Management
+    // ========================================================================
+
+    /// Register a notification channel
+    pub fn register_channel(mut self, name: &str, channel: Box<dyn NotificationChannel>) {
+        self.channels.insert(name.to_string(), channel);
+    }
+
+    /// Get available channels
+    pub fn get_channels(self) -> Vec<ChannelInfo> {
+        self.channels.iter()
+            .map(|(name, channel)| ChannelInfo {
+                name: name.clone(),
+                display_name: channel.display_name(),
+                enabled: channel.is_enabled(),
+                configurable: channel.is_configurable()
+            })
+            .collect()
+    }
+
+    // ========================================================================
+    // Sending Notifications
+    // ========================================================================
+
+    /// Send a notification
+    pub fn send(mut self, notification: Notification) -> Result<NotificationResult, NotificationError> {
+        // Get user preferences
+        let prefs = self.preferences_store.get(&notification.user_id)?;
+
+        // Check if notification type is enabled
+        if !self.is_notification_enabled(&prefs, &notification.notification_type) {
+            return Ok(NotificationResult::skipped("User disabled this notification type"));
+        }
+
+        // Get channels for this notification type
+        let channels = self.get_channels_for_type(&prefs, &notification.notification_type);
+
+        if channels.is_empty() {
+            return Ok(NotificationResult::skipped("No channels enabled"));
+        }
+
+        // Create delivery jobs
+        let mut results = vec![];
+
+        for channel_name in channels {
+            let job = NotificationJob {
+                id: Uuid::new_v4().to_string(),
+                notification: notification.clone(),
+                channel: channel_name.clone(),
+                status: JobStatus::Pending,
+                created_at: DateTime::now(),
+                scheduled_at: notification.scheduled_at,
+                attempts: 0
+            };
+
+            // Queue or send immediately
+            if notification.scheduled_at.is_some() {
+                self.queue.enqueue(job.clone());
+                results.push(ChannelResult::queued(&channel_name));
+            } else {
+                let result = self.deliver_now(&job)?;
+                results.push(result);
+            }
+        }
+
+        Ok(NotificationResult::sent(results))
+    }
+
+    /// Send to multiple users
+    pub fn send_bulk(mut self, request: BulkNotificationRequest) -> Result<BulkNotificationResult, NotificationError> {
+        let mut result = BulkNotificationResult::new();
+
+        for user_id in &request.user_ids {
+            let notification = Notification {
+                user_id: user_id.clone(),
+                notification_type: request.notification_type.clone(),
+                title: request.title.clone(),
+                body: request.body.clone(),
+                data: request.data.clone(),
+                priority: request.priority.clone(),
+                scheduled_at: request.scheduled_at
+            };
+
+            match self.send(notification) {
+                Ok(r) => result.add_success(user_id.clone(), r),
+                Err(e) => result.add_failure(user_id.clone(), e.to_string())
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Deliver a notification immediately
+    fn deliver_now(mut self, job: &NotificationJob) -> Result<ChannelResult, NotificationError> {
+        let channel = self.channels.get(&job.channel)
+            .ok_or_else(|| NotificationError::ChannelNotFound(job.channel.clone()))?;
+
+        // Build channel-specific message
+        let message = self.build_message(&job.notification, &job.channel)?;
+
+        // Deliver
+        match channel.send(&message) {
+            Ok(id) => {
+                self.record_delivery(&job, DeliveryStatus::Delivered, None);
+                Ok(ChannelResult::delivered(&job.channel, id))
+            }
+            Err(e) => {
+                self.record_delivery(&job, DeliveryStatus::Failed, Some(e.to_string()));
+                Err(e)
+            }
+        }
+    }
+
+    /// Build channel-specific message
+    fn build_message(self, notification: &Notification, channel: &str) -> Result<ChannelMessage, NotificationError> {
+        match channel {
+            "email" => self.build_email_message(notification),
+            "in_app" => self.build_in_app_message(notification),
+            "push" => self.build_push_message(notification),
+            "sms" => self.build_sms_message(notification),
+            "slack" => self.build_slack_message(notification),
+            _ => Err(NotificationError::ChannelNotFound(channel.to_string()))
+        }
+    }
+
+    fn build_email_message(self, notification: &Notification) -> Result<ChannelMessage, NotificationError> {
+        // Get user email
+        let user = self.get_user(&notification.user_id)?;
+
+        // Get template if available
+        let template_id = notification.data.get("template_id")
+            .and_then(|v| v.as_string());
+
+        let (subject, body) = match template_id {
+            Some(id) => {
+                let template = self.template_registry.get(&id);
+                match template {
+                    Some(t) => self.render_template(&t, &notification.data)?,
+                    None => (notification.title.clone(), notification.body.clone())
+                }
+            }
+            None => (notification.title.clone(), notification.body.clone())
+        };
+
+        Ok(ChannelMessage::Email(EmailMessage {
+            to: user.email,
+            subject,
+            html_body: body.clone(),
+            text_body: Some(self.strip_html(&body)),
+            from: None,
+            reply_to: None,
+            attachments: vec![]
+        }))
+    }
+
+    fn build_in_app_message(self, notification: &Notification) -> Result<ChannelMessage, NotificationError> {
+        Ok(ChannelMessage::InApp(InAppMessage {
+            user_id: notification.user_id.clone(),
+            title: notification.title.clone(),
+            body: notification.body.clone(),
+            icon: notification.data.get("icon").and_then(|v| v.as_string()),
+            action_url: notification.data.get("action_url").and_then(|v| v.as_string()),
+            data: notification.data.clone()
+        }))
+    }
+
+    fn build_push_message(self, notification: &Notification) -> Result<ChannelMessage, NotificationError> {
+        Ok(ChannelMessage::Push(PushMessage {
+            user_id: notification.user_id.clone(),
+            title: notification.title.clone(),
+            body: notification.body.clone(),
+            icon: notification.data.get("icon").and_then(|v| v.as_string()),
+            badge: notification.data.get("badge").and_then(|v| v.as_i64()).map(|v| v as i32),
+            data: notification.data.clone()
+        }))
+    }
+
+    fn build_sms_message(self, notification: &Notification) -> Result<ChannelMessage, NotificationError> {
+        let user = self.get_user(&notification.user_id)?;
+
+        let phone = user.phone
+            .ok_or_else(|| NotificationError::MissingRecipient("No phone number".to_string()))?;
+
+        Ok(ChannelMessage::Sms(SmsMessage {
+            to: phone,
+            body: notification.body.clone()
+        }))
+    }
+
+    fn build_slack_message(self, notification: &Notification) -> Result<ChannelMessage, NotificationError> {
+        let user = self.get_user(&notification.user_id)?;
+
+        let slack_id = user.metadata.get("slack_user_id")
+            .ok_or_else(|| NotificationError::MissingRecipient("No Slack user ID".to_string()))?;
+
+        Ok(ChannelMessage::Slack(SlackMessage {
+            channel: slack_id.clone(),
+            text: notification.body.clone(),
+            blocks: None
+        }))
+    }
+
+    // ========================================================================
+    // Preferences Management
+    // ========================================================================
+
+    /// Get user notification preferences
+    pub fn get_preferences(self, user_id: &str) -> Result<NotificationPreferences, NotificationError> {
+        self.preferences_store.get(user_id)
+    }
+
+    /// Update user notification preferences
+    pub fn update_preferences(mut self, user_id: &str, prefs: NotificationPreferences) -> Result<(), NotificationError> {
+        self.preferences_store.save(user_id, &prefs)
+    }
+
+    /// Get default preferences
+    pub fn get_default_preferences(self) -> NotificationPreferences {
+        NotificationPreferences {
+            enabled: true,
+            channels: {
+                let mut m = Map::new();
+                m.insert("email".to_string(), true);
+                m.insert("in_app".to_string(), true);
+                m.insert("push".to_string(), true);
+                m.insert("sms".to_string(), false);
+                m.insert("slack".to_string(), false);
+                m
+            },
+            type_preferences: Map::new(),
+            quiet_hours: None,
+            digest_frequency: Some(DigestFrequency::Daily),
+            timezone: "UTC".to_string()
+        }
+    }
+
+    // ========================================================================
+    // In-App Notifications
+    // ========================================================================
+
+    /// Get unread notifications for user
+    pub fn get_unread(self, user_id: &str) -> Result<Vec<InAppNotification>, NotificationError> {
+        // Would query from in-app message store
+        Ok(vec![])
+    }
+
+    /// Get all notifications for user
+    pub fn get_notifications(self, user_id: &str, query: NotificationQuery) -> Result<PagedResult<InAppNotification>, NotificationError> {
+        // Would query from message store with pagination
+        Ok(PagedResult {
+            items: vec![],
+            total: 0,
+            page: query.page.unwrap_or(1),
+            page_size: query.page_size.unwrap_or(20),
+            has_more: false,
+        })
+    }
+
+    /// Mark notification as read
+    pub fn mark_read(mut self, notification_id: &str) -> Result<(), NotificationError> {
+        // Would update notification status in database
+        Ok(())
+    }
+
+    /// Mark all notifications as read
+    pub fn mark_all_read(mut self, user_id: &str) -> Result<(), NotificationError> {
+        // Would batch update all unread notifications
+        Ok(())
+    }
+
+    /// Delete a notification
+    pub fn delete_notification(mut self, notification_id: &str) -> Result<(), NotificationError> {
+        // Would delete from database
+        Ok(())
+    }
+
+    // ========================================================================
+    // Digest & Batching
+    // ========================================================================
+
+    /// Process notification digests
+    pub fn process_digests(mut self) -> Result<DigestResults, NotificationError> {
+        let users = self.get_users_for_digest()?;
+        let mut results = DigestResults::new();
+
+        for user_id in users {
+            match self.send_digest(&user_id) {
+                Ok(_) => results.add_success(user_id),
+                Err(e) => results.add_failure(user_id, e.to_string())
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Send digest to a user
+    fn send_digest(mut self, user_id: &str) -> Result<(), NotificationError> {
+        let prefs = self.preferences_store.get(user_id)?;
+
+        // Get pending notifications for digest
+        let pending = self.get_pending_digest_notifications(user_id)?;
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Build digest email
+        let digest = self.build_digest(&pending)?;
+
+        // Send as email
+        let notification = Notification {
+            user_id: user_id.to_string(),
+            notification_type: NotificationType::Digest,
+            title: digest.title,
+            body: digest.body,
+            data: {
+                let mut m = Map::new();
+                m.insert("template_id".to_string(), Value::String("notification_digest".to_string()));
+                m.insert("notifications".to_string(), Value::Array(
+                    pending.iter().map(|n| Value::Object(Map::new())).collect()
+                ));
+                m
+            },
+            priority: NotificationPriority::Normal,
+            scheduled_at: None
+        };
+
+        self.send(notification)?;
+
+        // Mark as digested
+        for n in pending {
+            self.mark_as_digested(&n.id)?;
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn is_notification_enabled(self, prefs: &NotificationPreferences, notification_type: &NotificationType) -> bool {
+        if !prefs.enabled {
+            return false;
+        }
+
+        // Check type-specific preference
+        if let Some(type_pref) = prefs.type_preferences.get(&notification_type.to_string()) {
+            return type_pref.enabled;
+        }
+
+        true
+    }
+
+    fn get_channels_for_type(self, prefs: &NotificationPreferences, notification_type: &NotificationType) -> Vec<String> {
+        let mut channels = vec![];
+
+        // Check type-specific channel overrides
+        if let Some(type_pref) = prefs.type_preferences.get(&notification_type.to_string()) {
+            return type_pref.channels.clone();
+        }
+
+        // Use default channels
+        for (channel, enabled) in &prefs.channels {
+            if *enabled {
+                channels.push(channel.clone());
+            }
+        }
+
+        channels
+    }
+
+    fn get_user(self, user_id: &str) -> Result<UserInfo, NotificationError> {
+        // Would query user service
+        Err(NotificationError::UserNotFound(user_id.to_string()))
+    }
+
+    fn render_template(self, template: &TemplateConfig, data: &Map<String, Value>) -> Result<(String, String), NotificationError> {
+        // Simple variable substitution
+        let mut subject = template.subject.clone();
+        let mut body = template.body.clone();
+
+        for (key, value) in data {
+            let placeholder = format!("{{{{{}}}}}", key);
+            let value_str = match value {
+                Value::String(s) => s.clone(),
+                _ => value.to_string(),
+            };
+            subject = subject.replace(&placeholder, &value_str);
+            body = body.replace(&placeholder, &value_str);
+        }
+
+        Ok((subject, body))
+    }
+
+    fn strip_html(self, html: &str) -> String {
+        // Simple HTML stripping
+        html.replace("<br>", "\n")
+            .replace("<p>", "")
+            .replace("</p>", "\n")
+    }
+
+    fn record_delivery(self, job: &NotificationJob, status: DeliveryStatus, error: Option<String>) {
+        // Would persist delivery record to database
+        // Fire-and-forget operation
+    }
+
+    fn get_users_for_digest(self) -> Result<Vec<String>, NotificationError> {
+        // Would query users with pending digest notifications
+        Ok(vec![])
+    }
+
+    fn get_pending_digest_notifications(self, user_id: &str) -> Result<Vec<InAppNotification>, NotificationError> {
+        // Would query undigested notifications for user
+        Ok(vec![])
+    }
+
+    fn build_digest(self, notifications: &[InAppNotification]) -> Result<DigestContent, NotificationError> {
+        // Build digest summary from notifications
+        Ok(DigestContent {
+            subject: "Your notification digest".to_string(),
+            summary: format!("You have {} new notifications", notifications.len()),
+            items: notifications.iter().map(|n| DigestItem {
+                title: n.title.clone(),
+                body: n.body.clone(),
+                timestamp: n.created_at.clone(),
+            }).collect(),
+        })
+    }
+
+    fn mark_as_digested(self, notification_id: &str) -> Result<(), NotificationError> {
+        // Would update notification as included in digest
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Notification Channels
+// ============================================================================
+
+/// Notification channel trait
+pub trait NotificationChannel {
+    fn display_name(self) -> String;
+    fn is_enabled(self) -> bool;
+    fn is_configurable(self) -> bool;
+    fn send(self, message: &ChannelMessage) -> Result<String, NotificationError>;
+}
+
+/// Email channel
+pub actor EmailChannel {
+    smtp_config: SmtpConfig,
+
+    pub fn new() -> Self {
+        EmailChannel {
+            smtp_config: SmtpConfig::default()
+        }
+    }
+}
+
+impl NotificationChannel for EmailChannel {
+    fn display_name(self) -> String { "Email".to_string() }
+    fn is_enabled(self) -> bool { true }
+    fn is_configurable(self) -> bool { true }
+
+    fn send(self, message: &ChannelMessage) -> Result<String, NotificationError> {
+        match message {
+            ChannelMessage::Email(email) => {
+                // Send via SMTP
+                let id = self.send_smtp(email)?;
+                Ok(id)
+            }
+            _ => Err(NotificationError::InvalidMessage("Expected email message".to_string()))
+        }
+    }
+}
+
+impl EmailChannel {
+    fn send_smtp(self, email: &EmailMessage) -> Result<String, NotificationError> {
+        // SMTP integration would go here
+        // For now, return a placeholder message ID
+        Err(NotificationError::ChannelError("SMTP not configured - requires mail server integration".to_string()))
+    }
+}
+
+/// In-app notification channel
+pub actor InAppChannel {
+    store: InAppNotificationStore,
+
+    pub fn new() -> Self {
+        InAppChannel {
+            store: InAppNotificationStore::new()
+        }
+    }
+}
+
+impl NotificationChannel for InAppChannel {
+    fn display_name(self) -> String { "In-App".to_string() }
+    fn is_enabled(self) -> bool { true }
+    fn is_configurable(self) -> bool { false }
+
+    fn send(self, message: &ChannelMessage) -> Result<String, NotificationError> {
+        match message {
+            ChannelMessage::InApp(msg) => {
+                let id = self.store.save(msg)?;
+                Ok(id)
+            }
+            _ => Err(NotificationError::InvalidMessage("Expected in-app message".to_string()))
+        }
+    }
+}
+
+/// Push notification channel
+pub actor PushChannel {
+    fcm_config: Option<FcmConfig>,
+    apns_config: Option<ApnsConfig>,
+
+    pub fn new() -> Self {
+        PushChannel {
+            fcm_config: None,
+            apns_config: None
+        }
+    }
+}
+
+impl NotificationChannel for PushChannel {
+    fn display_name(self) -> String { "Push".to_string() }
+    fn is_enabled(self) -> bool { self.fcm_config.is_some() || self.apns_config.is_some() }
+    fn is_configurable(self) -> bool { true }
+
+    fn send(self, message: &ChannelMessage) -> Result<String, NotificationError> {
+        match message {
+            ChannelMessage::Push(msg) => {
+                // Push notification requires FCM/APNs integration
+                if self.fcm_config.is_none() && self.apns_config.is_none() {
+                    return Err(NotificationError::ChannelError("Push notifications not configured".to_string()));
+                }
+                // Return placeholder - actual implementation would call FCM/APNs
+                Err(NotificationError::ChannelError("Push notification service not yet implemented".to_string()))
+            }
+            _ => Err(NotificationError::InvalidMessage("Expected push message".to_string()))
+        }
+    }
+}
+
+/// SMS channel
+pub actor SmsChannel {
+    provider: Option<SmsProvider>,
+
+    pub fn new() -> Self {
+        SmsChannel { provider: None }
+    }
+}
+
+impl NotificationChannel for SmsChannel {
+    fn display_name(self) -> String { "SMS".to_string() }
+    fn is_enabled(self) -> bool { self.provider.is_some() }
+    fn is_configurable(self) -> bool { true }
+
+    fn send(self, message: &ChannelMessage) -> Result<String, NotificationError> {
+        match message {
+            ChannelMessage::Sms(msg) => {
+                let provider = self.provider.as_ref()
+                    .ok_or_else(|| NotificationError::ChannelNotConfigured("SMS".to_string()))?;
+                provider.send(&msg.to, &msg.body)
+            }
+            _ => Err(NotificationError::InvalidMessage("Expected SMS message".to_string()))
+        }
+    }
+}
+
+/// Slack channel
+pub actor SlackChannel {
+    webhook_url: Option<String>,
+    bot_token: Option<String>,
+
+    pub fn new() -> Self {
+        SlackChannel {
+            webhook_url: None,
+            bot_token: None
+        }
+    }
+}
+
+impl NotificationChannel for SlackChannel {
+    fn display_name(self) -> String { "Slack".to_string() }
+    fn is_enabled(self) -> bool { self.webhook_url.is_some() || self.bot_token.is_some() }
+    fn is_configurable(self) -> bool { true }
+
+    fn send(self, message: &ChannelMessage) -> Result<String, NotificationError> {
+        match message {
+            ChannelMessage::Slack(msg) => {
+                // Slack integration requires webhook URL or bot token
+                if self.webhook_url.is_none() && self.bot_token.is_none() {
+                    return Err(NotificationError::ChannelError("Slack not configured".to_string()));
+                }
+                // Actual implementation would call Slack API
+                Err(NotificationError::ChannelError("Slack integration not yet implemented".to_string()))
+            }
+            _ => Err(NotificationError::InvalidMessage("Expected Slack message".to_string()))
+        }
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Notification request
+pub type Notification = type {
+    user_id: String,
+    notification_type: NotificationType,
+    title: String,
+    body: String,
+    data: Map<String, Value>,
+    priority: NotificationPriority,
+    scheduled_at: Option<DateTime>
+}
+
+/// Notification types
+pub enum NotificationType {
+    // Course
+    CourseEnrollment,
+    CourseCompletion,
+    CourseUpdate,
+
+    // Assessment
+    AssignmentDue,
+    AssignmentGraded,
+    QuizAvailable,
+
+    // Discussion
+    DiscussionReply,
+    MentionNotification,
+
+    // System
+    SystemAlert,
+    MaintenanceNotice,
+
+    // Compliance
+    ComplianceDue,
+    ComplianceOverdue,
+
+    // Certificate
+    CertificateIssued,
+
+    // Digest
+    Digest,
+
+    // Custom
+    Custom(String)
+}
+
+impl NotificationType {
+    pub fn to_string(self) -> String {
+        match self {
+            NotificationType::CourseEnrollment => "course.enrollment".to_string(),
+            NotificationType::CourseCompletion => "course.completion".to_string(),
+            NotificationType::CourseUpdate => "course.update".to_string(),
+            NotificationType::AssignmentDue => "assignment.due".to_string(),
+            NotificationType::AssignmentGraded => "assignment.graded".to_string(),
+            NotificationType::QuizAvailable => "quiz.available".to_string(),
+            NotificationType::DiscussionReply => "discussion.reply".to_string(),
+            NotificationType::MentionNotification => "mention".to_string(),
+            NotificationType::SystemAlert => "system.alert".to_string(),
+            NotificationType::MaintenanceNotice => "system.maintenance".to_string(),
+            NotificationType::ComplianceDue => "compliance.due".to_string(),
+            NotificationType::ComplianceOverdue => "compliance.overdue".to_string(),
+            NotificationType::CertificateIssued => "certificate.issued".to_string(),
+            NotificationType::Digest => "digest".to_string(),
+            NotificationType::Custom(s) => s
+        }
+    }
+}
+
+/// Notification priority
+pub enum NotificationPriority {
+    Low,
+    Normal,
+    High,
+    Urgent
+}
+
+/// Channel message variants
+pub enum ChannelMessage {
+    Email(EmailMessage),
+    InApp(InAppMessage),
+    Push(PushMessage),
+    Sms(SmsMessage),
+    Slack(SlackMessage)
+}
+
+pub type EmailMessage = type {
+    to: String,
+    subject: String,
+    html_body: String,
+    text_body: Option<String>,
+    from: Option<String>,
+    reply_to: Option<String>,
+    attachments: Vec<EmailAttachment>
+}
+
+pub type EmailAttachment = type {
+    filename: String,
+    content_type: String,
+    data: Vec<u8>
+}
+
+pub type InAppMessage = type {
+    user_id: String,
+    title: String,
+    body: String,
+    icon: Option<String>,
+    action_url: Option<String>,
+    data: Map<String, Value>
+}
+
+pub type PushMessage = type {
+    user_id: String,
+    title: String,
+    body: String,
+    icon: Option<String>,
+    badge: Option<i32>,
+    data: Map<String, Value>
+}
+
+pub type SmsMessage = type {
+    to: String,
+    body: String
+}
+
+pub type SlackMessage = type {
+    channel: String,
+    text: String,
+    blocks: Option<Value>
+}
+
+/// In-app notification entity
+pub type InAppNotification = type {
+    id: String,
+    user_id: String,
+    notification_type: NotificationType,
+    title: String,
+    body: String,
+    icon: Option<String>,
+    action_url: Option<String>,
+    data: Map<String, Value>,
+    read: bool,
+    read_at: Option<DateTime>,
+    created_at: DateTime
+}
+
+/// Notification preferences
+pub type NotificationPreferences = type {
+    enabled: bool,
+    channels: Map<String, bool>,
+    type_preferences: Map<String, TypePreference>,
+    quiet_hours: Option<QuietHours>,
+    digest_frequency: Option<DigestFrequency>,
+    timezone: String
+}
+
+pub type TypePreference = type {
+    enabled: bool,
+    channels: Vec<String>
+}
+
+pub type QuietHours = type {
+    start: String,  // "22:00"
+    end: String,    // "08:00"
+    days: Vec<String>  // ["monday", "tuesday", ...]
+}
+
+pub enum DigestFrequency {
+    Immediate,
+    Hourly,
+    Daily,
+    Weekly
+}
+
+/// Channel info
+pub type ChannelInfo = type {
+    name: String,
+    display_name: String,
+    enabled: bool,
+    configurable: bool
+}
+
+/// Notification job
+pub type NotificationJob = type {
+    id: String,
+    notification: Notification,
+    channel: String,
+    status: JobStatus,
+    created_at: DateTime,
+    scheduled_at: Option<DateTime>,
+    attempts: i32
+}
+
+pub enum JobStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed
+}
+
+/// Bulk notification request
+pub type BulkNotificationRequest = type {
+    user_ids: Vec<String>,
+    notification_type: NotificationType,
+    title: String,
+    body: String,
+    data: Map<String, Value>,
+    priority: NotificationPriority,
+    scheduled_at: Option<DateTime>
+}
+
+/// Notification result
+pub type NotificationResult = type {
+    status: ResultStatus,
+    channel_results: Vec<ChannelResult>,
+    message: Option<String>
+}
+
+impl NotificationResult {
+    pub fn sent(results: Vec<ChannelResult>) -> Self {
+        NotificationResult { status: ResultStatus::Sent, channel_results: results, message: None }
+    }
+
+    pub fn skipped(reason: &str) -> Self {
+        NotificationResult { status: ResultStatus::Skipped, channel_results: vec![], message: Some(reason.to_string()) }
+    }
+}
+
+pub enum ResultStatus {
+    Sent,
+    Queued,
+    Skipped,
+    Failed
+}
+
+pub type ChannelResult = type {
+    channel: String,
+    status: ChannelDeliveryStatus,
+    message_id: Option<String>,
+    error: Option<String>
+}
+
+impl ChannelResult {
+    pub fn delivered(channel: &str, id: String) -> Self {
+        ChannelResult { channel: channel.to_string(), status: ChannelDeliveryStatus::Delivered, message_id: Some(id), error: None }
+    }
+
+    pub fn queued(channel: &str) -> Self {
+        ChannelResult { channel: channel.to_string(), status: ChannelDeliveryStatus::Queued, message_id: None, error: None }
+    }
+
+    pub fn failed(channel: &str, error: String) -> Self {
+        ChannelResult { channel: channel.to_string(), status: ChannelDeliveryStatus::Failed, message_id: None, error: Some(error) }
+    }
+}
+
+pub enum ChannelDeliveryStatus {
+    Delivered,
+    Queued,
+    Failed
+}
+
+/// Bulk notification result
+pub type BulkNotificationResult = type {
+    total: i32,
+    successful: i32,
+    failed: i32,
+    results: Map<String, NotificationResult>
+}
+
+impl BulkNotificationResult {
+    pub fn new() -> Self {
+        BulkNotificationResult { total: 0, successful: 0, failed: 0, results: Map::new() }
+    }
+
+    pub fn add_success(mut self, user_id: String, result: NotificationResult) {
+        self.total += 1;
+        self.successful += 1;
+        self.results.insert(user_id, result);
+    }
+
+    pub fn add_failure(mut self, user_id: String, error: String) {
+        self.total += 1;
+        self.failed += 1;
+        self.results.insert(user_id, NotificationResult {
+            status: ResultStatus::Failed,
+            channel_results: vec![],
+            message: Some(error)
+        });
+    }
+}
+
+/// Notification query
+pub type NotificationQuery = type {
+    read: Option<bool>,
+    notification_type: Option<NotificationType>,
+    from: Option<DateTime>,
+    to: Option<DateTime>,
+    page: Option<i32>,
+    page_size: Option<i32>
+}
+
+/// Digest results
+pub type DigestResults = type {
+    successful: Vec<String>,
+    failed: Vec<(String, String)>
+}
+
+impl DigestResults {
+    pub fn new() -> Self { DigestResults { successful: vec![], failed: vec![] } }
+    pub fn add_success(mut self, user_id: String) { self.successful.push(user_id); }
+    pub fn add_failure(mut self, user_id: String, error: String) { self.failed.push((user_id, error)); }
+}
+
+pub type DigestContent = type { title: String, body: String }
+
+pub enum DeliveryStatus {
+    Pending,
+    Delivered,
+    Failed
+}
+
+/// Configuration types
+pub type SmtpConfig = type {
+    host: String,
+    port: i32,
+    username: Option<String>,
+    password: Option<String>,
+    from_address: String,
+    from_name: String
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        SmtpConfig {
+            host: "localhost".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            from_address: "noreply@example.com".to_string(),
+            from_name: "Intelligo LMS".to_string()
+        }
+    }
+}
+
+pub type FcmConfig = type { server_key: String }
+pub type ApnsConfig = type { key_id: String, team_id: String, key_path: String }
+
+pub trait SmsProvider {
+    fn send(self, to: &str, body: &str) -> Result<String, NotificationError>;
+}
+
+pub type UserInfo = type {
+    id: String,
+    email: String,
+    phone: Option<String>,
+    metadata: Map<String, String>
+}
+
+pub type PagedResult<T> = type {
+    items: Vec<T>,
+    total: i64,
+    page: i32,
+    page_size: i32
+}
+
+// Stores
+pub type PreferencesStore = type {}
+impl PreferencesStore {
+    pub fn new() -> Self { PreferencesStore {} }
+
+    pub fn get(self, user_id: &str) -> Result<NotificationPreferences, NotificationError> {
+        // Would query from database
+        // Return default preferences
+        Ok(NotificationPreferences::default())
+    }
+
+    pub fn save(self, user_id: &str, prefs: &NotificationPreferences) -> Result<(), NotificationError> {
+        // Would persist to database
+        Ok(())
+    }
+}
+
+pub type InAppNotificationStore = type {}
+impl InAppNotificationStore {
+    pub fn new() -> Self { InAppNotificationStore {} }
+
+    pub fn save(self, msg: &InAppMessage) -> Result<String, NotificationError> {
+        // Would persist to database
+        let id = Uuid::new_v4().to_string();
+        Ok(id)
+    }
+}
+
+pub type BatchProcessor = type {}
+impl BatchProcessor {
+    pub fn new() -> Self { BatchProcessor {} }
+}
+
+/// Notification error
+pub enum NotificationError {
+    ChannelNotFound(String),
+    ChannelNotConfigured(String),
+    InvalidMessage(String),
+    MissingRecipient(String),
+    DeliveryFailed(String),
+    PreferencesError(String)
+}
+
+impl NotificationError {
+    pub fn to_string(self) -> String {
+        match self {
+            NotificationError::ChannelNotFound(c) => format!("Channel not found: {}", c),
+            NotificationError::ChannelNotConfigured(c) => format!("Channel not configured: {}", c),
+            NotificationError::InvalidMessage(m) => m,
+            NotificationError::MissingRecipient(m) => m,
+            NotificationError::DeliveryFailed(m) => format!("Delivery failed: {}", m),
+            NotificationError::PreferencesError(m) => m
+        }
+    }
+}

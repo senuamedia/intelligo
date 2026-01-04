@@ -1,0 +1,513 @@
+/// Intelligo LMS - Dark Theme
+///
+/// Dark mode theme with carefully selected colors for reduced eye strain
+/// and excellent contrast ratios for accessibility.
+
+module intelligo::themes::dark
+
+use intelligo::themes::core::*
+
+/// Create the dark theme
+pub fn create_dark_theme() -> Theme {
+    Theme {
+        id: "dark".to_string(),
+        name: "Intelligo Dark".to_string(),
+        description: "Dark theme optimized for low-light environments".to_string(),
+        colors: create_dark_colors(),
+        typography: create_dark_typography(),
+        spacing: create_dark_spacing(),
+        borders: create_dark_borders(),
+        shadows: create_dark_shadows(),
+        animations: create_dark_animations(),
+        component_styles: create_dark_component_styles(),
+        is_dark_mode: true,
+    }
+}
+
+/// Create dark theme color palette
+fn create_dark_colors() -> ThemeColors {
+    ThemeColors {
+        // Primary - Lighter blue for dark backgrounds
+        primary: ColorScale {
+            c50: "#0c1929".to_string(),
+            c100: "#0f2744".to_string(),
+            c200: "#163a61".to_string(),
+            c300: "#1e4d7e".to_string(),
+            c400: "#2563eb".to_string(),
+            c500: "#3b82f6".to_string(),
+            c600: "#60a5fa".to_string(),
+            c700: "#93c5fd".to_string(),
+            c800: "#bfdbfe".to_string(),
+            c900: "#dbeafe".to_string(),
+            c950: "#eff6ff".to_string(),
+        },
+
+        // Secondary - Lighter violet for dark backgrounds
+        secondary: ColorScale {
+            c50: "#1a0f2e".to_string(),
+            c100: "#2d1b4e".to_string(),
+            c200: "#42276e".to_string(),
+            c300: "#58338e".to_string(),
+            c400: "#7c3aed".to_string(),
+            c500: "#8b5cf6".to_string(),
+            c600: "#a78bfa".to_string(),
+            c700: "#c4b5fd".to_string(),
+            c800: "#ddd6fe".to_string(),
+            c900: "#ede9fe".to_string(),
+            c950: "#f5f3ff".to_string(),
+        },
+
+        // Accent - Warm amber for contrast
+        accent: ColorScale {
+            c50: "#1c1508".to_string(),
+            c100: "#342709".to_string(),
+            c200: "#4d3a0c".to_string(),
+            c300: "#78560e".to_string(),
+            c400: "#d97706".to_string(),
+            c500: "#f59e0b".to_string(),
+            c600: "#fbbf24".to_string(),
+            c700: "#fcd34d".to_string(),
+            c800: "#fde68a".to_string(),
+            c900: "#fef3c7".to_string(),
+            c950: "#fffbeb".to_string(),
+        },
+
+        // Neutral - Slate grays for dark mode
+        neutral: ColorScale {
+            c50: "#020617".to_string(),
+            c100: "#0f172a".to_string(),
+            c200: "#1e293b".to_string(),
+            c300: "#334155".to_string(),
+            c400: "#475569".to_string(),
+            c500: "#64748b".to_string(),
+            c600: "#94a3b8".to_string(),
+            c700: "#cbd5e1".to_string(),
+            c800: "#e2e8f0".to_string(),
+            c900: "#f1f5f9".to_string(),
+            c950: "#f8fafc".to_string(),
+        },
+
+        // Success - Green
+        success: ColorScale {
+            c50: "#052e16".to_string(),
+            c100: "#064e3b".to_string(),
+            c200: "#065f46".to_string(),
+            c300: "#047857".to_string(),
+            c400: "#059669".to_string(),
+            c500: "#10b981".to_string(),
+            c600: "#34d399".to_string(),
+            c700: "#6ee7b7".to_string(),
+            c800: "#a7f3d0".to_string(),
+            c900: "#d1fae5".to_string(),
+            c950: "#ecfdf5".to_string(),
+        },
+
+        // Warning - Amber
+        warning: ColorScale {
+            c50: "#1c1508".to_string(),
+            c100: "#451a03".to_string(),
+            c200: "#78350f".to_string(),
+            c300: "#92400e".to_string(),
+            c400: "#b45309".to_string(),
+            c500: "#d97706".to_string(),
+            c600: "#f59e0b".to_string(),
+            c700: "#fbbf24".to_string(),
+            c800: "#fcd34d".to_string(),
+            c900: "#fef3c7".to_string(),
+            c950: "#fffbeb".to_string(),
+        },
+
+        // Error - Red
+        error: ColorScale {
+            c50: "#2c0a0a".to_string(),
+            c100: "#450a0a".to_string(),
+            c200: "#7f1d1d".to_string(),
+            c300: "#991b1b".to_string(),
+            c400: "#b91c1c".to_string(),
+            c500: "#dc2626".to_string(),
+            c600: "#ef4444".to_string(),
+            c700: "#f87171".to_string(),
+            c800: "#fca5a5".to_string(),
+            c900: "#fee2e2".to_string(),
+            c950: "#fef2f2".to_string(),
+        },
+
+        // Info - Cyan
+        info: ColorScale {
+            c50: "#051c25".to_string(),
+            c100: "#083344".to_string(),
+            c200: "#164e63".to_string(),
+            c300: "#155e75".to_string(),
+            c400: "#0891b2".to_string(),
+            c500: "#06b6d4".to_string(),
+            c600: "#22d3ee".to_string(),
+            c700: "#67e8f9".to_string(),
+            c800: "#a5f3fc".to_string(),
+            c900: "#cffafe".to_string(),
+            c950: "#ecfeff".to_string(),
+        },
+
+        // Semantic colors for dark mode
+        background: "#0f172a".to_string(),         // Dark slate
+        surface: "#1e293b".to_string(),            // Slightly lighter
+        surface_elevated: "#334155".to_string(),    // Card backgrounds
+        text_primary: "#f1f5f9".to_string(),       // Almost white
+        text_secondary: "#94a3b8".to_string(),     // Muted text
+        text_disabled: "#475569".to_string(),      // Disabled state
+        text_inverse: "#0f172a".to_string(),       // For light backgrounds
+        border: "#334155".to_string(),             // Subtle borders
+        border_strong: "#475569".to_string(),      // Emphasized borders
+        divider: "#1e293b".to_string(),            // Divider lines
+        overlay: "rgba(0, 0, 0, 0.7)".to_string(), // Modal overlays
+        focus_ring: "#3b82f6".to_string(),         // Focus indicators
+    }
+}
+
+/// Create dark theme typography
+fn create_dark_typography() -> ThemeTypography {
+    ThemeTypography {
+        font_family_sans: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif".to_string(),
+        font_family_serif: "'Merriweather', Georgia, 'Times New Roman', serif".to_string(),
+        font_family_mono: "'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace".to_string(),
+
+        font_size_xs: "0.75rem".to_string(),
+        font_size_sm: "0.875rem".to_string(),
+        font_size_base: "1rem".to_string(),
+        font_size_lg: "1.125rem".to_string(),
+        font_size_xl: "1.25rem".to_string(),
+        font_size_2xl: "1.5rem".to_string(),
+        font_size_3xl: "1.875rem".to_string(),
+        font_size_4xl: "2.25rem".to_string(),
+        font_size_5xl: "3rem".to_string(),
+
+        font_weight_light: "300".to_string(),
+        font_weight_normal: "400".to_string(),
+        font_weight_medium: "500".to_string(),
+        font_weight_semibold: "600".to_string(),
+        font_weight_bold: "700".to_string(),
+
+        line_height_tight: "1.25".to_string(),
+        line_height_normal: "1.5".to_string(),
+        line_height_relaxed: "1.75".to_string(),
+
+        letter_spacing_tight: "-0.025em".to_string(),
+        letter_spacing_normal: "0".to_string(),
+        letter_spacing_wide: "0.05em".to_string(),
+    }
+}
+
+/// Create dark theme spacing (same as default)
+fn create_dark_spacing() -> ThemeSpacing {
+    ThemeSpacing {
+        xs: "0.25rem".to_string(),
+        sm: "0.5rem".to_string(),
+        md: "1rem".to_string(),
+        lg: "1.5rem".to_string(),
+        xl: "2rem".to_string(),
+        xxl: "3rem".to_string(),
+        xxxl: "4rem".to_string(),
+    }
+}
+
+/// Create dark theme borders
+fn create_dark_borders() -> ThemeBorders {
+    ThemeBorders {
+        radius_none: "0".to_string(),
+        radius_sm: "0.25rem".to_string(),
+        radius_md: "0.5rem".to_string(),
+        radius_lg: "0.75rem".to_string(),
+        radius_xl: "1rem".to_string(),
+        radius_2xl: "1.5rem".to_string(),
+        radius_full: "9999px".to_string(),
+
+        width_thin: "1px".to_string(),
+        width_medium: "2px".to_string(),
+        width_thick: "4px".to_string(),
+    }
+}
+
+/// Create dark theme shadows - adjusted for dark mode
+fn create_dark_shadows() -> ThemeShadows {
+    ThemeShadows {
+        // Dark mode shadows use darker colors and subtle glows
+        none: "none".to_string(),
+        sm: "0 1px 2px 0 rgba(0, 0, 0, 0.3)".to_string(),
+        md: "0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.3)".to_string(),
+        lg: "0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.4)".to_string(),
+        xl: "0 20px 25px -5px rgba(0, 0, 0, 0.6), 0 8px 10px -6px rgba(0, 0, 0, 0.5)".to_string(),
+        xxl: "0 25px 50px -12px rgba(0, 0, 0, 0.7)".to_string(),
+        inner: "inset 0 2px 4px 0 rgba(0, 0, 0, 0.4)".to_string(),
+        glow: "0 0 15px rgba(59, 130, 246, 0.3)".to_string(), // Blue glow for focus states
+    }
+}
+
+/// Create dark theme animations (same as default)
+fn create_dark_animations() -> ThemeAnimations {
+    ThemeAnimations {
+        duration_fast: "100ms".to_string(),
+        duration_normal: "200ms".to_string(),
+        duration_slow: "300ms".to_string(),
+        duration_slower: "500ms".to_string(),
+
+        easing_default: "cubic-bezier(0.4, 0, 0.2, 1)".to_string(),
+        easing_in: "cubic-bezier(0.4, 0, 1, 1)".to_string(),
+        easing_out: "cubic-bezier(0, 0, 0.2, 1)".to_string(),
+        easing_in_out: "cubic-bezier(0.4, 0, 0.2, 1)".to_string(),
+        easing_bounce: "cubic-bezier(0.68, -0.55, 0.265, 1.55)".to_string(),
+    }
+}
+
+/// Create dark theme component styles
+fn create_dark_component_styles() -> Map<String, Map<String, String>> {
+    let mut styles = Map::new()
+
+    // Button styles
+    let mut button = Map::new()
+    button.insert("primary_bg".to_string(), "#3b82f6".to_string())
+    button.insert("primary_hover".to_string(), "#60a5fa".to_string())
+    button.insert("primary_active".to_string(), "#2563eb".to_string())
+    button.insert("primary_text".to_string(), "#ffffff".to_string())
+    button.insert("secondary_bg".to_string(), "#334155".to_string())
+    button.insert("secondary_hover".to_string(), "#475569".to_string())
+    button.insert("secondary_active".to_string(), "#1e293b".to_string())
+    button.insert("secondary_text".to_string(), "#f1f5f9".to_string())
+    button.insert("ghost_hover".to_string(), "#1e293b".to_string())
+    button.insert("ghost_text".to_string(), "#94a3b8".to_string())
+    button.insert("danger_bg".to_string(), "#dc2626".to_string())
+    button.insert("danger_hover".to_string(), "#ef4444".to_string())
+    button.insert("danger_text".to_string(), "#ffffff".to_string())
+    button.insert("disabled_bg".to_string(), "#1e293b".to_string())
+    button.insert("disabled_text".to_string(), "#475569".to_string())
+    styles.insert("button".to_string(), button)
+
+    // Card styles
+    let mut card = Map::new()
+    card.insert("bg".to_string(), "#1e293b".to_string())
+    card.insert("bg_hover".to_string(), "#334155".to_string())
+    card.insert("border".to_string(), "#334155".to_string())
+    card.insert("shadow".to_string(), "0 4px 6px -1px rgba(0, 0, 0, 0.4)".to_string())
+    card.insert("header_bg".to_string(), "#0f172a".to_string())
+    card.insert("footer_bg".to_string(), "#0f172a".to_string())
+    styles.insert("card".to_string(), card)
+
+    // Input styles
+    let mut input = Map::new()
+    input.insert("bg".to_string(), "#0f172a".to_string())
+    input.insert("border".to_string(), "#334155".to_string())
+    input.insert("border_focus".to_string(), "#3b82f6".to_string())
+    input.insert("border_error".to_string(), "#ef4444".to_string())
+    input.insert("text".to_string(), "#f1f5f9".to_string())
+    input.insert("placeholder".to_string(), "#64748b".to_string())
+    input.insert("disabled_bg".to_string(), "#1e293b".to_string())
+    input.insert("disabled_text".to_string(), "#475569".to_string())
+    input.insert("focus_ring".to_string(), "0 0 0 3px rgba(59, 130, 246, 0.3)".to_string())
+    styles.insert("input".to_string(), input)
+
+    // Badge styles
+    let mut badge = Map::new()
+    badge.insert("primary_bg".to_string(), "#1e3a5f".to_string())
+    badge.insert("primary_text".to_string(), "#93c5fd".to_string())
+    badge.insert("secondary_bg".to_string(), "#2d1b4e".to_string())
+    badge.insert("secondary_text".to_string(), "#c4b5fd".to_string())
+    badge.insert("success_bg".to_string(), "#064e3b".to_string())
+    badge.insert("success_text".to_string(), "#6ee7b7".to_string())
+    badge.insert("warning_bg".to_string(), "#78350f".to_string())
+    badge.insert("warning_text".to_string(), "#fcd34d".to_string())
+    badge.insert("error_bg".to_string(), "#7f1d1d".to_string())
+    badge.insert("error_text".to_string(), "#fca5a5".to_string())
+    badge.insert("neutral_bg".to_string(), "#334155".to_string())
+    badge.insert("neutral_text".to_string(), "#cbd5e1".to_string())
+    styles.insert("badge".to_string(), badge)
+
+    // Alert styles
+    let mut alert = Map::new()
+    alert.insert("info_bg".to_string(), "#083344".to_string())
+    alert.insert("info_border".to_string(), "#0891b2".to_string())
+    alert.insert("info_text".to_string(), "#67e8f9".to_string())
+    alert.insert("success_bg".to_string(), "#064e3b".to_string())
+    alert.insert("success_border".to_string(), "#059669".to_string())
+    alert.insert("success_text".to_string(), "#6ee7b7".to_string())
+    alert.insert("warning_bg".to_string(), "#78350f".to_string())
+    alert.insert("warning_border".to_string(), "#d97706".to_string())
+    alert.insert("warning_text".to_string(), "#fcd34d".to_string())
+    alert.insert("error_bg".to_string(), "#7f1d1d".to_string())
+    alert.insert("error_border".to_string(), "#dc2626".to_string())
+    alert.insert("error_text".to_string(), "#fca5a5".to_string())
+    styles.insert("alert".to_string(), alert)
+
+    // Navigation styles
+    let mut nav = Map::new()
+    nav.insert("bg".to_string(), "#0f172a".to_string())
+    nav.insert("border".to_string(), "#1e293b".to_string())
+    nav.insert("item_text".to_string(), "#94a3b8".to_string())
+    nav.insert("item_hover_bg".to_string(), "#1e293b".to_string())
+    nav.insert("item_hover_text".to_string(), "#f1f5f9".to_string())
+    nav.insert("item_active_bg".to_string(), "#1e3a5f".to_string())
+    nav.insert("item_active_text".to_string(), "#60a5fa".to_string())
+    nav.insert("item_active_indicator".to_string(), "#3b82f6".to_string())
+    styles.insert("nav".to_string(), nav)
+
+    // Sidebar styles
+    let mut sidebar = Map::new()
+    sidebar.insert("bg".to_string(), "#0f172a".to_string())
+    sidebar.insert("border".to_string(), "#1e293b".to_string())
+    sidebar.insert("header_bg".to_string(), "#020617".to_string())
+    sidebar.insert("section_header".to_string(), "#64748b".to_string())
+    sidebar.insert("item_text".to_string(), "#94a3b8".to_string())
+    sidebar.insert("item_hover_bg".to_string(), "#1e293b".to_string())
+    sidebar.insert("item_active_bg".to_string(), "#1e3a5f".to_string())
+    sidebar.insert("item_active_text".to_string(), "#60a5fa".to_string())
+    styles.insert("sidebar".to_string(), sidebar)
+
+    // Table styles
+    let mut table = Map::new()
+    table.insert("header_bg".to_string(), "#0f172a".to_string())
+    table.insert("header_text".to_string(), "#94a3b8".to_string())
+    table.insert("row_bg".to_string(), "#1e293b".to_string())
+    table.insert("row_bg_alt".to_string(), "#0f172a".to_string())
+    table.insert("row_hover".to_string(), "#334155".to_string())
+    table.insert("row_selected".to_string(), "#1e3a5f".to_string())
+    table.insert("border".to_string(), "#334155".to_string())
+    table.insert("cell_text".to_string(), "#f1f5f9".to_string())
+    styles.insert("table".to_string(), table)
+
+    // Modal styles
+    let mut modal = Map::new()
+    modal.insert("overlay".to_string(), "rgba(0, 0, 0, 0.8)".to_string())
+    modal.insert("bg".to_string(), "#1e293b".to_string())
+    modal.insert("border".to_string(), "#334155".to_string())
+    modal.insert("shadow".to_string(), "0 25px 50px -12px rgba(0, 0, 0, 0.7)".to_string())
+    modal.insert("header_bg".to_string(), "#0f172a".to_string())
+    modal.insert("header_border".to_string(), "#334155".to_string())
+    modal.insert("footer_bg".to_string(), "#0f172a".to_string())
+    modal.insert("footer_border".to_string(), "#334155".to_string())
+    styles.insert("modal".to_string(), modal)
+
+    // Progress styles
+    let mut progress = Map::new()
+    progress.insert("track_bg".to_string(), "#334155".to_string())
+    progress.insert("fill_primary".to_string(), "#3b82f6".to_string())
+    progress.insert("fill_success".to_string(), "#10b981".to_string())
+    progress.insert("fill_warning".to_string(), "#f59e0b".to_string())
+    progress.insert("fill_error".to_string(), "#ef4444".to_string())
+    progress.insert("text".to_string(), "#f1f5f9".to_string())
+    styles.insert("progress".to_string(), progress)
+
+    // Tooltip styles
+    let mut tooltip = Map::new()
+    tooltip.insert("bg".to_string(), "#f1f5f9".to_string())
+    tooltip.insert("text".to_string(), "#0f172a".to_string())
+    tooltip.insert("shadow".to_string(), "0 4px 6px -1px rgba(0, 0, 0, 0.4)".to_string())
+    styles.insert("tooltip".to_string(), tooltip)
+
+    // Dropdown styles
+    let mut dropdown = Map::new()
+    dropdown.insert("bg".to_string(), "#1e293b".to_string())
+    dropdown.insert("border".to_string(), "#334155".to_string())
+    dropdown.insert("shadow".to_string(), "0 10px 15px -3px rgba(0, 0, 0, 0.5)".to_string())
+    dropdown.insert("item_text".to_string(), "#f1f5f9".to_string())
+    dropdown.insert("item_hover_bg".to_string(), "#334155".to_string())
+    dropdown.insert("item_active_bg".to_string(), "#1e3a5f".to_string())
+    dropdown.insert("item_disabled_text".to_string(), "#475569".to_string())
+    dropdown.insert("divider".to_string(), "#334155".to_string())
+    styles.insert("dropdown".to_string(), dropdown)
+
+    // Code block styles
+    let mut code = Map::new()
+    code.insert("bg".to_string(), "#0f172a".to_string())
+    code.insert("border".to_string(), "#334155".to_string())
+    code.insert("text".to_string(), "#e2e8f0".to_string())
+    code.insert("keyword".to_string(), "#c4b5fd".to_string())
+    code.insert("string".to_string(), "#86efac".to_string())
+    code.insert("comment".to_string(), "#64748b".to_string())
+    code.insert("number".to_string(), "#fcd34d".to_string())
+    code.insert("function".to_string(), "#7dd3fc".to_string())
+    code.insert("line_number".to_string(), "#475569".to_string())
+    code.insert("line_highlight".to_string(), "#1e293b".to_string())
+    styles.insert("code".to_string(), code)
+
+    // Skeleton/loading styles
+    let mut skeleton = Map::new()
+    skeleton.insert("bg".to_string(), "#334155".to_string())
+    skeleton.insert("shimmer".to_string(), "linear-gradient(90deg, #334155 0%, #475569 50%, #334155 100%)".to_string())
+    styles.insert("skeleton".to_string(), skeleton)
+
+    styles
+}
+
+/// Get CSS custom properties for dark theme
+pub fn get_dark_theme_css() -> String {
+    let theme = create_dark_theme()
+    theme.to_css()
+}
+
+/// Check if system prefers dark mode
+pub fn system_prefers_dark() -> bool {
+    // Check system preference (would be injected from browser/OS)
+    env::get("PREFERS_COLOR_SCHEME").unwrap_or("light".to_string()) == "dark"
+}
+
+/// Apply dark theme to document
+pub fn apply_dark_theme() {
+    let css = get_dark_theme_css()
+    // Inject CSS variables into document root
+    dom::set_css_variables(":root", css)
+    dom::set_attribute("html", "data-theme", "dark")
+    dom::add_class("html", "dark")
+}
+
+/// Toggle between light and dark themes
+pub fn toggle_dark_mode(currently_dark: bool) -> bool {
+    if currently_dark {
+        // Switch to light
+        let light_theme = intelligo::themes::default::create_default_theme()
+        dom::set_css_variables(":root", light_theme.to_css())
+        dom::set_attribute("html", "data-theme", "light")
+        dom::remove_class("html", "dark")
+        false
+    } else {
+        // Switch to dark
+        apply_dark_theme()
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_dark_theme_creation() {
+        let theme = create_dark_theme()
+        assert_eq!(theme.id, "dark")
+        assert_eq!(theme.is_dark_mode, true)
+    }
+
+    #[test]
+    fn test_dark_colors_contrast() {
+        let colors = create_dark_colors()
+        // Dark mode should have light text on dark background
+        assert!(colors.background.starts_with("#0") || colors.background.starts_with("#1"))
+        assert!(colors.text_primary.starts_with("#f") || colors.text_primary.starts_with("#e"))
+    }
+
+    #[test]
+    fn test_dark_component_styles() {
+        let styles = create_dark_component_styles()
+        assert!(styles.contains_key("button"))
+        assert!(styles.contains_key("card"))
+        assert!(styles.contains_key("code"))
+
+        // Code block should have syntax highlighting colors
+        let code = styles.get("code").unwrap()
+        assert!(code.contains_key("keyword"))
+        assert!(code.contains_key("string"))
+    }
+
+    #[test]
+    fn test_css_generation() {
+        let css = get_dark_theme_css()
+        assert!(css.contains("--color-background:"))
+        assert!(css.contains("--color-text-primary:"))
+    }
+}

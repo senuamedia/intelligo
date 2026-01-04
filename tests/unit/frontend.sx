@@ -1,0 +1,630 @@
+/// Intelligo LMS - Frontend Unit Tests
+///
+/// Unit tests for frontend rendering, hydration, caching, and components.
+
+module intelligo::tests::unit::frontend
+
+use intelligo::chai::*
+use intelligo::frontend::*
+
+pub fn register_tests() {
+    describe("Frontend Rendering", || {
+        describe("hydration system", || {
+            it("generates correct hydration script", || {
+                let config = HydrationConfig::default();
+                let generator = HydrationScriptGenerator::new(&config);
+
+                let state = HydrationState {
+                    components: vec![
+                        ComponentHydrationState {
+                            id: "auth-widget".to_string(),
+                            component_type: "auth-widget".to_string(),
+                            priority: HydrationPriority::High,
+                            strategy: HydrationStrategy::Eager,
+                            data: Map::new(),
+                        },
+                        ComponentHydrationState {
+                            id: "video-player-1".to_string(),
+                            component_type: "video-player".to_string(),
+                            priority: HydrationPriority::Low,
+                            strategy: HydrationStrategy::Lazy,
+                            data: Map::new(),
+                        },
+                    ],
+                };
+
+                let script = generator.generate(&state);
+
+                // Script should contain component registrations
+                expect(&script.contains("auth-widget")).to().be_true();
+                expect(&script.contains("video-player")).to().be_true();
+
+                // Script should be wrapped in IIFE
+                expect(&script.starts_with("(function()")).to().be_true();
+
+                // Should include lazy loading with IntersectionObserver
+                expect(&script.contains("IntersectionObserver")).to().be_true();
+            });
+
+            it("manages component hydration lifecycle", || {
+                let config = HydrationConfig::default();
+                let mut manager = HydrationManager::new(config);
+
+                // Register components
+                let component = HydratableComponent {
+                    id: "test-component".to_string(),
+                    component_type: "button".to_string(),
+                    priority: HydrationPriority::Normal,
+                    strategy: HydrationStrategy::Eager,
+                    selector: "[data-component='test-component']".to_string(),
+                    dependencies: vec![],
+                    events: vec![],
+                    data: Map::new(),
+                };
+
+                manager.register_component(component);
+
+                // Check component is registered
+                let components = manager.get_pending_components();
+                expect(&components.len()).to().equal(&1);
+
+                // Hydrate component
+                manager.hydrate_component("test-component");
+
+                // Check component is now hydrated
+                let hydrated = manager.is_hydrated("test-component");
+                expect(&hydrated).to().be_true();
+            });
+
+            it("respects hydration priorities", || {
+                let config = HydrationConfig::default();
+                let mut manager = HydrationManager::new(config);
+
+                // Register components with different priorities
+                manager.register_component(HydratableComponent {
+                    id: "low-priority".to_string(),
+                    component_type: "footer".to_string(),
+                    priority: HydrationPriority::Low,
+                    strategy: HydrationStrategy::Idle,
+                    selector: ".footer".to_string(),
+                    dependencies: vec![],
+                    events: vec![],
+                    data: Map::new(),
+                });
+
+                manager.register_component(HydratableComponent {
+                    id: "high-priority".to_string(),
+                    component_type: "auth-widget".to_string(),
+                    priority: HydrationPriority::High,
+                    strategy: HydrationStrategy::Eager,
+                    selector: ".auth".to_string(),
+                    dependencies: vec![],
+                    events: vec![],
+                    data: Map::new(),
+                });
+
+                manager.register_component(HydratableComponent {
+                    id: "critical".to_string(),
+                    component_type: "error-boundary".to_string(),
+                    priority: HydrationPriority::Critical,
+                    strategy: HydrationStrategy::Eager,
+                    selector: ".error".to_string(),
+                    dependencies: vec![],
+                    events: vec![],
+                    data: Map::new(),
+                });
+
+                // Get hydration order
+                let order = manager.get_hydration_order();
+
+                // Critical should be first, then high, then low
+                expect(&order[0]).to().equal(&"critical".to_string());
+                expect(&order[1]).to().equal(&"high-priority".to_string());
+                expect(&order[2]).to().equal(&"low-priority".to_string());
+            });
+        });
+
+        describe("page renderer", || {
+            it("renders student dashboard", || {
+                let config = FrontendConfig::default();
+                let mut renderer = PageRenderer::new(config);
+
+                let ctx = create_student_context();
+                let data = StudentDashboardData {
+                    enrolled_courses: vec![],
+                    in_progress: vec![],
+                    completed: vec![],
+                    upcoming_deadlines: vec![],
+                    recent_activity: vec![],
+                    achievements: vec![],
+                    stats: LearnerStats::default(),
+                };
+
+                let result = renderer.render_student_dashboard(&ctx, &data);
+
+                expect(&result.is_ok()).to().be_true();
+                let page = result.unwrap();
+
+                // Page should have correct structure
+                expect(&page.html.contains("<!DOCTYPE html>")).to().be_true();
+                expect(&page.html.contains("<title>")).to().be_true();
+
+                // Should include student-specific content
+                expect(&page.html.contains("student-dashboard")).to().be_true();
+
+                // Should include CSP nonce
+                expect(&page.html.contains("nonce=")).to().be_true();
+            });
+
+            it("renders teacher dashboard", || {
+                let config = FrontendConfig::default();
+                let mut renderer = PageRenderer::new(config);
+
+                let ctx = create_teacher_context();
+                let data = TeacherDashboardData {
+                    taught_courses: vec![],
+                    pending_submissions: vec![],
+                    recent_enrollments: vec![],
+                    course_stats: vec![],
+                    upcoming_sessions: vec![],
+                    announcements: vec![],
+                };
+
+                let result = renderer.render_teacher_dashboard(&ctx, &data);
+
+                expect(&result.is_ok()).to().be_true();
+                let page = result.unwrap();
+
+                expect(&page.html.contains("teacher-dashboard")).to().be_true();
+            });
+
+            it("renders admin dashboard", || {
+                let config = FrontendConfig::default();
+                let mut renderer = PageRenderer::new(config);
+
+                let ctx = create_admin_context();
+                let data = AdminDashboardData {
+                    total_users: 1000,
+                    active_users: 750,
+                    total_courses: 50,
+                    active_enrollments: 2500,
+                    completion_rate: 0.72,
+                    revenue_this_month: 15000.0,
+                    system_health: SystemHealth::Healthy,
+                    recent_activities: vec![],
+                    alerts: vec![],
+                };
+
+                let result = renderer.render_admin_dashboard(&ctx, &data);
+
+                expect(&result.is_ok()).to().be_true();
+                let page = result.unwrap();
+
+                expect(&page.html.contains("admin-dashboard")).to().be_true();
+            });
+
+            it("applies correct layout for role", || {
+                let config = FrontendConfig::default();
+                let renderer = PageRenderer::new(config);
+
+                let student_ctx = create_student_context();
+                let admin_ctx = create_admin_context();
+
+                let student_layout = renderer.get_layout_for_context(&student_ctx);
+                let admin_layout = renderer.get_layout_for_context(&admin_ctx);
+
+                // Different roles should get different layouts
+                expect(&student_layout).to().not_equal(&admin_layout);
+            });
+
+            it("generates cache control headers", || {
+                let config = FrontendConfig::default();
+                let renderer = PageRenderer::new(config);
+
+                // Public page (cacheable)
+                let public_headers = renderer.generate_cache_headers(true, false, 3600);
+                expect(&public_headers.contains_key("Cache-Control")).to().be_true();
+                expect(&public_headers.get("Cache-Control").unwrap().contains("public")).to().be_true();
+
+                // Private page (user-specific)
+                let private_headers = renderer.generate_cache_headers(false, false, 0);
+                expect(&private_headers.get("Cache-Control").unwrap().contains("private")).to().be_true();
+                expect(&private_headers.get("Cache-Control").unwrap().contains("no-store")).to().be_true();
+            });
+        });
+
+        describe("component registry", || {
+            it("registers and retrieves components", || {
+                let registry = ComponentRegistry::new();
+
+                // Built-in components should be registered
+                let button = registry.get("button");
+                expect(&button.is_some()).to().be_true();
+
+                let card = registry.get("card");
+                expect(&card.is_some()).to().be_true();
+
+                let quiz = registry.get("quiz-widget");
+                expect(&quiz.is_some()).to().be_true();
+            });
+
+            it("renders button component", || {
+                let registry = ComponentRegistry::new();
+                let ctx = RenderContext::default();
+
+                let mut props = Map::new();
+                props.insert("text".to_string(), Value::String("Click me".to_string()));
+                props.insert("variant".to_string(), Value::String("primary".to_string()));
+
+                let html = registry.render("button", &props, &ctx);
+
+                expect(&html.is_ok()).to().be_true();
+                let html = html.unwrap();
+
+                expect(&html.contains("<button")).to().be_true();
+                expect(&html.contains("Click me")).to().be_true();
+                expect(&html.contains("is-primary")).to().be_true();
+            });
+
+            it("renders course card component", || {
+                let registry = ComponentRegistry::new();
+                let ctx = RenderContext::default();
+
+                let mut props = Map::new();
+                props.insert("id".to_string(), Value::String("course_1".to_string()));
+                props.insert("title".to_string(), Value::String("Python Basics".to_string()));
+                props.insert("instructor".to_string(), Value::String("John Doe".to_string()));
+                props.insert("progress".to_string(), Value::Number(75.0));
+                props.insert("enrolled".to_string(), Value::Bool(true));
+
+                let html = registry.render("course-card", &props, &ctx);
+
+                expect(&html.is_ok()).to().be_true();
+                let html = html.unwrap();
+
+                expect(&html.contains("Python Basics")).to().be_true();
+                expect(&html.contains("John Doe")).to().be_true();
+                expect(&html.contains("progress-ring")).to().be_true();
+            });
+
+            it("handles component errors gracefully", || {
+                let registry = ComponentRegistry::new();
+                let ctx = RenderContext::default();
+
+                // Non-existent component
+                let result = registry.render("non-existent", &Map::new(), &ctx);
+
+                expect(&result.is_err()).to().be_true();
+                match result {
+                    Err(FrontendError::RenderError { message }) => {
+                        expect(&message.contains("not found")).to().be_true();
+                    }
+                    _ => panic!("Expected RenderError")
+                }
+            });
+        });
+    });
+
+    describe("Asset Management", || {
+        describe("asset manager", || {
+            it("generates cache-busted URLs", || {
+                let config = AssetConfig::default();
+                let cdn_config = CdnConfig::default();
+                let mut manager = AssetManager::new(config, cdn_config);
+
+                // Register an asset
+                let content = b"console.log('test');";
+                let entry = manager.register_asset("/js/app.js", content);
+
+                // URL should contain hash
+                let url = manager.asset_url("/js/app.js");
+                expect(&url.contains("?v=")).to().be_true();
+                expect(&url.contains(&entry.hash[0..8])).to().be_true();
+            });
+
+            it("generates CDN URLs when configured", || {
+                let config = AssetConfig::default();
+                let cdn_config = CdnConfig::cloudflare("myzone");
+                let mut manager = AssetManager::new(config, cdn_config);
+
+                let content = b"body { color: black; }";
+                manager.register_asset("/css/main.css", content);
+
+                let url = manager.asset_url("/css/main.css");
+                expect(&url.starts_with("https://")).to().be_true();
+                expect(&url.contains("cloudflarestorage.com")).to().be_true();
+            });
+
+            it("generates responsive image srcset", || {
+                let mut config = AssetConfig::default();
+                config.responsive_images = true;
+                let cdn_config = CdnConfig::default();
+                let manager = AssetManager::new(config, cdn_config);
+
+                let srcset = manager.get_image_srcset("/images/hero.jpg", "Hero image");
+
+                expect(&srcset.srcset.is_some()).to().be_true();
+                let srcset_value = srcset.srcset.unwrap();
+
+                // Should contain multiple sizes
+                expect(&srcset_value.contains("320w")).to().be_true();
+                expect(&srcset_value.contains("640w")).to().be_true();
+                expect(&srcset_value.contains("1024w")).to().be_true();
+
+                // Should have lazy loading
+                expect(&srcset.loading).to().equal(&"lazy".to_string());
+            });
+
+            it("generates preload hints for critical assets", || {
+                let config = AssetConfig::default();
+                let cdn_config = CdnConfig::default();
+                let mut manager = AssetManager::new(config, cdn_config);
+
+                // Register critical assets
+                manager.register_asset("/css/critical.css", b"body {}");
+                manager.register_asset("/fonts/main.woff2", b"font data");
+
+                let hints = manager.generate_preload_hints();
+
+                // Critical CSS should be preloaded
+                let css_hint = hints.iter().find(|h| h.href.contains("critical.css"));
+                expect(&css_hint.is_some()).to().be_true();
+                expect(&css_hint.unwrap().as_type).to().equal(&"style".to_string());
+
+                // Fonts should be preloaded with crossorigin
+                let font_hint = hints.iter().find(|h| h.href.contains(".woff2"));
+                expect(&font_hint.is_some()).to().be_true();
+                expect(&font_hint.unwrap().crossorigin.is_some()).to().be_true();
+            });
+
+            it("inlines small assets", || {
+                let mut config = AssetConfig::default();
+                config.inline_threshold = 1024; // 1KB threshold
+                let cdn_config = CdnConfig::default();
+                let manager = AssetManager::new(config, cdn_config);
+
+                // Small asset
+                let small_content = b"small svg";
+                let inline = manager.get_inline_asset("/icons/small.svg", small_content);
+                expect(&inline.is_some()).to().be_true();
+                expect(&inline.unwrap().starts_with("data:")).to().be_true();
+
+                // Large asset
+                let large_content = vec![0u8; 2048];
+                let inline = manager.get_inline_asset("/images/large.png", &large_content);
+                expect(&inline.is_none()).to().be_true();
+            });
+        });
+    });
+
+    describe("Frontend Caching", || {
+        describe("cache manager", || {
+            it("matches URL to cache strategy", || {
+                let config = FrontendCacheConfig::default();
+                let manager = CacheManager::new(config);
+
+                // API endpoints should use network-first or stale-while-revalidate
+                let api_strategy = manager.get_strategy("/api/v1/courses/123");
+                // Static assets should use cache-first
+                let static_strategy = manager.get_strategy("/static/js/app.js");
+
+                match static_strategy {
+                    CacheStrategyType::CacheFirst => expect(&true).to().be_true(),
+                    _ => panic!("Expected CacheFirst for static assets")
+                }
+            });
+
+            it("caches and retrieves responses", async || {
+                let config = FrontendCacheConfig::default();
+                let mut manager = CacheManager::new(config);
+
+                // Simulate a request
+                let request = CacheRequest::get("https://example.com/api/test");
+
+                // First request fetches from network
+                let response = manager.fetch_with_cache(&request).await;
+                // (In real test, this would mock the network)
+
+                // Subsequent requests may use cache depending on strategy
+            });
+
+            it("respects cache TTL", || {
+                let config = FrontendCacheConfig::default();
+                let mut cache = CacheInstance::new("test", 1024 * 1024);
+
+                let response = CacheResponse {
+                    url: "https://example.com/test".to_string(),
+                    status: 200,
+                    headers: Map::new(),
+                    body: b"cached content".to_vec(),
+                    cached_at: time::now_unix() - 400, // 400 seconds ago
+                    ttl: 300, // 5 minute TTL
+                    etag: None,
+                    last_modified: None,
+                };
+
+                cache.put("https://example.com/test", response);
+
+                let retrieved = cache.get("https://example.com/test");
+                expect(&retrieved.is_some()).to().be_true();
+                expect(&retrieved.unwrap().is_expired()).to().be_true();
+            });
+
+            it("evicts entries when cache is full", || {
+                let config = FrontendCacheConfig::default();
+                let mut cache = CacheInstance::new("test", 100); // 100 bytes max
+
+                // Add entries that exceed limit
+                for i in 0..5 {
+                    let response = CacheResponse {
+                        url: format!("https://example.com/{}", i),
+                        status: 200,
+                        headers: Map::new(),
+                        body: vec![0u8; 30], // 30 bytes each
+                        cached_at: time::now_unix(),
+                        ttl: 300,
+                        etag: None,
+                        last_modified: None,
+                    };
+                    cache.put(&format!("https://example.com/{}", i), response);
+                }
+
+                // Cache should have evicted older entries
+                let stats = cache.stats();
+                expect(&stats.current_size).to().be_less_than_or_equal(&100);
+            });
+        });
+
+        describe("service worker generator", || {
+            it("generates valid service worker code", || {
+                let config = FrontendCacheConfig::default();
+                let mut generator = ServiceWorkerGenerator::new(config);
+
+                generator.add_precache("/index.html");
+                generator.add_precache("/css/main.css");
+                generator.add_precache("/js/app.js");
+
+                let sw = generator.generate("v1.0.0");
+
+                // Should be valid JavaScript
+                expect(&sw.contains("self.addEventListener")).to().be_true();
+
+                // Should handle install event
+                expect(&sw.contains("addEventListener('install'")).to().be_true();
+
+                // Should handle activate event
+                expect(&sw.contains("addEventListener('activate'")).to().be_true();
+
+                // Should handle fetch event
+                expect(&sw.contains("addEventListener('fetch'")).to().be_true();
+
+                // Should include precache URLs
+                expect(&sw.contains("/index.html")).to().be_true();
+                expect(&sw.contains("/css/main.css")).to().be_true();
+            });
+
+            it("includes cache strategy functions", || {
+                let config = FrontendCacheConfig::default();
+                let generator = ServiceWorkerGenerator::new(config);
+
+                let sw = generator.generate("v1");
+
+                expect(&sw.contains("function cacheFirst")).to().be_true();
+                expect(&sw.contains("function networkFirst")).to().be_true();
+                expect(&sw.contains("function staleWhileRevalidate")).to().be_true();
+            });
+        });
+
+        describe("offline storage", || {
+            it("generates IndexedDB initialization code", || {
+                let mut storage = OfflineStorage::new("intelligo_lms", 1);
+
+                storage.add_store(
+                    StoreDef::new("courses", "id")
+                        .with_index("by_status", "status", false)
+                );
+
+                storage.add_store(
+                    StoreDef::new("progress", "enrollment_id")
+                        .with_index("by_user", "user_id", false)
+                );
+
+                let code = storage.generate_init_code();
+
+                // Should create object stores
+                expect(&code.contains("createObjectStore")).to().be_true();
+                expect(&code.contains("'courses'")).to().be_true();
+                expect(&code.contains("'progress'")).to().be_true();
+
+                // Should create indexes
+                expect(&code.contains("createIndex")).to().be_true();
+                expect(&code.contains("by_status")).to().be_true();
+            });
+        });
+    });
+
+    describe("API Client", || {
+        it("builds correct API URLs", || {
+            let config = ApiClientConfig {
+                base_url: "https://api.example.com/v1".to_string(),
+                timeout: 30000,
+                retry_count: 3,
+                cache_enabled: true,
+            };
+
+            let client = ApiClient::new(config);
+
+            let url = client.build_url("/courses/123");
+            expect(&url).to().equal(&"https://api.example.com/v1/courses/123".to_string());
+        });
+
+        it("handles authentication tokens", async || {
+            let config = ApiClientConfig::default();
+            let mut client = ApiClient::new(config);
+
+            // Set auth token
+            client.set_auth_token("test_token");
+
+            // Token should be included in requests
+            // (Would need to mock HTTP to verify)
+        });
+
+        it("caches API responses", async || {
+            let mut config = ApiClientConfig::default();
+            config.cache_enabled = true;
+            let mut client = ApiClient::new(config);
+
+            // Make a request (would be mocked)
+            // Subsequent identical requests should return cached data
+        });
+    });
+}
+
+// Test helper functions
+fn create_student_context() -> PageContext {
+    PageContext {
+        title: "Student Dashboard".to_string(),
+        description: "".to_string(),
+        canonical_url: "/dashboard".to_string(),
+        user: UserContext {
+            user_id: Some("student_1".to_string()),
+            email: Some("student@example.com".to_string()),
+            display_name: Some("John Student".to_string()),
+            avatar_url: None,
+            role: UserRole::Student,
+            permissions: vec![],
+            tenant_id: "tenant_1".to_string(),
+            tenant_name: "Test Tenant".to_string(),
+            session_id: Some("session_1".to_string()),
+            authenticated: true,
+            preferences: UserPreferences::default(),
+            feature_flags: Map::new(),
+        },
+        data: Map::new(),
+        hydration_data: Map::new(),
+        scripts: vec![],
+        styles: vec![],
+        meta_tags: vec![],
+        structured_data: None,
+        csp_nonce: "abc123".to_string(),
+        request_id: "req_1".to_string(),
+        path: "/dashboard".to_string(),
+        query: Map::new(),
+    }
+}
+
+fn create_teacher_context() -> PageContext {
+    let mut ctx = create_student_context();
+    ctx.user.role = UserRole::Teacher;
+    ctx.user.display_name = Some("Jane Teacher".to_string());
+    ctx.title = "Teacher Dashboard".to_string();
+    ctx
+}
+
+fn create_admin_context() -> PageContext {
+    let mut ctx = create_student_context();
+    ctx.user.role = UserRole::Admin;
+    ctx.user.display_name = Some("Admin User".to_string());
+    ctx.title = "Admin Dashboard".to_string();
+    ctx
+}

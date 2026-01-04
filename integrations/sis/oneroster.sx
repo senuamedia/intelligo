@@ -1,0 +1,1135 @@
+// OneRoster API Implementation for Intelligo LMS
+// Implements IMS Global OneRoster 1.1 and 1.2 specification
+
+module intelligo::integrations::sis::oneroster
+
+use intelligo::integrations::sis::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::http::Client as HttpClient
+use std::json::{Json, JsonValue}
+use std::uuid::Uuid
+
+/// OneRoster API version
+pub enum OneRosterVersion {
+    V1_1,
+    V1_2,
+}
+
+impl OneRosterVersion {
+    pub fn to_string(self) -> String {
+        match self {
+            OneRosterVersion::V1_1 => "1.1".to_string(),
+            OneRosterVersion::V1_2 => "1.2".to_string(),
+        }
+    }
+}
+
+/// OneRoster specific configuration
+pub type OneRosterConfig {
+    version: OneRosterVersion,
+    base_url: String,
+    client_id: String,
+    client_secret: String,
+    token_url: Option<String>,
+    scope: Option<String>,
+
+    // Optional endpoints override
+    orgs_endpoint: Option<String>,
+    users_endpoint: Option<String>,
+    classes_endpoint: Option<String>,
+    courses_endpoint: Option<String>,
+    enrollments_endpoint: Option<String>,
+    academic_sessions_endpoint: Option<String>,
+    demographics_endpoint: Option<String>,
+    line_items_endpoint: Option<String>,
+    results_endpoint: Option<String>,
+
+    // Behavior options
+    use_delta_sync: bool,
+    page_size: u32,
+    max_retries: u32,
+    retry_delay: Duration,
+}
+
+impl OneRosterConfig {
+    pub fn new(base_url: String, client_id: String, client_secret: String) -> Self {
+        OneRosterConfig {
+            version: OneRosterVersion::V1_1,
+            base_url: base_url,
+            client_id: client_id,
+            client_secret: client_secret,
+            token_url: None,
+            scope: None,
+            orgs_endpoint: None,
+            users_endpoint: None,
+            classes_endpoint: None,
+            courses_endpoint: None,
+            enrollments_endpoint: None,
+            academic_sessions_endpoint: None,
+            demographics_endpoint: None,
+            line_items_endpoint: None,
+            results_endpoint: None,
+            use_delta_sync: true,
+            page_size: 100,
+            max_retries: 3,
+            retry_delay: Duration::seconds(1),
+        }
+    }
+
+    pub fn with_version(mut self, version: OneRosterVersion) -> Self {
+        self.version = version;
+        self
+    }
+}
+
+/// OneRoster status values
+pub enum OneRosterStatus {
+    Active,
+    ToBeDeleted,
+    Inactive,
+}
+
+impl OneRosterStatus {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "active" => OneRosterStatus::Active,
+            "tobedeleted" => OneRosterStatus::ToBeDeleted,
+            "inactive" => OneRosterStatus::Inactive,
+            _ => OneRosterStatus::Active,
+        }
+    }
+
+    pub fn to_string(self) -> String {
+        match self {
+            OneRosterStatus::Active => "active".to_string(),
+            OneRosterStatus::ToBeDeleted => "tobedeleted".to_string(),
+            OneRosterStatus::Inactive => "inactive".to_string(),
+        }
+    }
+}
+
+/// OneRoster role types
+pub enum OneRosterRole {
+    Administrator,
+    Aide,
+    Guardian,
+    Parent,
+    Proctor,
+    Relative,
+    Student,
+    Teacher,
+}
+
+impl OneRosterRole {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "administrator" => OneRosterRole::Administrator,
+            "aide" => OneRosterRole::Aide,
+            "guardian" => OneRosterRole::Guardian,
+            "parent" => OneRosterRole::Parent,
+            "proctor" => OneRosterRole::Proctor,
+            "relative" => OneRosterRole::Relative,
+            "student" => OneRosterRole::Student,
+            "teacher" => OneRosterRole::Teacher,
+            _ => OneRosterRole::Student,
+        }
+    }
+
+    pub fn to_sis_role(self) -> SisRole {
+        match self {
+            OneRosterRole::Administrator => SisRole::Administrator,
+            OneRosterRole::Aide => SisRole::Aide,
+            OneRosterRole::Guardian => SisRole::Guardian,
+            OneRosterRole::Parent => SisRole::Parent,
+            OneRosterRole::Student => SisRole::Student,
+            OneRosterRole::Teacher => SisRole::Teacher,
+            OneRosterRole::Proctor => SisRole::Other { name: "proctor".to_string() },
+            OneRosterRole::Relative => SisRole::Other { name: "relative".to_string() },
+        }
+    }
+}
+
+/// OneRoster organization type
+pub enum OrgType {
+    Department,
+    School,
+    District,
+    Local,
+    State,
+    National,
+}
+
+impl OrgType {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "department" => OrgType::Department,
+            "school" => OrgType::School,
+            "district" => OrgType::District,
+            "local" => OrgType::Local,
+            "state" => OrgType::State,
+            "national" => OrgType::National,
+            _ => OrgType::School,
+        }
+    }
+}
+
+/// OneRoster session type
+pub enum SessionType {
+    GradingPeriod,
+    Semester,
+    SchoolYear,
+    Term,
+}
+
+impl SessionType {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "gradingperiod" => SessionType::GradingPeriod,
+            "semester" => SessionType::Semester,
+            "schoolyear" => SessionType::SchoolYear,
+            "term" => SessionType::Term,
+            _ => SessionType::Term,
+        }
+    }
+
+    pub fn to_sis_term_type(self) -> SisTermType {
+        match self {
+            SessionType::GradingPeriod => SisTermType::GradingPeriod,
+            SessionType::Semester => SisTermType::Semester,
+            SessionType::SchoolYear => SisTermType::Year,
+            SessionType::Term => SisTermType::Term,
+        }
+    }
+}
+
+/// OneRoster GUIDRef (reference to another object)
+pub type GUIDRef {
+    href: String,
+    source_id: String,
+    type_name: String,
+}
+
+impl GUIDRef {
+    pub fn from_json(json: &JsonValue) -> Option<Self> {
+        Some(GUIDRef {
+            href: json["href"].as_str()?.to_string(),
+            source_id: json["sourcedId"].as_str()?.to_string(),
+            type_name: json["type"].as_str()?.to_string(),
+        })
+    }
+}
+
+/// OneRoster User object
+pub type OneRosterUser {
+    sourced_id: String,
+    status: OneRosterStatus,
+    date_last_modified: Option<DateTime>,
+    metadata: HashMap<String, String>,
+
+    enabled_user: bool,
+    username: Option<String>,
+    user_ids: Vec<UserIdPair>,
+    given_name: String,
+    family_name: String,
+    middle_name: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    sms: Option<String>,
+    role: OneRosterRole,
+    identifier: Option<String>,
+    grades: Vec<String>,
+    password: Option<String>,
+    orgs: Vec<GUIDRef>,
+    agents: Vec<GUIDRef>,
+}
+
+/// User ID pair (type and identifier)
+pub type UserIdPair {
+    id_type: String,
+    identifier: String,
+}
+
+impl OneRosterUser {
+    pub fn from_json(json: &JsonValue) -> Result<Self, SisError> {
+        let sourced_id = json["sourcedId"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "user".to_string(),
+                details: "Missing sourcedId".to_string()
+            })?
+            .to_string();
+
+        let status = json["status"].as_str()
+            .map(OneRosterStatus::from_string)
+            .unwrap_or(OneRosterStatus::Active);
+
+        let date_last_modified = json["dateLastModified"].as_str()
+            .and_then(|s| DateTime::parse_iso8601(s).ok());
+
+        let role = json["role"].as_str()
+            .map(OneRosterRole::from_string)
+            .unwrap_or(OneRosterRole::Student);
+
+        let grades: Vec<String> = json["grades"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+
+        let orgs: Vec<GUIDRef> = json["orgs"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| GUIDRef::from_json(v)).collect())
+            .unwrap_or_default();
+
+        let agents: Vec<GUIDRef> = json["agents"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| GUIDRef::from_json(v)).collect())
+            .unwrap_or_default();
+
+        let user_ids: Vec<UserIdPair> = json["userIds"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| {
+                Some(UserIdPair {
+                    id_type: v["type"].as_str()?.to_string(),
+                    identifier: v["identifier"].as_str()?.to_string(),
+                })
+            }).collect())
+            .unwrap_or_default();
+
+        Ok(OneRosterUser {
+            sourced_id: sourced_id,
+            status: status,
+            date_last_modified: date_last_modified,
+            metadata: extract_metadata(&json["metadata"]),
+            enabled_user: json["enabledUser"].as_bool().unwrap_or(true),
+            username: json["username"].as_str().map(|s| s.to_string()),
+            user_ids: user_ids,
+            given_name: json["givenName"].as_str().unwrap_or("").to_string(),
+            family_name: json["familyName"].as_str().unwrap_or("").to_string(),
+            middle_name: json["middleName"].as_str().map(|s| s.to_string()),
+            email: json["email"].as_str().map(|s| s.to_string()),
+            phone: json["phone"].as_str().map(|s| s.to_string()),
+            sms: json["sms"].as_str().map(|s| s.to_string()),
+            role: role,
+            identifier: json["identifier"].as_str().map(|s| s.to_string()),
+            grades: grades,
+            password: json["password"].as_str().map(|s| s.to_string()),
+            orgs: orgs,
+            agents: agents,
+        })
+    }
+
+    pub fn to_sis_user(self) -> SisUser {
+        let status = match self.status {
+            OneRosterStatus::Active => SisUserStatus::Active,
+            OneRosterStatus::Inactive => SisUserStatus::Inactive,
+            OneRosterStatus::ToBeDeleted => SisUserStatus::ToBeDeleted,
+        };
+
+        SisUser {
+            source_id: self.sourced_id,
+            email: self.email.unwrap_or_default(),
+            first_name: self.given_name,
+            last_name: self.family_name,
+            username: self.username,
+            role: self.role.to_sis_role(),
+            grade_levels: self.grades,
+            status: status,
+            phone: self.phone,
+            metadata: self.metadata,
+        }
+    }
+}
+
+/// OneRoster Course object
+pub type OneRosterCourse {
+    sourced_id: String,
+    status: OneRosterStatus,
+    date_last_modified: Option<DateTime>,
+    metadata: HashMap<String, String>,
+
+    title: String,
+    school_year: Option<GUIDRef>,
+    course_code: Option<String>,
+    grades: Vec<String>,
+    subjects: Vec<String>,
+    subject_codes: Vec<String>,
+    org: Option<GUIDRef>,
+}
+
+impl OneRosterCourse {
+    pub fn from_json(json: &JsonValue) -> Result<Self, SisError> {
+        let sourced_id = json["sourcedId"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "course".to_string(),
+                details: "Missing sourcedId".to_string()
+            })?
+            .to_string();
+
+        let status = json["status"].as_str()
+            .map(OneRosterStatus::from_string)
+            .unwrap_or(OneRosterStatus::Active);
+
+        let title = json["title"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "course".to_string(),
+                details: "Missing title".to_string()
+            })?
+            .to_string();
+
+        Ok(OneRosterCourse {
+            sourced_id: sourced_id,
+            status: status,
+            date_last_modified: json["dateLastModified"].as_str()
+                .and_then(|s| DateTime::parse_iso8601(s).ok()),
+            metadata: extract_metadata(&json["metadata"]),
+            title: title,
+            school_year: json["schoolYear"].as_object().and_then(|_| GUIDRef::from_json(&json["schoolYear"])),
+            course_code: json["courseCode"].as_str().map(|s| s.to_string()),
+            grades: json["grades"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            subjects: json["subjects"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            subject_codes: json["subjectCodes"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            org: json["org"].as_object().and_then(|_| GUIDRef::from_json(&json["org"])),
+        })
+    }
+
+    pub fn to_sis_course(self) -> SisCourse {
+        let status = match self.status {
+            OneRosterStatus::Active => SisCourseStatus::Active,
+            OneRosterStatus::Inactive => SisCourseStatus::Inactive,
+            OneRosterStatus::ToBeDeleted => SisCourseStatus::ToBeDeleted,
+        };
+
+        SisCourse {
+            source_id: self.sourced_id,
+            code: self.course_code.unwrap_or_default(),
+            name: self.title,
+            description: None,
+            term_ids: self.school_year.map(|s| vec![s.source_id]).unwrap_or_default(),
+            status: status,
+            subject_codes: self.subject_codes,
+            grade_levels: self.grades,
+            metadata: self.metadata,
+        }
+    }
+}
+
+/// OneRoster Class object
+pub type OneRosterClass {
+    sourced_id: String,
+    status: OneRosterStatus,
+    date_last_modified: Option<DateTime>,
+    metadata: HashMap<String, String>,
+
+    title: String,
+    class_code: Option<String>,
+    class_type: Option<String>,
+    location: Option<String>,
+    grades: Vec<String>,
+    subjects: Vec<String>,
+    course: Option<GUIDRef>,
+    school: Option<GUIDRef>,
+    terms: Vec<GUIDRef>,
+    subject_codes: Vec<String>,
+    periods: Vec<String>,
+}
+
+impl OneRosterClass {
+    pub fn from_json(json: &JsonValue) -> Result<Self, SisError> {
+        let sourced_id = json["sourcedId"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "class".to_string(),
+                details: "Missing sourcedId".to_string()
+            })?
+            .to_string();
+
+        let title = json["title"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "class".to_string(),
+                details: "Missing title".to_string()
+            })?
+            .to_string();
+
+        Ok(OneRosterClass {
+            sourced_id: sourced_id,
+            status: json["status"].as_str()
+                .map(OneRosterStatus::from_string)
+                .unwrap_or(OneRosterStatus::Active),
+            date_last_modified: json["dateLastModified"].as_str()
+                .and_then(|s| DateTime::parse_iso8601(s).ok()),
+            metadata: extract_metadata(&json["metadata"]),
+            title: title,
+            class_code: json["classCode"].as_str().map(|s| s.to_string()),
+            class_type: json["classType"].as_str().map(|s| s.to_string()),
+            location: json["location"].as_str().map(|s| s.to_string()),
+            grades: json["grades"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            subjects: json["subjects"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            course: json["course"].as_object().and_then(|_| GUIDRef::from_json(&json["course"])),
+            school: json["school"].as_object().and_then(|_| GUIDRef::from_json(&json["school"])),
+            terms: json["terms"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| GUIDRef::from_json(v)).collect())
+                .unwrap_or_default(),
+            subject_codes: json["subjectCodes"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            periods: json["periods"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn to_sis_class(self) -> SisClass {
+        let status = match self.status {
+            OneRosterStatus::Active => SisCourseStatus::Active,
+            OneRosterStatus::Inactive => SisCourseStatus::Inactive,
+            OneRosterStatus::ToBeDeleted => SisCourseStatus::ToBeDeleted,
+        };
+
+        SisClass {
+            source_id: self.sourced_id,
+            course_id: self.course.map(|c| c.source_id).unwrap_or_default(),
+            name: self.title,
+            code: self.class_code,
+            term_ids: self.terms.iter().map(|t| t.source_id.clone()).collect(),
+            status: status,
+            periods: self.periods,
+            location: self.location,
+            metadata: self.metadata,
+        }
+    }
+}
+
+/// OneRoster Enrollment object
+pub type OneRosterEnrollment {
+    sourced_id: String,
+    status: OneRosterStatus,
+    date_last_modified: Option<DateTime>,
+    metadata: HashMap<String, String>,
+
+    user: GUIDRef,
+    class_ref: GUIDRef,
+    school: Option<GUIDRef>,
+    role: OneRosterRole,
+    primary: Option<bool>,
+    begin_date: Option<String>,
+    end_date: Option<String>,
+}
+
+impl OneRosterEnrollment {
+    pub fn from_json(json: &JsonValue) -> Result<Self, SisError> {
+        let sourced_id = json["sourcedId"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "enrollment".to_string(),
+                details: "Missing sourcedId".to_string()
+            })?
+            .to_string();
+
+        let user = GUIDRef::from_json(&json["user"])
+            .ok_or(SisError::ParseError {
+                entity: "enrollment".to_string(),
+                details: "Missing user reference".to_string()
+            })?;
+
+        let class_ref = GUIDRef::from_json(&json["class"])
+            .ok_or(SisError::ParseError {
+                entity: "enrollment".to_string(),
+                details: "Missing class reference".to_string()
+            })?;
+
+        Ok(OneRosterEnrollment {
+            sourced_id: sourced_id,
+            status: json["status"].as_str()
+                .map(OneRosterStatus::from_string)
+                .unwrap_or(OneRosterStatus::Active),
+            date_last_modified: json["dateLastModified"].as_str()
+                .and_then(|s| DateTime::parse_iso8601(s).ok()),
+            metadata: extract_metadata(&json["metadata"]),
+            user: user,
+            class_ref: class_ref,
+            school: json["school"].as_object().and_then(|_| GUIDRef::from_json(&json["school"])),
+            role: json["role"].as_str()
+                .map(OneRosterRole::from_string)
+                .unwrap_or(OneRosterRole::Student),
+            primary: json["primary"].as_bool(),
+            begin_date: json["beginDate"].as_str().map(|s| s.to_string()),
+            end_date: json["endDate"].as_str().map(|s| s.to_string()),
+        })
+    }
+
+    pub fn to_sis_enrollment(self) -> SisEnrollment {
+        let status = match self.status {
+            OneRosterStatus::Active => SisEnrollmentStatus::Active,
+            OneRosterStatus::Inactive => SisEnrollmentStatus::Inactive,
+            OneRosterStatus::ToBeDeleted => SisEnrollmentStatus::ToBeDeleted,
+        };
+
+        SisEnrollment {
+            source_id: self.sourced_id,
+            user_id: self.user.source_id,
+            class_id: self.class_ref.source_id,
+            role: self.role.to_sis_role(),
+            status: status,
+            begin_date: self.begin_date.and_then(|s| DateTime::parse_iso8601(&s).ok()),
+            end_date: self.end_date.and_then(|s| DateTime::parse_iso8601(&s).ok()),
+            primary: self.primary.unwrap_or(true),
+        }
+    }
+}
+
+/// OneRoster Academic Session (term)
+pub type OneRosterAcademicSession {
+    sourced_id: String,
+    status: OneRosterStatus,
+    date_last_modified: Option<DateTime>,
+    metadata: HashMap<String, String>,
+
+    title: String,
+    session_type: SessionType,
+    start_date: String,
+    end_date: String,
+    parent: Option<GUIDRef>,
+    school_year: String,
+}
+
+impl OneRosterAcademicSession {
+    pub fn from_json(json: &JsonValue) -> Result<Self, SisError> {
+        let sourced_id = json["sourcedId"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "academicSession".to_string(),
+                details: "Missing sourcedId".to_string()
+            })?
+            .to_string();
+
+        let title = json["title"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "academicSession".to_string(),
+                details: "Missing title".to_string()
+            })?
+            .to_string();
+
+        Ok(OneRosterAcademicSession {
+            sourced_id: sourced_id,
+            status: json["status"].as_str()
+                .map(OneRosterStatus::from_string)
+                .unwrap_or(OneRosterStatus::Active),
+            date_last_modified: json["dateLastModified"].as_str()
+                .and_then(|s| DateTime::parse_iso8601(s).ok()),
+            metadata: extract_metadata(&json["metadata"]),
+            title: title,
+            session_type: json["type"].as_str()
+                .map(SessionType::from_string)
+                .unwrap_or(SessionType::Term),
+            start_date: json["startDate"].as_str().unwrap_or("").to_string(),
+            end_date: json["endDate"].as_str().unwrap_or("").to_string(),
+            parent: json["parent"].as_object().and_then(|_| GUIDRef::from_json(&json["parent"])),
+            school_year: json["schoolYear"].as_str().unwrap_or("").to_string(),
+        })
+    }
+
+    pub fn to_sis_term(self) -> SisTerm {
+        let status = match self.status {
+            OneRosterStatus::Active => SisTermStatus::Active,
+            OneRosterStatus::Inactive => SisTermStatus::Inactive,
+            OneRosterStatus::ToBeDeleted => SisTermStatus::ToBeDeleted,
+        };
+
+        SisTerm {
+            source_id: self.sourced_id,
+            name: self.title,
+            start_date: DateTime::parse_iso8601(&self.start_date)
+                .unwrap_or(DateTime::now()),
+            end_date: DateTime::parse_iso8601(&self.end_date)
+                .unwrap_or(DateTime::now()),
+            status: status,
+            term_type: self.session_type.to_sis_term_type(),
+        }
+    }
+}
+
+/// OneRoster Provider implementation
+pub actor OneRosterProvider {
+    config: SisConfig,
+    oneroster_config: OneRosterConfig,
+    client: BaseSisClient,
+
+    pub fn new(config: SisConfig) -> Self {
+        let oneroster_config = OneRosterConfig::new(
+            config.api_endpoint.clone().unwrap_or_default(),
+            config.oauth_config.as_ref().map(|c| c.client_id.clone()).unwrap_or_default(),
+            config.oauth_config.as_ref().map(|c| c.client_secret.clone()).unwrap_or_default(),
+        );
+
+        let mut client = BaseSisClient::new(config.api_endpoint.clone().unwrap_or_default());
+
+        if let Some(ref oauth) = config.oauth_config {
+            client = client.with_oauth(oauth.clone());
+        } else if let Some(ref api_key) = config.api_key {
+            client = client.with_api_key(api_key.clone());
+        }
+
+        OneRosterProvider {
+            config: config,
+            oneroster_config: oneroster_config,
+            client: client,
+        }
+    }
+
+    pub fn with_oneroster_config(mut self, oneroster_config: OneRosterConfig) -> Self {
+        self.oneroster_config = oneroster_config;
+        self
+    }
+
+    /// Get endpoint for entity type
+    fn get_endpoint(self, entity: &str) -> String {
+        match entity {
+            "orgs" => self.oneroster_config.orgs_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/orgs".to_string()),
+            "users" => self.oneroster_config.users_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/users".to_string()),
+            "classes" => self.oneroster_config.classes_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/classes".to_string()),
+            "courses" => self.oneroster_config.courses_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/courses".to_string()),
+            "enrollments" => self.oneroster_config.enrollments_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/enrollments".to_string()),
+            "academicSessions" => self.oneroster_config.academic_sessions_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/academicSessions".to_string()),
+            "demographics" => self.oneroster_config.demographics_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/demographics".to_string()),
+            "lineItems" => self.oneroster_config.line_items_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/lineItems".to_string()),
+            "results" => self.oneroster_config.results_endpoint.clone()
+                .unwrap_or("/ims/oneroster/v1p1/results".to_string()),
+            _ => format!("/ims/oneroster/v1p1/{}", entity),
+        }
+    }
+
+    /// Build query string with filters and pagination
+    fn build_query(
+        self,
+        options: &FetchOptions,
+        entity_name: &str
+    ) -> String {
+        let mut params = Vec::new();
+
+        // Pagination
+        let limit = options.limit.unwrap_or(self.oneroster_config.page_size);
+        params.push(format!("limit={}", limit));
+
+        if let Some(offset) = options.offset {
+            params.push(format!("offset={}", offset));
+        }
+
+        // Filter by status
+        if !options.include_inactive {
+            params.push("filter=status='active'".to_string());
+        }
+
+        // Sort
+        if let Some(ref sort_by) = options.sort_by {
+            let order = match options.sort_order {
+                SortOrder::Ascending => "asc",
+                SortOrder::Descending => "desc",
+            };
+            params.push(format!("sort={}:{}", sort_by, order));
+        }
+
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        }
+    }
+
+    /// Fetch all pages of an entity
+    async fn fetch_all<T, F>(
+        mut self,
+        endpoint: &str,
+        entity_key: &str,
+        parser: F,
+        options: FetchOptions
+    ) -> Result<Vec<T>, SisError>
+    where
+        F: Fn(&JsonValue) -> Result<T, SisError>
+    {
+        let mut all_items = Vec::new();
+        let mut offset = options.offset.unwrap_or(0);
+        let limit = options.limit.unwrap_or(self.oneroster_config.page_size);
+
+        loop {
+            let mut fetch_opts = options.clone();
+            fetch_opts.offset = Some(offset);
+            fetch_opts.limit = Some(limit);
+
+            let query = self.build_query(&fetch_opts, entity_key);
+            let url = format!("{}{}", endpoint, query);
+
+            let response = self.client.get(&url).await?;
+
+            let items = response[entity_key].as_array()
+                .ok_or(SisError::ParseError {
+                    entity: entity_key.to_string(),
+                    details: "Missing data array".to_string()
+                })?;
+
+            for item in items {
+                all_items.push(parser(item)?);
+            }
+
+            // Check if there are more pages
+            let count = items.len() as u32;
+            if count < limit {
+                break;
+            }
+
+            // Check if specific limit was requested
+            if options.limit.is_some() {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        Ok(all_items)
+    }
+}
+
+impl SisProvider for OneRosterProvider {
+    fn get_config(self) -> SisConfig {
+        self.config.clone()
+    }
+
+    async fn test_connection(mut self) -> Result<ConnectionTestResult, SisError> {
+        let start = DateTime::now();
+
+        // Try to fetch a single org to test connection
+        let endpoint = self.get_endpoint("orgs");
+        let response = self.client.get(&format!("{}?limit=1", endpoint)).await?;
+
+        let latency = (DateTime::now() - start).as_millis() as u64;
+
+        let capabilities = vec![
+            "users".to_string(),
+            "courses".to_string(),
+            "classes".to_string(),
+            "enrollments".to_string(),
+            "academicSessions".to_string(),
+        ];
+
+        Ok(ConnectionTestResult {
+            success: true,
+            message: "Connected to OneRoster API".to_string(),
+            latency_ms: latency,
+            version: Some(self.oneroster_config.version.to_string()),
+            capabilities: capabilities,
+        })
+    }
+
+    async fn fetch_users(mut self, options: FetchOptions) -> Result<Vec<SisUser>, SisError> {
+        let endpoint = self.get_endpoint("users");
+
+        let or_users: Vec<OneRosterUser> = self.fetch_all(
+            &endpoint,
+            "users",
+            |json| OneRosterUser::from_json(json),
+            options
+        ).await?;
+
+        Ok(or_users.into_iter().map(|u| u.to_sis_user()).collect())
+    }
+
+    async fn fetch_user(mut self, source_id: String) -> Result<Option<SisUser>, SisError> {
+        let endpoint = format!("{}/{}", self.get_endpoint("users"), source_id);
+
+        match self.client.get(&endpoint).await {
+            Ok(response) => {
+                let user = OneRosterUser::from_json(&response["user"])?;
+                Ok(Some(user.to_sis_user()))
+            },
+            Err(SisError::ApiError { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_courses(mut self, options: FetchOptions) -> Result<Vec<SisCourse>, SisError> {
+        let endpoint = self.get_endpoint("courses");
+
+        let or_courses: Vec<OneRosterCourse> = self.fetch_all(
+            &endpoint,
+            "courses",
+            |json| OneRosterCourse::from_json(json),
+            options
+        ).await?;
+
+        Ok(or_courses.into_iter().map(|c| c.to_sis_course()).collect())
+    }
+
+    async fn fetch_course(mut self, source_id: String) -> Result<Option<SisCourse>, SisError> {
+        let endpoint = format!("{}/{}", self.get_endpoint("courses"), source_id);
+
+        match self.client.get(&endpoint).await {
+            Ok(response) => {
+                let course = OneRosterCourse::from_json(&response["course"])?;
+                Ok(Some(course.to_sis_course()))
+            },
+            Err(SisError::ApiError { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_classes(mut self, options: FetchOptions) -> Result<Vec<SisClass>, SisError> {
+        let endpoint = self.get_endpoint("classes");
+
+        let or_classes: Vec<OneRosterClass> = self.fetch_all(
+            &endpoint,
+            "classes",
+            |json| OneRosterClass::from_json(json),
+            options
+        ).await?;
+
+        Ok(or_classes.into_iter().map(|c| c.to_sis_class()).collect())
+    }
+
+    async fn fetch_class(mut self, source_id: String) -> Result<Option<SisClass>, SisError> {
+        let endpoint = format!("{}/{}", self.get_endpoint("classes"), source_id);
+
+        match self.client.get(&endpoint).await {
+            Ok(response) => {
+                let class = OneRosterClass::from_json(&response["class"])?;
+                Ok(Some(class.to_sis_class()))
+            },
+            Err(SisError::ApiError { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_enrollments(mut self, options: FetchOptions) -> Result<Vec<SisEnrollment>, SisError> {
+        let endpoint = self.get_endpoint("enrollments");
+
+        let or_enrollments: Vec<OneRosterEnrollment> = self.fetch_all(
+            &endpoint,
+            "enrollments",
+            |json| OneRosterEnrollment::from_json(json),
+            options
+        ).await?;
+
+        Ok(or_enrollments.into_iter().map(|e| e.to_sis_enrollment()).collect())
+    }
+
+    async fn fetch_class_enrollments(
+        mut self,
+        class_id: String,
+        options: FetchOptions
+    ) -> Result<Vec<SisEnrollment>, SisError> {
+        let endpoint = format!("{}/{}/enrollments",
+            self.get_endpoint("classes"), class_id);
+
+        let or_enrollments: Vec<OneRosterEnrollment> = self.fetch_all(
+            &endpoint,
+            "enrollments",
+            |json| OneRosterEnrollment::from_json(json),
+            options
+        ).await?;
+
+        Ok(or_enrollments.into_iter().map(|e| e.to_sis_enrollment()).collect())
+    }
+
+    async fn fetch_terms(mut self, options: FetchOptions) -> Result<Vec<SisTerm>, SisError> {
+        let endpoint = self.get_endpoint("academicSessions");
+
+        let or_sessions: Vec<OneRosterAcademicSession> = self.fetch_all(
+            &endpoint,
+            "academicSessions",
+            |json| OneRosterAcademicSession::from_json(json),
+            options
+        ).await?;
+
+        Ok(or_sessions.into_iter().map(|s| s.to_sis_term()).collect())
+    }
+
+    async fn push_grades(mut self, grades: Vec<SisGrade>) -> Result<GradePushResult, SisError> {
+        let endpoint = self.get_endpoint("results");
+        let mut result = GradePushResult {
+            success: true,
+            grades_pushed: 0,
+            grades_failed: 0,
+            errors: Vec::new(),
+        };
+
+        for grade in grades {
+            let body = Json::object([
+                ("result", Json::object([
+                    ("sourcedId", Json::string(&grade.source_id)),
+                    ("status", Json::string("active")),
+                    ("lineItem", Json::object([
+                        ("sourcedId", Json::string(grade.line_item_id.as_ref().unwrap_or(&"".to_string()))),
+                    ])),
+                    ("student", Json::object([
+                        ("sourcedId", Json::string(&grade.user_id)),
+                    ])),
+                    ("score", Json::number(grade.score)),
+                    ("scoreStatus", Json::string("fully graded")),
+                    ("comment", Json::string(grade.comment.as_ref().unwrap_or(&"".to_string()))),
+                ])),
+            ]);
+
+            match self.client.put(&format!("{}/{}", endpoint, grade.source_id), body).await {
+                Ok(_) => result.grades_pushed += 1,
+                Err(e) => {
+                    result.grades_failed += 1;
+                    result.errors.push(GradePushError {
+                        grade_id: grade.source_id.clone(),
+                        user_id: grade.user_id.clone(),
+                        class_id: grade.class_id.clone(),
+                        error_code: "PUSH_FAILED".to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        result.success = result.grades_failed == 0;
+        Ok(result)
+    }
+
+    fn supports_grade_passback(self) -> bool {
+        true
+    }
+
+    fn get_capabilities(self) -> Vec<SisCapability> {
+        vec![
+            SisCapability::Users,
+            SisCapability::Courses,
+            SisCapability::Classes,
+            SisCapability::Enrollments,
+            SisCapability::Terms,
+            SisCapability::GradePassback,
+            SisCapability::DeltaSync,
+        ]
+    }
+
+    async fn fetch_deltas(
+        mut self,
+        since: DateTime,
+        entity_types: Vec<SisEntityType>
+    ) -> Result<SisDelta, SisError> {
+        let mut delta = SisDelta {
+            since: since,
+            until: DateTime::now(),
+            users: Vec::new(),
+            courses: Vec::new(),
+            classes: Vec::new(),
+            enrollments: Vec::new(),
+        };
+
+        let since_str = since.to_iso8601();
+
+        for entity_type in entity_types {
+            let endpoint = match entity_type {
+                SisEntityType::User => self.get_endpoint("users"),
+                SisEntityType::Course => self.get_endpoint("courses"),
+                SisEntityType::Class => self.get_endpoint("classes"),
+                SisEntityType::Enrollment => self.get_endpoint("enrollments"),
+                _ => continue,
+            };
+
+            let query = format!("?filter=dateLastModified>'{}'", since_str);
+            let response = self.client.get(&format!("{}{}", endpoint, query)).await?;
+
+            match entity_type {
+                SisEntityType::User => {
+                    if let Some(items) = response["users"].as_array() {
+                        for item in items {
+                            let user = OneRosterUser::from_json(item)?;
+                            let operation = match user.status {
+                                OneRosterStatus::ToBeDeleted => DeltaOperation::Delete,
+                                _ => DeltaOperation::Update,
+                            };
+                            delta.users.push(SisDeltaItem {
+                                operation: operation,
+                                entity: user.to_sis_user(),
+                                modified_at: user.date_last_modified.unwrap_or(DateTime::now()),
+                            });
+                        }
+                    }
+                },
+                SisEntityType::Course => {
+                    if let Some(items) = response["courses"].as_array() {
+                        for item in items {
+                            let course = OneRosterCourse::from_json(item)?;
+                            let operation = match course.status {
+                                OneRosterStatus::ToBeDeleted => DeltaOperation::Delete,
+                                _ => DeltaOperation::Update,
+                            };
+                            delta.courses.push(SisDeltaItem {
+                                operation: operation,
+                                entity: course.to_sis_course(),
+                                modified_at: course.date_last_modified.unwrap_or(DateTime::now()),
+                            });
+                        }
+                    }
+                },
+                SisEntityType::Class => {
+                    if let Some(items) = response["classes"].as_array() {
+                        for item in items {
+                            let class = OneRosterClass::from_json(item)?;
+                            let operation = match class.status {
+                                OneRosterStatus::ToBeDeleted => DeltaOperation::Delete,
+                                _ => DeltaOperation::Update,
+                            };
+                            delta.classes.push(SisDeltaItem {
+                                operation: operation,
+                                entity: class.to_sis_class(),
+                                modified_at: class.date_last_modified.unwrap_or(DateTime::now()),
+                            });
+                        }
+                    }
+                },
+                SisEntityType::Enrollment => {
+                    if let Some(items) = response["enrollments"].as_array() {
+                        for item in items {
+                            let enrollment = OneRosterEnrollment::from_json(item)?;
+                            let operation = match enrollment.status {
+                                OneRosterStatus::ToBeDeleted => DeltaOperation::Delete,
+                                _ => DeltaOperation::Update,
+                            };
+                            delta.enrollments.push(SisDeltaItem {
+                                operation: operation,
+                                entity: enrollment.to_sis_enrollment(),
+                                modified_at: enrollment.date_last_modified.unwrap_or(DateTime::now()),
+                            });
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+
+        Ok(delta)
+    }
+
+    fn supports_delta_sync(self) -> bool {
+        self.oneroster_config.use_delta_sync
+    }
+}
+
+/// Helper function to extract metadata from JSON
+fn extract_metadata(json: &JsonValue) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+
+    if let Some(obj) = json.as_object() {
+        for (key, value) in obj {
+            if let Some(s) = value.as_str() {
+                metadata.insert(key.clone(), s.to_string());
+            }
+        }
+    }
+
+    metadata
+}

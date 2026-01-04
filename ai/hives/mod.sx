@@ -1,0 +1,22 @@
+/// Intelligo LMS - AI Hives Module
+///
+/// Exports all AI hives for the swarm intelligence system.
+
+module intelligo::ai::hives
+
+pub use intelligo::ai::hives::tutor_hive::*
+pub use intelligo::ai::hives::content_hive::*
+pub use intelligo::ai::hives::assessment_hive::*
+pub use intelligo::ai::hives::learning_path_hive::*
+pub use intelligo::ai::hives::observation_hive::*
+pub use intelligo::ai::hives::evolution_hive::*
+pub use intelligo::ai::hives::monitoring_hive::*
+
+// Re-export hive types
+pub use TutorHive
+pub use ContentHive
+pub use AssessmentHive
+pub use LearningPathHive
+pub use ObservationHive
+pub use EvolutionHive
+pub use MonitoringHive

@@ -1,0 +1,16 @@
+/// Intelligo LMS - Payments Module
+///
+/// Exports payment processor integrations.
+
+module intelligo::integrations::payments
+
+pub use intelligo::integrations::payments::core::*
+pub use intelligo::integrations::payments::stripe::*
+pub use intelligo::integrations::payments::paypal::*
+
+// Re-export commonly used types
+pub use PaymentProcessor
+pub use PaymentIntent
+pub use PaymentResult
+pub use StripeProvider
+pub use PayPalProvider

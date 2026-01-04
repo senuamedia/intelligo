@@ -1,0 +1,616 @@
+// Video Hosting Integration Module for Intelligo LMS
+// Provides video embedding, playback tracking, and analytics
+
+module intelligo::integrations::video
+
+pub use intelligo::integrations::video::core::*
+pub use intelligo::integrations::video::youtube::*
+pub use intelligo::integrations::video::vimeo::*
+pub use intelligo::integrations::video::wistia::*
+pub use intelligo::integrations::video::kaltura::*
+
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+
+/// Supported video provider types
+pub enum VideoProviderType {
+    YouTube,
+    Vimeo,
+    Wistia,
+    Kaltura,
+    Custom,
+}
+
+impl VideoProviderType {
+    pub fn to_string(self) -> String {
+        match self {
+            VideoProviderType::YouTube => "youtube".to_string(),
+            VideoProviderType::Vimeo => "vimeo".to_string(),
+            VideoProviderType::Wistia => "wistia".to_string(),
+            VideoProviderType::Kaltura => "kaltura".to_string(),
+            VideoProviderType::Custom => "custom".to_string(),
+        }
+    }
+
+    pub fn from_string(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "youtube" => Some(VideoProviderType::YouTube),
+            "vimeo" => Some(VideoProviderType::Vimeo),
+            "wistia" => Some(VideoProviderType::Wistia),
+            "kaltura" => Some(VideoProviderType::Kaltura),
+            "custom" => Some(VideoProviderType::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// Video configuration
+pub type VideoConfig {
+    provider_id: String,
+    provider_type: VideoProviderType,
+    display_name: String,
+    enabled: bool,
+    organization_id: Option<String>,
+
+    // API credentials
+    api_key: Option<String>,
+    api_secret: Option<String>,
+    access_token: Option<String>,
+    account_id: Option<String>,
+
+    // Provider-specific settings
+    youtube_config: Option<YouTubeConfig>,
+    vimeo_config: Option<VimeoConfig>,
+    wistia_config: Option<WistiaConfig>,
+    kaltura_config: Option<KalturaConfig>,
+
+    // Playback settings
+    default_quality: VideoQuality,
+    autoplay: bool,
+    show_controls: bool,
+    enable_captions: bool,
+    default_caption_language: Option<String>,
+
+    // Tracking settings
+    track_progress: bool,
+    track_engagement: bool,
+    completion_threshold: f64, // 0.0 to 1.0
+
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// Video quality options
+pub enum VideoQuality {
+    Auto,
+    Low,      // 360p
+    Medium,   // 480p
+    High,     // 720p
+    HD,       // 1080p
+    UHD,      // 4K
+}
+
+impl VideoQuality {
+    pub fn to_string(self) -> String {
+        match self {
+            VideoQuality::Auto => "auto".to_string(),
+            VideoQuality::Low => "360p".to_string(),
+            VideoQuality::Medium => "480p".to_string(),
+            VideoQuality::High => "720p".to_string(),
+            VideoQuality::HD => "1080p".to_string(),
+            VideoQuality::UHD => "2160p".to_string(),
+        }
+    }
+}
+
+/// Video metadata
+pub type Video {
+    id: String,
+    provider_type: VideoProviderType,
+    external_id: String,
+    title: String,
+    description: Option<String>,
+    duration: Duration,
+    thumbnail_url: Option<String>,
+    embed_url: String,
+    watch_url: String,
+
+    // Technical details
+    width: Option<u32>,
+    height: Option<u32>,
+    available_qualities: Vec<VideoQuality>,
+    has_captions: bool,
+    caption_languages: Vec<String>,
+
+    // Status
+    status: VideoStatus,
+    privacy: VideoPrivacy,
+    created_at: DateTime,
+    updated_at: DateTime,
+
+    // Additional metadata
+    tags: Vec<String>,
+    categories: Vec<String>,
+    custom_fields: HashMap<String, String>,
+}
+
+/// Video status
+pub enum VideoStatus {
+    Processing,
+    Ready,
+    Failed,
+    Deleted,
+}
+
+/// Video privacy settings
+pub enum VideoPrivacy {
+    Public,
+    Unlisted,
+    Private,
+    Password,
+}
+
+/// Video embed options
+pub type VideoEmbedOptions {
+    width: Option<u32>,
+    height: Option<u32>,
+    responsive: bool,
+    autoplay: bool,
+    muted: bool,
+    loop_video: bool,
+    show_controls: bool,
+    start_time: Option<Duration>,
+    end_time: Option<Duration>,
+    quality: VideoQuality,
+    enable_captions: bool,
+    caption_language: Option<String>,
+    custom_params: HashMap<String, String>,
+}
+
+impl VideoEmbedOptions {
+    pub fn default() -> Self {
+        VideoEmbedOptions {
+            width: None,
+            height: None,
+            responsive: true,
+            autoplay: false,
+            muted: false,
+            loop_video: false,
+            show_controls: true,
+            start_time: None,
+            end_time: None,
+            quality: VideoQuality::Auto,
+            enable_captions: false,
+            caption_language: None,
+            custom_params: HashMap::new(),
+        }
+    }
+}
+
+/// Video embed result
+pub type VideoEmbed {
+    html: String,
+    iframe_url: String,
+    script_url: Option<String>,
+    width: u32,
+    height: u32,
+}
+
+/// Video playback event
+pub type VideoPlaybackEvent {
+    event_type: PlaybackEventType,
+    video_id: String,
+    user_id: Uuid,
+    timestamp: DateTime,
+    position: Duration,
+    duration: Duration,
+    percent_complete: f64,
+    playback_rate: f64,
+    quality: VideoQuality,
+    metadata: HashMap<String, String>,
+}
+
+/// Playback event types
+pub enum PlaybackEventType {
+    Play,
+    Pause,
+    Stop,
+    Seek,
+    Complete,
+    Progress,
+    QualityChange,
+    CaptionToggle,
+    FullscreenToggle,
+    Error,
+}
+
+/// Video engagement analytics
+pub type VideoEngagement {
+    video_id: String,
+    user_id: Uuid,
+    total_watch_time: Duration,
+    percent_watched: f64,
+    completed: bool,
+    completed_at: Option<DateTime>,
+    segments_watched: Vec<WatchedSegment>,
+    play_count: u32,
+    last_position: Duration,
+    last_watched: DateTime,
+}
+
+/// Watched segment
+pub type WatchedSegment {
+    start: Duration,
+    end: Duration,
+    watch_count: u32,
+}
+
+/// Video analytics (aggregate)
+pub type VideoAnalytics {
+    video_id: String,
+    total_views: u64,
+    unique_viewers: u64,
+    total_watch_time: Duration,
+    average_watch_time: Duration,
+    completion_rate: f64,
+    engagement_score: f64,
+    heatmap: Vec<HeatmapPoint>,
+    top_dropoff_points: Vec<Duration>,
+    device_breakdown: HashMap<String, u64>,
+    quality_breakdown: HashMap<String, u64>,
+}
+
+/// Heatmap point for engagement visualization
+pub type HeatmapPoint {
+    position: Duration,
+    engagement: f64, // 0.0 to 1.0
+}
+
+/// Video error types
+pub enum VideoError {
+    ConfigurationError { message: String },
+    AuthenticationError { message: String },
+    VideoNotFound { video_id: String },
+    UploadError { message: String },
+    ProcessingError { message: String },
+    EmbedError { message: String },
+    TrackingError { message: String },
+    ApiError { status: u16, message: String },
+    RateLimitError { retry_after: Option<Duration> },
+    NetworkError { message: String },
+}
+
+impl VideoError {
+    pub fn to_string(self) -> String {
+        match self {
+            VideoError::ConfigurationError { message } =>
+                format!("Configuration error: {}", message),
+            VideoError::AuthenticationError { message } =>
+                format!("Authentication error: {}", message),
+            VideoError::VideoNotFound { video_id } =>
+                format!("Video not found: {}", video_id),
+            VideoError::UploadError { message } =>
+                format!("Upload error: {}", message),
+            VideoError::ProcessingError { message } =>
+                format!("Processing error: {}", message),
+            VideoError::EmbedError { message } =>
+                format!("Embed error: {}", message),
+            VideoError::TrackingError { message } =>
+                format!("Tracking error: {}", message),
+            VideoError::ApiError { status, message } =>
+                format!("API error ({}): {}", status, message),
+            VideoError::RateLimitError { retry_after } =>
+                format!("Rate limit exceeded, retry after: {:?}", retry_after),
+            VideoError::NetworkError { message } =>
+                format!("Network error: {}", message),
+        }
+    }
+}
+
+/// Video Manager actor - coordinates video operations
+pub actor VideoManager {
+    providers: HashMap<String, Box<dyn VideoProvider>>,
+    config_store: Box<dyn VideoConfigStore>,
+    tracking_service: Box<dyn VideoTrackingService>,
+
+    pub fn new(
+        config_store: Box<dyn VideoConfigStore>,
+        tracking_service: Box<dyn VideoTrackingService>
+    ) -> Self {
+        VideoManager {
+            providers: HashMap::new(),
+            config_store: config_store,
+            tracking_service: tracking_service,
+        }
+    }
+
+    /// Register a video provider
+    pub async fn register_provider(
+        mut self,
+        provider: Box<dyn VideoProvider>
+    ) -> Result<(), VideoError> {
+        let config = provider.get_config();
+        self.providers.insert(config.provider_id.clone(), provider);
+        Ok(())
+    }
+
+    /// Load all configured providers
+    pub async fn load_providers(mut self) -> Result<(), VideoError> {
+        let configs = self.config_store.list_configs().await?;
+
+        for config in configs {
+            if config.enabled {
+                let provider = self.create_provider(config).await?;
+                self.providers.insert(provider.get_config().provider_id.clone(), provider);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a provider from configuration
+    async fn create_provider(self, config: VideoConfig) -> Result<Box<dyn VideoProvider>, VideoError> {
+        match config.provider_type {
+            VideoProviderType::YouTube => {
+                Ok(Box::new(YouTubeProvider::new(config)))
+            },
+            VideoProviderType::Vimeo => {
+                Ok(Box::new(VimeoProvider::new(config)))
+            },
+            VideoProviderType::Wistia => {
+                Ok(Box::new(WistiaProvider::new(config)))
+            },
+            VideoProviderType::Kaltura => {
+                Ok(Box::new(KalturaProvider::new(config)))
+            },
+            VideoProviderType::Custom => {
+                Err(VideoError::ConfigurationError {
+                    message: "Custom provider requires manual setup".to_string()
+                })
+            }
+        }
+    }
+
+    /// Get a provider by ID
+    pub fn get_provider(self, provider_id: &str) -> Option<&Box<dyn VideoProvider>> {
+        self.providers.get(provider_id)
+    }
+
+    /// Detect provider from URL
+    pub fn detect_provider(self, url: &str) -> Option<&Box<dyn VideoProvider>> {
+        for (_, provider) in &self.providers {
+            if provider.can_handle_url(url) {
+                return Some(provider);
+            }
+        }
+        None
+    }
+
+    /// Parse video URL and get metadata
+    pub async fn get_video_from_url(self, url: String) -> Result<Video, VideoError> {
+        let provider = self.detect_provider(&url).ok_or(
+            VideoError::ConfigurationError {
+                message: "No provider found for URL".to_string()
+            }
+        )?;
+
+        let video_id = provider.extract_video_id(&url)?;
+        provider.get_video(video_id).await
+    }
+
+    /// Generate embed code for a video
+    pub async fn get_embed(
+        self,
+        provider_id: &str,
+        video_id: String,
+        options: VideoEmbedOptions
+    ) -> Result<VideoEmbed, VideoError> {
+        let provider = self.providers.get(provider_id).ok_or(
+            VideoError::ConfigurationError {
+                message: format!("Provider not found: {}", provider_id)
+            }
+        )?;
+
+        provider.get_embed(video_id, options).await
+    }
+
+    /// Track a playback event
+    pub async fn track_event(
+        mut self,
+        event: VideoPlaybackEvent
+    ) -> Result<(), VideoError> {
+        self.tracking_service.record_event(event).await
+    }
+
+    /// Get engagement data for a user and video
+    pub async fn get_engagement(
+        self,
+        video_id: String,
+        user_id: Uuid
+    ) -> Result<VideoEngagement, VideoError> {
+        self.tracking_service.get_engagement(video_id, user_id).await
+    }
+
+    /// Get analytics for a video
+    pub async fn get_analytics(
+        self,
+        provider_id: &str,
+        video_id: String
+    ) -> Result<VideoAnalytics, VideoError> {
+        let provider = self.providers.get(provider_id).ok_or(
+            VideoError::ConfigurationError {
+                message: format!("Provider not found: {}", provider_id)
+            }
+        )?;
+
+        provider.get_analytics(video_id).await
+    }
+
+    /// List available providers
+    pub fn list_providers(self) -> Vec<VideoProviderInfo> {
+        self.providers.iter().map(|(id, provider)| {
+            let config = provider.get_config();
+            VideoProviderInfo {
+                provider_id: id.clone(),
+                display_name: config.display_name,
+                provider_type: config.provider_type,
+                enabled: config.enabled,
+            }
+        }).collect()
+    }
+}
+
+/// Video provider info for listing
+pub type VideoProviderInfo {
+    provider_id: String,
+    display_name: String,
+    provider_type: VideoProviderType,
+    enabled: bool,
+}
+
+/// Video configuration store trait
+pub trait VideoConfigStore {
+    async fn get_config(self, provider_id: String) -> Result<VideoConfig, VideoError>
+    async fn save_config(self, config: VideoConfig) -> Result<(), VideoError>
+    async fn delete_config(self, provider_id: String) -> Result<(), VideoError>
+    async fn list_configs(self) -> Result<Vec<VideoConfig>, VideoError>
+}
+
+/// Video tracking service trait
+pub trait VideoTrackingService {
+    async fn record_event(self, event: VideoPlaybackEvent) -> Result<(), VideoError>
+    async fn get_engagement(
+        self,
+        video_id: String,
+        user_id: Uuid
+    ) -> Result<VideoEngagement, VideoError>
+    async fn get_user_history(
+        self,
+        user_id: Uuid,
+        limit: u32
+    ) -> Result<Vec<VideoEngagement>, VideoError>
+    async fn update_completion(
+        self,
+        video_id: String,
+        user_id: Uuid,
+        completed: bool
+    ) -> Result<(), VideoError>
+}
+
+/// Helper to parse video URLs
+pub fn parse_video_url(url: &str) -> Option<(VideoProviderType, String)> {
+    // YouTube patterns
+    if url.contains("youtube.com") || url.contains("youtu.be") {
+        if let Some(id) = extract_youtube_id(url) {
+            return Some((VideoProviderType::YouTube, id));
+        }
+    }
+
+    // Vimeo patterns
+    if url.contains("vimeo.com") {
+        if let Some(id) = extract_vimeo_id(url) {
+            return Some((VideoProviderType::Vimeo, id));
+        }
+    }
+
+    // Wistia patterns
+    if url.contains("wistia.com") || url.contains("wi.st") {
+        if let Some(id) = extract_wistia_id(url) {
+            return Some((VideoProviderType::Wistia, id));
+        }
+    }
+
+    // Kaltura patterns
+    if url.contains("kaltura.com") || url.contains("mediaspace") {
+        if let Some(id) = extract_kaltura_id(url) {
+            return Some((VideoProviderType::Kaltura, id));
+        }
+    }
+
+    None
+}
+
+fn extract_youtube_id(url: &str) -> Option<String> {
+    // Handle youtube.com/watch?v=ID
+    if let Some(pos) = url.find("v=") {
+        let start = pos + 2;
+        let id: String = url[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if id.len() == 11 {
+            return Some(id);
+        }
+    }
+
+    // Handle youtu.be/ID
+    if url.contains("youtu.be/") {
+        if let Some(pos) = url.find("youtu.be/") {
+            let start = pos + 9;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if id.len() == 11 {
+                return Some(id);
+            }
+        }
+    }
+
+    // Handle youtube.com/embed/ID
+    if let Some(pos) = url.find("/embed/") {
+        let start = pos + 7;
+        let id: String = url[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if id.len() == 11 {
+            return Some(id);
+        }
+    }
+
+    None
+}
+
+fn extract_vimeo_id(url: &str) -> Option<String> {
+    // Handle vimeo.com/ID
+    let parts: Vec<&str> = url.split('/').collect();
+    for part in parts.iter().rev() {
+        let id: String = part.chars().take_while(|c| c.is_numeric()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn extract_wistia_id(url: &str) -> Option<String> {
+    // Handle wistia.com/medias/ID or wi.st/medias/ID
+    if let Some(pos) = url.find("/medias/") {
+        let start = pos + 8;
+        let id: String = url[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn extract_kaltura_id(url: &str) -> Option<String> {
+    // Handle various Kaltura URL formats
+    if let Some(pos) = url.find("entry_id/") {
+        let start = pos + 9;
+        let id: String = url[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}

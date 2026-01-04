@@ -1,0 +1,1848 @@
+/// Intelligo LMS - AI API
+///
+/// This module provides AI-powered learning endpoints:
+/// - AI tutoring and chat
+/// - Content generation
+/// - Assessment assistance
+/// - Learning path recommendations
+/// - Analytics and insights
+
+module intelligo::api::ai
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::ai::coordinator::*
+use intelligo::ai::hives::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the AI router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Tutoring
+        .post("/tutor/chat", move |req| tutor_chat(req, db.clone()))
+        .post("/tutor/explain", move |req| tutor_explain(req, db.clone()))
+        .get("/tutor/sessions", move |req| get_tutor_sessions(req, db.clone()))
+        .get("/tutor/sessions/:session_id", move |req| get_tutor_session(req, db.clone()))
+        .delete("/tutor/sessions/:session_id", move |req| delete_tutor_session(req, db.clone()))
+
+        // Study assistance
+        .post("/study/guide", move |req| generate_study_guide(req, db.clone()))
+        .post("/study/flashcards", move |req| generate_flashcards(req, db.clone()))
+        .post("/study/quiz", move |req| generate_practice_quiz(req, db.clone()))
+        .post("/study/summary", move |req| summarize_content(req, db.clone()))
+
+        // Content generation
+        .post("/content/lesson", move |req| generate_lesson(req, db.clone()))
+        .post("/content/questions", move |req| generate_questions(req, db.clone()))
+        .post("/content/rubric", move |req| generate_rubric(req, db.clone()))
+        .post("/content/feedback", move |req| generate_feedback(req, db.clone()))
+        .post("/content/improve", move |req| improve_content(req, db.clone()))
+
+        // Assessment
+        .post("/assess/grade", move |req| auto_grade(req, db.clone()))
+        .post("/assess/evaluate", move |req| evaluate_response(req, db.clone()))
+        .post("/assess/plagiarism", move |req| check_plagiarism(req, db.clone()))
+
+        // Learning paths
+        .post("/paths/recommend", move |req| recommend_path(req, db.clone()))
+        .post("/paths/generate", move |req| generate_path(req, db.clone()))
+        .post("/paths/adapt", move |req| adapt_path(req, db.clone()))
+        .get("/paths/diagnostic", move |req| get_diagnostic(req, db.clone()))
+        .post("/paths/diagnostic", move |req| run_diagnostic(req, db.clone()))
+
+        // Analytics and insights
+        .get("/insights/learner/:user_id", move |req| get_learner_insights(req, db.clone()))
+        .get("/insights/course/:course_id", move |req| get_course_insights(req, db.clone()))
+        .get("/insights/at-risk", move |req| get_at_risk_students(req, db.clone()))
+        .post("/insights/predict", move |req| predict_outcomes(req, db.clone()))
+
+        // Admin
+        .get("/usage", move |req| get_ai_usage(req, db.clone()))
+        .get("/models", move |req| list_models(req, db.clone()))
+        .post("/models/test", move |req| test_model(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Tutor chat request
+type TutorChatRequest {
+    message: String,
+    session_id: Option<String>,
+    context: Option<TutorContext>,
+    preferences: Option<TutorPreferences>
+}
+
+/// Tutor context
+type TutorContext {
+    course_id: Option<CourseId>,
+    lesson_id: Option<String>,
+    topic: Option<String>,
+    learning_objectives: Option<List<String>>
+}
+
+/// Tutor preferences
+type TutorPreferences {
+    explanation_style: Option<ExplanationStyle>,
+    language: Option<String>,
+    difficulty_level: Option<DifficultyLevel>,
+    include_examples: Option<Bool>,
+    include_visuals: Option<Bool>
+}
+
+/// Explanation style
+enum ExplanationStyle {
+    Concise,
+    Detailed,
+    StepByStep,
+    Socratic,
+    Analogy
+}
+
+/// Difficulty level
+enum DifficultyLevel {
+    Beginner,
+    Intermediate,
+    Advanced,
+    Expert
+}
+
+/// Tutor chat response
+type TutorChatResponse {
+    session_id: String,
+    message: AiMessage,
+    suggestions: Option<List<String>>,
+    related_resources: Option<List<ResourceReference>>,
+    follow_up_questions: Option<List<String>>
+}
+
+/// AI message
+type AiMessage {
+    role: String,
+    content: String,
+    timestamp: DateTime,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Resource reference
+type ResourceReference {
+    type_: String,
+    id: String,
+    title: String,
+    url: Option<String>
+}
+
+/// Tutor session
+type TutorSessionResponse {
+    id: String,
+    user_id: UserId,
+    course_id: Option<CourseId>,
+    topic: Option<String>,
+    messages: List<AiMessage>,
+    created_at: DateTime,
+    updated_at: DateTime,
+    summary: Option<String>
+}
+
+/// Explain request
+type ExplainRequest {
+    topic: String,
+    context: Option<String>,
+    level: Option<DifficultyLevel>,
+    style: Option<ExplanationStyle>,
+    include_examples: Option<Bool>
+}
+
+/// Explain response
+type ExplainResponse {
+    explanation: String,
+    examples: Option<List<Example>>,
+    related_concepts: List<String>,
+    further_reading: Option<List<ResourceReference>>
+}
+
+/// Example
+type Example {
+    title: Option<String>,
+    content: String,
+    explanation: Option<String>
+}
+
+/// Study guide request
+type StudyGuideRequest {
+    course_id: Option<CourseId>,
+    lesson_ids: Option<List<String>>,
+    topic: Option<String>,
+    content: Option<String>,
+    learning_objectives: Option<List<String>>,
+    format: Option<StudyGuideFormat>
+}
+
+/// Study guide format
+enum StudyGuideFormat {
+    Outline,
+    Narrative,
+    QandA,
+    Cornell,
+    MindMap
+}
+
+/// Study guide response
+type StudyGuideResponse {
+    title: String,
+    content: String,
+    key_concepts: List<KeyConcept>,
+    review_questions: List<ReviewQuestion>,
+    summary: String
+}
+
+/// Key concept
+type KeyConcept {
+    term: String,
+    definition: String,
+    importance: Option<String>
+}
+
+/// Review question
+type ReviewQuestion {
+    question: String,
+    answer: Option<String>,
+    difficulty: DifficultyLevel
+}
+
+/// Flashcard request
+type FlashcardRequest {
+    content: String,
+    topic: Option<String>,
+    count: Option<i32>,
+    difficulty: Option<DifficultyLevel>,
+    include_hints: Option<Bool>
+}
+
+/// Flashcard response
+type FlashcardResponse {
+    flashcards: List<Flashcard>,
+    topic: String,
+    difficulty: DifficultyLevel
+}
+
+/// Flashcard
+type Flashcard {
+    id: String,
+    front: String,
+    back: String,
+    hint: Option<String>,
+    tags: List<String>
+}
+
+/// Practice quiz request
+type PracticeQuizRequest {
+    content: String,
+    topic: Option<String>,
+    question_count: Option<i32>,
+    question_types: Option<List<QuestionType>>,
+    difficulty: Option<DifficultyLevel>,
+    time_limit_minutes: Option<i32>
+}
+
+/// Question type
+enum QuestionType {
+    MultipleChoice,
+    TrueFalse,
+    ShortAnswer,
+    FillInBlank,
+    Matching,
+    Essay
+}
+
+/// Practice quiz response
+type PracticeQuizResponse {
+    id: String,
+    title: String,
+    questions: List<QuizQuestion>,
+    time_limit_minutes: Option<i32>,
+    passing_score: f64
+}
+
+/// Quiz question
+type QuizQuestion {
+    id: String,
+    type_: QuestionType,
+    question: String,
+    options: Option<List<QuestionOption>>,
+    correct_answer: Option<String>,
+    explanation: Option<String>,
+    points: f64,
+    hint: Option<String>
+}
+
+/// Question option
+type QuestionOption {
+    id: String,
+    text: String,
+    is_correct: Bool
+}
+
+/// Summary request
+type SummaryRequest {
+    content: String,
+    max_length: Option<i32>,
+    style: Option<SummaryStyle>,
+    include_key_points: Option<Bool>
+}
+
+/// Summary style
+enum SummaryStyle {
+    Brief,
+    Detailed,
+    Bullet,
+    Executive
+}
+
+/// Summary response
+type SummaryResponse {
+    summary: String,
+    key_points: Option<List<String>>,
+    word_count: i32
+}
+
+/// Generate lesson request
+type GenerateLessonRequest {
+    title: String,
+    topic: String,
+    learning_objectives: List<String>,
+    target_audience: Option<String>,
+    difficulty: Option<DifficultyLevel>,
+    duration_minutes: Option<i32>,
+    include_activities: Option<Bool>,
+    include_assessments: Option<Bool>,
+    content_types: Option<List<ContentType>>
+}
+
+/// Content type
+enum ContentType {
+    Text,
+    Video,
+    Interactive,
+    Quiz,
+    Discussion,
+    Assignment
+}
+
+/// Generated lesson response
+type GeneratedLessonResponse {
+    title: String,
+    description: String,
+    learning_objectives: List<String>,
+    sections: List<LessonSection>,
+    activities: Option<List<LessonActivity>>,
+    assessment: Option<LessonAssessment>,
+    estimated_duration_minutes: i32,
+    resources: List<ResourceReference>
+}
+
+/// Lesson section
+type LessonSection {
+    title: String,
+    content: String,
+    content_type: ContentType,
+    order: i32,
+    duration_minutes: Option<i32>
+}
+
+/// Lesson activity
+type LessonActivity {
+    title: String,
+    description: String,
+    type_: String,
+    instructions: String,
+    duration_minutes: Option<i32>
+}
+
+/// Lesson assessment
+type LessonAssessment {
+    questions: List<QuizQuestion>,
+    passing_score: f64
+}
+
+/// Generate questions request
+type GenerateQuestionsRequest {
+    content: String,
+    learning_objectives: Option<List<String>>,
+    question_count: i32,
+    question_types: List<QuestionType>,
+    difficulty: DifficultyLevel,
+    bloom_levels: Option<List<BloomLevel>>
+}
+
+/// Bloom's taxonomy level
+enum BloomLevel {
+    Remember,
+    Understand,
+    Apply,
+    Analyze,
+    Evaluate,
+    Create
+}
+
+/// Generated questions response
+type GeneratedQuestionsResponse {
+    questions: List<GeneratedQuestion>
+}
+
+/// Generated question
+type GeneratedQuestion {
+    id: String,
+    type_: QuestionType,
+    question: String,
+    options: Option<List<QuestionOption>>,
+    correct_answer: String,
+    explanation: String,
+    points: f64,
+    difficulty: DifficultyLevel,
+    bloom_level: Option<BloomLevel>,
+    learning_objective: Option<String>,
+    rubric: Option<String>
+}
+
+/// Generate rubric request
+type GenerateRubricRequest {
+    assignment_description: String,
+    learning_objectives: List<String>,
+    criteria_count: Option<i32>,
+    scale_points: Option<i32>,
+    include_exemplars: Option<Bool>
+}
+
+/// Generated rubric response
+type GeneratedRubricResponse {
+    title: String,
+    description: String,
+    criteria: List<RubricCriterion>,
+    total_points: f64
+}
+
+/// Rubric criterion
+type RubricCriterion {
+    name: String,
+    description: String,
+    weight: f64,
+    levels: List<RubricLevel>
+}
+
+/// Rubric level
+type RubricLevel {
+    score: f64,
+    label: String,
+    description: String,
+    exemplar: Option<String>
+}
+
+/// Generate feedback request
+type GenerateFeedbackRequest {
+    submission_content: String,
+    rubric: Option<GeneratedRubricResponse>,
+    assignment_description: Option<String>,
+    learning_objectives: Option<List<String>>,
+    feedback_style: Option<FeedbackStyle>,
+    include_suggestions: Option<Bool>
+}
+
+/// Feedback style
+enum FeedbackStyle {
+    Encouraging,
+    Constructive,
+    Detailed,
+    Concise
+}
+
+/// Generated feedback response
+type GeneratedFeedbackResponse {
+    overall_feedback: String,
+    strengths: List<String>,
+    areas_for_improvement: List<String>,
+    specific_comments: List<SpecificComment>,
+    suggestions: Option<List<String>>,
+    score: Option<f64>
+}
+
+/// Specific comment
+type SpecificComment {
+    location: Option<String>,
+    comment: String,
+    type_: CommentType
+}
+
+/// Comment type
+enum CommentType {
+    Praise,
+    Suggestion,
+    Correction,
+    Question
+}
+
+/// Auto grade request
+type AutoGradeRequest {
+    submission_id: Option<String>,
+    submission_content: String,
+    question: Option<String>,
+    rubric: Option<GeneratedRubricResponse>,
+    correct_answer: Option<String>,
+    max_points: f64,
+    grading_type: GradingType
+}
+
+/// Grading type
+enum GradingType {
+    Exact,
+    Semantic,
+    Rubric,
+    Holistic
+}
+
+/// Auto grade response
+type AutoGradeResponse {
+    score: f64,
+    max_score: f64,
+    percentage: f64,
+    feedback: String,
+    rubric_scores: Option<List<RubricScore>>,
+    confidence: f64,
+    needs_review: Bool
+}
+
+/// Rubric score
+type RubricScore {
+    criterion_name: String,
+    score: f64,
+    max_score: f64,
+    feedback: String
+}
+
+/// Plagiarism check request
+type PlagiarismCheckRequest {
+    content: String,
+    check_against: Option<List<String>>,
+    threshold: Option<f64>
+}
+
+/// Plagiarism check response
+type PlagiarismCheckResponse {
+    is_original: Bool,
+    similarity_score: f64,
+    matches: List<PlagiarismMatch>,
+    ai_generated_probability: Option<f64>
+}
+
+/// Plagiarism match
+type PlagiarismMatch {
+    source: String,
+    source_type: String,
+    matched_content: String,
+    similarity: f64,
+    url: Option<String>
+}
+
+/// Recommend path request
+type RecommendPathRequest {
+    user_id: Option<UserId>,
+    goal: String,
+    current_skills: Option<List<Skill>>,
+    time_available_hours: Option<f64>,
+    learning_style: Option<LearningStyle>,
+    constraints: Option<PathConstraints>
+}
+
+/// Skill
+type Skill {
+    name: String,
+    level: SkillLevel
+}
+
+/// Skill level
+enum SkillLevel {
+    None,
+    Beginner,
+    Intermediate,
+    Advanced,
+    Expert
+}
+
+/// Learning style
+enum LearningStyle {
+    Visual,
+    Auditory,
+    ReadingWriting,
+    Kinesthetic
+}
+
+/// Path constraints
+type PathConstraints {
+    max_courses: Option<i32>,
+    preferred_duration_weeks: Option<i32>,
+    exclude_courses: Option<List<CourseId>>,
+    must_include_topics: Option<List<String>>
+}
+
+/// Learning path response
+type LearningPathResponse {
+    id: String,
+    title: String,
+    description: String,
+    goal: String,
+    estimated_hours: f64,
+    estimated_weeks: i32,
+    steps: List<PathStep>,
+    skills_gained: List<Skill>,
+    prerequisites: List<String>
+}
+
+/// Path step
+type PathStep {
+    order: i32,
+    type_: PathStepType,
+    course_id: Option<CourseId>,
+    course_title: Option<String>,
+    lesson_id: Option<String>,
+    lesson_title: Option<String>,
+    external_resource: Option<String>,
+    description: String,
+    estimated_hours: f64,
+    is_optional: Bool
+}
+
+/// Path step type
+enum PathStepType {
+    Course,
+    Lesson,
+    Assessment,
+    Project,
+    ExternalResource
+}
+
+/// Diagnostic request
+type DiagnosticRequest {
+    topic: String,
+    skill_areas: List<String>,
+    question_count: Option<i32>
+}
+
+/// Diagnostic response
+type DiagnosticResponse {
+    id: String,
+    topic: String,
+    questions: List<DiagnosticQuestion>,
+    estimated_time_minutes: i32
+}
+
+/// Diagnostic question
+type DiagnosticQuestion {
+    id: String,
+    skill_area: String,
+    difficulty: DifficultyLevel,
+    question: String,
+    options: List<QuestionOption>
+}
+
+/// Diagnostic result
+type DiagnosticResult {
+    id: String,
+    topic: String,
+    skill_assessments: List<SkillAssessment>,
+    overall_level: DifficultyLevel,
+    strengths: List<String>,
+    gaps: List<String>,
+    recommendations: List<String>
+}
+
+/// Skill assessment
+type SkillAssessment {
+    skill_area: String,
+    score: f64,
+    level: SkillLevel,
+    correct_count: i32,
+    total_count: i32
+}
+
+/// Learner insights response
+type LearnerInsightsResponse {
+    user_id: UserId,
+    learning_style: Option<LearningStyle>,
+    engagement_level: EngagementLevel,
+    strengths: List<InsightItem>,
+    challenges: List<InsightItem>,
+    learning_patterns: LearningPatterns,
+    recommendations: List<Recommendation>,
+    risk_factors: Option<List<RiskFactor>>
+}
+
+/// Engagement level
+enum EngagementLevel {
+    Low,
+    Moderate,
+    High,
+    VeryHigh
+}
+
+/// Insight item
+type InsightItem {
+    area: String,
+    description: String,
+    evidence: List<String>,
+    confidence: f64
+}
+
+/// Learning patterns
+type LearningPatterns {
+    preferred_time: Option<String>,
+    session_duration_avg_minutes: f64,
+    completion_rate: f64,
+    retry_behavior: String,
+    content_preferences: List<String>
+}
+
+/// Recommendation
+type Recommendation {
+    type_: String,
+    title: String,
+    description: String,
+    priority: Priority,
+    action_url: Option<String>
+}
+
+/// Priority
+enum Priority {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+/// Risk factor
+type RiskFactor {
+    factor: String,
+    severity: Priority,
+    indicators: List<String>,
+    suggested_interventions: List<String>
+}
+
+/// Course insights response
+type CourseInsightsResponse {
+    course_id: CourseId,
+    overall_health: CourseHealth,
+    engagement_metrics: EngagementMetrics,
+    content_effectiveness: List<ContentEffectiveness>,
+    common_struggles: List<StrugglePoint>,
+    recommendations: List<Recommendation>
+}
+
+/// Course health
+enum CourseHealth {
+    Excellent,
+    Good,
+    NeedsAttention,
+    Critical
+}
+
+/// Engagement metrics
+type EngagementMetrics {
+    active_learner_percentage: f64,
+    average_session_minutes: f64,
+    completion_rate: f64,
+    average_grade: Option<f64>,
+    discussion_participation_rate: f64
+}
+
+/// Content effectiveness
+type ContentEffectiveness {
+    content_id: String,
+    content_title: String,
+    effectiveness_score: f64,
+    completion_rate: f64,
+    average_time_minutes: f64,
+    feedback_sentiment: f64
+}
+
+/// Struggle point
+type StrugglePoint {
+    content_id: String,
+    content_title: String,
+    issue: String,
+    affected_learner_percentage: f64,
+    suggested_improvements: List<String>
+}
+
+/// At-risk students response
+type AtRiskStudentsResponse {
+    course_id: Option<CourseId>,
+    at_risk_students: List<AtRiskStudent>,
+    summary: RiskSummary
+}
+
+/// At-risk student
+type AtRiskStudent {
+    user_id: UserId,
+    name: String,
+    email: String,
+    risk_level: Priority,
+    risk_factors: List<String>,
+    current_grade: Option<f64>,
+    last_activity_days_ago: i32,
+    suggested_interventions: List<String>
+}
+
+/// Risk summary
+type RiskSummary {
+    total_students: i32,
+    at_risk_count: i32,
+    critical_count: i32,
+    high_count: i32,
+    medium_count: i32
+}
+
+/// Predict outcomes request
+type PredictOutcomesRequest {
+    course_id: CourseId,
+    user_ids: Option<List<UserId>>
+}
+
+/// Predict outcomes response
+type PredictOutcomesResponse {
+    predictions: List<OutcomePrediction>
+}
+
+/// Outcome prediction
+type OutcomePrediction {
+    user_id: UserId,
+    predicted_grade: f64,
+    predicted_completion: Bool,
+    confidence: f64,
+    factors: List<PredictionFactor>
+}
+
+/// Prediction factor
+type PredictionFactor {
+    factor: String,
+    impact: String,
+    weight: f64
+}
+
+/// AI usage response
+type AiUsageResponse {
+    period: String,
+    total_requests: i64,
+    total_tokens: i64,
+    total_cost: f64,
+    by_feature: List<FeatureUsage>,
+    by_model: List<ModelUsage>,
+    trends: List<UsageTrend>
+}
+
+/// Feature usage
+type FeatureUsage {
+    feature: String,
+    request_count: i64,
+    token_count: i64,
+    cost: f64
+}
+
+/// Model usage
+type ModelUsage {
+    model: String,
+    request_count: i64,
+    token_count: i64,
+    cost: f64,
+    average_latency_ms: f64
+}
+
+/// Usage trend
+type UsageTrend {
+    date: DateTime,
+    requests: i64,
+    tokens: i64,
+    cost: f64
+}
+
+// =============================================================================
+// TUTORING ENDPOINTS
+// =============================================================================
+
+/// Tutor chat
+async fn tutor_chat(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: TutorChatRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    // Get or create session
+    let session_id = body.session_id.unwrap_or_else(|| generate_session_id());
+    let session = get_or_create_tutor_session(&db, &auth.user_id, &session_id, body.context.as_ref()).await?;
+
+    // Build AI request
+    let ai_request = TutorRequest {
+        user_id: auth.user_id.clone(),
+        session_id: session_id.clone(),
+        message: body.message.clone(),
+        conversation_history: session.messages.clone(),
+        context: body.context,
+        preferences: body.preferences
+    };
+
+    // Call tutor hive
+    let ai_response = call_tutor_hive(&db, ai_request).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    // Save messages to session
+    save_tutor_message(&db, &session_id, "user", &body.message).await.ok();
+    save_tutor_message(&db, &session_id, "assistant", &ai_response.content).await.ok();
+
+    // Track AI usage
+    track_ai_usage(&db, &auth.user_id, "tutor_chat", ai_response.tokens_used).await.ok();
+
+    let response = TutorChatResponse {
+        session_id,
+        message: AiMessage {
+            role: "assistant".to_string(),
+            content: ai_response.content,
+            timestamp: DateTime::now(),
+            metadata: ai_response.metadata
+        },
+        suggestions: ai_response.suggestions,
+        related_resources: ai_response.related_resources,
+        follow_up_questions: ai_response.follow_up_questions
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Tutor explain
+async fn tutor_explain(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: ExplainRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let ai_response = call_explain_hive(&db, ExplainHiveRequest {
+        topic: body.topic,
+        context: body.context,
+        level: body.level.unwrap_or(DifficultyLevel::Intermediate),
+        style: body.style.unwrap_or(ExplanationStyle::Detailed),
+        include_examples: body.include_examples.unwrap_or(true)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "explain", ai_response.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(ai_response.result, &ctx)))
+}
+
+/// Get tutor sessions
+async fn get_tutor_sessions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let sessions = db.tutor_sessions().find_by_user(&auth.user_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(sessions, &ctx)))
+}
+
+/// Get tutor session
+async fn get_tutor_session(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let session_id = req.param("session_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Session ID required".to_string()
+    })?;
+
+    let session = db.tutor_sessions().find_by_id(&session_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "TutorSession".to_string(), id: session_id.clone() })?;
+
+    if session.user_id != auth.user_id && !ctx.is_admin() {
+        return Err(ApiError::Forbidden { message: "Access denied".to_string(), required_permission: None })
+    }
+
+    Ok(Response::json(ApiResponse::success(session, &ctx)))
+}
+
+/// Delete tutor session
+async fn delete_tutor_session(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let session_id = req.param("session_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Session ID required".to_string()
+    })?;
+
+    let session = db.tutor_sessions().find_by_id(&session_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?
+        .ok_or_else(|| ApiError::NotFound { resource: "TutorSession".to_string(), id: session_id.clone() })?;
+
+    if session.user_id != auth.user_id && !ctx.is_admin() {
+        return Err(ApiError::Forbidden { message: "Access denied".to_string(), required_permission: None })
+    }
+
+    db.tutor_sessions().delete(&session_id).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(Map::from([("deleted".to_string(), Dynamic::Bool(true))])))
+}
+
+// =============================================================================
+// STUDY ASSISTANCE
+// =============================================================================
+
+/// Generate study guide
+async fn generate_study_guide(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: StudyGuideRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let content = if let Some(c) = body.content {
+        c
+    } else if let Some(lesson_ids) = body.lesson_ids {
+        get_content_from_lessons(&db, &lesson_ids).await?
+    } else {
+        return Err(ApiError::BadRequest { message: "Content or lesson_ids required".to_string() })
+    };
+
+    let result = call_content_hive(&db, ContentHiveRequest::StudyGuide {
+        content,
+        topic: body.topic,
+        learning_objectives: body.learning_objectives,
+        format: body.format.unwrap_or(StudyGuideFormat::Outline)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "study_guide", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.study_guide.unwrap(), &ctx)))
+}
+
+/// Generate flashcards
+async fn generate_flashcards(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: FlashcardRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_content_hive(&db, ContentHiveRequest::Flashcards {
+        content: body.content,
+        topic: body.topic,
+        count: body.count.unwrap_or(10),
+        difficulty: body.difficulty.unwrap_or(DifficultyLevel::Intermediate),
+        include_hints: body.include_hints.unwrap_or(true)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "flashcards", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.flashcards.unwrap(), &ctx)))
+}
+
+/// Generate practice quiz
+async fn generate_practice_quiz(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: PracticeQuizRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_content_hive(&db, ContentHiveRequest::PracticeQuiz {
+        content: body.content,
+        topic: body.topic,
+        question_count: body.question_count.unwrap_or(10),
+        question_types: body.question_types.unwrap_or(vec![QuestionType::MultipleChoice]),
+        difficulty: body.difficulty.unwrap_or(DifficultyLevel::Intermediate)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "practice_quiz", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.quiz.unwrap(), &ctx)))
+}
+
+/// Summarize content
+async fn summarize_content(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: SummaryRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_content_hive(&db, ContentHiveRequest::Summary {
+        content: body.content,
+        max_length: body.max_length,
+        style: body.style.unwrap_or(SummaryStyle::Brief),
+        include_key_points: body.include_key_points.unwrap_or(true)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "summary", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.summary.unwrap(), &ctx)))
+}
+
+// =============================================================================
+// CONTENT GENERATION
+// =============================================================================
+
+/// Generate lesson
+async fn generate_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::CreateContent)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: GenerateLessonRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_content_hive(&db, ContentHiveRequest::Lesson {
+        title: body.title,
+        topic: body.topic,
+        learning_objectives: body.learning_objectives,
+        target_audience: body.target_audience,
+        difficulty: body.difficulty.unwrap_or(DifficultyLevel::Intermediate),
+        duration_minutes: body.duration_minutes.unwrap_or(30),
+        include_activities: body.include_activities.unwrap_or(true),
+        include_assessments: body.include_assessments.unwrap_or(true)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "generate_lesson", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.lesson.unwrap(), &ctx)))
+}
+
+/// Generate questions
+async fn generate_questions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::CreateContent)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: GenerateQuestionsRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_assessment_hive(&db, AssessmentHiveRequest::GenerateQuestions {
+        content: body.content,
+        learning_objectives: body.learning_objectives,
+        question_count: body.question_count,
+        question_types: body.question_types,
+        difficulty: body.difficulty,
+        bloom_levels: body.bloom_levels
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "generate_questions", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.questions.unwrap(), &ctx)))
+}
+
+/// Generate rubric
+async fn generate_rubric(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::CreateContent)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: GenerateRubricRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_assessment_hive(&db, AssessmentHiveRequest::GenerateRubric {
+        assignment_description: body.assignment_description,
+        learning_objectives: body.learning_objectives,
+        criteria_count: body.criteria_count.unwrap_or(4),
+        scale_points: body.scale_points.unwrap_or(4),
+        include_exemplars: body.include_exemplars.unwrap_or(false)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "generate_rubric", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.rubric.unwrap(), &ctx)))
+}
+
+/// Generate feedback
+async fn generate_feedback(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: GenerateFeedbackRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_assessment_hive(&db, AssessmentHiveRequest::GenerateFeedback {
+        submission_content: body.submission_content,
+        rubric: body.rubric,
+        assignment_description: body.assignment_description,
+        learning_objectives: body.learning_objectives,
+        feedback_style: body.feedback_style.unwrap_or(FeedbackStyle::Constructive),
+        include_suggestions: body.include_suggestions.unwrap_or(true)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "generate_feedback", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.feedback.unwrap(), &ctx)))
+}
+
+/// Improve content
+async fn improve_content(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::CreateContent)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct ImproveRequest {
+        content: String,
+        improvement_type: String,
+        instructions: Option<String>
+    }
+
+    let body: ImproveRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_content_hive(&db, ContentHiveRequest::Improve {
+        content: body.content,
+        improvement_type: body.improvement_type,
+        instructions: body.instructions
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "improve_content", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.improved_content.unwrap(), &ctx)))
+}
+
+// =============================================================================
+// ASSESSMENT
+// =============================================================================
+
+/// Auto grade
+async fn auto_grade(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: AutoGradeRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_assessment_hive(&db, AssessmentHiveRequest::AutoGrade {
+        submission_content: body.submission_content,
+        question: body.question,
+        rubric: body.rubric,
+        correct_answer: body.correct_answer,
+        max_points: body.max_points,
+        grading_type: body.grading_type
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "auto_grade", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.grade.unwrap(), &ctx)))
+}
+
+/// Evaluate response
+async fn evaluate_response(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct EvaluateRequest {
+        question: String,
+        response: String,
+        correct_answer: Option<String>,
+        rubric: Option<String>
+    }
+
+    let body: EvaluateRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_assessment_hive(&db, AssessmentHiveRequest::Evaluate {
+        question: body.question,
+        response: body.response,
+        correct_answer: body.correct_answer,
+        rubric: body.rubric
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "evaluate", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.evaluation.unwrap(), &ctx)))
+}
+
+/// Check plagiarism
+async fn check_plagiarism(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::EditGrades)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: PlagiarismCheckRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_assessment_hive(&db, AssessmentHiveRequest::Plagiarism {
+        content: body.content,
+        check_against: body.check_against,
+        threshold: body.threshold.unwrap_or(0.3)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "plagiarism", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.plagiarism_result.unwrap(), &ctx)))
+}
+
+// =============================================================================
+// LEARNING PATHS
+// =============================================================================
+
+/// Recommend learning path
+async fn recommend_path(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: RecommendPathRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_learning_path_hive(&db, LearningPathHiveRequest::Recommend {
+        user_id: body.user_id.or(Some(auth.user_id.clone())),
+        goal: body.goal,
+        current_skills: body.current_skills,
+        time_available_hours: body.time_available_hours,
+        learning_style: body.learning_style,
+        constraints: body.constraints
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "recommend_path", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.path.unwrap(), &ctx)))
+}
+
+/// Generate learning path
+async fn generate_path(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::CreateContent)?;
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: RecommendPathRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_learning_path_hive(&db, LearningPathHiveRequest::Generate {
+        goal: body.goal,
+        current_skills: body.current_skills,
+        time_available_hours: body.time_available_hours,
+        constraints: body.constraints
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "generate_path", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.path.unwrap(), &ctx)))
+}
+
+/// Adapt learning path
+async fn adapt_path(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct AdaptPathRequest {
+        path_id: String,
+        progress_data: Map<String, Dynamic>,
+        feedback: Option<String>
+    }
+
+    let body: AdaptPathRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_learning_path_hive(&db, LearningPathHiveRequest::Adapt {
+        path_id: body.path_id,
+        user_id: auth.user_id.clone(),
+        progress_data: body.progress_data,
+        feedback: body.feedback
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "adapt_path", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.path.unwrap(), &ctx)))
+}
+
+/// Get diagnostic
+async fn get_diagnostic(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let topic = req.query_param("topic").ok_or_else(|| ApiError::BadRequest {
+        message: "Topic required".to_string()
+    })?;
+
+    let diagnostic = db.diagnostics().find_by_user_and_topic(&auth.user_id, &topic).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    match diagnostic {
+        Some(d) => Ok(Response::json(ApiResponse::success(d, &ctx))),
+        None => Err(ApiError::NotFound { resource: "Diagnostic".to_string(), id: topic })
+    }
+}
+
+/// Run diagnostic
+async fn run_diagnostic(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: DiagnosticRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_learning_path_hive(&db, LearningPathHiveRequest::Diagnostic {
+        topic: body.topic,
+        skill_areas: body.skill_areas,
+        question_count: body.question_count.unwrap_or(10)
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    track_ai_usage(&db, &auth.user_id, "diagnostic", result.tokens_used).await.ok();
+
+    Ok(Response::json(ApiResponse::success(result.diagnostic.unwrap(), &ctx)))
+}
+
+// =============================================================================
+// INSIGHTS
+// =============================================================================
+
+/// Get learner insights
+async fn get_learner_insights(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    let is_own = ctx.auth.as_ref().map(|a| a.user_id.to_string() == user_id).unwrap_or(false);
+    if !is_own {
+        ctx.require_permission(Permission::ViewAnalytics)?;
+    }
+
+    let result = call_observation_hive(&db, ObservationHiveRequest::LearnerInsights {
+        user_id: user_id.clone()
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(result.insights.unwrap(), &ctx)))
+}
+
+/// Get course insights
+async fn get_course_insights(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewAnalytics)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let result = call_observation_hive(&db, ObservationHiveRequest::CourseInsights {
+        course_id: course_id.clone()
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(result.course_insights.unwrap(), &ctx)))
+}
+
+/// Get at-risk students
+async fn get_at_risk_students(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewAnalytics)?;
+
+    let course_id = req.query_param("course_id");
+
+    let result = call_observation_hive(&db, ObservationHiveRequest::AtRisk {
+        course_id
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(result.at_risk.unwrap(), &ctx)))
+}
+
+/// Predict outcomes
+async fn predict_outcomes(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ViewAnalytics)?;
+
+    let body: PredictOutcomesRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = call_observation_hive(&db, ObservationHiveRequest::Predict {
+        course_id: body.course_id,
+        user_ids: body.user_ids
+    }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(result.predictions.unwrap(), &ctx)))
+}
+
+// =============================================================================
+// ADMIN
+// =============================================================================
+
+/// Get AI usage
+async fn get_ai_usage(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageAI)?;
+
+    let period = req.query_param("period").unwrap_or("month".to_string());
+
+    let usage = db.ai_usage().get_usage(&period).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(usage, &ctx)))
+}
+
+/// List models
+async fn list_models(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageAI)?;
+
+    let models = get_available_models().await;
+
+    Ok(Response::json(ApiResponse::success(models, &ctx)))
+}
+
+/// Test model
+async fn test_model(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+    ctx.require_permission(Permission::ManageAI)?;
+
+    #[derive(Deserialize)]
+    struct TestModelRequest {
+        model: String,
+        prompt: String
+    }
+
+    let body: TestModelRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request: {}", e)
+    })?;
+
+    let result = test_model_connection(&body.model, &body.prompt).await
+        .map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: ctx.trace_id.clone() })?;
+
+    Ok(Response::json(ApiResponse::success(result, &ctx)))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn generate_session_id() -> String {
+    format!("tutor_{}", generate_uuid())
+}
+
+fn generate_uuid() -> String {
+    use std::random::random;
+    format!("{:08x}{:08x}", random::<u32>(), random::<u32>())
+}
+
+async fn get_or_create_tutor_session(db: &Database, user_id: &str, session_id: &str, context: Option<&TutorContext>) -> Result<TutorSessionResponse, ApiError> {
+    match db.tutor_sessions().find_by_id(session_id).await {
+        Ok(Some(session)) => Ok(session),
+        _ => {
+            let session = db.tutor_sessions().create(CreateTutorSessionInput {
+                id: session_id.to_string(),
+                user_id: user_id.to_string(),
+                course_id: context.and_then(|c| c.course_id.clone()),
+                topic: context.and_then(|c| c.topic.clone())
+            }).await.map_err(|e| ApiError::InternalError { message: e.to_string(), trace_id: "".to_string() })?;
+            Ok(session)
+        }
+    }
+}
+
+async fn save_tutor_message(db: &Database, session_id: &str, role: &str, content: &str) -> Result<(), String> {
+    db.tutor_sessions().add_message(session_id, AiMessage {
+        role: role.to_string(),
+        content: content.to_string(),
+        timestamp: DateTime::now(),
+        metadata: None
+    }).await
+}
+
+async fn track_ai_usage(db: &Database, user_id: &str, feature: &str, tokens: i64) -> Result<(), String> {
+    db.ai_usage().record(user_id, feature, tokens).await
+}
+
+async fn get_content_from_lessons(db: &Database, lesson_ids: &List<String>) -> Result<String, ApiError> {
+    let mut content = String::new();
+    for id in lesson_ids {
+        if let Some(lesson) = db.lessons().find_by_id(id).await.ok().flatten() {
+            content.push_str(&lesson.content);
+            content.push_str("\n\n");
+        }
+    }
+    Ok(content)
+}
+
+async fn get_available_models() -> List<Map<String, Dynamic>> {
+    vec![
+        Map::from([
+            ("id".to_string(), Dynamic::String("gpt-4".to_string())),
+            ("name".to_string(), Dynamic::String("GPT-4".to_string())),
+            ("available".to_string(), Dynamic::Bool(true))
+        ]),
+        Map::from([
+            ("id".to_string(), Dynamic::String("claude-3".to_string())),
+            ("name".to_string(), Dynamic::String("Claude 3".to_string())),
+            ("available".to_string(), Dynamic::Bool(true))
+        ])
+    ]
+}
+
+async fn test_model_connection(model: &str, prompt: &str) -> Result<Map<String, Dynamic>, String> {
+    Ok(Map::from([
+        ("success".to_string(), Dynamic::Bool(true)),
+        ("response".to_string(), Dynamic::String("Test response".to_string())),
+        ("latency_ms".to_string(), Dynamic::Int(150))
+    ]))
+}
+
+// Placeholder hive call functions
+async fn call_tutor_hive(db: &Database, request: TutorRequest) -> Result<TutorHiveResponse, String> {
+    Ok(TutorHiveResponse {
+        content: "I'd be happy to help you with that!".to_string(),
+        suggestions: Some(vec!["Ask a follow-up question".to_string()]),
+        related_resources: None,
+        follow_up_questions: Some(vec!["Would you like more details?".to_string()]),
+        tokens_used: 100,
+        metadata: None
+    })
+}
+
+async fn call_explain_hive(db: &Database, request: ExplainHiveRequest) -> Result<ExplainHiveResponse, String> {
+    Ok(ExplainHiveResponse {
+        result: ExplainResponse {
+            explanation: "Explanation here".to_string(),
+            examples: None,
+            related_concepts: vec![],
+            further_reading: None
+        },
+        tokens_used: 100
+    })
+}
+
+async fn call_content_hive(db: &Database, request: ContentHiveRequest) -> Result<ContentHiveResponse, String> {
+    Ok(ContentHiveResponse {
+        study_guide: None,
+        flashcards: None,
+        quiz: None,
+        summary: None,
+        lesson: None,
+        improved_content: None,
+        tokens_used: 100
+    })
+}
+
+async fn call_assessment_hive(db: &Database, request: AssessmentHiveRequest) -> Result<AssessmentHiveResponse, String> {
+    Ok(AssessmentHiveResponse {
+        questions: None,
+        rubric: None,
+        feedback: None,
+        grade: None,
+        evaluation: None,
+        plagiarism_result: None,
+        tokens_used: 100
+    })
+}
+
+async fn call_learning_path_hive(db: &Database, request: LearningPathHiveRequest) -> Result<LearningPathHiveResponse, String> {
+    Ok(LearningPathHiveResponse {
+        path: None,
+        diagnostic: None,
+        tokens_used: 100
+    })
+}
+
+async fn call_observation_hive(db: &Database, request: ObservationHiveRequest) -> Result<ObservationHiveResponse, String> {
+    Ok(ObservationHiveResponse {
+        insights: None,
+        course_insights: None,
+        at_risk: None,
+        predictions: None
+    })
+}
+
+// Request/response types for hives
+type TutorRequest {
+    user_id: UserId,
+    session_id: String,
+    message: String,
+    conversation_history: List<AiMessage>,
+    context: Option<TutorContext>,
+    preferences: Option<TutorPreferences>
+}
+
+type TutorHiveResponse {
+    content: String,
+    suggestions: Option<List<String>>,
+    related_resources: Option<List<ResourceReference>>,
+    follow_up_questions: Option<List<String>>,
+    tokens_used: i64,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+type ExplainHiveRequest {
+    topic: String,
+    context: Option<String>,
+    level: DifficultyLevel,
+    style: ExplanationStyle,
+    include_examples: Bool
+}
+
+type ExplainHiveResponse {
+    result: ExplainResponse,
+    tokens_used: i64
+}
+
+enum ContentHiveRequest {
+    StudyGuide { content: String, topic: Option<String>, learning_objectives: Option<List<String>>, format: StudyGuideFormat },
+    Flashcards { content: String, topic: Option<String>, count: i32, difficulty: DifficultyLevel, include_hints: Bool },
+    PracticeQuiz { content: String, topic: Option<String>, question_count: i32, question_types: List<QuestionType>, difficulty: DifficultyLevel },
+    Summary { content: String, max_length: Option<i32>, style: SummaryStyle, include_key_points: Bool },
+    Lesson { title: String, topic: String, learning_objectives: List<String>, target_audience: Option<String>, difficulty: DifficultyLevel, duration_minutes: i32, include_activities: Bool, include_assessments: Bool },
+    Improve { content: String, improvement_type: String, instructions: Option<String> }
+}
+
+type ContentHiveResponse {
+    study_guide: Option<StudyGuideResponse>,
+    flashcards: Option<FlashcardResponse>,
+    quiz: Option<PracticeQuizResponse>,
+    summary: Option<SummaryResponse>,
+    lesson: Option<GeneratedLessonResponse>,
+    improved_content: Option<String>,
+    tokens_used: i64
+}
+
+enum AssessmentHiveRequest {
+    GenerateQuestions { content: String, learning_objectives: Option<List<String>>, question_count: i32, question_types: List<QuestionType>, difficulty: DifficultyLevel, bloom_levels: Option<List<BloomLevel>> },
+    GenerateRubric { assignment_description: String, learning_objectives: List<String>, criteria_count: i32, scale_points: i32, include_exemplars: Bool },
+    GenerateFeedback { submission_content: String, rubric: Option<GeneratedRubricResponse>, assignment_description: Option<String>, learning_objectives: Option<List<String>>, feedback_style: FeedbackStyle, include_suggestions: Bool },
+    AutoGrade { submission_content: String, question: Option<String>, rubric: Option<GeneratedRubricResponse>, correct_answer: Option<String>, max_points: f64, grading_type: GradingType },
+    Evaluate { question: String, response: String, correct_answer: Option<String>, rubric: Option<String> },
+    Plagiarism { content: String, check_against: Option<List<String>>, threshold: f64 }
+}
+
+type AssessmentHiveResponse {
+    questions: Option<GeneratedQuestionsResponse>,
+    rubric: Option<GeneratedRubricResponse>,
+    feedback: Option<GeneratedFeedbackResponse>,
+    grade: Option<AutoGradeResponse>,
+    evaluation: Option<Map<String, Dynamic>>,
+    plagiarism_result: Option<PlagiarismCheckResponse>,
+    tokens_used: i64
+}
+
+enum LearningPathHiveRequest {
+    Recommend { user_id: Option<UserId>, goal: String, current_skills: Option<List<Skill>>, time_available_hours: Option<f64>, learning_style: Option<LearningStyle>, constraints: Option<PathConstraints> },
+    Generate { goal: String, current_skills: Option<List<Skill>>, time_available_hours: Option<f64>, constraints: Option<PathConstraints> },
+    Adapt { path_id: String, user_id: UserId, progress_data: Map<String, Dynamic>, feedback: Option<String> },
+    Diagnostic { topic: String, skill_areas: List<String>, question_count: i32 }
+}
+
+type LearningPathHiveResponse {
+    path: Option<LearningPathResponse>,
+    diagnostic: Option<DiagnosticResponse>,
+    tokens_used: i64
+}
+
+enum ObservationHiveRequest {
+    LearnerInsights { user_id: UserId },
+    CourseInsights { course_id: CourseId },
+    AtRisk { course_id: Option<CourseId> },
+    Predict { course_id: CourseId, user_ids: Option<List<UserId>> }
+}
+
+type ObservationHiveResponse {
+    insights: Option<LearnerInsightsResponse>,
+    course_insights: Option<CourseInsightsResponse>,
+    at_risk: Option<AtRiskStudentsResponse>,
+    predictions: Option<PredictOutcomesResponse>
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use TutorChatResponse;
+pub use StudyGuideResponse;
+pub use GeneratedLessonResponse;
+pub use AutoGradeResponse;
+pub use LearningPathResponse;

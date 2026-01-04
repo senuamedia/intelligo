@@ -1,0 +1,1355 @@
+/// Intelligo LMS - Activity Entity
+///
+/// Activities are the building blocks of courses. They represent completable
+/// learning experiences such as SCORM packages, videos, assignments, quizzes,
+/// discussions, and custom content.
+
+module intelligo::entities::activity
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// ACTIVITY ENTITY
+// =============================================================================
+
+/// A learning activity within a course
+pub type Activity {
+    /// Unique activity identifier
+    id: ActivityId,
+
+    /// Tenant ID for multi-tenancy
+    tenant_id: TenantId,
+
+    /// Activity type
+    activity_type: ActivityType,
+
+    /// Activity title
+    title: String,
+
+    /// Short description
+    description: Option<String>,
+
+    /// Detailed instructions for learners
+    instructions: Option<String>,
+
+    /// Activity category for organization
+    category_id: Option<TermId>,
+
+    /// Tags for searchability
+    tags: List<String>,
+
+    /// Thumbnail/icon
+    thumbnail: Option<MediaId>,
+
+    /// External content reference (SCORM, video, etc.)
+    content_ref: Option<ContentReference>,
+
+    /// Configuration for this activity type
+    config: ActivityConfig,
+
+    /// Completion criteria
+    completion_criteria: CompletionCriteria,
+
+    /// Grading configuration
+    grading: Option<GradingConfig>,
+
+    /// Time constraints
+    time_constraints: Option<TimeConstraints>,
+
+    /// Availability settings
+    availability: AvailabilitySettings,
+
+    /// AI-generated metadata
+    ai_metadata: Option<AiActivityMetadata>,
+
+    /// Status
+    status: ActivityStatus,
+
+    /// Version for optimistic locking
+    version: i32,
+
+    /// Creation timestamp
+    created_at: DateTime,
+
+    /// Last update timestamp
+    updated_at: DateTime,
+
+    /// Created by user
+    created_by: UserId,
+
+    /// Last updated by user
+    updated_by: UserId
+}
+
+/// Activity ID wrapper
+pub type ActivityId = String;
+
+/// Activity status
+pub enum ActivityStatus {
+    /// Draft - being created/edited
+    Draft,
+    /// Published - available for use
+    Published,
+    /// Archived - no longer active
+    Archived
+}
+
+impl ActivityStatus {
+    fn from_string(s: &str) -> Option<ActivityStatus> {
+        match s.to_lowercase().as_str() {
+            "draft" => Some(ActivityStatus::Draft),
+            "published" => Some(ActivityStatus::Published),
+            "archived" => Some(ActivityStatus::Archived),
+            _ => None
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            ActivityStatus::Draft => "draft".to_string(),
+            ActivityStatus::Published => "published".to_string(),
+            ActivityStatus::Archived => "archived".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// ACTIVITY TYPES
+// =============================================================================
+
+/// Types of learning activities
+pub enum ActivityType {
+    /// SCORM 1.2/2004 package
+    Scorm { version: ScormVersion },
+
+    /// xAPI/Tin Can package
+    XApi { activity_iri: String },
+
+    /// cmi5 assignable unit
+    Cmi5 { au_id: String },
+
+    /// Video lesson
+    Video { provider: VideoProvider, video_id: String },
+
+    /// Interactive video with questions
+    InteractiveVideo { video_id: String, interactions: List<VideoInteraction> },
+
+    /// Reading/text content
+    Reading { content_id: ContentId },
+
+    /// Quiz/assessment
+    Quiz { assessment_id: AssessmentId },
+
+    /// Assignment submission
+    Assignment { assignment_id: AssignmentId },
+
+    /// Discussion participation
+    Discussion { discussion_id: DiscussionId, min_posts: Option<i32> },
+
+    /// Live session (webinar, class)
+    LiveSession { session_id: SessionId },
+
+    /// External URL
+    ExternalUrl { url: String, track_time: bool },
+
+    /// File download
+    FileDownload { file_id: MediaId },
+
+    /// Survey/feedback form
+    Survey { survey_id: SurveyId },
+
+    /// Peer review
+    PeerReview { submission_type: String, review_count: i32 },
+
+    /// Simulation/lab
+    Simulation { simulation_id: String, provider: String },
+
+    /// AI-guided learning
+    AiTutor { topic: String, learning_objectives: List<String> },
+
+    /// Checklist completion
+    Checklist { items: List<ChecklistItem> },
+
+    /// Certificate/badge earning
+    Achievement { achievement_id: AchievementId },
+
+    /// Custom activity type
+    Custom { type_name: String, config: Map<String, Dynamic> }
+}
+
+/// SCORM version
+pub enum ScormVersion {
+    Scorm12,
+    Scorm2004_2nd,
+    Scorm2004_3rd,
+    Scorm2004_4th
+}
+
+/// Video provider type
+pub enum VideoProvider {
+    Internal,
+    YouTube,
+    Vimeo,
+    Kaltura,
+    Wistia,
+    BrightCove,
+    Custom
+}
+
+/// Video interaction point
+pub type VideoInteraction {
+    timestamp: Duration,
+    interaction_type: VideoInteractionType,
+    question: Option<String>,
+    options: Option<List<String>>,
+    correct_answer: Option<String>
+}
+
+/// Types of video interactions
+pub enum VideoInteractionType {
+    Question,
+    Pause,
+    Hotspot,
+    Branch,
+    Note
+}
+
+/// Checklist item
+pub type ChecklistItem {
+    id: String,
+    title: String,
+    description: Option<String>,
+    required: bool
+}
+
+// =============================================================================
+// CONTENT REFERENCE
+// =============================================================================
+
+/// Reference to external or internal content
+pub enum ContentReference {
+    /// SCORM package in storage
+    ScormPackage { package_id: String, manifest_path: String },
+
+    /// xAPI package
+    XApiPackage { package_id: String, launch_url: String },
+
+    /// Media file
+    Media { media_id: MediaId, media_type: MediaType },
+
+    /// External URL
+    External { url: String, embed: bool },
+
+    /// Internal content block
+    Content { content_id: ContentId },
+
+    /// LTI tool
+    Lti { tool_id: String, launch_url: String }
+}
+
+/// Media type
+pub enum MediaType {
+    Video,
+    Audio,
+    Document,
+    Image,
+    Interactive
+}
+
+// =============================================================================
+// ACTIVITY CONFIGURATION
+// =============================================================================
+
+/// Activity-specific configuration
+pub type ActivityConfig {
+    /// Maximum attempts allowed (None = unlimited)
+    max_attempts: Option<i32>,
+
+    /// Allow retrying after completion
+    allow_retry: bool,
+
+    /// Show correct answers after completion
+    show_answers: bool,
+
+    /// Randomize content/questions
+    randomize: bool,
+
+    /// Require sequential completion
+    sequential: bool,
+
+    /// Custom settings per activity type
+    custom: Map<String, Dynamic>
+}
+
+impl ActivityConfig {
+    fn default() -> ActivityConfig {
+        ActivityConfig {
+            max_attempts: None,
+            allow_retry: true,
+            show_answers: false,
+            randomize: false,
+            sequential: false,
+            custom: Map::new()
+        }
+    }
+}
+
+// =============================================================================
+// COMPLETION CRITERIA
+// =============================================================================
+
+/// Criteria for completing an activity
+pub type CompletionCriteria {
+    /// Completion type
+    completion_type: CompletionType,
+
+    /// Minimum score required (percentage)
+    min_score: Option<f32>,
+
+    /// Minimum time spent
+    min_time: Option<Duration>,
+
+    /// Required progress percentage
+    min_progress: Option<f32>,
+
+    /// Custom completion rules
+    custom_rules: Option<List<CompletionRule>>
+}
+
+/// How completion is determined
+pub enum CompletionType {
+    /// Auto-complete when viewed
+    OnView,
+
+    /// Auto-complete when launched
+    OnLaunch,
+
+    /// Complete based on content CMI data
+    CmiData,
+
+    /// Complete when scoring threshold met
+    OnScore,
+
+    /// Complete when time threshold met
+    OnTime,
+
+    /// Manual completion by learner
+    ManualLearner,
+
+    /// Manual completion by instructor
+    ManualInstructor,
+
+    /// Custom rules
+    Custom
+}
+
+/// Custom completion rule
+pub type CompletionRule {
+    field: String,
+    operator: ComparisonOperator,
+    value: Dynamic
+}
+
+/// Comparison operators for rules
+pub enum ComparisonOperator {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    LessThan,
+    GreaterOrEqual,
+    LessOrEqual,
+    Contains,
+    StartsWith,
+    EndsWith
+}
+
+// =============================================================================
+// GRADING CONFIGURATION
+// =============================================================================
+
+/// Grading configuration for an activity
+pub type GradingConfig {
+    /// Is this activity graded?
+    is_graded: bool,
+
+    /// Weight in course grade (0.0 - 1.0)
+    weight: f32,
+
+    /// Maximum points
+    max_points: f32,
+
+    /// Passing score (percentage)
+    passing_score: Option<f32>,
+
+    /// Grade category
+    category: Option<String>,
+
+    /// Grading rubric
+    rubric_id: Option<RubricId>,
+
+    /// Late submission policy
+    late_policy: Option<LatePolicy>
+}
+
+/// Late submission policy
+pub type LatePolicy {
+    /// Accept late submissions
+    accept_late: bool,
+
+    /// Penalty per day (percentage)
+    penalty_per_day: f32,
+
+    /// Maximum penalty (percentage)
+    max_penalty: f32,
+
+    /// Grace period after deadline
+    grace_period: Option<Duration>,
+
+    /// Hard cutoff date
+    cutoff_date: Option<DateTime>
+}
+
+// =============================================================================
+// TIME CONSTRAINTS
+// =============================================================================
+
+/// Time-related constraints for an activity
+pub type TimeConstraints {
+    /// Estimated completion time
+    estimated_time: Option<Duration>,
+
+    /// Time limit for completion
+    time_limit: Option<Duration>,
+
+    /// Countdown timer visible
+    show_timer: bool,
+
+    /// Auto-submit when time expires
+    auto_submit: bool,
+
+    /// Extra time accommodation (percentage)
+    extra_time_percent: Option<f32>
+}
+
+// =============================================================================
+// AVAILABILITY SETTINGS
+// =============================================================================
+
+/// When and how an activity is available
+pub type AvailabilitySettings {
+    /// Available from date
+    available_from: Option<DateTime>,
+
+    /// Available until date
+    available_until: Option<DateTime>,
+
+    /// Release based on rules
+    release_rules: Option<List<ReleaseRule>>,
+
+    /// Visible but locked message
+    locked_message: Option<String>,
+
+    /// Hide if not available (vs. show as locked)
+    hide_if_unavailable: bool
+}
+
+/// Rule for releasing content
+pub type ReleaseRule {
+    rule_type: ReleaseRuleType,
+    config: Map<String, Dynamic>
+}
+
+/// Types of release rules
+pub enum ReleaseRuleType {
+    /// Release on specific date
+    OnDate { date: DateTime },
+
+    /// Release after completing another activity
+    AfterActivity { activity_id: ActivityId },
+
+    /// Release after completing a module
+    AfterModule { module_id: ModuleId },
+
+    /// Release based on score in another activity
+    OnScore { activity_id: ActivityId, min_score: f32 },
+
+    /// Release based on group membership
+    ForGroup { group_id: GroupId },
+
+    /// Custom rule
+    Custom { rule_name: String }
+}
+
+// =============================================================================
+// AI METADATA
+// =============================================================================
+
+/// AI-generated metadata for activities
+pub type AiActivityMetadata {
+    /// Auto-generated learning objectives
+    learning_objectives: List<String>,
+
+    /// Bloom's taxonomy levels covered
+    bloom_levels: List<BloomLevel>,
+
+    /// Difficulty rating (1-5)
+    difficulty: f32,
+
+    /// Prerequisite knowledge
+    prerequisites: List<String>,
+
+    /// Keywords for search
+    keywords: List<String>,
+
+    /// Suggested duration
+    suggested_duration: Option<Duration>,
+
+    /// Related topics
+    related_topics: List<String>,
+
+    /// Accessibility notes
+    accessibility_notes: Option<String>,
+
+    /// Generation timestamp
+    generated_at: DateTime
+}
+
+/// Bloom's taxonomy levels
+pub enum BloomLevel {
+    Remember,
+    Understand,
+    Apply,
+    Analyze,
+    Evaluate,
+    Create
+}
+
+// =============================================================================
+// COURSE ACTIVITY MAPPING
+// =============================================================================
+
+/// Maps activities to courses with workflow configuration
+pub type CourseActivity {
+    /// Mapping ID
+    id: CourseActivityId,
+
+    /// Course this activity belongs to
+    course_id: CourseId,
+
+    /// Module within the course (optional)
+    module_id: Option<ModuleId>,
+
+    /// The activity
+    activity_id: ActivityId,
+
+    /// Position in sequence
+    position: i32,
+
+    /// Is this activity required for course completion?
+    required: bool,
+
+    /// Override activity settings for this course
+    overrides: Option<ActivityOverrides>,
+
+    /// Prerequisites (other activities that must be completed first)
+    prerequisites: List<ActivityPrerequisite>,
+
+    /// Workflow configuration
+    workflow: Option<ActivityWorkflow>
+}
+
+/// Course activity ID wrapper
+pub type CourseActivityId = String;
+
+/// Override settings when activity is used in a course
+pub type ActivityOverrides {
+    /// Override title
+    title: Option<String>,
+
+    /// Override instructions
+    instructions: Option<String>,
+
+    /// Override availability
+    available_from: Option<DateTime>,
+    available_until: Option<DateTime>,
+
+    /// Override time limit
+    time_limit: Option<Duration>,
+
+    /// Override max attempts
+    max_attempts: Option<i32>,
+
+    /// Override grading weight
+    weight: Option<f32>
+}
+
+/// Prerequisite definition
+pub type ActivityPrerequisite {
+    /// The required activity
+    activity_id: ActivityId,
+
+    /// Requirement type
+    requirement: PrerequisiteRequirement,
+
+    /// Minimum score (if score-based)
+    min_score: Option<f32>
+}
+
+/// Types of prerequisites
+pub enum PrerequisiteRequirement {
+    /// Must be completed
+    Completed,
+
+    /// Must be completed with passing score
+    Passed,
+
+    /// Must achieve minimum score
+    MinScore,
+
+    /// Must have attempted
+    Attempted,
+
+    /// Must have started
+    Started
+}
+
+// =============================================================================
+// ACTIVITY WORKFLOW
+// =============================================================================
+
+/// Workflow configuration for an activity
+pub type ActivityWorkflow {
+    /// Workflow stages
+    stages: List<WorkflowStage>,
+
+    /// Auto-advance to next activity on completion
+    auto_advance: bool,
+
+    /// Notification settings
+    notifications: WorkflowNotifications,
+
+    /// Approval requirements
+    approvals: Option<List<ApprovalStep>>
+}
+
+/// A stage in the activity workflow
+pub type WorkflowStage {
+    /// Stage ID
+    id: String,
+
+    /// Stage name
+    name: String,
+
+    /// Actions to perform at this stage
+    actions: List<WorkflowAction>
+}
+
+/// Action to perform in a workflow stage
+pub enum WorkflowAction {
+    /// Send notification
+    Notify { recipients: List<NotificationRecipient>, template: String },
+
+    /// Create calendar event
+    CreateEvent { title: String, duration: Duration },
+
+    /// Assign reviewer
+    AssignReviewer { reviewer_type: ReviewerType },
+
+    /// Update status
+    UpdateStatus { status: String },
+
+    /// Award points/badge
+    Award { type_: AwardType },
+
+    /// Start next activity
+    StartActivity { activity_id: ActivityId },
+
+    /// Webhook call
+    Webhook { url: String, payload: Map<String, Dynamic> },
+
+    /// Custom action
+    Custom { action_name: String, config: Map<String, Dynamic> }
+}
+
+/// Notification recipient type
+pub enum NotificationRecipient {
+    Learner,
+    Instructor,
+    Admin,
+    Role { role: String },
+    User { user_id: UserId },
+    Group { group_id: GroupId }
+}
+
+/// Reviewer type
+pub enum ReviewerType {
+    Instructor,
+    Peer,
+    Assigned { user_id: UserId }
+}
+
+/// Award type
+pub enum AwardType {
+    Points { amount: i32 },
+    Badge { badge_id: String },
+    Certificate { certificate_id: String }
+}
+
+/// Workflow notifications
+pub type WorkflowNotifications {
+    /// Notify on activity start
+    on_start: bool,
+
+    /// Notify on activity completion
+    on_complete: bool,
+
+    /// Notify on activity failure
+    on_fail: bool,
+
+    /// Reminder before deadline
+    reminder_before_deadline: Option<Duration>,
+
+    /// Notify instructor on submission
+    notify_instructor: bool
+}
+
+/// Approval step in workflow
+pub type ApprovalStep {
+    /// Step order
+    order: i32,
+
+    /// Approver
+    approver: ApproverType,
+
+    /// Required or optional
+    required: bool,
+
+    /// Auto-approve after timeout
+    auto_approve_after: Option<Duration>
+}
+
+/// Types of approvers
+pub enum ApproverType {
+    Instructor,
+    CourseAdmin,
+    SystemAdmin,
+    User { user_id: UserId },
+    Role { role: String }
+}
+
+// =============================================================================
+// ACTIVITY PROGRESS
+// =============================================================================
+
+/// Learner's progress on an activity
+pub type ActivityProgress {
+    /// Progress ID
+    id: String,
+
+    /// User ID
+    user_id: UserId,
+
+    /// Activity ID
+    activity_id: ActivityId,
+
+    /// Course context (if applicable)
+    course_id: Option<CourseId>,
+
+    /// Current status
+    status: ProgressStatus,
+
+    /// Completion percentage (0-100)
+    progress_percent: f32,
+
+    /// Current score (if applicable)
+    score: Option<f32>,
+
+    /// Maximum score achieved
+    max_score: Option<f32>,
+
+    /// Number of attempts
+    attempts: i32,
+
+    /// Time spent
+    time_spent: Duration,
+
+    /// First access
+    first_accessed: Option<DateTime>,
+
+    /// Last access
+    last_accessed: Option<DateTime>,
+
+    /// Completion date
+    completed_at: Option<DateTime>,
+
+    /// CMI/xAPI data
+    tracking_data: Option<Map<String, Dynamic>>,
+
+    /// Submission data (if applicable)
+    submission: Option<ActivitySubmission>
+}
+
+/// Progress status
+pub enum ProgressStatus {
+    NotStarted,
+    InProgress,
+    Completed,
+    Passed,
+    Failed,
+    Incomplete,
+    PendingReview,
+    Reviewed
+}
+
+/// Activity submission
+pub type ActivitySubmission {
+    /// Submission ID
+    id: String,
+
+    /// Submission timestamp
+    submitted_at: DateTime,
+
+    /// Submission content
+    content: SubmissionContent,
+
+    /// Feedback received
+    feedback: Option<List<SubmissionFeedback>>
+}
+
+/// Submission content types
+pub enum SubmissionContent {
+    Text { content: String },
+    File { file_id: MediaId },
+    Url { url: String },
+    Files { file_ids: List<MediaId> },
+    Custom { data: Map<String, Dynamic> }
+}
+
+/// Feedback on submission
+pub type SubmissionFeedback {
+    reviewer_id: UserId,
+    reviewer_type: String,
+    score: Option<f32>,
+    comments: String,
+    rubric_scores: Option<Map<String, f32>>,
+    created_at: DateTime
+}
+
+// =============================================================================
+// ACTIVITY ANALYTICS
+// =============================================================================
+
+/// Analytics for an activity
+pub type ActivityAnalytics {
+    activity_id: ActivityId,
+
+    /// Total learners who started
+    total_started: i64,
+
+    /// Total learners who completed
+    total_completed: i64,
+
+    /// Completion rate
+    completion_rate: f32,
+
+    /// Average score
+    average_score: Option<f32>,
+
+    /// Score distribution
+    score_distribution: Map<String, i64>,
+
+    /// Average time to complete
+    average_time: Duration,
+
+    /// Attempt distribution
+    attempt_distribution: Map<i32, i64>,
+
+    /// Drop-off points (for sequential content)
+    drop_off_points: List<DropOffPoint>,
+
+    /// Common errors (if applicable)
+    common_errors: List<CommonError>
+}
+
+/// Point where learners drop off
+pub type DropOffPoint {
+    position: f32,
+    drop_count: i64,
+    description: Option<String>
+}
+
+/// Common error in activity
+pub type CommonError {
+    error_type: String,
+    description: String,
+    occurrence_count: i64,
+    affected_percent: f32
+}
+
+// =============================================================================
+// ACTIVITY ACTOR
+// =============================================================================
+
+/// Actor for managing activities
+pub actor ActivityActor {
+    state {
+        storage: Box<dyn ActivityStorage>,
+        ai_service: Option<Box<dyn AiService>>
+    }
+
+    /// Create a new activity
+    receive CreateActivity(input: CreateActivityInput) -> Result<Activity, ActivityError> {
+        // Validate input
+        self.validate_activity_input(&input)?;
+
+        let now = DateTime::now();
+        let id = generate_uuid();
+
+        let activity = Activity {
+            id,
+            tenant_id: input.tenant_id,
+            activity_type: input.activity_type,
+            title: input.title,
+            description: input.description,
+            instructions: input.instructions,
+            category_id: input.category_id,
+            tags: input.tags.unwrap_or_default(),
+            thumbnail: input.thumbnail,
+            content_ref: input.content_ref,
+            config: input.config.unwrap_or_else(|| ActivityConfig::default()),
+            completion_criteria: input.completion_criteria,
+            grading: input.grading,
+            time_constraints: input.time_constraints,
+            availability: input.availability.unwrap_or_else(|| AvailabilitySettings {
+                available_from: None,
+                available_until: None,
+                release_rules: None,
+                locked_message: None,
+                hide_if_unavailable: false
+            }),
+            ai_metadata: None,
+            status: ActivityStatus::Draft,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+            created_by: input.created_by,
+            updated_by: input.created_by
+        };
+
+        self.state.storage.save(&activity).await?;
+
+        // Generate AI metadata asynchronously if AI service available
+        if let Some(ref ai) = self.state.ai_service {
+            self.generate_ai_metadata(&activity.id).await.ok();
+        }
+
+        Ok(activity)
+    }
+
+    /// Update an activity
+    receive UpdateActivity(id: ActivityId, input: UpdateActivityInput) -> Result<Activity, ActivityError> {
+        let mut activity = self.state.storage.get(&id).await?
+            .ok_or(ActivityError::NotFound { id: id.clone() })?;
+
+        // Apply updates
+        if let Some(title) = input.title {
+            activity.title = title;
+        }
+        if let Some(description) = input.description {
+            activity.description = Some(description);
+        }
+        if let Some(instructions) = input.instructions {
+            activity.instructions = Some(instructions);
+        }
+        if let Some(config) = input.config {
+            activity.config = config;
+        }
+        if let Some(completion) = input.completion_criteria {
+            activity.completion_criteria = completion;
+        }
+        if let Some(grading) = input.grading {
+            activity.grading = Some(grading);
+        }
+        if let Some(availability) = input.availability {
+            activity.availability = availability;
+        }
+
+        activity.updated_at = DateTime::now();
+        activity.updated_by = input.updated_by;
+        activity.version += 1;
+
+        self.state.storage.save(&activity).await?;
+
+        Ok(activity)
+    }
+
+    /// Publish an activity
+    receive PublishActivity(id: ActivityId, by: UserId) -> Result<Activity, ActivityError> {
+        let mut activity = self.state.storage.get(&id).await?
+            .ok_or(ActivityError::NotFound { id: id.clone() })?;
+
+        // Validate activity is ready for publishing
+        self.validate_for_publish(&activity)?;
+
+        activity.status = ActivityStatus::Published;
+        activity.updated_at = DateTime::now();
+        activity.updated_by = by;
+        activity.version += 1;
+
+        self.state.storage.save(&activity).await?;
+
+        Ok(activity)
+    }
+
+    /// Map activity to a course
+    receive MapToCourse(input: MapToCourseInput) -> Result<CourseActivity, ActivityError> {
+        // Validate activity exists
+        let activity = self.state.storage.get(&input.activity_id).await?
+            .ok_or(ActivityError::NotFound { id: input.activity_id.clone() })?;
+
+        // Create the mapping
+        let mapping = CourseActivity {
+            id: generate_uuid(),
+            course_id: input.course_id,
+            module_id: input.module_id,
+            activity_id: input.activity_id,
+            position: input.position,
+            required: input.required.unwrap_or(true),
+            overrides: input.overrides,
+            prerequisites: input.prerequisites.unwrap_or_default(),
+            workflow: input.workflow
+        };
+
+        self.state.storage.save_mapping(&mapping).await?;
+
+        Ok(mapping)
+    }
+
+    /// Set activity prerequisites
+    receive SetPrerequisites(activity_id: ActivityId, course_id: CourseId, prerequisites: List<ActivityPrerequisite>) -> Result<(), ActivityError> {
+        let mut mapping = self.state.storage.get_mapping(&activity_id, &course_id).await?
+            .ok_or(ActivityError::MappingNotFound {
+                activity_id: activity_id.clone(),
+                course_id: course_id.clone()
+            })?;
+
+        // Validate no circular dependencies
+        self.check_circular_dependencies(&activity_id, &course_id, &prerequisites)?;
+
+        mapping.prerequisites = prerequisites;
+        self.state.storage.save_mapping(&mapping).await?;
+
+        Ok(())
+    }
+
+    /// Check if activity is available for a learner
+    receive CheckAvailability(activity_id: ActivityId, course_id: CourseId, user_id: UserId) -> Result<AvailabilityResult, ActivityError> {
+        let activity = self.state.storage.get(&activity_id).await?
+            .ok_or(ActivityError::NotFound { id: activity_id.clone() })?;
+
+        let mapping = self.state.storage.get_mapping(&activity_id, &course_id).await?
+            .ok_or(ActivityError::MappingNotFound {
+                activity_id: activity_id.clone(),
+                course_id: course_id.clone()
+            })?;
+
+        // Check date-based availability
+        let now = DateTime::now();
+        let availability = &activity.availability;
+
+        if let Some(from) = &availability.available_from {
+            if now < *from {
+                return Ok(AvailabilityResult::NotYetAvailable {
+                    available_from: from.clone()
+                });
+            }
+        }
+
+        if let Some(until) = &availability.available_until {
+            if now > *until {
+                return Ok(AvailabilityResult::NoLongerAvailable {
+                    expired_at: until.clone()
+                });
+            }
+        }
+
+        // Check prerequisites
+        for prereq in &mapping.prerequisites {
+            let progress = self.state.storage.get_progress(&user_id, &prereq.activity_id, &course_id).await?;
+
+            let met = match &prereq.requirement {
+                PrerequisiteRequirement::Completed => {
+                    progress.map(|p| matches!(p.status, ProgressStatus::Completed | ProgressStatus::Passed)).unwrap_or(false)
+                }
+                PrerequisiteRequirement::Passed => {
+                    progress.map(|p| matches!(p.status, ProgressStatus::Passed)).unwrap_or(false)
+                }
+                PrerequisiteRequirement::MinScore => {
+                    if let Some(min) = prereq.min_score {
+                        progress.and_then(|p| p.score).map(|s| s >= min).unwrap_or(false)
+                    } else {
+                        true
+                    }
+                }
+                PrerequisiteRequirement::Attempted => {
+                    progress.map(|p| p.attempts > 0).unwrap_or(false)
+                }
+                PrerequisiteRequirement::Started => {
+                    progress.map(|p| p.first_accessed.is_some()).unwrap_or(false)
+                }
+            };
+
+            if !met {
+                return Ok(AvailabilityResult::PrerequisiteNotMet {
+                    prerequisite: prereq.clone()
+                });
+            }
+        }
+
+        Ok(AvailabilityResult::Available)
+    }
+
+    /// Generate AI metadata for an activity
+    receive GenerateAiMetadata(activity_id: ActivityId) -> Result<AiActivityMetadata, ActivityError> {
+        let activity = self.state.storage.get(&activity_id).await?
+            .ok_or(ActivityError::NotFound { id: activity_id.clone() })?;
+
+        let ai = self.state.ai_service.as_ref()
+            .ok_or(ActivityError::AiNotConfigured)?;
+
+        // Generate metadata based on activity content
+        let metadata = ai.generate_activity_metadata(&activity).await
+            .map_err(|e| ActivityError::AiError { message: e.to_string() })?;
+
+        // Save metadata to activity
+        let mut updated = activity;
+        updated.ai_metadata = Some(metadata.clone());
+        updated.updated_at = DateTime::now();
+        self.state.storage.save(&updated).await?;
+
+        Ok(metadata)
+    }
+
+    /// Suggest activities for a course based on learning objectives
+    receive SuggestActivities(input: SuggestActivitiesInput) -> Result<List<ActivitySuggestion>, ActivityError> {
+        let ai = self.state.ai_service.as_ref()
+            .ok_or(ActivityError::AiNotConfigured)?;
+
+        let suggestions = ai.suggest_activities(
+            &input.learning_objectives,
+            &input.target_audience,
+            input.duration_budget,
+            &input.preferences
+        ).await.map_err(|e| ActivityError::AiError { message: e.to_string() })?;
+
+        Ok(suggestions)
+    }
+
+    // Helper methods
+
+    fn validate_activity_input(&self, input: &CreateActivityInput) -> Result<(), ActivityError> {
+        if input.title.is_empty() {
+            return Err(ActivityError::ValidationError {
+                field: "title".to_string(),
+                message: "Title is required".to_string()
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_for_publish(&self, activity: &Activity) -> Result<(), ActivityError> {
+        if activity.title.is_empty() {
+            return Err(ActivityError::NotReadyToPublish {
+                reason: "Activity must have a title".to_string()
+            });
+        }
+        // Add more validation as needed
+        Ok(())
+    }
+
+    fn check_circular_dependencies(
+        &self,
+        activity_id: &ActivityId,
+        course_id: &CourseId,
+        prerequisites: &List<ActivityPrerequisite>
+    ) -> Result<(), ActivityError> {
+        // Would implement DAG check here
+        Ok(())
+    }
+
+    async fn generate_ai_metadata(&self, activity_id: &ActivityId) -> Result<(), ActivityError> {
+        // Trigger async AI metadata generation
+        Ok(())
+    }
+}
+
+// =============================================================================
+// INPUT/OUTPUT TYPES
+// =============================================================================
+
+/// Input for creating an activity
+pub type CreateActivityInput {
+    tenant_id: TenantId,
+    activity_type: ActivityType,
+    title: String,
+    description: Option<String>,
+    instructions: Option<String>,
+    category_id: Option<TermId>,
+    tags: Option<List<String>>,
+    thumbnail: Option<MediaId>,
+    content_ref: Option<ContentReference>,
+    config: Option<ActivityConfig>,
+    completion_criteria: CompletionCriteria,
+    grading: Option<GradingConfig>,
+    time_constraints: Option<TimeConstraints>,
+    availability: Option<AvailabilitySettings>,
+    created_by: UserId
+}
+
+/// Input for updating an activity
+pub type UpdateActivityInput {
+    title: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
+    config: Option<ActivityConfig>,
+    completion_criteria: Option<CompletionCriteria>,
+    grading: Option<GradingConfig>,
+    availability: Option<AvailabilitySettings>,
+    updated_by: UserId
+}
+
+/// Input for mapping activity to course
+pub type MapToCourseInput {
+    activity_id: ActivityId,
+    course_id: CourseId,
+    module_id: Option<ModuleId>,
+    position: i32,
+    required: Option<bool>,
+    overrides: Option<ActivityOverrides>,
+    prerequisites: Option<List<ActivityPrerequisite>>,
+    workflow: Option<ActivityWorkflow>
+}
+
+/// Input for AI activity suggestions
+pub type SuggestActivitiesInput {
+    learning_objectives: List<String>,
+    target_audience: String,
+    duration_budget: Option<Duration>,
+    preferences: Map<String, Dynamic>
+}
+
+/// AI-generated activity suggestion
+pub type ActivitySuggestion {
+    activity_type: ActivityType,
+    title: String,
+    description: String,
+    estimated_duration: Duration,
+    learning_objectives: List<String>,
+    confidence: f32,
+    rationale: String
+}
+
+/// Availability check result
+pub enum AvailabilityResult {
+    Available,
+    NotYetAvailable { available_from: DateTime },
+    NoLongerAvailable { expired_at: DateTime },
+    PrerequisiteNotMet { prerequisite: ActivityPrerequisite },
+    MaxAttemptsReached { attempts: i32 },
+    Locked { message: String }
+}
+
+// =============================================================================
+// ERRORS
+// =============================================================================
+
+/// Activity errors
+pub enum ActivityError {
+    NotFound { id: ActivityId },
+    MappingNotFound { activity_id: ActivityId, course_id: CourseId },
+    ValidationError { field: String, message: String },
+    NotReadyToPublish { reason: String },
+    CircularDependency { activities: List<ActivityId> },
+    AiNotConfigured,
+    AiError { message: String },
+    StorageError { message: String }
+}
+
+impl ActivityError {
+    fn to_string(&self) -> String {
+        match self {
+            ActivityError::NotFound { id } =>
+                format!("Activity not found: {}", id),
+            ActivityError::MappingNotFound { activity_id, course_id } =>
+                format!("Activity {} not mapped to course {}", activity_id, course_id),
+            ActivityError::ValidationError { field, message } =>
+                format!("Validation error on {}: {}", field, message),
+            ActivityError::NotReadyToPublish { reason } =>
+                format!("Activity not ready to publish: {}", reason),
+            ActivityError::CircularDependency { activities } =>
+                format!("Circular dependency detected: {:?}", activities),
+            ActivityError::AiNotConfigured =>
+                "AI service not configured".to_string(),
+            ActivityError::AiError { message } =>
+                format!("AI error: {}", message),
+            ActivityError::StorageError { message } =>
+                format!("Storage error: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// STORAGE TRAIT
+// =============================================================================
+
+/// Storage interface for activities
+pub trait ActivityStorage: Send + Sync {
+    async fn get(&self, id: &ActivityId) -> Result<Option<Activity>, ActivityError>;
+    async fn save(&self, activity: &Activity) -> Result<(), ActivityError>;
+    async fn delete(&self, id: &ActivityId) -> Result<(), ActivityError>;
+    async fn list(&self, tenant_id: &TenantId, filter: &ActivityFilter) -> Result<List<Activity>, ActivityError>;
+
+    async fn get_mapping(&self, activity_id: &ActivityId, course_id: &CourseId) -> Result<Option<CourseActivity>, ActivityError>;
+    async fn save_mapping(&self, mapping: &CourseActivity) -> Result<(), ActivityError>;
+    async fn list_course_activities(&self, course_id: &CourseId) -> Result<List<CourseActivity>, ActivityError>;
+
+    async fn get_progress(&self, user_id: &UserId, activity_id: &ActivityId, course_id: &CourseId) -> Result<Option<ActivityProgress>, ActivityError>;
+    async fn save_progress(&self, progress: &ActivityProgress) -> Result<(), ActivityError>;
+}
+
+/// Filter for listing activities
+pub type ActivityFilter {
+    activity_type: Option<String>,
+    category_id: Option<TermId>,
+    status: Option<ActivityStatus>,
+    search: Option<String>,
+    tags: Option<List<String>>,
+    limit: Option<i32>,
+    offset: Option<i32>
+}
+
+// =============================================================================
+// AI SERVICE TRAIT
+// =============================================================================
+
+/// AI service interface for activity intelligence
+pub trait AiService: Send + Sync {
+    async fn generate_activity_metadata(&self, activity: &Activity) -> Result<AiActivityMetadata, String>;
+    async fn suggest_activities(
+        &self,
+        objectives: &List<String>,
+        audience: &str,
+        duration: Option<Duration>,
+        preferences: &Map<String, Dynamic>
+    ) -> Result<List<ActivitySuggestion>, String>;
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}

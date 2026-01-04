@@ -1,0 +1,952 @@
+/// Intelligo LMS - Feature Flags
+///
+/// Feature flag system for controlled rollout, A/B testing, and
+/// tenant-specific feature enablement.
+
+module intelligo::config::feature_flags
+
+use intelligo::core::types::*
+use intelligo::tenant::core::TenantId
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// FEATURE FLAG TYPES
+// =============================================================================
+
+/// A feature flag definition
+type FeatureFlag {
+    /// Unique flag key
+    key: String,
+
+    /// Human-readable name
+    name: String,
+
+    /// Description
+    description: String,
+
+    /// Flag type
+    flag_type: FlagType,
+
+    /// Default value when not matched
+    default_value: FlagValue,
+
+    /// Targeting rules
+    rules: List<TargetingRule>,
+
+    /// Override values for specific targets
+    overrides: List<FlagOverride>,
+
+    /// Tags for organization
+    tags: Set<String>,
+
+    /// Whether the flag is enabled
+    enabled: Bool,
+
+    /// Archived (no longer in use)
+    archived: Bool,
+
+    /// Created by
+    created_by: UserId,
+
+    /// Created at
+    created_at: DateTime,
+
+    /// Updated at
+    updated_at: DateTime,
+
+    /// Metadata
+    metadata: Map<String, Dynamic>
+}
+
+impl FeatureFlag {
+    fn new(key: String, name: String, default_value: FlagValue) -> FeatureFlag {
+        let now = DateTime::now();
+        FeatureFlag {
+            key,
+            name,
+            description: String::new(),
+            flag_type: FlagType::from_value(&default_value),
+            default_value,
+            rules: vec![],
+            overrides: vec![],
+            tags: Set::new(),
+            enabled: true,
+            archived: false,
+            created_by: UserId("system".to_string()),
+            created_at: now,
+            updated_at: now,
+            metadata: Map::new()
+        }
+    }
+}
+
+/// Flag value types
+enum FlagValue {
+    /// Boolean on/off
+    Boolean(Bool),
+    /// String value
+    String(String),
+    /// Numeric value
+    Number(f64),
+    /// JSON value
+    Json(Dynamic)
+}
+
+impl FlagValue {
+    fn as_bool(&self) -> Option<Bool> {
+        match self {
+            FlagValue::Boolean(b) => Some(*b),
+            _ => None
+        }
+    }
+
+    fn as_string(&self) -> Option<String> {
+        match self {
+            FlagValue::String(s) => Some(s.clone()),
+            FlagValue::Boolean(b) => Some(b.to_string()),
+            FlagValue::Number(n) => Some(n.to_string()),
+            _ => None
+        }
+    }
+
+    fn as_number(&self) -> Option<f64> {
+        match self {
+            FlagValue::Number(n) => Some(*n),
+            _ => None
+        }
+    }
+}
+
+/// Flag type classification
+enum FlagType {
+    /// Simple on/off toggle
+    Boolean,
+    /// Percentage rollout
+    Percentage,
+    /// String variant
+    String,
+    /// Numeric value
+    Number,
+    /// A/B test with variants
+    Multivariate,
+    /// Feature entitlement
+    Entitlement
+}
+
+impl FlagType {
+    fn from_value(value: &FlagValue) -> FlagType {
+        match value {
+            FlagValue::Boolean(_) => FlagType::Boolean,
+            FlagValue::String(_) => FlagType::String,
+            FlagValue::Number(_) => FlagType::Number,
+            FlagValue::Json(_) => FlagType::Multivariate
+        }
+    }
+}
+
+// =============================================================================
+// TARGETING
+// =============================================================================
+
+/// A targeting rule for determining flag value
+type TargetingRule {
+    /// Rule ID
+    id: String,
+
+    /// Rule name
+    name: String,
+
+    /// Conditions that must all match
+    conditions: List<TargetingCondition>,
+
+    /// Value to return if matched
+    value: FlagValue,
+
+    /// Percentage rollout (0-100)
+    percentage: Option<f32>,
+
+    /// Priority (lower = higher priority)
+    priority: i32,
+
+    /// Whether this rule is enabled
+    enabled: Bool
+}
+
+/// A condition within a targeting rule
+type TargetingCondition {
+    /// Attribute to check
+    attribute: TargetAttribute,
+
+    /// Operator for comparison
+    operator: ConditionOperator,
+
+    /// Value to compare against
+    values: List<String>
+}
+
+/// Target attribute types
+enum TargetAttribute {
+    /// User ID
+    UserId,
+    /// User email
+    UserEmail,
+    /// User role
+    UserRole,
+    /// Tenant ID
+    TenantId,
+    /// Tenant tier
+    TenantTier,
+    /// Environment
+    Environment,
+    /// Country
+    Country,
+    /// Browser
+    Browser,
+    /// Platform
+    Platform,
+    /// App version
+    AppVersion,
+    /// Custom attribute
+    Custom { key: String }
+}
+
+impl TargetAttribute {
+    fn key(&self) -> String {
+        match self {
+            TargetAttribute::UserId => "user_id".to_string(),
+            TargetAttribute::UserEmail => "user_email".to_string(),
+            TargetAttribute::UserRole => "user_role".to_string(),
+            TargetAttribute::TenantId => "tenant_id".to_string(),
+            TargetAttribute::TenantTier => "tenant_tier".to_string(),
+            TargetAttribute::Environment => "environment".to_string(),
+            TargetAttribute::Country => "country".to_string(),
+            TargetAttribute::Browser => "browser".to_string(),
+            TargetAttribute::Platform => "platform".to_string(),
+            TargetAttribute::AppVersion => "app_version".to_string(),
+            TargetAttribute::Custom { key } => key.clone()
+        }
+    }
+}
+
+/// Comparison operators for conditions
+enum ConditionOperator {
+    /// Equals
+    Equals,
+    /// Not equals
+    NotEquals,
+    /// Contains (string)
+    Contains,
+    /// Starts with
+    StartsWith,
+    /// Ends with
+    EndsWith,
+    /// In list
+    In,
+    /// Not in list
+    NotIn,
+    /// Regex match
+    Matches,
+    /// Less than (numeric)
+    LessThan,
+    /// Less than or equal
+    LessThanOrEqual,
+    /// Greater than (numeric)
+    GreaterThan,
+    /// Greater than or equal
+    GreaterThanOrEqual,
+    /// Semantic version comparison
+    SemverEquals,
+    SemverLessThan,
+    SemverGreaterThan
+}
+
+impl ConditionOperator {
+    fn evaluate(&self, attribute_value: &str, target_values: &List<String>) -> Bool {
+        let target = target_values.first().map(|s| s.as_str()).unwrap_or("");
+
+        match self {
+            ConditionOperator::Equals => attribute_value == target,
+            ConditionOperator::NotEquals => attribute_value != target,
+            ConditionOperator::Contains => attribute_value.contains(target),
+            ConditionOperator::StartsWith => attribute_value.starts_with(target),
+            ConditionOperator::EndsWith => attribute_value.ends_with(target),
+            ConditionOperator::In => target_values.contains(&attribute_value.to_string()),
+            ConditionOperator::NotIn => !target_values.contains(&attribute_value.to_string()),
+            ConditionOperator::Matches => {
+                // Regex match - simplified
+                attribute_value.contains(target)
+            },
+            ConditionOperator::LessThan => {
+                attribute_value.parse::<f64>().ok()
+                    .zip(target.parse::<f64>().ok())
+                    .map(|(a, b)| a < b)
+                    .unwrap_or(false)
+            },
+            ConditionOperator::LessThanOrEqual => {
+                attribute_value.parse::<f64>().ok()
+                    .zip(target.parse::<f64>().ok())
+                    .map(|(a, b)| a <= b)
+                    .unwrap_or(false)
+            },
+            ConditionOperator::GreaterThan => {
+                attribute_value.parse::<f64>().ok()
+                    .zip(target.parse::<f64>().ok())
+                    .map(|(a, b)| a > b)
+                    .unwrap_or(false)
+            },
+            ConditionOperator::GreaterThanOrEqual => {
+                attribute_value.parse::<f64>().ok()
+                    .zip(target.parse::<f64>().ok())
+                    .map(|(a, b)| a >= b)
+                    .unwrap_or(false)
+            },
+            ConditionOperator::SemverEquals |
+            ConditionOperator::SemverLessThan |
+            ConditionOperator::SemverGreaterThan => {
+                compare_semver(attribute_value, target, self)
+            }
+        }
+    }
+}
+
+/// Override for specific targets
+type FlagOverride {
+    /// Target type
+    target_type: OverrideTarget,
+
+    /// Target ID
+    target_id: String,
+
+    /// Override value
+    value: FlagValue,
+
+    /// Expiration
+    expires_at: Option<DateTime>
+}
+
+/// Override target types
+enum OverrideTarget {
+    User,
+    Tenant,
+    Environment
+}
+
+// =============================================================================
+// EVALUATION CONTEXT
+// =============================================================================
+
+/// Context for evaluating feature flags
+type EvaluationContext {
+    /// User ID
+    user_id: Option<String>,
+
+    /// User email
+    user_email: Option<String>,
+
+    /// User roles
+    user_roles: Set<String>,
+
+    /// Tenant ID
+    tenant_id: Option<String>,
+
+    /// Tenant tier
+    tenant_tier: Option<String>,
+
+    /// Environment
+    environment: String,
+
+    /// Custom attributes
+    custom: Map<String, String>
+}
+
+impl EvaluationContext {
+    fn new() -> EvaluationContext {
+        EvaluationContext {
+            user_id: None,
+            user_email: None,
+            user_roles: Set::new(),
+            tenant_id: None,
+            tenant_tier: None,
+            environment: "development".to_string(),
+            custom: Map::new()
+        }
+    }
+
+    fn with_user(mut self, user_id: String) -> EvaluationContext {
+        self.user_id = Some(user_id);
+        self
+    }
+
+    fn with_tenant(mut self, tenant_id: String) -> EvaluationContext {
+        self.tenant_id = Some(tenant_id);
+        self
+    }
+
+    fn with_environment(mut self, env: String) -> EvaluationContext {
+        self.environment = env;
+        self
+    }
+
+    fn with_attribute(mut self, key: String, value: String) -> EvaluationContext {
+        self.custom.insert(key, value);
+        self
+    }
+
+    fn get_attribute(&self, attr: &TargetAttribute) -> Option<String> {
+        match attr {
+            TargetAttribute::UserId => self.user_id.clone(),
+            TargetAttribute::UserEmail => self.user_email.clone(),
+            TargetAttribute::UserRole => self.user_roles.iter().next().cloned(),
+            TargetAttribute::TenantId => self.tenant_id.clone(),
+            TargetAttribute::TenantTier => self.tenant_tier.clone(),
+            TargetAttribute::Environment => Some(self.environment.clone()),
+            TargetAttribute::Custom { key } => self.custom.get(key).cloned(),
+            _ => None
+        }
+    }
+}
+
+/// Result of flag evaluation
+type EvaluationResult {
+    /// The flag key
+    flag_key: String,
+
+    /// The resolved value
+    value: FlagValue,
+
+    /// Reason for this result
+    reason: EvaluationReason,
+
+    /// Rule that matched (if any)
+    rule_id: Option<String>,
+
+    /// Evaluation timestamp
+    evaluated_at: DateTime
+}
+
+/// Reason for evaluation result
+enum EvaluationReason {
+    /// Flag is disabled
+    FlagDisabled,
+    /// No rules matched, using default
+    Default,
+    /// Matched a targeting rule
+    Rule { rule_name: String },
+    /// Matched an override
+    Override { target_type: String },
+    /// Percentage rollout
+    Rollout { percentage: f32 },
+    /// Error during evaluation
+    Error { message: String }
+}
+
+// =============================================================================
+// FEATURE FLAG SERVICE
+// =============================================================================
+
+/// Feature flag service actor
+actor FeatureFlagService {
+    var flags: Map<String, FeatureFlag> = Map::new()
+    var evaluation_cache: Map<(String, String), (FlagValue, DateTime)> = Map::new()
+    var cache_ttl: Duration = Duration::minutes(5)
+    var metrics: FlagMetrics = FlagMetrics::default()
+
+    fn new() -> Self {
+        FeatureFlagService::default()
+    }
+
+    /// Create a new feature flag
+    receive CreateFlag(flag: FeatureFlag) -> Result<FeatureFlag, FlagError> {
+        if self.flags.contains_key(&flag.key) {
+            return Err(FlagError::AlreadyExists { key: flag.key.clone() });
+        }
+
+        self.flags.insert(flag.key.clone(), flag.clone());
+        checkpoint();
+
+        Ok(flag)
+    }
+
+    /// Get a feature flag
+    receive GetFlag(key: String) -> Option<FeatureFlag> {
+        self.flags.get(&key).cloned()
+    }
+
+    /// Update a feature flag
+    receive UpdateFlag(key: String, update: FlagUpdate) -> Result<FeatureFlag, FlagError> {
+        let flag = self.flags.get_mut(&key)
+            .ok_or(FlagError::NotFound { key: key.clone() })?;
+
+        if let Some(name) = update.name {
+            flag.name = name;
+        }
+
+        if let Some(description) = update.description {
+            flag.description = description;
+        }
+
+        if let Some(default_value) = update.default_value {
+            flag.default_value = default_value;
+        }
+
+        if let Some(rules) = update.rules {
+            flag.rules = rules;
+        }
+
+        if let Some(enabled) = update.enabled {
+            flag.enabled = enabled;
+        }
+
+        if let Some(tags) = update.tags {
+            flag.tags = tags;
+        }
+
+        flag.updated_at = DateTime::now();
+
+        // Invalidate cache for this flag
+        self.invalidate_cache(&key);
+
+        let updated = flag.clone();
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Delete a feature flag
+    receive DeleteFlag(key: String) -> Result<(), FlagError> {
+        if self.flags.remove(&key).is_none() {
+            return Err(FlagError::NotFound { key });
+        }
+
+        self.invalidate_cache(&key);
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Archive a feature flag
+    receive ArchiveFlag(key: String) -> Result<FeatureFlag, FlagError> {
+        let flag = self.flags.get_mut(&key)
+            .ok_or(FlagError::NotFound { key: key.clone() })?;
+
+        flag.archived = true;
+        flag.enabled = false;
+        flag.updated_at = DateTime::now();
+
+        let updated = flag.clone();
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Evaluate a flag for a context
+    receive Evaluate(key: String, context: EvaluationContext) -> EvaluationResult {
+        let now = DateTime::now();
+
+        // Check cache
+        let cache_key = self.make_cache_key(&key, &context);
+        if let Some((value, cached_at)) = self.evaluation_cache.get(&cache_key) {
+            if now - *cached_at < self.cache_ttl {
+                self.metrics.cache_hits += 1;
+                return EvaluationResult {
+                    flag_key: key,
+                    value: value.clone(),
+                    reason: EvaluationReason::Default,
+                    rule_id: None,
+                    evaluated_at: now
+                };
+            }
+        }
+
+        self.metrics.cache_misses += 1;
+        self.metrics.evaluations += 1;
+
+        // Get flag
+        let flag = match self.flags.get(&key) {
+            Some(f) => f,
+            None => {
+                return EvaluationResult {
+                    flag_key: key,
+                    value: FlagValue::Boolean(false),
+                    reason: EvaluationReason::Error { message: "Flag not found".to_string() },
+                    rule_id: None,
+                    evaluated_at: now
+                };
+            }
+        };
+
+        // Check if flag is disabled or archived
+        if !flag.enabled || flag.archived {
+            return EvaluationResult {
+                flag_key: key,
+                value: flag.default_value.clone(),
+                reason: EvaluationReason::FlagDisabled,
+                rule_id: None,
+                evaluated_at: now
+            };
+        }
+
+        // Check overrides
+        for override_item in &flag.overrides {
+            let matches = match override_item.target_type {
+                OverrideTarget::User => context.user_id.as_ref() == Some(&override_item.target_id),
+                OverrideTarget::Tenant => context.tenant_id.as_ref() == Some(&override_item.target_id),
+                OverrideTarget::Environment => context.environment == override_item.target_id
+            };
+
+            if matches {
+                // Check expiration
+                if let Some(expires) = &override_item.expires_at {
+                    if now >= *expires {
+                        continue;
+                    }
+                }
+
+                let value = override_item.value.clone();
+                self.cache_result(&cache_key, &value);
+
+                return EvaluationResult {
+                    flag_key: key,
+                    value,
+                    reason: EvaluationReason::Override {
+                        target_type: format!("{:?}", override_item.target_type)
+                    },
+                    rule_id: None,
+                    evaluated_at: now
+                };
+            }
+        }
+
+        // Evaluate rules in priority order
+        let mut sorted_rules = flag.rules.clone();
+        sorted_rules.sort_by_key(|r| r.priority);
+
+        for rule in &sorted_rules {
+            if !rule.enabled {
+                continue;
+            }
+
+            let all_conditions_match = rule.conditions.iter().all(|cond| {
+                if let Some(attr_value) = context.get_attribute(&cond.attribute) {
+                    cond.operator.evaluate(&attr_value, &cond.values)
+                } else {
+                    false
+                }
+            });
+
+            if all_conditions_match {
+                // Check percentage rollout
+                if let Some(percentage) = rule.percentage {
+                    if !self.is_in_rollout(&key, &context, percentage) {
+                        continue;
+                    }
+                }
+
+                let value = rule.value.clone();
+                self.cache_result(&cache_key, &value);
+
+                return EvaluationResult {
+                    flag_key: key,
+                    value,
+                    reason: EvaluationReason::Rule { rule_name: rule.name.clone() },
+                    rule_id: Some(rule.id.clone()),
+                    evaluated_at: now
+                };
+            }
+        }
+
+        // Return default value
+        let value = flag.default_value.clone();
+        self.cache_result(&cache_key, &value);
+
+        EvaluationResult {
+            flag_key: key,
+            value,
+            reason: EvaluationReason::Default,
+            rule_id: None,
+            evaluated_at: now
+        }
+    }
+
+    /// Evaluate boolean flag
+    receive IsEnabled(key: String, context: EvaluationContext) -> Bool {
+        let result = self.evaluate_internal(&key, &context);
+        result.value.as_bool().unwrap_or(false)
+    }
+
+    /// Evaluate string variant
+    receive GetVariant(key: String, context: EvaluationContext, default: String) -> String {
+        let result = self.evaluate_internal(&key, &context);
+        result.value.as_string().unwrap_or(default)
+    }
+
+    /// List all flags
+    receive ListFlags(filter: FlagFilter) -> List<FeatureFlag> {
+        self.flags.values()
+            .filter(|f| self.matches_filter(f, &filter))
+            .cloned()
+            .collect()
+    }
+
+    /// Add override
+    receive AddOverride(key: String, override_item: FlagOverride) -> Result<(), FlagError> {
+        let flag = self.flags.get_mut(&key)
+            .ok_or(FlagError::NotFound { key: key.clone() })?;
+
+        flag.overrides.push(override_item);
+        flag.updated_at = DateTime::now();
+
+        self.invalidate_cache(&key);
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Remove override
+    receive RemoveOverride(key: String, target_type: OverrideTarget, target_id: String) -> Result<(), FlagError> {
+        let flag = self.flags.get_mut(&key)
+            .ok_or(FlagError::NotFound { key: key.clone() })?;
+
+        flag.overrides.retain(|o| {
+            !(matches!(&o.target_type, t if std::mem::discriminant(t) == std::mem::discriminant(&target_type))
+              && o.target_id == target_id)
+        });
+
+        flag.updated_at = DateTime::now();
+
+        self.invalidate_cache(&key);
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Get metrics
+    receive GetMetrics() -> FlagMetrics {
+        self.metrics.clone()
+    }
+
+    /// Clear cache
+    receive ClearCache() {
+        self.evaluation_cache.clear();
+    }
+
+    // Internal methods
+
+    fn evaluate_internal(&self, key: &str, context: &EvaluationContext) -> EvaluationResult {
+        // Same logic as Evaluate but without actor messaging
+        // Simplified for internal use
+        let now = DateTime::now();
+
+        let flag = match self.flags.get(key) {
+            Some(f) => f,
+            None => {
+                return EvaluationResult {
+                    flag_key: key.to_string(),
+                    value: FlagValue::Boolean(false),
+                    reason: EvaluationReason::Error { message: "Flag not found".to_string() },
+                    rule_id: None,
+                    evaluated_at: now
+                };
+            }
+        };
+
+        if !flag.enabled || flag.archived {
+            return EvaluationResult {
+                flag_key: key.to_string(),
+                value: flag.default_value.clone(),
+                reason: EvaluationReason::FlagDisabled,
+                rule_id: None,
+                evaluated_at: now
+            };
+        }
+
+        EvaluationResult {
+            flag_key: key.to_string(),
+            value: flag.default_value.clone(),
+            reason: EvaluationReason::Default,
+            rule_id: None,
+            evaluated_at: now
+        }
+    }
+
+    fn make_cache_key(&self, flag_key: &str, context: &EvaluationContext) -> (String, String) {
+        let context_hash = format!("{:?}{:?}{:?}",
+            context.user_id, context.tenant_id, context.environment);
+        (flag_key.to_string(), context_hash)
+    }
+
+    fn cache_result(&mut self, key: &(String, String), value: &FlagValue) {
+        self.evaluation_cache.insert(key.clone(), (value.clone(), DateTime::now()));
+    }
+
+    fn invalidate_cache(&mut self, flag_key: &str) {
+        self.evaluation_cache.retain(|(k, _), _| k != flag_key);
+    }
+
+    fn is_in_rollout(&self, flag_key: &str, context: &EvaluationContext, percentage: f32) -> Bool {
+        // Use consistent hashing for stable rollout
+        let key = format!("{}{:?}", flag_key, context.user_id);
+        let hash = hash_string(&key);
+        let bucket = (hash % 100) as f32;
+        bucket < percentage
+    }
+
+    fn matches_filter(&self, flag: &FeatureFlag, filter: &FlagFilter) -> Bool {
+        if filter.archived_only && !flag.archived {
+            return false;
+        }
+
+        if !filter.include_archived && flag.archived {
+            return false;
+        }
+
+        if let Some(ref search) = filter.search {
+            let lower = search.to_lowercase();
+            if !flag.key.to_lowercase().contains(&lower) &&
+               !flag.name.to_lowercase().contains(&lower) {
+                return false;
+            }
+        }
+
+        if let Some(ref tags) = filter.tags {
+            if !tags.iter().any(|t| flag.tags.contains(t)) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+// =============================================================================
+// SUPPORTING TYPES
+// =============================================================================
+
+/// Flag update request
+type FlagUpdate {
+    name: Option<String>,
+    description: Option<String>,
+    default_value: Option<FlagValue>,
+    rules: Option<List<TargetingRule>>,
+    enabled: Option<Bool>,
+    tags: Option<Set<String>>
+}
+
+/// Flag filter
+type FlagFilter {
+    search: Option<String>,
+    tags: Option<List<String>>,
+    include_archived: Bool,
+    archived_only: Bool
+}
+
+/// Flag metrics
+type FlagMetrics {
+    evaluations: i64,
+    cache_hits: i64,
+    cache_misses: i64
+}
+
+impl Default for FlagMetrics {
+    fn default() -> Self {
+        FlagMetrics {
+            evaluations: 0,
+            cache_hits: 0,
+            cache_misses: 0
+        }
+    }
+}
+
+/// Flag errors
+enum FlagError {
+    NotFound { key: String },
+    AlreadyExists { key: String },
+    InvalidRule { message: String }
+}
+
+impl FlagError {
+    fn to_string(&self) -> String {
+        match self {
+            FlagError::NotFound { key } => format!("Flag not found: {}", key),
+            FlagError::AlreadyExists { key } => format!("Flag already exists: {}", key),
+            FlagError::InvalidRule { message } => format!("Invalid rule: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn hash_string(s: &str) -> u64 {
+    let mut hash: u64 = 5381;
+    for c in s.chars() {
+        hash = ((hash << 5).wrapping_add(hash)).wrapping_add(c as u64);
+    }
+    hash
+}
+
+fn compare_semver(a: &str, b: &str, op: &ConditionOperator) -> Bool {
+    let parse = |s: &str| -> Option<(i32, i32, i32)> {
+        let parts: Vec<_> = s.split('.').collect();
+        if parts.len() >= 3 {
+            let major = parts[0].parse().ok()?;
+            let minor = parts[1].parse().ok()?;
+            let patch = parts[2].parse().ok()?;
+            Some((major, minor, patch))
+        } else {
+            None
+        }
+    };
+
+    match (parse(a), parse(b)) {
+        (Some(av), Some(bv)) => {
+            match op {
+                ConditionOperator::SemverEquals => av == bv,
+                ConditionOperator::SemverLessThan => av < bv,
+                ConditionOperator::SemverGreaterThan => av > bv,
+                _ => false
+            }
+        },
+        _ => false
+    }
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_condition_operator() {
+        let eq = ConditionOperator::Equals;
+        assert!(eq.evaluate("hello", &vec!["hello".to_string()]));
+        assert!(!eq.evaluate("hello", &vec!["world".to_string()]));
+
+        let in_op = ConditionOperator::In;
+        assert!(in_op.evaluate("a", &vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert!(!in_op.evaluate("d", &vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+    }
+
+    #[test]
+    fn test_evaluation_context() {
+        let ctx = EvaluationContext::new()
+            .with_user("user123".to_string())
+            .with_tenant("tenant456".to_string())
+            .with_environment("production".to_string());
+
+        assert_eq!(ctx.get_attribute(&TargetAttribute::UserId), Some("user123".to_string()));
+        assert_eq!(ctx.get_attribute(&TargetAttribute::TenantId), Some("tenant456".to_string()));
+    }
+
+    #[test]
+    fn test_semver_comparison() {
+        assert!(compare_semver("1.2.3", "1.2.3", &ConditionOperator::SemverEquals));
+        assert!(compare_semver("1.2.3", "1.2.4", &ConditionOperator::SemverLessThan));
+        assert!(compare_semver("2.0.0", "1.9.9", &ConditionOperator::SemverGreaterThan));
+    }
+}

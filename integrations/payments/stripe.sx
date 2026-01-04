@@ -1,0 +1,2297 @@
+/// Intelligo LMS - Stripe Payment Integration
+///
+/// Complete Stripe integration for payment processing including:
+/// - Product/Price management for courses
+/// - Checkout sessions for purchases
+/// - Subscription management (monthly/annual)
+/// - Webhook handling for payment events
+/// - Refund processing and invoice generation
+/// - Coupon/discount support
+/// - Multi-currency support
+/// - Connect marketplace for course creators
+
+module intelligo::integrations::payments::stripe
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+use std::http::{HttpClient, Request, Response, Headers}
+use std::crypto::{hmac_sha256, constant_time_compare}
+use std::json::{Json, to_json, from_json}
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+/// Stripe configuration
+type StripeConfig {
+    /// API secret key
+    secret_key: String,
+
+    /// Publishable key (for client)
+    publishable_key: String,
+
+    /// Webhook signing secret
+    webhook_secret: String,
+
+    /// Connect client ID (for marketplace)
+    connect_client_id: Option<String>,
+
+    /// Default currency
+    default_currency: Currency,
+
+    /// API version
+    api_version: String,
+
+    /// Base API URL
+    base_url: String,
+
+    /// Webhook tolerance window (seconds)
+    webhook_tolerance: i64,
+
+    /// Enable test mode
+    test_mode: Bool
+}
+
+impl StripeConfig {
+    fn default() -> StripeConfig {
+        StripeConfig {
+            secret_key: "",
+            publishable_key: "",
+            webhook_secret: "",
+            connect_client_id: None,
+            default_currency: Currency::USD,
+            api_version: "2023-10-16",
+            base_url: "https://api.stripe.com/v1",
+            webhook_tolerance: 300,
+            test_mode: true
+        }
+    }
+
+    fn from_env() -> Result<StripeConfig, StripeError> {
+        let secret_key = std::env::get("STRIPE_SECRET_KEY")
+            .ok_or(StripeError::ConfigurationError { message: "STRIPE_SECRET_KEY not set".to_string() })?;
+        let publishable_key = std::env::get("STRIPE_PUBLISHABLE_KEY")
+            .ok_or(StripeError::ConfigurationError { message: "STRIPE_PUBLISHABLE_KEY not set".to_string() })?;
+        let webhook_secret = std::env::get("STRIPE_WEBHOOK_SECRET")
+            .ok_or(StripeError::ConfigurationError { message: "STRIPE_WEBHOOK_SECRET not set".to_string() })?;
+
+        Ok(StripeConfig {
+            secret_key,
+            publishable_key,
+            webhook_secret,
+            connect_client_id: std::env::get("STRIPE_CONNECT_CLIENT_ID"),
+            default_currency: Currency::USD,
+            api_version: "2023-10-16".to_string(),
+            base_url: "https://api.stripe.com/v1".to_string(),
+            webhook_tolerance: 300,
+            test_mode: secret_key.starts_with("sk_test_")
+        })
+    }
+}
+
+// =============================================================================
+// CURRENCY TYPES
+// =============================================================================
+
+/// Supported currencies
+enum Currency {
+    USD,
+    EUR,
+    GBP,
+    CAD,
+    AUD,
+    JPY,
+    CHF,
+    INR,
+    BRL,
+    MXN,
+    Custom { code: String }
+}
+
+impl Currency {
+    fn to_code(&self) -> String {
+        match self {
+            Currency::USD => "usd",
+            Currency::EUR => "eur",
+            Currency::GBP => "gbp",
+            Currency::CAD => "cad",
+            Currency::AUD => "aud",
+            Currency::JPY => "jpy",
+            Currency::CHF => "chf",
+            Currency::INR => "inr",
+            Currency::BRL => "brl",
+            Currency::MXN => "mxn",
+            Currency::Custom { code } => code.to_lowercase()
+        }.to_string()
+    }
+
+    fn from_code(code: &str) -> Currency {
+        match code.to_lowercase().as_str() {
+            "usd" => Currency::USD,
+            "eur" => Currency::EUR,
+            "gbp" => Currency::GBP,
+            "cad" => Currency::CAD,
+            "aud" => Currency::AUD,
+            "jpy" => Currency::JPY,
+            "chf" => Currency::CHF,
+            "inr" => Currency::INR,
+            "brl" => Currency::BRL,
+            "mxn" => Currency::MXN,
+            _ => Currency::Custom { code: code.to_string() }
+        }
+    }
+
+    /// Check if currency uses zero decimal (no cents)
+    fn is_zero_decimal(&self) -> Bool {
+        matches!(self, Currency::JPY)
+    }
+
+    /// Convert amount to smallest unit (cents/pence/etc)
+    fn to_smallest_unit(&self, amount: f64) -> i64 {
+        if self.is_zero_decimal() {
+            amount as i64
+        } else {
+            (amount * 100.0).round() as i64
+        }
+    }
+
+    /// Convert from smallest unit to decimal
+    fn from_smallest_unit(&self, amount: i64) -> f64 {
+        if self.is_zero_decimal() {
+            amount as f64
+        } else {
+            amount as f64 / 100.0
+        }
+    }
+}
+
+// =============================================================================
+// STRIPE TYPES
+// =============================================================================
+
+/// Stripe customer
+type StripeCustomer {
+    id: String,
+    email: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    metadata: Map<String, String>,
+    default_source: Option<String>,
+    invoice_settings: Option<InvoiceSettings>,
+    created: i64,
+    livemode: Bool
+}
+
+/// Invoice settings for customer
+type InvoiceSettings {
+    default_payment_method: Option<String>,
+    footer: Option<String>,
+    custom_fields: List<CustomField>
+}
+
+/// Custom field for invoices
+type CustomField {
+    name: String,
+    value: String
+}
+
+/// Stripe product (represents a course)
+type StripeProduct {
+    id: String,
+    name: String,
+    description: Option<String>,
+    active: Bool,
+    metadata: Map<String, String>,
+    images: List<String>,
+    default_price: Option<String>,
+    created: i64,
+    updated: i64
+}
+
+/// Stripe price (pricing for a product)
+type StripePrice {
+    id: String,
+    product: String,
+    active: Bool,
+    currency: String,
+    unit_amount: Option<i64>,
+    billing_scheme: BillingScheme,
+    recurring: Option<RecurringPrice>,
+    type_: PriceType,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Billing scheme
+enum BillingScheme {
+    PerUnit,
+    Tiered
+}
+
+/// Recurring pricing
+type RecurringPrice {
+    interval: PriceInterval,
+    interval_count: i32,
+    trial_period_days: Option<i32>,
+    usage_type: UsageType
+}
+
+/// Price interval
+enum PriceInterval {
+    Day,
+    Week,
+    Month,
+    Year
+}
+
+/// Usage type for metered billing
+enum UsageType {
+    Licensed,
+    Metered
+}
+
+/// Price type
+enum PriceType {
+    OneTime,
+    Recurring
+}
+
+/// Checkout session
+type CheckoutSession {
+    id: String,
+    url: Option<String>,
+    success_url: String,
+    cancel_url: String,
+    customer: Option<String>,
+    customer_email: Option<String>,
+    payment_status: PaymentStatus,
+    status: SessionStatus,
+    mode: SessionMode,
+    line_items: Option<List<LineItem>>,
+    metadata: Map<String, String>,
+    amount_total: Option<i64>,
+    currency: Option<String>,
+    subscription: Option<String>,
+    payment_intent: Option<String>,
+    created: i64,
+    expires_at: i64
+}
+
+/// Payment status
+enum PaymentStatus {
+    Paid,
+    Unpaid,
+    NoPaymentRequired
+}
+
+/// Session status
+enum SessionStatus {
+    Open,
+    Complete,
+    Expired
+}
+
+/// Session mode
+enum SessionMode {
+    Payment,
+    Setup,
+    Subscription
+}
+
+/// Line item in checkout
+type LineItem {
+    id: String,
+    price: String,
+    quantity: i64,
+    description: Option<String>,
+    amount_total: i64,
+    amount_discount: i64
+}
+
+/// Stripe subscription
+type StripeSubscription {
+    id: String,
+    customer: String,
+    status: SubscriptionState,
+    current_period_start: i64,
+    current_period_end: i64,
+    cancel_at_period_end: Bool,
+    canceled_at: Option<i64>,
+    ended_at: Option<i64>,
+    trial_start: Option<i64>,
+    trial_end: Option<i64>,
+    items: SubscriptionItems,
+    default_payment_method: Option<String>,
+    latest_invoice: Option<String>,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Subscription state
+enum SubscriptionState {
+    Incomplete,
+    IncompleteExpired,
+    Trialing,
+    Active,
+    PastDue,
+    Canceled,
+    Unpaid,
+    Paused
+}
+
+/// Subscription items
+type SubscriptionItems {
+    data: List<SubscriptionItem>
+}
+
+/// Subscription item
+type SubscriptionItem {
+    id: String,
+    price: StripePrice,
+    quantity: i64
+}
+
+/// Payment intent
+type PaymentIntent {
+    id: String,
+    amount: i64,
+    currency: String,
+    status: PaymentIntentStatus,
+    customer: Option<String>,
+    payment_method: Option<String>,
+    client_secret: String,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Payment intent status
+enum PaymentIntentStatus {
+    RequiresPaymentMethod,
+    RequiresConfirmation,
+    RequiresAction,
+    Processing,
+    RequiresCapture,
+    Canceled,
+    Succeeded
+}
+
+/// Stripe refund
+type StripeRefund {
+    id: String,
+    amount: i64,
+    currency: String,
+    payment_intent: Option<String>,
+    charge: Option<String>,
+    status: RefundStatus,
+    reason: Option<RefundReason>,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Refund status
+enum RefundStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Canceled
+}
+
+/// Refund reason
+enum RefundReason {
+    Duplicate,
+    Fraudulent,
+    RequestedByCustomer
+}
+
+/// Stripe invoice
+type StripeInvoice {
+    id: String,
+    customer: String,
+    subscription: Option<String>,
+    status: InvoiceStatus,
+    amount_due: i64,
+    amount_paid: i64,
+    amount_remaining: i64,
+    currency: String,
+    hosted_invoice_url: Option<String>,
+    invoice_pdf: Option<String>,
+    lines: InvoiceLines,
+    metadata: Map<String, String>,
+    created: i64,
+    due_date: Option<i64>
+}
+
+/// Invoice status
+enum InvoiceStatus {
+    Draft,
+    Open,
+    Paid,
+    Uncollectible,
+    Void
+}
+
+/// Invoice lines
+type InvoiceLines {
+    data: List<InvoiceLineItem>
+}
+
+/// Invoice line item
+type InvoiceLineItem {
+    id: String,
+    amount: i64,
+    currency: String,
+    description: Option<String>,
+    price: Option<StripePrice>,
+    quantity: i64
+}
+
+/// Stripe coupon
+type StripeCoupon {
+    id: String,
+    name: Option<String>,
+    amount_off: Option<i64>,
+    percent_off: Option<f64>,
+    currency: Option<String>,
+    duration: CouponDuration,
+    duration_in_months: Option<i32>,
+    max_redemptions: Option<i64>,
+    times_redeemed: i64,
+    valid: Bool,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Coupon duration
+enum CouponDuration {
+    Once,
+    Repeating,
+    Forever
+}
+
+/// Promotion code (links to coupon)
+type PromotionCode {
+    id: String,
+    code: String,
+    coupon: StripeCoupon,
+    active: Bool,
+    max_redemptions: Option<i64>,
+    times_redeemed: i64,
+    expires_at: Option<i64>,
+    restrictions: CodeRestrictions,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Code restrictions
+type CodeRestrictions {
+    first_time_transaction: Bool,
+    minimum_amount: Option<i64>,
+    minimum_amount_currency: Option<String>
+}
+
+// =============================================================================
+// STRIPE CONNECT (MARKETPLACE)
+// =============================================================================
+
+/// Connected account (course creator)
+type ConnectedAccount {
+    id: String,
+    type_: AccountType,
+    email: Option<String>,
+    business_profile: Option<BusinessProfile>,
+    capabilities: AccountCapabilities,
+    charges_enabled: Bool,
+    payouts_enabled: Bool,
+    details_submitted: Bool,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Account type
+enum AccountType {
+    Standard,
+    Express,
+    Custom
+}
+
+/// Business profile
+type BusinessProfile {
+    name: Option<String>,
+    url: Option<String>,
+    support_email: Option<String>
+}
+
+/// Account capabilities
+type AccountCapabilities {
+    card_payments: CapabilityStatus,
+    transfers: CapabilityStatus
+}
+
+/// Capability status
+enum CapabilityStatus {
+    Active,
+    Inactive,
+    Pending
+}
+
+/// Transfer to connected account
+type StripeTransfer {
+    id: String,
+    amount: i64,
+    currency: String,
+    destination: String,
+    source_transaction: Option<String>,
+    transfer_group: Option<String>,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Payout to connected account's bank
+type StripePayout {
+    id: String,
+    amount: i64,
+    currency: String,
+    status: PayoutStatus,
+    arrival_date: i64,
+    method: PayoutMethod,
+    destination: Option<String>,
+    metadata: Map<String, String>,
+    created: i64
+}
+
+/// Payout status
+enum PayoutStatus {
+    Pending,
+    InTransit,
+    Paid,
+    Failed,
+    Canceled
+}
+
+/// Payout method
+enum PayoutMethod {
+    Standard,
+    Instant
+}
+
+// =============================================================================
+// WEBHOOK TYPES
+// =============================================================================
+
+/// Stripe webhook event
+type StripeEvent {
+    id: String,
+    type_: String,
+    api_version: String,
+    created: i64,
+    livemode: Bool,
+    pending_webhooks: i64,
+    data: EventData
+}
+
+/// Event data wrapper
+type EventData {
+    object: Json,
+    previous_attributes: Option<Map<String, Json>>
+}
+
+/// Webhook event types we handle
+enum WebhookEventType {
+    /// Checkout completed
+    CheckoutSessionCompleted,
+    /// Payment succeeded
+    PaymentIntentSucceeded,
+    /// Payment failed
+    PaymentIntentPaymentFailed,
+    /// Subscription created
+    CustomerSubscriptionCreated,
+    /// Subscription updated
+    CustomerSubscriptionUpdated,
+    /// Subscription deleted
+    CustomerSubscriptionDeleted,
+    /// Invoice paid
+    InvoicePaid,
+    /// Invoice payment failed
+    InvoicePaymentFailed,
+    /// Refund created
+    ChargeRefunded,
+    /// Customer created
+    CustomerCreated,
+    /// Account updated (Connect)
+    AccountUpdated,
+    /// Transfer created (Connect)
+    TransferCreated,
+    /// Unknown event
+    Unknown { event_type: String }
+}
+
+impl WebhookEventType {
+    fn from_string(s: &str) -> WebhookEventType {
+        match s {
+            "checkout.session.completed" => WebhookEventType::CheckoutSessionCompleted,
+            "payment_intent.succeeded" => WebhookEventType::PaymentIntentSucceeded,
+            "payment_intent.payment_failed" => WebhookEventType::PaymentIntentPaymentFailed,
+            "customer.subscription.created" => WebhookEventType::CustomerSubscriptionCreated,
+            "customer.subscription.updated" => WebhookEventType::CustomerSubscriptionUpdated,
+            "customer.subscription.deleted" => WebhookEventType::CustomerSubscriptionDeleted,
+            "invoice.paid" => WebhookEventType::InvoicePaid,
+            "invoice.payment_failed" => WebhookEventType::InvoicePaymentFailed,
+            "charge.refunded" => WebhookEventType::ChargeRefunded,
+            "customer.created" => WebhookEventType::CustomerCreated,
+            "account.updated" => WebhookEventType::AccountUpdated,
+            "transfer.created" => WebhookEventType::TransferCreated,
+            _ => WebhookEventType::Unknown { event_type: s.to_string() }
+        }
+    }
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// Stripe-specific errors
+enum StripeError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// API error from Stripe
+    ApiError { code: String, message: String, status: i32 },
+    /// Card error
+    CardError { code: String, decline_code: Option<String>, message: String },
+    /// Invalid request
+    InvalidRequest { message: String },
+    /// Authentication error
+    AuthenticationError { message: String },
+    /// Rate limit exceeded
+    RateLimitError { retry_after: Option<i64> },
+    /// Webhook verification failed
+    WebhookError { message: String },
+    /// Idempotency error
+    IdempotencyError { message: String },
+    /// Network error
+    NetworkError { message: String },
+    /// Serialization error
+    SerializationError { message: String }
+}
+
+impl StripeError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            StripeError::ConfigurationError { message } =>
+                LmsError::IntegrationError { provider: "stripe".to_string(), message: message.clone() },
+            StripeError::ApiError { message, .. } =>
+                LmsError::IntegrationError { provider: "stripe".to_string(), message: message.clone() },
+            StripeError::CardError { message, .. } =>
+                LmsError::IntegrationError { provider: "stripe".to_string(), message: message.clone() },
+            StripeError::InvalidRequest { message } =>
+                LmsError::ValidationFailed { errors: vec![ValidationError { field: "stripe".to_string(), message: message.clone(), code: "invalid_request".to_string() }] },
+            StripeError::AuthenticationError { message } =>
+                LmsError::AccessDenied { reason: message.clone() },
+            StripeError::RateLimitError { retry_after } =>
+                LmsError::RateLimitExceeded { retry_after: Duration::seconds(retry_after.unwrap_or(60)) },
+            StripeError::WebhookError { message } =>
+                LmsError::IntegrationError { provider: "stripe".to_string(), message: message.clone() },
+            _ => LmsError::IntegrationError { provider: "stripe".to_string(), message: format!("{:?}", self) }
+        }
+    }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating a product
+type CreateProductInput {
+    name: String,
+    description: Option<String>,
+    course_id: CourseId,
+    images: List<String>,
+    metadata: Option<Map<String, String>>
+}
+
+/// Input for creating a price
+type CreatePriceInput {
+    product_id: String,
+    amount: f64,
+    currency: Currency,
+    recurring: Option<RecurringPriceInput>,
+    metadata: Option<Map<String, String>>
+}
+
+/// Recurring price input
+type RecurringPriceInput {
+    interval: PriceInterval,
+    interval_count: Option<i32>,
+    trial_period_days: Option<i32>
+}
+
+/// Input for creating checkout session
+type CreateCheckoutInput {
+    customer_id: Option<String>,
+    customer_email: Option<String>,
+    price_id: String,
+    quantity: Option<i64>,
+    success_url: String,
+    cancel_url: String,
+    mode: SessionMode,
+    allow_promotion_codes: Bool,
+    metadata: Map<String, String>,
+    /// Connected account for Connect marketplace
+    connected_account_id: Option<String>,
+    /// Application fee percentage (for Connect)
+    application_fee_percent: Option<f64>
+}
+
+/// Input for creating a coupon
+type CreateCouponInput {
+    name: Option<String>,
+    percent_off: Option<f64>,
+    amount_off: Option<i64>,
+    currency: Option<Currency>,
+    duration: CouponDuration,
+    duration_in_months: Option<i32>,
+    max_redemptions: Option<i64>,
+    metadata: Option<Map<String, String>>
+}
+
+/// Input for creating promotion code
+type CreatePromotionCodeInput {
+    coupon_id: String,
+    code: String,
+    max_redemptions: Option<i64>,
+    expires_at: Option<DateTime>,
+    first_time_transaction: Bool,
+    minimum_amount: Option<i64>,
+    minimum_amount_currency: Option<Currency>,
+    metadata: Option<Map<String, String>>
+}
+
+/// Input for creating refund
+type CreateRefundInput {
+    payment_intent_id: Option<String>,
+    charge_id: Option<String>,
+    amount: Option<i64>,
+    reason: Option<RefundReason>,
+    metadata: Option<Map<String, String>>
+}
+
+/// Input for creating transfer (Connect)
+type CreateTransferInput {
+    amount: i64,
+    currency: Currency,
+    destination: String,
+    source_transaction: Option<String>,
+    transfer_group: Option<String>,
+    metadata: Option<Map<String, String>>
+}
+
+/// Input for creating connected account
+type CreateConnectedAccountInput {
+    type_: AccountType,
+    email: String,
+    country: String,
+    business_type: Option<String>,
+    metadata: Option<Map<String, String>>
+}
+
+// =============================================================================
+// STRIPE ACTOR
+// =============================================================================
+
+/// Actor for Stripe payment processing
+actor StripeActor {
+    /// Configuration
+    config: StripeConfig,
+
+    /// HTTP client
+    client: HttpClient,
+
+    /// Idempotency key cache (key -> timestamp)
+    idempotency_cache: Map<String, i64>,
+
+    /// Processed webhook events (event_id -> timestamp)
+    processed_events: Map<String, i64>,
+
+    /// Customer cache (user_id -> stripe_customer_id)
+    customer_cache: Map<UserId, String>,
+
+    /// Product cache (course_id -> stripe_product_id)
+    product_cache: Map<CourseId, String>
+}
+
+impl StripeActor {
+    /// Create new Stripe actor
+    pub fn new(config: StripeConfig) -> StripeActor {
+        StripeActor {
+            config,
+            client: HttpClient::new(),
+            idempotency_cache: Map::new(),
+            processed_events: Map::new(),
+            customer_cache: Map::new(),
+            product_cache: Map::new()
+        }
+    }
+
+    /// Create from environment
+    pub fn from_env() -> Result<StripeActor, StripeError> {
+        let config = StripeConfig::from_env()?;
+        Ok(StripeActor::new(config))
+    }
+
+    // =========================================================================
+    // HTTP HELPERS
+    // =========================================================================
+
+    /// Build authorization header
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.config.secret_key)
+    }
+
+    /// Build common headers
+    fn build_headers(&self, idempotency_key: Option<String>) -> Headers {
+        let mut headers = Headers::new();
+        headers.set("Authorization", self.auth_header());
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        headers.set("Stripe-Version", &self.config.api_version);
+
+        if let Some(key) = idempotency_key {
+            headers.set("Idempotency-Key", &key);
+        }
+
+        headers
+    }
+
+    /// Build headers for Connect (on behalf of)
+    fn build_connect_headers(&self, account_id: &str, idempotency_key: Option<String>) -> Headers {
+        let mut headers = self.build_headers(idempotency_key);
+        headers.set("Stripe-Account", account_id);
+        headers
+    }
+
+    /// Make POST request
+    async fn post(&self, endpoint: &str, body: &str, idempotency_key: Option<String>) -> Result<Json, StripeError> {
+        let url = format!("{}{}", self.config.base_url, endpoint);
+        let headers = self.build_headers(idempotency_key);
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| StripeError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make GET request
+    async fn get(&self, endpoint: &str) -> Result<Json, StripeError> {
+        let url = format!("{}{}", self.config.base_url, endpoint);
+        let headers = self.build_headers(None);
+
+        let response = self.client.get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| StripeError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make DELETE request
+    async fn delete(&self, endpoint: &str) -> Result<Json, StripeError> {
+        let url = format!("{}{}", self.config.base_url, endpoint);
+        let headers = self.build_headers(None);
+
+        let response = self.client.delete(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| StripeError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Handle API response
+    async fn handle_response(&self, response: Response) -> Result<Json, StripeError> {
+        let status = response.status();
+        let body = response.text().await
+            .map_err(|e| StripeError::NetworkError { message: e.to_string() })?;
+
+        let json: Json = from_json(&body)
+            .map_err(|e| StripeError::SerializationError { message: e.to_string() })?;
+
+        if status >= 200 && status < 300 {
+            return Ok(json)
+        }
+
+        // Parse error response
+        let error = json.get("error").unwrap_or(&json);
+        let error_type = error.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let error_code = error.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let error_message = error.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+
+        match error_type {
+            "card_error" => Err(StripeError::CardError {
+                code: error_code.to_string(),
+                decline_code: error.get("decline_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                message: error_message.to_string()
+            }),
+            "invalid_request_error" => Err(StripeError::InvalidRequest {
+                message: error_message.to_string()
+            }),
+            "authentication_error" => Err(StripeError::AuthenticationError {
+                message: error_message.to_string()
+            }),
+            "rate_limit_error" => Err(StripeError::RateLimitError {
+                retry_after: error.get("retry_after").and_then(|v| v.as_i64())
+            }),
+            "idempotency_error" => Err(StripeError::IdempotencyError {
+                message: error_message.to_string()
+            }),
+            _ => Err(StripeError::ApiError {
+                code: error_code.to_string(),
+                message: error_message.to_string(),
+                status
+            })
+        }
+    }
+
+    /// Generate idempotency key
+    fn generate_idempotency_key(&self, operation: &str, params: &str) -> String {
+        let input = format!("{}:{}", operation, params);
+        let hash = std::crypto::sha256(&input);
+        format!("idem_{}", hash[..32].to_string())
+    }
+
+    /// Clean old idempotency keys
+    fn clean_idempotency_cache(&mut self) {
+        let now = DateTime::now().timestamp();
+        let day_ago = now - 86400; // 24 hours
+
+        self.idempotency_cache.retain(|_, &mut timestamp| timestamp > day_ago);
+    }
+
+    // =========================================================================
+    // CUSTOMER MANAGEMENT
+    // =========================================================================
+
+    /// Create or get customer for user
+    pub async fn get_or_create_customer(
+        &mut self,
+        user_id: UserId,
+        email: &str,
+        name: Option<String>,
+        tenant_id: TenantId
+    ) -> Result<StripeCustomer, StripeError> {
+        // Check cache first
+        if let Some(customer_id) = self.customer_cache.get(&user_id) {
+            return self.get_customer(customer_id).await
+        }
+
+        // Create new customer
+        let mut params = vec![
+            format!("email={}", urlencoding::encode(email)),
+            format!("metadata[user_id]={}", user_id),
+            format!("metadata[tenant_id]={}", tenant_id)
+        ];
+
+        if let Some(n) = name {
+            params.push(format!("name={}", urlencoding::encode(&n)));
+        }
+
+        let body = params.join("&");
+        let idempotency_key = self.generate_idempotency_key("create_customer", &user_id);
+
+        let json = self.post("/customers", &body, Some(idempotency_key)).await?;
+        let customer = self.parse_customer(json)?;
+
+        // Cache the mapping
+        self.customer_cache.insert(user_id, customer.id.clone());
+
+        Ok(customer)
+    }
+
+    /// Get customer by ID
+    pub async fn get_customer(&self, customer_id: &str) -> Result<StripeCustomer, StripeError> {
+        let json = self.get(&format!("/customers/{}", customer_id)).await?;
+        self.parse_customer(json)
+    }
+
+    /// Update customer
+    pub async fn update_customer(
+        &self,
+        customer_id: &str,
+        email: Option<String>,
+        name: Option<String>,
+        metadata: Option<Map<String, String>>
+    ) -> Result<StripeCustomer, StripeError> {
+        let mut params = Vec::new();
+
+        if let Some(e) = email {
+            params.push(format!("email={}", urlencoding::encode(&e)));
+        }
+        if let Some(n) = name {
+            params.push(format!("name={}", urlencoding::encode(&n)));
+        }
+        if let Some(meta) = metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let json = self.post(&format!("/customers/{}", customer_id), &body, None).await?;
+        self.parse_customer(json)
+    }
+
+    fn parse_customer(&self, json: Json) -> Result<StripeCustomer, StripeError> {
+        Ok(StripeCustomer {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            name: json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            description: json.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            metadata: self.parse_metadata(&json),
+            default_source: json.get("default_source").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            invoice_settings: None, // Parse if needed
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            livemode: json.get("livemode").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+    }
+
+    // =========================================================================
+    // PRODUCT MANAGEMENT
+    // =========================================================================
+
+    /// Create product for course
+    pub async fn create_product(&mut self, input: CreateProductInput) -> Result<StripeProduct, StripeError> {
+        let mut params = vec![
+            format!("name={}", urlencoding::encode(&input.name)),
+            format!("metadata[course_id]={}", input.course_id)
+        ];
+
+        if let Some(desc) = input.description {
+            params.push(format!("description={}", urlencoding::encode(&desc)));
+        }
+
+        for (i, image) in input.images.iter().enumerate() {
+            params.push(format!("images[{}]={}", i, urlencoding::encode(image)));
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let idempotency_key = self.generate_idempotency_key("create_product", &input.course_id);
+
+        let json = self.post("/products", &body, Some(idempotency_key)).await?;
+        let product = self.parse_product(json)?;
+
+        // Cache the mapping
+        self.product_cache.insert(input.course_id, product.id.clone());
+
+        Ok(product)
+    }
+
+    /// Get product by ID
+    pub async fn get_product(&self, product_id: &str) -> Result<StripeProduct, StripeError> {
+        let json = self.get(&format!("/products/{}", product_id)).await?;
+        self.parse_product(json)
+    }
+
+    /// Update product
+    pub async fn update_product(
+        &self,
+        product_id: &str,
+        name: Option<String>,
+        description: Option<String>,
+        active: Option<Bool>
+    ) -> Result<StripeProduct, StripeError> {
+        let mut params = Vec::new();
+
+        if let Some(n) = name {
+            params.push(format!("name={}", urlencoding::encode(&n)));
+        }
+        if let Some(d) = description {
+            params.push(format!("description={}", urlencoding::encode(&d)));
+        }
+        if let Some(a) = active {
+            params.push(format!("active={}", a));
+        }
+
+        let body = params.join("&");
+        let json = self.post(&format!("/products/{}", product_id), &body, None).await?;
+        self.parse_product(json)
+    }
+
+    /// Archive product (deactivate)
+    pub async fn archive_product(&self, product_id: &str) -> Result<StripeProduct, StripeError> {
+        self.update_product(product_id, None, None, Some(false)).await
+    }
+
+    fn parse_product(&self, json: Json) -> Result<StripeProduct, StripeError> {
+        Ok(StripeProduct {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            description: json.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            active: json.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
+            metadata: self.parse_metadata(&json),
+            images: json.get("images")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            default_price: json.get("default_price").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            updated: json.get("updated").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // PRICE MANAGEMENT
+    // =========================================================================
+
+    /// Create price for product
+    pub async fn create_price(&self, input: CreatePriceInput) -> Result<StripePrice, StripeError> {
+        let amount = input.currency.to_smallest_unit(input.amount);
+
+        let mut params = vec![
+            format!("product={}", input.product_id),
+            format!("unit_amount={}", amount),
+            format!("currency={}", input.currency.to_code())
+        ];
+
+        if let Some(recurring) = input.recurring {
+            let interval = match recurring.interval {
+                PriceInterval::Day => "day",
+                PriceInterval::Week => "week",
+                PriceInterval::Month => "month",
+                PriceInterval::Year => "year"
+            };
+            params.push(format!("recurring[interval]={}", interval));
+
+            if let Some(count) = recurring.interval_count {
+                params.push(format!("recurring[interval_count]={}", count));
+            }
+            if let Some(trial) = recurring.trial_period_days {
+                params.push(format!("recurring[trial_period_days]={}", trial));
+            }
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let idempotency_key = self.generate_idempotency_key("create_price", &format!("{}:{}", input.product_id, amount));
+
+        let json = self.post("/prices", &body, Some(idempotency_key)).await?;
+        self.parse_price(json)
+    }
+
+    /// Get price by ID
+    pub async fn get_price(&self, price_id: &str) -> Result<StripePrice, StripeError> {
+        let json = self.get(&format!("/prices/{}", price_id)).await?;
+        self.parse_price(json)
+    }
+
+    /// List prices for product
+    pub async fn list_prices(&self, product_id: &str, active_only: Bool) -> Result<List<StripePrice>, StripeError> {
+        let mut endpoint = format!("/prices?product={}", product_id);
+        if active_only {
+            endpoint.push_str("&active=true");
+        }
+
+        let json = self.get(&endpoint).await?;
+        let data = json.get("data").and_then(|v| v.as_array()).unwrap_or(&vec![]);
+
+        data.iter()
+            .map(|item| self.parse_price(item.clone()))
+            .collect()
+    }
+
+    fn parse_price(&self, json: Json) -> Result<StripePrice, StripeError> {
+        let recurring = json.get("recurring").map(|r| RecurringPrice {
+            interval: match r.get("interval").and_then(|v| v.as_str()).unwrap_or("month") {
+                "day" => PriceInterval::Day,
+                "week" => PriceInterval::Week,
+                "month" => PriceInterval::Month,
+                "year" => PriceInterval::Year,
+                _ => PriceInterval::Month
+            },
+            interval_count: r.get("interval_count").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(1),
+            trial_period_days: r.get("trial_period_days").and_then(|v| v.as_i64()).map(|n| n as i32),
+            usage_type: match r.get("usage_type").and_then(|v| v.as_str()).unwrap_or("licensed") {
+                "metered" => UsageType::Metered,
+                _ => UsageType::Licensed
+            }
+        });
+
+        Ok(StripePrice {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            product: json.get("product").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            active: json.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
+            currency: json.get("currency").and_then(|v| v.as_str()).unwrap_or("usd").to_string(),
+            unit_amount: json.get("unit_amount").and_then(|v| v.as_i64()),
+            billing_scheme: match json.get("billing_scheme").and_then(|v| v.as_str()).unwrap_or("per_unit") {
+                "tiered" => BillingScheme::Tiered,
+                _ => BillingScheme::PerUnit
+            },
+            recurring,
+            type_: if json.get("recurring").is_some() { PriceType::Recurring } else { PriceType::OneTime },
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // CHECKOUT SESSION
+    // =========================================================================
+
+    /// Create checkout session
+    pub async fn create_checkout_session(&self, input: CreateCheckoutInput) -> Result<CheckoutSession, StripeError> {
+        let mode = match input.mode {
+            SessionMode::Payment => "payment",
+            SessionMode::Setup => "setup",
+            SessionMode::Subscription => "subscription"
+        };
+
+        let mut params = vec![
+            format!("success_url={}", urlencoding::encode(&input.success_url)),
+            format!("cancel_url={}", urlencoding::encode(&input.cancel_url)),
+            format!("mode={}", mode),
+            format!("line_items[0][price]={}", input.price_id),
+            format!("line_items[0][quantity]={}", input.quantity.unwrap_or(1))
+        ];
+
+        if let Some(customer_id) = input.customer_id {
+            params.push(format!("customer={}", customer_id));
+        } else if let Some(email) = input.customer_email {
+            params.push(format!("customer_email={}", urlencoding::encode(&email)));
+        }
+
+        if input.allow_promotion_codes {
+            params.push("allow_promotion_codes=true".to_string());
+        }
+
+        for (k, v) in input.metadata {
+            params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+        }
+
+        // Connect marketplace support
+        if let Some(account_id) = input.connected_account_id {
+            params.push(format!("payment_intent_data[transfer_data][destination]={}", account_id));
+
+            if let Some(fee_percent) = input.application_fee_percent {
+                params.push(format!("payment_intent_data[application_fee_amount]={{CALCULATED}}"));
+                // Fee will be calculated based on total
+            }
+        }
+
+        let body = params.join("&");
+        let idempotency_key = self.generate_idempotency_key("create_checkout", &input.price_id);
+
+        let json = self.post("/checkout/sessions", &body, Some(idempotency_key)).await?;
+        self.parse_checkout_session(json)
+    }
+
+    /// Get checkout session by ID
+    pub async fn get_checkout_session(&self, session_id: &str) -> Result<CheckoutSession, StripeError> {
+        let json = self.get(&format!("/checkout/sessions/{}?expand[]=line_items", session_id)).await?;
+        self.parse_checkout_session(json)
+    }
+
+    /// Expire a checkout session
+    pub async fn expire_checkout_session(&self, session_id: &str) -> Result<CheckoutSession, StripeError> {
+        let json = self.post(&format!("/checkout/sessions/{}/expire", session_id), "", None).await?;
+        self.parse_checkout_session(json)
+    }
+
+    fn parse_checkout_session(&self, json: Json) -> Result<CheckoutSession, StripeError> {
+        Ok(CheckoutSession {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            url: json.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            success_url: json.get("success_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            cancel_url: json.get("cancel_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            customer: json.get("customer").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            customer_email: json.get("customer_email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            payment_status: match json.get("payment_status").and_then(|v| v.as_str()).unwrap_or("unpaid") {
+                "paid" => PaymentStatus::Paid,
+                "no_payment_required" => PaymentStatus::NoPaymentRequired,
+                _ => PaymentStatus::Unpaid
+            },
+            status: match json.get("status").and_then(|v| v.as_str()).unwrap_or("open") {
+                "complete" => SessionStatus::Complete,
+                "expired" => SessionStatus::Expired,
+                _ => SessionStatus::Open
+            },
+            mode: match json.get("mode").and_then(|v| v.as_str()).unwrap_or("payment") {
+                "subscription" => SessionMode::Subscription,
+                "setup" => SessionMode::Setup,
+                _ => SessionMode::Payment
+            },
+            line_items: None, // Parse if expanded
+            metadata: self.parse_metadata(&json),
+            amount_total: json.get("amount_total").and_then(|v| v.as_i64()),
+            currency: json.get("currency").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            subscription: json.get("subscription").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            payment_intent: json.get("payment_intent").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            expires_at: json.get("expires_at").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // SUBSCRIPTION MANAGEMENT
+    // =========================================================================
+
+    /// Create subscription
+    pub async fn create_subscription(
+        &self,
+        customer_id: &str,
+        price_id: &str,
+        trial_days: Option<i32>,
+        metadata: Map<String, String>
+    ) -> Result<StripeSubscription, StripeError> {
+        let mut params = vec![
+            format!("customer={}", customer_id),
+            format!("items[0][price]={}", price_id)
+        ];
+
+        if let Some(trial) = trial_days {
+            params.push(format!("trial_period_days={}", trial));
+        }
+
+        for (k, v) in metadata {
+            params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+        }
+
+        let body = params.join("&");
+        let idempotency_key = self.generate_idempotency_key("create_subscription", &format!("{}:{}", customer_id, price_id));
+
+        let json = self.post("/subscriptions", &body, Some(idempotency_key)).await?;
+        self.parse_subscription(json)
+    }
+
+    /// Get subscription by ID
+    pub async fn get_subscription(&self, subscription_id: &str) -> Result<StripeSubscription, StripeError> {
+        let json = self.get(&format!("/subscriptions/{}", subscription_id)).await?;
+        self.parse_subscription(json)
+    }
+
+    /// Update subscription
+    pub async fn update_subscription(
+        &self,
+        subscription_id: &str,
+        new_price_id: Option<String>,
+        cancel_at_period_end: Option<Bool>
+    ) -> Result<StripeSubscription, StripeError> {
+        let mut params = Vec::new();
+
+        if let Some(price) = new_price_id {
+            params.push(format!("items[0][price]={}", price));
+            params.push("proration_behavior=create_prorations".to_string());
+        }
+
+        if let Some(cancel) = cancel_at_period_end {
+            params.push(format!("cancel_at_period_end={}", cancel));
+        }
+
+        let body = params.join("&");
+        let json = self.post(&format!("/subscriptions/{}", subscription_id), &body, None).await?;
+        self.parse_subscription(json)
+    }
+
+    /// Cancel subscription immediately
+    pub async fn cancel_subscription(&self, subscription_id: &str) -> Result<StripeSubscription, StripeError> {
+        let json = self.delete(&format!("/subscriptions/{}", subscription_id)).await?;
+        self.parse_subscription(json)
+    }
+
+    /// Cancel subscription at period end
+    pub async fn cancel_subscription_at_period_end(&self, subscription_id: &str) -> Result<StripeSubscription, StripeError> {
+        self.update_subscription(subscription_id, None, Some(true)).await
+    }
+
+    /// Resume cancelled subscription
+    pub async fn resume_subscription(&self, subscription_id: &str) -> Result<StripeSubscription, StripeError> {
+        self.update_subscription(subscription_id, None, Some(false)).await
+    }
+
+    /// List customer subscriptions
+    pub async fn list_subscriptions(&self, customer_id: &str) -> Result<List<StripeSubscription>, StripeError> {
+        let json = self.get(&format!("/subscriptions?customer={}", customer_id)).await?;
+        let data = json.get("data").and_then(|v| v.as_array()).unwrap_or(&vec![]);
+
+        data.iter()
+            .map(|item| self.parse_subscription(item.clone()))
+            .collect()
+    }
+
+    fn parse_subscription(&self, json: Json) -> Result<StripeSubscription, StripeError> {
+        Ok(StripeSubscription {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            customer: json.get("customer").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: match json.get("status").and_then(|v| v.as_str()).unwrap_or("active") {
+                "incomplete" => SubscriptionState::Incomplete,
+                "incomplete_expired" => SubscriptionState::IncompleteExpired,
+                "trialing" => SubscriptionState::Trialing,
+                "active" => SubscriptionState::Active,
+                "past_due" => SubscriptionState::PastDue,
+                "canceled" => SubscriptionState::Canceled,
+                "unpaid" => SubscriptionState::Unpaid,
+                "paused" => SubscriptionState::Paused,
+                _ => SubscriptionState::Active
+            },
+            current_period_start: json.get("current_period_start").and_then(|v| v.as_i64()).unwrap_or(0),
+            current_period_end: json.get("current_period_end").and_then(|v| v.as_i64()).unwrap_or(0),
+            cancel_at_period_end: json.get("cancel_at_period_end").and_then(|v| v.as_bool()).unwrap_or(false),
+            canceled_at: json.get("canceled_at").and_then(|v| v.as_i64()),
+            ended_at: json.get("ended_at").and_then(|v| v.as_i64()),
+            trial_start: json.get("trial_start").and_then(|v| v.as_i64()),
+            trial_end: json.get("trial_end").and_then(|v| v.as_i64()),
+            items: SubscriptionItems { data: vec![] }, // Parse if needed
+            default_payment_method: json.get("default_payment_method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            latest_invoice: json.get("latest_invoice").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // REFUNDS
+    // =========================================================================
+
+    /// Create refund
+    pub async fn create_refund(&self, input: CreateRefundInput) -> Result<StripeRefund, StripeError> {
+        let mut params = Vec::new();
+
+        if let Some(pi) = input.payment_intent_id {
+            params.push(format!("payment_intent={}", pi));
+        } else if let Some(charge) = input.charge_id {
+            params.push(format!("charge={}", charge));
+        } else {
+            return Err(StripeError::InvalidRequest {
+                message: "Either payment_intent_id or charge_id is required".to_string()
+            })
+        }
+
+        if let Some(amount) = input.amount {
+            params.push(format!("amount={}", amount));
+        }
+
+        if let Some(reason) = input.reason {
+            let reason_str = match reason {
+                RefundReason::Duplicate => "duplicate",
+                RefundReason::Fraudulent => "fraudulent",
+                RefundReason::RequestedByCustomer => "requested_by_customer"
+            };
+            params.push(format!("reason={}", reason_str));
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let json = self.post("/refunds", &body, None).await?;
+        self.parse_refund(json)
+    }
+
+    /// Get refund by ID
+    pub async fn get_refund(&self, refund_id: &str) -> Result<StripeRefund, StripeError> {
+        let json = self.get(&format!("/refunds/{}", refund_id)).await?;
+        self.parse_refund(json)
+    }
+
+    fn parse_refund(&self, json: Json) -> Result<StripeRefund, StripeError> {
+        Ok(StripeRefund {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            amount: json.get("amount").and_then(|v| v.as_i64()).unwrap_or(0),
+            currency: json.get("currency").and_then(|v| v.as_str()).unwrap_or("usd").to_string(),
+            payment_intent: json.get("payment_intent").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            charge: json.get("charge").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            status: match json.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
+                "succeeded" => RefundStatus::Succeeded,
+                "failed" => RefundStatus::Failed,
+                "canceled" => RefundStatus::Canceled,
+                _ => RefundStatus::Pending
+            },
+            reason: json.get("reason").and_then(|v| v.as_str()).map(|r| match r {
+                "duplicate" => RefundReason::Duplicate,
+                "fraudulent" => RefundReason::Fraudulent,
+                _ => RefundReason::RequestedByCustomer
+            }),
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // INVOICES
+    // =========================================================================
+
+    /// Get invoice by ID
+    pub async fn get_invoice(&self, invoice_id: &str) -> Result<StripeInvoice, StripeError> {
+        let json = self.get(&format!("/invoices/{}", invoice_id)).await?;
+        self.parse_invoice(json)
+    }
+
+    /// List customer invoices
+    pub async fn list_invoices(&self, customer_id: &str, limit: Option<i32>) -> Result<List<StripeInvoice>, StripeError> {
+        let mut endpoint = format!("/invoices?customer={}", customer_id);
+        if let Some(l) = limit {
+            endpoint.push_str(&format!("&limit={}", l));
+        }
+
+        let json = self.get(&endpoint).await?;
+        let data = json.get("data").and_then(|v| v.as_array()).unwrap_or(&vec![]);
+
+        data.iter()
+            .map(|item| self.parse_invoice(item.clone()))
+            .collect()
+    }
+
+    /// Finalize draft invoice
+    pub async fn finalize_invoice(&self, invoice_id: &str) -> Result<StripeInvoice, StripeError> {
+        let json = self.post(&format!("/invoices/{}/finalize", invoice_id), "", None).await?;
+        self.parse_invoice(json)
+    }
+
+    /// Send invoice
+    pub async fn send_invoice(&self, invoice_id: &str) -> Result<StripeInvoice, StripeError> {
+        let json = self.post(&format!("/invoices/{}/send", invoice_id), "", None).await?;
+        self.parse_invoice(json)
+    }
+
+    /// Void invoice
+    pub async fn void_invoice(&self, invoice_id: &str) -> Result<StripeInvoice, StripeError> {
+        let json = self.post(&format!("/invoices/{}/void", invoice_id), "", None).await?;
+        self.parse_invoice(json)
+    }
+
+    fn parse_invoice(&self, json: Json) -> Result<StripeInvoice, StripeError> {
+        Ok(StripeInvoice {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            customer: json.get("customer").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            subscription: json.get("subscription").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            status: match json.get("status").and_then(|v| v.as_str()).unwrap_or("draft") {
+                "open" => InvoiceStatus::Open,
+                "paid" => InvoiceStatus::Paid,
+                "uncollectible" => InvoiceStatus::Uncollectible,
+                "void" => InvoiceStatus::Void,
+                _ => InvoiceStatus::Draft
+            },
+            amount_due: json.get("amount_due").and_then(|v| v.as_i64()).unwrap_or(0),
+            amount_paid: json.get("amount_paid").and_then(|v| v.as_i64()).unwrap_or(0),
+            amount_remaining: json.get("amount_remaining").and_then(|v| v.as_i64()).unwrap_or(0),
+            currency: json.get("currency").and_then(|v| v.as_str()).unwrap_or("usd").to_string(),
+            hosted_invoice_url: json.get("hosted_invoice_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            invoice_pdf: json.get("invoice_pdf").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            lines: InvoiceLines { data: vec![] }, // Parse if needed
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            due_date: json.get("due_date").and_then(|v| v.as_i64())
+        })
+    }
+
+    // =========================================================================
+    // COUPONS & PROMOTIONS
+    // =========================================================================
+
+    /// Create coupon
+    pub async fn create_coupon(&self, input: CreateCouponInput) -> Result<StripeCoupon, StripeError> {
+        let mut params = Vec::new();
+
+        let duration = match input.duration {
+            CouponDuration::Once => "once",
+            CouponDuration::Repeating => "repeating",
+            CouponDuration::Forever => "forever"
+        };
+        params.push(format!("duration={}", duration));
+
+        if let Some(name) = input.name {
+            params.push(format!("name={}", urlencoding::encode(&name)));
+        }
+
+        if let Some(percent) = input.percent_off {
+            params.push(format!("percent_off={}", percent));
+        } else if let Some(amount) = input.amount_off {
+            params.push(format!("amount_off={}", amount));
+            if let Some(curr) = input.currency {
+                params.push(format!("currency={}", curr.to_code()));
+            }
+        }
+
+        if let Some(months) = input.duration_in_months {
+            params.push(format!("duration_in_months={}", months));
+        }
+
+        if let Some(max) = input.max_redemptions {
+            params.push(format!("max_redemptions={}", max));
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let json = self.post("/coupons", &body, None).await?;
+        self.parse_coupon(json)
+    }
+
+    /// Get coupon by ID
+    pub async fn get_coupon(&self, coupon_id: &str) -> Result<StripeCoupon, StripeError> {
+        let json = self.get(&format!("/coupons/{}", coupon_id)).await?;
+        self.parse_coupon(json)
+    }
+
+    /// Delete coupon
+    pub async fn delete_coupon(&self, coupon_id: &str) -> Result<(), StripeError> {
+        self.delete(&format!("/coupons/{}", coupon_id)).await?;
+        Ok(())
+    }
+
+    fn parse_coupon(&self, json: Json) -> Result<StripeCoupon, StripeError> {
+        Ok(StripeCoupon {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            amount_off: json.get("amount_off").and_then(|v| v.as_i64()),
+            percent_off: json.get("percent_off").and_then(|v| v.as_f64()),
+            currency: json.get("currency").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            duration: match json.get("duration").and_then(|v| v.as_str()).unwrap_or("once") {
+                "repeating" => CouponDuration::Repeating,
+                "forever" => CouponDuration::Forever,
+                _ => CouponDuration::Once
+            },
+            duration_in_months: json.get("duration_in_months").and_then(|v| v.as_i64()).map(|n| n as i32),
+            max_redemptions: json.get("max_redemptions").and_then(|v| v.as_i64()),
+            times_redeemed: json.get("times_redeemed").and_then(|v| v.as_i64()).unwrap_or(0),
+            valid: json.get("valid").and_then(|v| v.as_bool()).unwrap_or(true),
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    /// Create promotion code
+    pub async fn create_promotion_code(&self, input: CreatePromotionCodeInput) -> Result<PromotionCode, StripeError> {
+        let mut params = vec![
+            format!("coupon={}", input.coupon_id),
+            format!("code={}", urlencoding::encode(&input.code))
+        ];
+
+        if let Some(max) = input.max_redemptions {
+            params.push(format!("max_redemptions={}", max));
+        }
+
+        if let Some(expires) = input.expires_at {
+            params.push(format!("expires_at={}", expires.timestamp()));
+        }
+
+        if input.first_time_transaction {
+            params.push("restrictions[first_time_transaction]=true".to_string());
+        }
+
+        if let Some(min) = input.minimum_amount {
+            params.push(format!("restrictions[minimum_amount]={}", min));
+            if let Some(curr) = input.minimum_amount_currency {
+                params.push(format!("restrictions[minimum_amount_currency]={}", curr.to_code()));
+            }
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let json = self.post("/promotion_codes", &body, None).await?;
+        self.parse_promotion_code(json)
+    }
+
+    fn parse_promotion_code(&self, json: Json) -> Result<PromotionCode, StripeError> {
+        let coupon_json = json.get("coupon").cloned().unwrap_or(Json::Null);
+        let coupon = self.parse_coupon(coupon_json)?;
+
+        let restrictions = json.get("restrictions").cloned().unwrap_or(Json::Null);
+
+        Ok(PromotionCode {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            code: json.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            coupon,
+            active: json.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
+            max_redemptions: json.get("max_redemptions").and_then(|v| v.as_i64()),
+            times_redeemed: json.get("times_redeemed").and_then(|v| v.as_i64()).unwrap_or(0),
+            expires_at: json.get("expires_at").and_then(|v| v.as_i64()),
+            restrictions: CodeRestrictions {
+                first_time_transaction: restrictions.get("first_time_transaction").and_then(|v| v.as_bool()).unwrap_or(false),
+                minimum_amount: restrictions.get("minimum_amount").and_then(|v| v.as_i64()),
+                minimum_amount_currency: restrictions.get("minimum_amount_currency").and_then(|v| v.as_str()).map(|s| s.to_string())
+            },
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // STRIPE CONNECT (MARKETPLACE)
+    // =========================================================================
+
+    /// Create connected account for instructor
+    pub async fn create_connected_account(&self, input: CreateConnectedAccountInput) -> Result<ConnectedAccount, StripeError> {
+        let account_type = match input.type_ {
+            AccountType::Standard => "standard",
+            AccountType::Express => "express",
+            AccountType::Custom => "custom"
+        };
+
+        let mut params = vec![
+            format!("type={}", account_type),
+            format!("email={}", urlencoding::encode(&input.email)),
+            format!("country={}", input.country)
+        ];
+
+        if let Some(bt) = input.business_type {
+            params.push(format!("business_type={}", bt));
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        // Enable required capabilities
+        params.push("capabilities[card_payments][requested]=true".to_string());
+        params.push("capabilities[transfers][requested]=true".to_string());
+
+        let body = params.join("&");
+        let json = self.post("/accounts", &body, None).await?;
+        self.parse_connected_account(json)
+    }
+
+    /// Get connected account
+    pub async fn get_connected_account(&self, account_id: &str) -> Result<ConnectedAccount, StripeError> {
+        let json = self.get(&format!("/accounts/{}", account_id)).await?;
+        self.parse_connected_account(json)
+    }
+
+    /// Create account link for onboarding
+    pub async fn create_account_link(
+        &self,
+        account_id: &str,
+        refresh_url: &str,
+        return_url: &str
+    ) -> Result<String, StripeError> {
+        let params = vec![
+            format!("account={}", account_id),
+            format!("refresh_url={}", urlencoding::encode(refresh_url)),
+            format!("return_url={}", urlencoding::encode(return_url)),
+            "type=account_onboarding".to_string()
+        ];
+
+        let body = params.join("&");
+        let json = self.post("/account_links", &body, None).await?;
+
+        json.get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or(StripeError::ApiError {
+                code: "missing_url".to_string(),
+                message: "No URL in response".to_string(),
+                status: 500
+            })
+    }
+
+    /// Create transfer to connected account
+    pub async fn create_transfer(&self, input: CreateTransferInput) -> Result<StripeTransfer, StripeError> {
+        let mut params = vec![
+            format!("amount={}", input.amount),
+            format!("currency={}", input.currency.to_code()),
+            format!("destination={}", input.destination)
+        ];
+
+        if let Some(source) = input.source_transaction {
+            params.push(format!("source_transaction={}", source));
+        }
+
+        if let Some(group) = input.transfer_group {
+            params.push(format!("transfer_group={}", urlencoding::encode(&group)));
+        }
+
+        if let Some(meta) = input.metadata {
+            for (k, v) in meta {
+                params.push(format!("metadata[{}]={}", k, urlencoding::encode(&v)));
+            }
+        }
+
+        let body = params.join("&");
+        let json = self.post("/transfers", &body, None).await?;
+        self.parse_transfer(json)
+    }
+
+    fn parse_connected_account(&self, json: Json) -> Result<ConnectedAccount, StripeError> {
+        let capabilities = json.get("capabilities").cloned().unwrap_or(Json::Null);
+
+        Ok(ConnectedAccount {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            type_: match json.get("type").and_then(|v| v.as_str()).unwrap_or("standard") {
+                "express" => AccountType::Express,
+                "custom" => AccountType::Custom,
+                _ => AccountType::Standard
+            },
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            business_profile: json.get("business_profile").map(|bp| BusinessProfile {
+                name: bp.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                url: bp.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                support_email: bp.get("support_email").and_then(|v| v.as_str()).map(|s| s.to_string())
+            }),
+            capabilities: AccountCapabilities {
+                card_payments: self.parse_capability_status(capabilities.get("card_payments")),
+                transfers: self.parse_capability_status(capabilities.get("transfers"))
+            },
+            charges_enabled: json.get("charges_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            payouts_enabled: json.get("payouts_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            details_submitted: json.get("details_submitted").and_then(|v| v.as_bool()).unwrap_or(false),
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    fn parse_capability_status(&self, json: Option<&Json>) -> CapabilityStatus {
+        json.and_then(|v| v.as_str())
+            .map(|s| match s {
+                "active" => CapabilityStatus::Active,
+                "pending" => CapabilityStatus::Pending,
+                _ => CapabilityStatus::Inactive
+            })
+            .unwrap_or(CapabilityStatus::Inactive)
+    }
+
+    fn parse_transfer(&self, json: Json) -> Result<StripeTransfer, StripeError> {
+        Ok(StripeTransfer {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            amount: json.get("amount").and_then(|v| v.as_i64()).unwrap_or(0),
+            currency: json.get("currency").and_then(|v| v.as_str()).unwrap_or("usd").to_string(),
+            destination: json.get("destination").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            source_transaction: json.get("source_transaction").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            transfer_group: json.get("transfer_group").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            metadata: self.parse_metadata(&json),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // WEBHOOK HANDLING
+    // =========================================================================
+
+    /// Verify webhook signature
+    pub fn verify_webhook_signature(
+        &self,
+        payload: &str,
+        signature_header: &str
+    ) -> Result<(), StripeError> {
+        // Parse signature header
+        // Format: t=timestamp,v1=signature,v0=signature
+        let mut timestamp: Option<i64> = None;
+        let mut signatures: Vec<String> = Vec::new();
+
+        for part in signature_header.split(',') {
+            let kv: Vec<&str> = part.split('=').collect();
+            if kv.len() != 2 {
+                continue
+            }
+
+            match kv[0] {
+                "t" => timestamp = kv[1].parse().ok(),
+                "v1" => signatures.push(kv[1].to_string()),
+                _ => {}
+            }
+        }
+
+        let timestamp = timestamp.ok_or(StripeError::WebhookError {
+            message: "Missing timestamp in signature".to_string()
+        })?;
+
+        if signatures.is_empty() {
+            return Err(StripeError::WebhookError {
+                message: "Missing signature".to_string()
+            })
+        }
+
+        // Check timestamp tolerance
+        let now = DateTime::now().timestamp();
+        if (now - timestamp).abs() > self.config.webhook_tolerance {
+            return Err(StripeError::WebhookError {
+                message: "Timestamp outside tolerance window".to_string()
+            })
+        }
+
+        // Compute expected signature
+        let signed_payload = format!("{}.{}", timestamp, payload);
+        let expected_signature = hmac_sha256(&self.config.webhook_secret, &signed_payload);
+        let expected_hex = hex::encode(&expected_signature);
+
+        // Compare signatures (constant time)
+        for sig in signatures {
+            if constant_time_compare(&sig, &expected_hex) {
+                return Ok(())
+            }
+        }
+
+        Err(StripeError::WebhookError {
+            message: "Invalid signature".to_string()
+        })
+    }
+
+    /// Parse webhook event
+    pub fn parse_webhook_event(&self, payload: &str) -> Result<StripeEvent, StripeError> {
+        let json: Json = from_json(payload)
+            .map_err(|e| StripeError::SerializationError { message: e.to_string() })?;
+
+        Ok(StripeEvent {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            type_: json.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            api_version: json.get("api_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            livemode: json.get("livemode").and_then(|v| v.as_bool()).unwrap_or(false),
+            pending_webhooks: json.get("pending_webhooks").and_then(|v| v.as_i64()).unwrap_or(0),
+            data: EventData {
+                object: json.get("data").and_then(|d| d.get("object")).cloned().unwrap_or(Json::Null),
+                previous_attributes: json.get("data")
+                    .and_then(|d| d.get("previous_attributes"))
+                    .and_then(|pa| pa.as_object())
+                    .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            }
+        })
+    }
+
+    /// Handle webhook event (idempotent)
+    pub async fn handle_webhook(
+        &mut self,
+        payload: &str,
+        signature_header: &str
+    ) -> Result<WebhookResult, StripeError> {
+        // Verify signature
+        self.verify_webhook_signature(payload, signature_header)?;
+
+        // Parse event
+        let event = self.parse_webhook_event(payload)?;
+
+        // Check for duplicate processing (idempotency)
+        if self.processed_events.contains_key(&event.id) {
+            return Ok(WebhookResult::AlreadyProcessed { event_id: event.id })
+        }
+
+        // Process event based on type
+        let event_type = WebhookEventType::from_string(&event.type_);
+        let result = match event_type {
+            WebhookEventType::CheckoutSessionCompleted => {
+                self.handle_checkout_completed(&event.data.object).await
+            },
+            WebhookEventType::PaymentIntentSucceeded => {
+                self.handle_payment_succeeded(&event.data.object).await
+            },
+            WebhookEventType::PaymentIntentPaymentFailed => {
+                self.handle_payment_failed(&event.data.object).await
+            },
+            WebhookEventType::CustomerSubscriptionCreated => {
+                self.handle_subscription_created(&event.data.object).await
+            },
+            WebhookEventType::CustomerSubscriptionUpdated => {
+                self.handle_subscription_updated(&event.data.object).await
+            },
+            WebhookEventType::CustomerSubscriptionDeleted => {
+                self.handle_subscription_deleted(&event.data.object).await
+            },
+            WebhookEventType::InvoicePaid => {
+                self.handle_invoice_paid(&event.data.object).await
+            },
+            WebhookEventType::InvoicePaymentFailed => {
+                self.handle_invoice_payment_failed(&event.data.object).await
+            },
+            WebhookEventType::ChargeRefunded => {
+                self.handle_charge_refunded(&event.data.object).await
+            },
+            WebhookEventType::AccountUpdated => {
+                self.handle_account_updated(&event.data.object).await
+            },
+            _ => Ok(WebhookAction::Ignored)
+        };
+
+        // Mark as processed
+        self.processed_events.insert(event.id.clone(), DateTime::now().timestamp());
+
+        // Clean old processed events
+        self.clean_processed_events();
+
+        result.map(|action| WebhookResult::Processed { event_id: event.id, action })
+    }
+
+    /// Clean old processed events
+    fn clean_processed_events(&mut self) {
+        let now = DateTime::now().timestamp();
+        let day_ago = now - 86400;
+
+        self.processed_events.retain(|_, &mut timestamp| timestamp > day_ago);
+    }
+
+    // Webhook event handlers
+    async fn handle_checkout_completed(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let session_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let customer_id = data.get("customer").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let metadata = self.parse_metadata(data);
+
+        // Extract course_id and user_id from metadata
+        let course_id = metadata.get("course_id").cloned();
+        let user_id = metadata.get("user_id").cloned();
+
+        Ok(WebhookAction::EnrollUser {
+            session_id: session_id.to_string(),
+            customer_id,
+            course_id,
+            user_id
+        })
+    }
+
+    async fn handle_payment_succeeded(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let payment_intent_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let amount = data.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let currency = data.get("currency").and_then(|v| v.as_str()).unwrap_or("usd");
+
+        Ok(WebhookAction::RecordPayment {
+            payment_intent_id: payment_intent_id.to_string(),
+            amount,
+            currency: currency.to_string()
+        })
+    }
+
+    async fn handle_payment_failed(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let payment_intent_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let error = data.get("last_payment_error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Payment failed");
+
+        Ok(WebhookAction::PaymentFailed {
+            payment_intent_id: payment_intent_id.to_string(),
+            error: error.to_string()
+        })
+    }
+
+    async fn handle_subscription_created(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let subscription_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let customer_id = data.get("customer").and_then(|v| v.as_str()).unwrap_or("");
+        let metadata = self.parse_metadata(data);
+
+        Ok(WebhookAction::SubscriptionCreated {
+            subscription_id: subscription_id.to_string(),
+            customer_id: customer_id.to_string(),
+            metadata
+        })
+    }
+
+    async fn handle_subscription_updated(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let subscription_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let cancel_at_period_end = data.get("cancel_at_period_end").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        Ok(WebhookAction::SubscriptionUpdated {
+            subscription_id: subscription_id.to_string(),
+            status: status.to_string(),
+            cancel_at_period_end
+        })
+    }
+
+    async fn handle_subscription_deleted(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let subscription_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let customer_id = data.get("customer").and_then(|v| v.as_str()).unwrap_or("");
+        let metadata = self.parse_metadata(data);
+
+        Ok(WebhookAction::RevokeAccess {
+            subscription_id: subscription_id.to_string(),
+            customer_id: customer_id.to_string(),
+            course_id: metadata.get("course_id").cloned()
+        })
+    }
+
+    async fn handle_invoice_paid(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let invoice_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let subscription_id = data.get("subscription").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let amount_paid = data.get("amount_paid").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        Ok(WebhookAction::InvoicePaid {
+            invoice_id: invoice_id.to_string(),
+            subscription_id,
+            amount_paid
+        })
+    }
+
+    async fn handle_invoice_payment_failed(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let invoice_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let subscription_id = data.get("subscription").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let attempt_count = data.get("attempt_count").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        Ok(WebhookAction::InvoicePaymentFailed {
+            invoice_id: invoice_id.to_string(),
+            subscription_id,
+            attempt_count: attempt_count as i32
+        })
+    }
+
+    async fn handle_charge_refunded(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let charge_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let amount_refunded = data.get("amount_refunded").and_then(|v| v.as_i64()).unwrap_or(0);
+        let refunded = data.get("refunded").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        Ok(WebhookAction::Refunded {
+            charge_id: charge_id.to_string(),
+            amount_refunded,
+            fully_refunded: refunded
+        })
+    }
+
+    async fn handle_account_updated(&self, data: &Json) -> Result<WebhookAction, StripeError> {
+        let account_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let charges_enabled = data.get("charges_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let payouts_enabled = data.get("payouts_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        Ok(WebhookAction::ConnectAccountUpdated {
+            account_id: account_id.to_string(),
+            charges_enabled,
+            payouts_enabled
+        })
+    }
+
+    // =========================================================================
+    // HELPER METHODS
+    // =========================================================================
+
+    fn parse_metadata(&self, json: &Json) -> Map<String, String> {
+        json.get("metadata")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+// =============================================================================
+// WEBHOOK RESULT TYPES
+// =============================================================================
+
+/// Result of webhook processing
+enum WebhookResult {
+    /// Event was processed
+    Processed { event_id: String, action: WebhookAction },
+    /// Event was already processed (idempotent)
+    AlreadyProcessed { event_id: String }
+}
+
+/// Action to take based on webhook event
+enum WebhookAction {
+    /// Enroll user in course
+    EnrollUser {
+        session_id: String,
+        customer_id: Option<String>,
+        course_id: Option<String>,
+        user_id: Option<String>
+    },
+    /// Record successful payment
+    RecordPayment {
+        payment_intent_id: String,
+        amount: i64,
+        currency: String
+    },
+    /// Handle failed payment
+    PaymentFailed {
+        payment_intent_id: String,
+        error: String
+    },
+    /// Handle new subscription
+    SubscriptionCreated {
+        subscription_id: String,
+        customer_id: String,
+        metadata: Map<String, String>
+    },
+    /// Handle subscription update
+    SubscriptionUpdated {
+        subscription_id: String,
+        status: String,
+        cancel_at_period_end: Bool
+    },
+    /// Revoke course access
+    RevokeAccess {
+        subscription_id: String,
+        customer_id: String,
+        course_id: Option<String>
+    },
+    /// Handle paid invoice
+    InvoicePaid {
+        invoice_id: String,
+        subscription_id: Option<String>,
+        amount_paid: i64
+    },
+    /// Handle failed invoice payment
+    InvoicePaymentFailed {
+        invoice_id: String,
+        subscription_id: Option<String>,
+        attempt_count: i32
+    },
+    /// Handle refund
+    Refunded {
+        charge_id: String,
+        amount_refunded: i64,
+        fully_refunded: Bool
+    },
+    /// Handle Connect account update
+    ConnectAccountUpdated {
+        account_id: String,
+        charges_enabled: Bool,
+        payouts_enabled: Bool
+    },
+    /// Event ignored (not relevant)
+    Ignored
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// URL encoding helper
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut encoded = String::new();
+        for c in s.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                    encoded.push(c);
+                }
+                _ => {
+                    for byte in c.to_string().as_bytes() {
+                        encoded.push_str(&format!("%{:02X}", byte));
+                    }
+                }
+            }
+        }
+        encoded
+    }
+}
+
+/// Hex encoding helper
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}

@@ -1,0 +1,518 @@
+/// Intelligo LMS - Frontend Module
+///
+/// Lightweight frontend rendering system with progressive hydration.
+/// Follows Aether CMS patterns for SSG with minimal client-side JavaScript.
+
+module intelligo::frontend
+
+pub use intelligo::frontend::hydration::*
+pub use intelligo::frontend::renderer::*
+pub use intelligo::frontend::api_client::*
+pub use intelligo::frontend::components::*
+pub use intelligo::frontend::assets::*
+pub use intelligo::frontend::cache::*
+
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Frontend Configuration
+// ============================================================================
+
+/// Frontend configuration for rendering and hydration
+pub type FrontendConfig = type {
+    // Base URLs
+    api_base_url: String,
+    cdn_base_url: String,
+    static_base_url: String,
+
+    // Hydration settings
+    hydration: HydrationConfig,
+
+    // Asset settings
+    assets: AssetConfig,
+
+    // Caching
+    cache: FrontendCacheConfig,
+
+    // Feature flags
+    features: FeatureFlags,
+
+    // Environment
+    environment: Environment,
+}
+
+impl FrontendConfig {
+    pub fn default() -> Self {
+        FrontendConfig {
+            api_base_url: "/api/v1".to_string(),
+            cdn_base_url: "".to_string(),
+            static_base_url: "/static".to_string(),
+            hydration: HydrationConfig::default(),
+            assets: AssetConfig::default(),
+            cache: FrontendCacheConfig::default(),
+            features: FeatureFlags::default(),
+            environment: Environment::Development,
+        }
+    }
+
+    pub fn production(cdn_url: &str, api_url: &str) -> Self {
+        FrontendConfig {
+            api_base_url: api_url.to_string(),
+            cdn_base_url: cdn_url.to_string(),
+            static_base_url: format!("{}/static", cdn_url),
+            hydration: HydrationConfig::production(),
+            assets: AssetConfig::production(),
+            cache: FrontendCacheConfig::production(),
+            features: FeatureFlags::default(),
+            environment: Environment::Production,
+        }
+    }
+}
+
+/// Hydration configuration
+pub type HydrationConfig = type {
+    // Enable progressive hydration
+    progressive: bool,
+
+    // Hydration strategy
+    strategy: HydrationStrategy,
+
+    // Intersection observer for lazy hydration
+    lazy_threshold: f64,
+
+    // Idle callback timeout for idle hydration
+    idle_timeout: i32,
+
+    // Components to hydrate immediately
+    priority_components: Vec<String>,
+
+    // Components to never hydrate (pure static)
+    static_components: Vec<String>,
+
+    // Enable debug mode
+    debug: bool,
+}
+
+impl HydrationConfig {
+    pub fn default() -> Self {
+        HydrationConfig {
+            progressive: true,
+            strategy: HydrationStrategy::Progressive,
+            lazy_threshold: 0.1,
+            idle_timeout: 2000,
+            priority_components: vec![
+                "auth-widget".to_string(),
+                "notification-bell".to_string(),
+                "search-bar".to_string(),
+            ],
+            static_components: vec![
+                "footer".to_string(),
+                "breadcrumb".to_string(),
+            ],
+            debug: false,
+        }
+    }
+
+    pub fn production() -> Self {
+        let mut config = Self::default();
+        config.debug = false;
+        config
+    }
+}
+
+/// Hydration strategy for component activation
+pub enum HydrationStrategy {
+    /// Hydrate all components on page load
+    Eager,
+    /// Hydrate components progressively based on priority
+    Progressive,
+    /// Hydrate components when they become visible
+    Lazy,
+    /// Hydrate components during browser idle time
+    Idle,
+    /// Hydrate on user interaction (click, hover, focus)
+    Interaction,
+    /// Hydrate based on media query
+    MediaQuery { query: String },
+}
+
+/// Asset configuration
+pub type AssetConfig = type {
+    // Enable content hashing for cache busting
+    hash_assets: bool,
+
+    // Inline small assets below this threshold (bytes)
+    inline_threshold: i64,
+
+    // Image optimization settings
+    image_optimization: ImageOptimization,
+
+    // Preload critical assets
+    preload_critical: bool,
+
+    // Use native lazy loading
+    lazy_load_images: bool,
+
+    // Generate responsive srcset
+    responsive_images: bool,
+}
+
+impl AssetConfig {
+    pub fn default() -> Self {
+        AssetConfig {
+            hash_assets: true,
+            inline_threshold: 4096,
+            image_optimization: ImageOptimization::default(),
+            preload_critical: true,
+            lazy_load_images: true,
+            responsive_images: true,
+        }
+    }
+
+    pub fn production() -> Self {
+        Self::default()
+    }
+}
+
+/// Image optimization settings
+pub type ImageOptimization = type {
+    enabled: bool,
+    quality: i32,
+    formats: Vec<ImageFormat>,
+    max_width: i32,
+    responsive_sizes: Vec<i32>,
+}
+
+impl ImageOptimization {
+    pub fn default() -> Self {
+        ImageOptimization {
+            enabled: true,
+            quality: 85,
+            formats: vec![ImageFormat::WebP, ImageFormat::Avif, ImageFormat::Jpeg],
+            max_width: 2048,
+            responsive_sizes: vec![320, 640, 768, 1024, 1280, 1536, 1920],
+        }
+    }
+}
+
+/// Supported image formats
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+    WebP,
+    Avif,
+    Svg,
+}
+
+/// Frontend cache configuration
+pub type FrontendCacheConfig = type {
+    // Enable service worker caching
+    service_worker: bool,
+
+    // Cache API responses
+    cache_api: bool,
+
+    // API cache TTL (seconds)
+    api_cache_ttl: i64,
+
+    // Static asset cache TTL (seconds)
+    static_cache_ttl: i64,
+
+    // Maximum cache size (bytes)
+    max_cache_size: i64,
+
+    // Cache strategies per path pattern
+    strategies: Vec<CacheStrategy>,
+}
+
+impl FrontendCacheConfig {
+    pub fn default() -> Self {
+        FrontendCacheConfig {
+            service_worker: true,
+            cache_api: true,
+            api_cache_ttl: 300,       // 5 minutes
+            static_cache_ttl: 31536000, // 1 year (immutable with hash)
+            max_cache_size: 52428800,  // 50MB
+            strategies: vec![
+                CacheStrategy {
+                    pattern: "/api/v1/courses/*".to_string(),
+                    strategy_type: CacheStrategyType::StaleWhileRevalidate,
+                    ttl: 300,
+                },
+                CacheStrategy {
+                    pattern: "/api/v1/user/profile".to_string(),
+                    strategy_type: CacheStrategyType::NetworkFirst,
+                    ttl: 60,
+                },
+                CacheStrategy {
+                    pattern: "/static/*".to_string(),
+                    strategy_type: CacheStrategyType::CacheFirst,
+                    ttl: 31536000,
+                },
+            ],
+        }
+    }
+
+    pub fn production() -> Self {
+        Self::default()
+    }
+}
+
+/// Cache strategy for specific URL patterns
+pub type CacheStrategy = type {
+    pattern: String,
+    strategy_type: CacheStrategyType,
+    ttl: i64,
+}
+
+/// Cache strategy types
+pub enum CacheStrategyType {
+    /// Always serve from cache, update in background
+    CacheFirst,
+    /// Try network first, fall back to cache
+    NetworkFirst,
+    /// Serve stale while fetching fresh
+    StaleWhileRevalidate,
+    /// Never cache
+    NetworkOnly,
+    /// Only serve from cache
+    CacheOnly,
+}
+
+/// Feature flags for frontend
+pub type FeatureFlags = type {
+    // Enable offline mode
+    offline_mode: bool,
+
+    // Enable push notifications
+    push_notifications: bool,
+
+    // Enable real-time updates via WebSocket
+    realtime_updates: bool,
+
+    // Enable analytics tracking
+    analytics: bool,
+
+    // Enable A/B testing
+    ab_testing: bool,
+
+    // Enable performance monitoring
+    performance_monitoring: bool,
+}
+
+impl FeatureFlags {
+    pub fn default() -> Self {
+        FeatureFlags {
+            offline_mode: true,
+            push_notifications: true,
+            realtime_updates: true,
+            analytics: true,
+            ab_testing: false,
+            performance_monitoring: true,
+        }
+    }
+}
+
+/// Environment type
+pub enum Environment {
+    Development,
+    Staging,
+    Production,
+}
+
+// ============================================================================
+// User Context
+// ============================================================================
+
+/// Current user context for frontend rendering
+pub type UserContext = type {
+    // User info
+    user_id: Option<String>,
+    email: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+
+    // Role and permissions
+    role: UserRole,
+    permissions: Vec<String>,
+
+    // Tenant context
+    tenant_id: String,
+    tenant_name: String,
+
+    // Session info
+    session_id: Option<String>,
+    authenticated: bool,
+
+    // Preferences
+    preferences: UserPreferences,
+
+    // Feature flags for user
+    feature_flags: Map<String, bool>,
+}
+
+/// User role for frontend access control
+pub enum UserRole {
+    Anonymous,
+    Student,
+    Teacher,
+    Admin,
+    TenantAdmin,
+}
+
+impl UserRole {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "student" | "learner" => UserRole::Student,
+            "teacher" | "instructor" => UserRole::Teacher,
+            "admin" | "administrator" => UserRole::Admin,
+            "tenant_admin" | "tenantadmin" => UserRole::TenantAdmin,
+            _ => UserRole::Anonymous,
+        }
+    }
+
+    pub fn can_access_admin(self) -> bool {
+        match self {
+            UserRole::Admin | UserRole::TenantAdmin => true,
+            _ => false,
+        }
+    }
+
+    pub fn can_access_teacher_dashboard(self) -> bool {
+        match self {
+            UserRole::Teacher | UserRole::Admin | UserRole::TenantAdmin => true,
+            _ => false,
+        }
+    }
+
+    pub fn can_access_student_dashboard(self) -> bool {
+        match self {
+            UserRole::Student | UserRole::Teacher | UserRole::Admin | UserRole::TenantAdmin => true,
+            _ => false,
+        }
+    }
+}
+
+/// User preferences
+pub type UserPreferences = type {
+    language: String,
+    timezone: String,
+    theme: String,
+    notifications_enabled: bool,
+    email_frequency: String,
+}
+
+impl UserPreferences {
+    pub fn default() -> Self {
+        UserPreferences {
+            language: "en".to_string(),
+            timezone: "UTC".to_string(),
+            theme: "light".to_string(),
+            notifications_enabled: true,
+            email_frequency: "daily".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// Page Context
+// ============================================================================
+
+/// Page context for server-side rendering
+pub type PageContext = type {
+    // Page metadata
+    title: String,
+    description: String,
+    canonical_url: String,
+
+    // User context
+    user: UserContext,
+
+    // Page data (pre-fetched)
+    data: Map<String, Value>,
+
+    // Hydration state
+    hydration_data: Map<String, Value>,
+
+    // Scripts to inject
+    scripts: Vec<Script>,
+
+    // Styles to inject
+    styles: Vec<Style>,
+
+    // Meta tags
+    meta_tags: Vec<MetaTag>,
+
+    // Structured data (JSON-LD)
+    structured_data: Option<Value>,
+
+    // CSP nonce for inline scripts
+    csp_nonce: String,
+
+    // Request info
+    request_id: String,
+    path: String,
+    query: Map<String, String>,
+}
+
+/// Script injection
+pub type Script = type {
+    src: Option<String>,
+    content: Option<String>,
+    async_load: bool,
+    defer: bool,
+    module: bool,
+    integrity: Option<String>,
+    crossorigin: Option<String>,
+}
+
+/// Style injection
+pub type Style = type {
+    href: Option<String>,
+    content: Option<String>,
+    media: Option<String>,
+    integrity: Option<String>,
+}
+
+/// Meta tag
+pub type MetaTag = type {
+    name: Option<String>,
+    property: Option<String>,
+    content: String,
+}
+
+// ============================================================================
+// Frontend Error Types
+// ============================================================================
+
+pub enum FrontendError {
+    RenderError { message: String },
+    HydrationError { component: String, message: String },
+    ApiError { status: i32, message: String },
+    CacheError { message: String },
+    AuthError { message: String },
+    NotFound { path: String },
+    Forbidden { resource: String },
+}
+
+impl FrontendError {
+    pub fn to_string(self) -> String {
+        match self {
+            FrontendError::RenderError { message } =>
+                format!("Render error: {}", message),
+            FrontendError::HydrationError { component, message } =>
+                format!("Hydration error in {}: {}", component, message),
+            FrontendError::ApiError { status, message } =>
+                format!("API error ({}): {}", status, message),
+            FrontendError::CacheError { message } =>
+                format!("Cache error: {}", message),
+            FrontendError::AuthError { message } =>
+                format!("Auth error: {}", message),
+            FrontendError::NotFound { path } =>
+                format!("Not found: {}", path),
+            FrontendError::Forbidden { resource } =>
+                format!("Forbidden: {}", resource),
+        }
+    }
+}

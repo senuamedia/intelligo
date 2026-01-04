@@ -1,0 +1,1225 @@
+/// Intelligo LMS - Lessons API
+///
+/// This module provides lesson management endpoints:
+/// - Lesson CRUD operations
+/// - Lesson content management
+/// - Lesson progress tracking
+
+module intelligo::api::lessons
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::entities::lesson::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the lessons router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Lesson CRUD
+        .get("/", move |req| list_lessons(req, db.clone()))
+        .get("/:lesson_id", move |req| get_lesson(req, db.clone()))
+        .post("/", move |req| create_lesson(req, db.clone()))
+        .patch("/:lesson_id", move |req| update_lesson(req, db.clone()))
+        .delete("/:lesson_id", move |req| delete_lesson(req, db.clone()))
+
+        // Lesson publishing
+        .post("/:lesson_id/publish", move |req| publish_lesson(req, db.clone()))
+        .post("/:lesson_id/unpublish", move |req| unpublish_lesson(req, db.clone()))
+
+        // Lesson content
+        .get("/:lesson_id/content", move |req| get_lesson_content(req, db.clone()))
+        .put("/:lesson_id/content", move |req| update_lesson_content(req, db.clone()))
+
+        // Lesson media
+        .post("/:lesson_id/media", move |req| upload_lesson_media(req, db.clone()))
+        .get("/:lesson_id/media", move |req| get_lesson_media(req, db.clone()))
+        .delete("/:lesson_id/media/:media_id", move |req| delete_lesson_media(req, db.clone()))
+
+        // Lesson progress (for student)
+        .get("/:lesson_id/progress", move |req| get_lesson_progress(req, db.clone()))
+        .post("/:lesson_id/progress", move |req| update_lesson_progress(req, db.clone()))
+        .post("/:lesson_id/complete", move |req| mark_lesson_complete(req, db.clone()))
+
+        // Lesson attachments
+        .get("/:lesson_id/attachments", move |req| get_attachments(req, db.clone()))
+        .post("/:lesson_id/attachments", move |req| add_attachment(req, db.clone()))
+        .delete("/:lesson_id/attachments/:attachment_id", move |req| remove_attachment(req, db.clone()))
+
+        // Duplication
+        .post("/:lesson_id/duplicate", move |req| duplicate_lesson(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Lesson response type
+type LessonResponse {
+    id: LessonId,
+    module_id: ModuleId,
+    course_id: CourseId,
+    title: String,
+    description: Option<String>,
+    lesson_type: LessonType,
+    position: i32,
+    duration_minutes: Option<i32>,
+    is_published: Bool,
+    is_required: Bool,
+    is_free_preview: Bool,
+    unlock_at: Option<DateTime>,
+    due_date: Option<DateTime>,
+    content_summary: Option<ContentSummary>,
+    attachments_count: i32,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Content summary for lesson list
+type ContentSummary {
+    word_count: Option<i32>,
+    video_duration_seconds: Option<i32>,
+    page_count: Option<i32>,
+    has_interactive: Bool
+}
+
+/// Lesson type enum
+enum LessonType {
+    Video,
+    Text,
+    Document,
+    Presentation,
+    Interactive,
+    External,
+    Audio,
+    Live,
+    Scorm,
+    Xapi
+}
+
+/// Create lesson request
+type CreateLessonRequest {
+    module_id: ModuleId,
+    title: String,
+    lesson_type: String,
+    description: Option<String>,
+    duration_minutes: Option<i32>,
+    is_required: Option<Bool>,
+    is_free_preview: Option<Bool>,
+    position: Option<i32>
+}
+
+/// Update lesson request
+type UpdateLessonRequest {
+    title: Option<String>,
+    description: Option<String>,
+    lesson_type: Option<String>,
+    duration_minutes: Option<i32>,
+    is_required: Option<Bool>,
+    is_free_preview: Option<Bool>,
+    unlock_at: Option<DateTime>,
+    due_date: Option<DateTime>,
+    position: Option<i32>
+}
+
+/// Lesson content types
+enum LessonContent {
+    /// Video content
+    Video {
+        video_id: MediaId,
+        video_url: String,
+        duration_seconds: i32,
+        transcript: Option<String>,
+        captions: List<CaptionTrack>,
+        chapters: List<VideoChapter>
+    },
+
+    /// Text/article content
+    Text {
+        body: String,
+        format: TextFormat,
+        word_count: i32
+    },
+
+    /// Document content (PDF, etc)
+    Document {
+        document_id: MediaId,
+        document_url: String,
+        page_count: i32,
+        preview_url: Option<String>
+    },
+
+    /// Presentation content
+    Presentation {
+        presentation_id: MediaId,
+        slides: List<Slide>,
+        slide_count: i32
+    },
+
+    /// Interactive content (H5P, etc)
+    Interactive {
+        content_id: String,
+        content_type: String,
+        embed_url: String,
+        width: Option<i32>,
+        height: Option<i32>
+    },
+
+    /// External URL
+    External {
+        url: String,
+        embed: Bool,
+        new_window: Bool
+    },
+
+    /// Audio content
+    Audio {
+        audio_id: MediaId,
+        audio_url: String,
+        duration_seconds: i32,
+        transcript: Option<String>
+    },
+
+    /// Live session
+    Live {
+        session_type: LiveSessionType,
+        meeting_url: Option<String>,
+        start_time: DateTime,
+        end_time: DateTime,
+        recording_available: Bool,
+        recording_url: Option<String>
+    },
+
+    /// SCORM package
+    Scorm {
+        package_id: String,
+        version: String,
+        launch_url: String
+    },
+
+    /// xAPI content
+    Xapi {
+        activity_id: String,
+        launch_url: String,
+        activity_type: String
+    }
+}
+
+/// Caption track
+type CaptionTrack {
+    id: String,
+    language: String,
+    label: String,
+    url: String,
+    is_default: Bool
+}
+
+/// Video chapter
+type VideoChapter {
+    title: String,
+    start_seconds: i32,
+    end_seconds: i32
+}
+
+/// Presentation slide
+type Slide {
+    id: String,
+    position: i32,
+    image_url: String,
+    notes: Option<String>
+}
+
+/// Live session type
+enum LiveSessionType {
+    Zoom,
+    Teams,
+    Meet,
+    Webex,
+    Custom
+}
+
+/// Text format
+enum TextFormat {
+    PlainText,
+    Markdown,
+    Html,
+    RichText
+}
+
+/// Lesson progress
+type LessonProgress {
+    lesson_id: LessonId,
+    enrollment_id: EnrollmentId,
+    status: ProgressStatus,
+    progress_percentage: f32,
+    time_spent_seconds: i64,
+    started_at: Option<DateTime>,
+    completed_at: Option<DateTime>,
+    last_position: Option<i32>,
+    video_position_seconds: Option<i32>,
+    page_number: Option<i32>
+}
+
+/// Progress status
+enum ProgressStatus {
+    NotStarted,
+    InProgress,
+    Completed
+}
+
+/// Update progress request
+type UpdateProgressRequest {
+    progress_percentage: Option<f32>,
+    time_spent_seconds: Option<i64>,
+    video_position_seconds: Option<i32>,
+    page_number: Option<i32>,
+    last_position: Option<i32>
+}
+
+/// Lesson attachment
+type LessonAttachment {
+    id: String,
+    lesson_id: LessonId,
+    filename: String,
+    file_size: i64,
+    mime_type: String,
+    download_url: String,
+    uploaded_at: DateTime
+}
+
+// =============================================================================
+// LIST LESSONS
+// =============================================================================
+
+/// List lessons
+async fn list_lessons(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let pagination = PaginationParams::from_request(&req);
+    let module_id = req.query_param("module_id");
+    let course_id = req.query_param("course_id");
+
+    let (lessons, total) = if let Some(mid) = module_id {
+        // Verify access via module
+        let module = db.modules()
+            .find_by_id(&mid)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                resource: "Module".to_string(),
+                id: mid.clone()
+            })?;
+
+        verify_course_access(&db, &module.course_id, &ctx).await?;
+
+        let lessons = db.lessons()
+            .find_by_module(&mid)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?;
+
+        (lessons.clone(), lessons.len() as i64)
+    } else if let Some(cid) = course_id {
+        verify_course_access(&db, &cid, &ctx).await?;
+
+        db.lessons()
+            .find_by_course(&cid, pagination.limit(), pagination.offset())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    } else {
+        ctx.require_permission(Permission::ViewAllCourses)?;
+
+        db.lessons()
+            .list_all(ctx.tenant_id().as_ref(), pagination.limit(), pagination.offset())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    };
+
+    // Filter unpublished if not editor
+    let filtered = filter_unpublished_lessons(&db, lessons, &ctx).await;
+
+    let items: List<LessonResponse> = filtered.iter().map(lesson_to_response).collect();
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(items, meta, &ctx)))
+}
+
+// =============================================================================
+// GET LESSON
+// =============================================================================
+
+/// Get a specific lesson
+async fn get_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let lesson = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+    let response = lesson_to_response(&lesson);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// CREATE LESSON
+// =============================================================================
+
+/// Create a new lesson
+async fn create_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: CreateLessonRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Verify module access
+    let module = db.modules()
+        .find_by_id(&body.module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: body.module_id.clone()
+        })?;
+
+    verify_course_edit_access(&db, &module.course_id, &ctx).await?;
+
+    // Validate
+    if body.title.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "title".to_string(),
+            message: "Lesson title is required".to_string(),
+            errors: vec![]
+        })
+    }
+
+    let lesson_type = parse_lesson_type(&body.lesson_type)?;
+
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.lessons()
+            .get_next_position(&body.module_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let lesson = db.lessons()
+        .create(CreateLessonInput {
+            module_id: body.module_id,
+            course_id: module.course_id,
+            title: body.title,
+            lesson_type,
+            description: body.description,
+            duration_minutes: body.duration_minutes,
+            is_required: body.is_required.unwrap_or(true),
+            is_free_preview: body.is_free_preview.unwrap_or(false),
+            position,
+            tenant_id: ctx.tenant_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = lesson_to_response(&lesson);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// UPDATE LESSON
+// =============================================================================
+
+/// Update a lesson
+async fn update_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let lesson = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let body: UpdateLessonRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let lesson_type = if let Some(lt) = body.lesson_type {
+        Some(parse_lesson_type(&lt)?)
+    } else {
+        None
+    };
+
+    let updated = db.lessons()
+        .update(&lesson_id, UpdateLessonInput {
+            title: body.title,
+            description: body.description,
+            lesson_type,
+            duration_minutes: body.duration_minutes,
+            is_required: body.is_required,
+            is_free_preview: body.is_free_preview,
+            unlock_at: body.unlock_at,
+            due_date: body.due_date,
+            position: body.position
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = lesson_to_response(&updated);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// DELETE LESSON
+// =============================================================================
+
+/// Delete a lesson
+async fn delete_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    db.lessons()
+        .delete(&lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Lesson deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// PUBLISH/UNPUBLISH
+// =============================================================================
+
+/// Publish a lesson
+async fn publish_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    db.lessons()
+        .publish(&lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Lesson published".to_string()))
+    ])))
+}
+
+/// Unpublish a lesson
+async fn unpublish_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    db.lessons()
+        .unpublish(&lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Lesson unpublished".to_string()))
+    ])))
+}
+
+// =============================================================================
+// LESSON CONTENT
+// =============================================================================
+
+/// Get lesson content
+async fn get_lesson_content(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let lesson = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+
+    // Check if user has access (enrolled or free preview)
+    if !lesson.is_free_preview && !is_enrolled_in_course(&db, &lesson.course_id, &ctx).await {
+        return Err(ApiError::Forbidden {
+            message: "Enrollment required to view this content".to_string(),
+            required_permission: None
+        })
+    }
+
+    let content = db.lesson_content()
+        .find_by_lesson(&lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Record view
+    if let Some(user_id) = ctx.user_id() {
+        record_lesson_view(&db, &lesson_id, &user_id).await.ok();
+    }
+
+    Ok(Response::json(ApiResponse::success(content, &ctx)))
+}
+
+/// Update lesson content
+async fn update_lesson_content(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let body: LessonContent = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let content = db.lesson_content()
+        .upsert(&lesson_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(content, &ctx)))
+}
+
+// =============================================================================
+// LESSON MEDIA
+// =============================================================================
+
+/// Upload lesson media
+async fn upload_lesson_media(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let file = req.file("media").await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid file upload: {}", e)
+    })?;
+
+    let media = db.storage()
+        .upload_lesson_media(&lesson_id, &file)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(media, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Get lesson media
+async fn get_lesson_media(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let media = db.lesson_media()
+        .find_by_lesson(&lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(media, &ctx)))
+}
+
+/// Delete lesson media
+async fn delete_lesson_media(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let media_id = req.param("media_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Media ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    db.lesson_media()
+        .delete(&media_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    db.storage()
+        .delete_media(&media_id)
+        .await
+        .ok();
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Media deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// LESSON PROGRESS
+// =============================================================================
+
+/// Get lesson progress for current user
+async fn get_lesson_progress(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let lesson = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &lesson.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled in this course".to_string(),
+            required_permission: None
+        })?;
+
+    let progress = db.progress()
+        .get_lesson_progress(&enrollment.id, &lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .unwrap_or_else(|| LessonProgress {
+            lesson_id: lesson_id.clone(),
+            enrollment_id: enrollment.id.clone(),
+            status: ProgressStatus::NotStarted,
+            progress_percentage: 0.0,
+            time_spent_seconds: 0,
+            started_at: None,
+            completed_at: None,
+            last_position: None,
+            video_position_seconds: None,
+            page_number: None
+        });
+
+    Ok(Response::json(ApiResponse::success(progress, &ctx)))
+}
+
+/// Update lesson progress
+async fn update_lesson_progress(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let lesson = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &lesson.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled in this course".to_string(),
+            required_permission: None
+        })?;
+
+    let body: UpdateProgressRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let progress = db.progress()
+        .update_lesson_progress(&enrollment.id, &lesson_id, UpdateLessonProgressInput {
+            progress_percentage: body.progress_percentage,
+            time_spent_seconds: body.time_spent_seconds,
+            video_position_seconds: body.video_position_seconds,
+            page_number: body.page_number,
+            last_position: body.last_position
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(progress, &ctx)))
+}
+
+/// Mark lesson as complete
+async fn mark_lesson_complete(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let lesson = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &lesson.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled in this course".to_string(),
+            required_permission: None
+        })?;
+
+    let progress = db.progress()
+        .mark_lesson_complete(&enrollment.id, &lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Check if module is complete
+    check_and_update_module_completion(&db, &enrollment.id, &lesson.module_id).await.ok();
+
+    Ok(Response::json(ApiResponse::success(progress, &ctx)))
+}
+
+// =============================================================================
+// ATTACHMENTS
+// =============================================================================
+
+/// Get lesson attachments
+async fn get_attachments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_viewable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let attachments = db.lesson_attachments()
+        .find_by_lesson(&lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(attachments, &ctx)))
+}
+
+/// Add attachment to lesson
+async fn add_attachment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    let file = req.file("attachment").await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid file upload: {}", e)
+    })?;
+
+    let attachment = db.lesson_attachments()
+        .create(&lesson_id, &file)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(attachment, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Remove attachment
+async fn remove_attachment(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let attachment_id = req.param("attachment_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Attachment ID required".to_string()
+    })?;
+
+    let _ = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    db.lesson_attachments()
+        .delete(&attachment_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Attachment removed".to_string()))
+    ])))
+}
+
+// =============================================================================
+// DUPLICATION
+// =============================================================================
+
+/// Duplicate a lesson
+async fn duplicate_lesson(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let lesson_id = req.param("lesson_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Lesson ID required".to_string()
+    })?;
+
+    let lesson = get_editable_lesson(&db, &lesson_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct DuplicateRequest {
+        new_title: Option<String>,
+        target_module_id: Option<ModuleId>,
+        include_content: Option<Bool>
+    }
+
+    let body: DuplicateRequest = req.json().await.unwrap_or(DuplicateRequest {
+        new_title: None,
+        target_module_id: None,
+        include_content: Some(true)
+    });
+
+    // Verify target module access if different
+    let target_module = body.target_module_id.clone().unwrap_or(lesson.module_id.clone());
+    if target_module != lesson.module_id {
+        let module = db.modules()
+            .find_by_id(&target_module)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                resource: "Module".to_string(),
+                id: target_module.clone()
+            })?;
+
+        verify_course_edit_access(&db, &module.course_id, &ctx).await?;
+    }
+
+    let new_lesson = db.lessons()
+        .duplicate(
+            &lesson_id,
+            body.new_title.as_deref(),
+            Some(&target_module),
+            body.include_content.unwrap_or(true)
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = lesson_to_response(&new_lesson);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn lesson_to_response(lesson: &Lesson) -> LessonResponse {
+    LessonResponse {
+        id: lesson.id.clone(),
+        module_id: lesson.module_id.clone(),
+        course_id: lesson.course_id.clone(),
+        title: lesson.title.clone(),
+        description: lesson.description.clone(),
+        lesson_type: lesson.lesson_type.clone(),
+        position: lesson.position,
+        duration_minutes: lesson.duration_minutes,
+        is_published: lesson.is_published,
+        is_required: lesson.is_required,
+        is_free_preview: lesson.is_free_preview,
+        unlock_at: lesson.unlock_at,
+        due_date: lesson.due_date,
+        content_summary: None,
+        attachments_count: 0,
+        created_at: lesson.created_at,
+        updated_at: lesson.updated_at
+    }
+}
+
+async fn filter_unpublished_lessons(db: &Database, lessons: List<Lesson>, ctx: &RequestContext) -> List<Lesson> {
+    if lessons.is_empty() {
+        return lessons
+    }
+
+    // Check if user can edit the course
+    let course_id = &lessons[0].course_id;
+    let can_edit = can_edit_course_content(db, course_id, ctx).await;
+
+    if can_edit {
+        lessons
+    } else {
+        lessons.into_iter().filter(|l| l.is_published).collect()
+    }
+}
+
+async fn verify_course_access(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Result<(), ApiError> {
+    if ctx.has_permission(Permission::ViewAllCourses) {
+        return Ok(())
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrolled = db.enrollments()
+            .is_enrolled(&user_id, course_id)
+            .await
+            .unwrap_or(false);
+        if enrolled {
+            return Ok(())
+        }
+    }
+
+    let course = db.courses()
+        .find_by_id(course_id)
+        .await
+        .ok()
+        .flatten();
+
+    if let Some(c) = course {
+        if c.visibility == CourseVisibility::Public && c.status == CourseStatus::Published {
+            return Ok(())
+        }
+    }
+
+    Err(ApiError::Forbidden {
+        message: "Access denied".to_string(),
+        required_permission: None
+    })
+}
+
+async fn verify_course_edit_access(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Result<(), ApiError> {
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return Ok(())
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, course_id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            if e.can_edit_content() {
+                return Ok(())
+            }
+        }
+    }
+
+    Err(ApiError::Forbidden {
+        message: "You don't have permission to edit this course".to_string(),
+        required_permission: Some("EditCourses".to_string())
+    })
+}
+
+async fn can_edit_course_content(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Bool {
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return true
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, course_id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            return e.can_edit_content()
+        }
+    }
+
+    false
+}
+
+async fn get_viewable_lesson(db: &Database, lesson_id: &str, ctx: &RequestContext) -> Result<Lesson, ApiError> {
+    let lesson = db.lessons()
+        .find_by_id(lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Lesson".to_string(),
+            id: lesson_id.to_string()
+        })?;
+
+    verify_course_access(db, &lesson.course_id, ctx).await?;
+
+    if !lesson.is_published && !can_edit_course_content(db, &lesson.course_id, ctx).await {
+        return Err(ApiError::NotFound {
+            resource: "Lesson".to_string(),
+            id: lesson_id.to_string()
+        })
+    }
+
+    Ok(lesson)
+}
+
+async fn get_editable_lesson(db: &Database, lesson_id: &str, ctx: &RequestContext) -> Result<Lesson, ApiError> {
+    let lesson = db.lessons()
+        .find_by_id(lesson_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Lesson".to_string(),
+            id: lesson_id.to_string()
+        })?;
+
+    verify_course_edit_access(db, &lesson.course_id, ctx).await?;
+
+    Ok(lesson)
+}
+
+async fn is_enrolled_in_course(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Bool {
+    if ctx.has_permission(Permission::ViewAllCourses) {
+        return true
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        return db.enrollments()
+            .is_enrolled(&user_id, course_id)
+            .await
+            .unwrap_or(false)
+    }
+
+    false
+}
+
+async fn record_lesson_view(db: &Database, lesson_id: &LessonId, user_id: &UserId) -> Result<(), String> {
+    db.lesson_views()
+        .record(lesson_id, user_id)
+        .await
+}
+
+async fn check_and_update_module_completion(db: &Database, enrollment_id: &EnrollmentId, module_id: &ModuleId) -> Result<(), String> {
+    db.progress()
+        .check_module_completion(enrollment_id, module_id)
+        .await
+}
+
+fn parse_lesson_type(s: &str) -> Result<LessonType, ApiError> {
+    match s.to_lowercase().as_str() {
+        "video" => Ok(LessonType::Video),
+        "text" | "article" => Ok(LessonType::Text),
+        "document" | "pdf" => Ok(LessonType::Document),
+        "presentation" => Ok(LessonType::Presentation),
+        "interactive" => Ok(LessonType::Interactive),
+        "external" => Ok(LessonType::External),
+        "audio" => Ok(LessonType::Audio),
+        "live" => Ok(LessonType::Live),
+        "scorm" => Ok(LessonType::Scorm),
+        "xapi" => Ok(LessonType::Xapi),
+        _ => Err(ApiError::ValidationError {
+            field: "lesson_type".to_string(),
+            message: format!("Unknown lesson type: {}", s),
+            errors: vec![]
+        })
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use LessonResponse;
+pub use LessonContent;
+pub use LessonProgress;

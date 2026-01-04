@@ -1,0 +1,924 @@
+// Email Template Engine and Registry for Intelligo LMS
+// Provides templating, localization, and email rendering
+
+module intelligo::templates
+
+pub mod email
+
+pub use email::EmailTemplateRegistry
+
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+
+/// Template types
+pub enum TemplateType {
+    Email,
+    Push,
+    Sms,
+    InApp,
+}
+
+/// Template configuration
+pub type TemplateConfig {
+    template_id: String,
+    template_type: TemplateType,
+    name: String,
+    description: Option<String>,
+    category: String,
+
+    // Content
+    subject: Option<String>,
+    body_html: String,
+    body_text: Option<String>,
+
+    // Localization
+    default_locale: String,
+    available_locales: Vec<String>,
+
+    // Settings
+    enabled: bool,
+    track_opens: bool,
+    track_clicks: bool,
+
+    // Metadata
+    required_variables: Vec<String>,
+    optional_variables: Vec<String>,
+
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// Template context for rendering
+pub type TemplateContext {
+    variables: HashMap<String, ContextValue>,
+    locale: String,
+    timezone: Option<String>,
+}
+
+impl TemplateContext {
+    pub fn new() -> Self {
+        TemplateContext {
+            variables: HashMap::new(),
+            locale: "en".to_string(),
+            timezone: None,
+        }
+    }
+
+    pub fn with_locale(mut self, locale: String) -> Self {
+        self.locale = locale;
+        self
+    }
+
+    pub fn with_timezone(mut self, timezone: String) -> Self {
+        self.timezone = Some(timezone);
+        self
+    }
+
+    pub fn set(mut self, key: &str, value: ContextValue) -> Self {
+        self.variables.insert(key.to_string(), value);
+        self
+    }
+
+    pub fn set_string(mut self, key: &str, value: String) -> Self {
+        self.variables.insert(key.to_string(), ContextValue::String(value));
+        self
+    }
+
+    pub fn set_number(mut self, key: &str, value: f64) -> Self {
+        self.variables.insert(key.to_string(), ContextValue::Number(value));
+        self
+    }
+
+    pub fn set_bool(mut self, key: &str, value: bool) -> Self {
+        self.variables.insert(key.to_string(), ContextValue::Boolean(value));
+        self
+    }
+
+    pub fn set_datetime(mut self, key: &str, value: DateTime) -> Self {
+        self.variables.insert(key.to_string(), ContextValue::DateTime(value));
+        self
+    }
+
+    pub fn set_list(mut self, key: &str, value: Vec<ContextValue>) -> Self {
+        self.variables.insert(key.to_string(), ContextValue::List(value));
+        self
+    }
+
+    pub fn set_object(mut self, key: &str, value: HashMap<String, ContextValue>) -> Self {
+        self.variables.insert(key.to_string(), ContextValue::Object(value));
+        self
+    }
+}
+
+/// Context value types
+pub enum ContextValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    DateTime(DateTime),
+    Duration(Duration),
+    List(Vec<ContextValue>),
+    Object(HashMap<String, ContextValue>),
+    Null,
+}
+
+impl ContextValue {
+    pub fn to_string(self) -> String {
+        match self {
+            ContextValue::String(s) => s,
+            ContextValue::Number(n) => n.to_string(),
+            ContextValue::Boolean(b) => if b { "true".to_string() } else { "false".to_string() },
+            ContextValue::DateTime(dt) => dt.to_iso8601(),
+            ContextValue::Duration(d) => format_duration(d),
+            ContextValue::List(l) => format!("[{}]", l.iter()
+                .map(|v| v.clone().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")),
+            ContextValue::Object(_) => "[Object]".to_string(),
+            ContextValue::Null => "".to_string(),
+        }
+    }
+
+    pub fn is_truthy(self) -> bool {
+        match self {
+            ContextValue::String(s) => !s.is_empty(),
+            ContextValue::Number(n) => n != 0.0,
+            ContextValue::Boolean(b) => b,
+            ContextValue::DateTime(_) => true,
+            ContextValue::Duration(_) => true,
+            ContextValue::List(l) => !l.is_empty(),
+            ContextValue::Object(o) => !o.is_empty(),
+            ContextValue::Null => false,
+        }
+    }
+}
+
+/// Rendered template output
+pub type RenderedTemplate {
+    template_id: String,
+    subject: Option<String>,
+    body_html: String,
+    body_text: Option<String>,
+    locale: String,
+    rendered_at: DateTime,
+}
+
+/// Template errors
+pub enum TemplateError {
+    NotFound { template_id: String },
+    ParseError { message: String, line: Option<u32>, column: Option<u32> },
+    RenderError { message: String },
+    MissingVariable { variable: String },
+    InvalidVariable { variable: String, expected: String },
+    LocaleNotFound { locale: String },
+    IoError { message: String },
+}
+
+impl TemplateError {
+    pub fn to_string(self) -> String {
+        match self {
+            TemplateError::NotFound { template_id } =>
+                format!("Template not found: {}", template_id),
+            TemplateError::ParseError { message, line, column } => {
+                match (line, column) {
+                    (Some(l), Some(c)) => format!("Parse error at {}:{}: {}", l, c, message),
+                    (Some(l), None) => format!("Parse error at line {}: {}", l, message),
+                    _ => format!("Parse error: {}", message),
+                }
+            },
+            TemplateError::RenderError { message } =>
+                format!("Render error: {}", message),
+            TemplateError::MissingVariable { variable } =>
+                format!("Missing required variable: {}", variable),
+            TemplateError::InvalidVariable { variable, expected } =>
+                format!("Invalid variable '{}': expected {}", variable, expected),
+            TemplateError::LocaleNotFound { locale } =>
+                format!("Locale not found: {}", locale),
+            TemplateError::IoError { message } =>
+                format!("IO error: {}", message),
+        }
+    }
+}
+
+/// Template Engine actor
+pub actor TemplateEngine {
+    templates: HashMap<String, TemplateConfig>,
+    localized_content: HashMap<String, HashMap<String, LocalizedContent>>,
+    helpers: HashMap<String, Box<dyn TemplateHelper>>,
+    partials: HashMap<String, String>,
+    base_layouts: HashMap<String, String>,
+
+    pub fn new() -> Self {
+        let mut engine = TemplateEngine {
+            templates: HashMap::new(),
+            localized_content: HashMap::new(),
+            helpers: HashMap::new(),
+            partials: HashMap::new(),
+            base_layouts: HashMap::new(),
+        };
+
+        // Register default helpers
+        engine.register_default_helpers();
+        engine.register_default_layouts();
+
+        engine
+    }
+
+    /// Register a template
+    pub fn register_template(mut self, config: TemplateConfig) {
+        self.templates.insert(config.template_id.clone(), config);
+    }
+
+    /// Register localized content for a template
+    pub fn register_localization(
+        mut self,
+        template_id: String,
+        locale: String,
+        content: LocalizedContent
+    ) {
+        self.localized_content
+            .entry(template_id)
+            .or_insert_with(HashMap::new)
+            .insert(locale, content);
+    }
+
+    /// Register a helper function
+    pub fn register_helper(mut self, name: String, helper: Box<dyn TemplateHelper>) {
+        self.helpers.insert(name, helper);
+    }
+
+    /// Register a partial template
+    pub fn register_partial(mut self, name: String, content: String) {
+        self.partials.insert(name, content);
+    }
+
+    /// Register a base layout
+    pub fn register_layout(mut self, name: String, content: String) {
+        self.base_layouts.insert(name, content);
+    }
+
+    /// Render a template
+    pub fn render(
+        self,
+        template_id: &str,
+        context: TemplateContext
+    ) -> Result<RenderedTemplate, TemplateError> {
+        let template = self.templates.get(template_id).ok_or(
+            TemplateError::NotFound { template_id: template_id.to_string() }
+        )?;
+
+        // Check required variables
+        for var in &template.required_variables {
+            if !context.variables.contains_key(var) {
+                return Err(TemplateError::MissingVariable { variable: var.clone() });
+            }
+        }
+
+        // Get localized content if available
+        let locale = &context.locale;
+        let localized = self.localized_content
+            .get(template_id)
+            .and_then(|m| m.get(locale).or_else(|| m.get(&template.default_locale)));
+
+        // Determine subject, html, and text content
+        let (subject_template, html_template, text_template) = match localized {
+            Some(loc) => (
+                loc.subject.as_ref().or(template.subject.as_ref()),
+                &loc.body_html.as_ref().unwrap_or(&template.body_html),
+                loc.body_text.as_ref().or(template.body_text.as_ref()),
+            ),
+            None => (
+                template.subject.as_ref(),
+                &template.body_html,
+                template.body_text.as_ref(),
+            ),
+        };
+
+        // Render subject
+        let rendered_subject = subject_template
+            .map(|s| self.render_string(s, &context))
+            .transpose()?;
+
+        // Render HTML body
+        let rendered_html = self.render_string(html_template, &context)?;
+
+        // Wrap in layout if needed
+        let final_html = self.apply_layout(&rendered_html, template, &context)?;
+
+        // Render text body
+        let rendered_text = text_template
+            .map(|s| self.render_string(s, &context))
+            .transpose()?;
+
+        Ok(RenderedTemplate {
+            template_id: template_id.to_string(),
+            subject: rendered_subject,
+            body_html: final_html,
+            body_text: rendered_text,
+            locale: locale.clone(),
+            rendered_at: DateTime::now(),
+        })
+    }
+
+    /// Render a string with context
+    fn render_string(self, template: &str, context: &TemplateContext) -> Result<String, TemplateError> {
+        let mut result = template.to_string();
+
+        // Process includes/partials
+        result = self.process_partials(&result)?;
+
+        // Process conditionals
+        result = self.process_conditionals(&result, context)?;
+
+        // Process loops
+        result = self.process_loops(&result, context)?;
+
+        // Process helpers
+        result = self.process_helpers(&result, context)?;
+
+        // Substitute variables
+        result = self.substitute_variables(&result, context)?;
+
+        Ok(result)
+    }
+
+    /// Process partial includes
+    fn process_partials(self, template: &str) -> Result<String, TemplateError> {
+        let mut result = template.to_string();
+        let pattern = r"\{\{>\s*(\w+)\s*\}\}";
+
+        // Simple regex replacement
+        loop {
+            let found = result.find("{{>");
+            if found.is_none() {
+                break;
+            }
+
+            let start = found.unwrap();
+            let end = result[start..].find("}}").map(|i| start + i + 2);
+
+            if let Some(end_pos) = end {
+                let tag = &result[start..end_pos];
+                let partial_name = tag
+                    .trim_start_matches("{{>")
+                    .trim_end_matches("}}")
+                    .trim();
+
+                let partial_content = self.partials.get(partial_name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                result = format!("{}{}{}", &result[..start], partial_content, &result[end_pos..]);
+            } else {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Process conditional blocks
+    fn process_conditionals(
+        self,
+        template: &str,
+        context: &TemplateContext
+    ) -> Result<String, TemplateError> {
+        let mut result = template.to_string();
+
+        // Process {{#if variable}}...{{/if}} blocks
+        loop {
+            let if_start = result.find("{{#if ");
+            if if_start.is_none() {
+                break;
+            }
+
+            let start = if_start.unwrap();
+            let tag_end = result[start..].find("}}").map(|i| start + i + 2);
+
+            if tag_end.is_none() {
+                break;
+            }
+
+            let tag_end_pos = tag_end.unwrap();
+            let condition = result[start + 6..tag_end_pos - 2].trim().to_string();
+
+            // Find the matching {{/if}}
+            let end_tag = "{{/if}}";
+            let block_end = result[tag_end_pos..].find(end_tag).map(|i| tag_end_pos + i);
+
+            if block_end.is_none() {
+                return Err(TemplateError::ParseError {
+                    message: format!("Unclosed #if block for '{}'", condition),
+                    line: None,
+                    column: None,
+                });
+            }
+
+            let block_end_pos = block_end.unwrap();
+            let block_content = &result[tag_end_pos..block_end_pos];
+
+            // Check for {{else}}
+            let (if_content, else_content) = if let Some(else_pos) = block_content.find("{{else}}") {
+                (&block_content[..else_pos], &block_content[else_pos + 8..])
+            } else {
+                (block_content, "")
+            };
+
+            // Evaluate condition
+            let is_true = self.evaluate_condition(&condition, context);
+
+            let replacement = if is_true {
+                if_content.to_string()
+            } else {
+                else_content.to_string()
+            };
+
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                replacement,
+                &result[block_end_pos + end_tag.len()..]
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Evaluate a condition expression
+    fn evaluate_condition(self, condition: &str, context: &TemplateContext) -> bool {
+        // Handle negation
+        if condition.starts_with("!") {
+            return !self.evaluate_condition(&condition[1..], context);
+        }
+
+        // Get variable value
+        context.variables.get(condition)
+            .map(|v| v.clone().is_truthy())
+            .unwrap_or(false)
+    }
+
+    /// Process loop blocks
+    fn process_loops(
+        self,
+        template: &str,
+        context: &TemplateContext
+    ) -> Result<String, TemplateError> {
+        let mut result = template.to_string();
+
+        // Process {{#each items}}...{{/each}} blocks
+        loop {
+            let each_start = result.find("{{#each ");
+            if each_start.is_none() {
+                break;
+            }
+
+            let start = each_start.unwrap();
+            let tag_end = result[start..].find("}}").map(|i| start + i + 2);
+
+            if tag_end.is_none() {
+                break;
+            }
+
+            let tag_end_pos = tag_end.unwrap();
+            let list_name = result[start + 8..tag_end_pos - 2].trim().to_string();
+
+            // Find the matching {{/each}}
+            let end_tag = "{{/each}}";
+            let block_end = result[tag_end_pos..].find(end_tag).map(|i| tag_end_pos + i);
+
+            if block_end.is_none() {
+                return Err(TemplateError::ParseError {
+                    message: format!("Unclosed #each block for '{}'", list_name),
+                    line: None,
+                    column: None,
+                });
+            }
+
+            let block_end_pos = block_end.unwrap();
+            let block_content = &result[tag_end_pos..block_end_pos];
+
+            // Get the list and iterate
+            let replacement = match context.variables.get(&list_name) {
+                Some(ContextValue::List(items)) => {
+                    let mut output = String::new();
+                    for (index, item) in items.iter().enumerate() {
+                        let mut item_context = context.clone();
+
+                        // Add loop variables
+                        item_context.variables.insert("@index".to_string(),
+                            ContextValue::Number(index as f64));
+                        item_context.variables.insert("@first".to_string(),
+                            ContextValue::Boolean(index == 0));
+                        item_context.variables.insert("@last".to_string(),
+                            ContextValue::Boolean(index == items.len() - 1));
+
+                        // Add item as "this" and merge object properties
+                        match item {
+                            ContextValue::Object(obj) => {
+                                for (k, v) in obj {
+                                    item_context.variables.insert(k.clone(), v.clone());
+                                }
+                            },
+                            _ => {
+                                item_context.variables.insert("this".to_string(), item.clone());
+                            }
+                        }
+
+                        // Render this iteration
+                        let rendered = self.render_string(block_content, &item_context)?;
+                        output.push_str(&rendered);
+                    }
+                    output
+                },
+                _ => String::new(),
+            };
+
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                replacement,
+                &result[block_end_pos + end_tag.len()..]
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Process helper functions
+    fn process_helpers(
+        self,
+        template: &str,
+        context: &TemplateContext
+    ) -> Result<String, TemplateError> {
+        let mut result = template.to_string();
+
+        // Process {{helper arg1 arg2}} patterns
+        loop {
+            let helper_start = result.find("{{");
+            if helper_start.is_none() {
+                break;
+            }
+
+            let start = helper_start.unwrap();
+
+            // Skip special tags
+            if result[start..].starts_with("{{#") ||
+               result[start..].starts_with("{{/") ||
+               result[start..].starts_with("{{>") ||
+               result[start..].starts_with("{{!") {
+                // Move past this tag to find the next
+                if let Some(end) = result[start..].find("}}") {
+                    let skip_len = start + end + 2;
+                    if skip_len >= result.len() {
+                        break;
+                    }
+                    // We'll just break here to avoid infinite loops
+                    break;
+                }
+                break;
+            }
+
+            let tag_end = result[start..].find("}}").map(|i| start + i + 2);
+            if tag_end.is_none() {
+                break;
+            }
+
+            let tag_end_pos = tag_end.unwrap();
+            let content = result[start + 2..tag_end_pos - 2].trim();
+
+            // Check if this looks like a helper call (has spaces)
+            if content.contains(' ') && !content.starts_with('#') {
+                let parts: Vec<&str> = content.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let helper_name = parts[0];
+
+                    if let Some(helper) = self.helpers.get(helper_name) {
+                        let args: Vec<String> = parts[1..].iter()
+                            .map(|s| {
+                                // Resolve variable references
+                                if let Some(val) = context.variables.get(*s) {
+                                    val.clone().to_string()
+                                } else {
+                                    // Remove quotes for string literals
+                                    s.trim_matches('"').trim_matches('\'').to_string()
+                                }
+                            })
+                            .collect();
+
+                        let helper_result = helper.call(args, context);
+
+                        result = format!(
+                            "{}{}{}",
+                            &result[..start],
+                            helper_result,
+                            &result[tag_end_pos..]
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Not a helper, move on
+            break;
+        }
+
+        Ok(result)
+    }
+
+    /// Substitute simple variables
+    fn substitute_variables(
+        self,
+        template: &str,
+        context: &TemplateContext
+    ) -> Result<String, TemplateError> {
+        let mut result = template.to_string();
+
+        // Process {{variable}} patterns
+        for (key, value) in &context.variables {
+            let pattern = format!("{{{{{}}}}}", key);
+            result = result.replace(&pattern, &value.clone().to_string());
+
+            // Also handle with whitespace
+            let pattern_ws = format!("{{{{ {} }}}}", key);
+            result = result.replace(&pattern_ws, &value.clone().to_string());
+        }
+
+        Ok(result)
+    }
+
+    /// Apply a layout to rendered content
+    fn apply_layout(
+        self,
+        content: &str,
+        template: &TemplateConfig,
+        context: &TemplateContext
+    ) -> Result<String, TemplateError> {
+        // Get the appropriate layout for email templates
+        if matches!(template.template_type, TemplateType::Email) {
+            if let Some(layout) = self.base_layouts.get("email") {
+                let mut layout_context = context.clone();
+                layout_context.variables.insert(
+                    "content".to_string(),
+                    ContextValue::String(content.to_string())
+                );
+
+                return self.render_string(layout, &layout_context);
+            }
+        }
+
+        Ok(content.to_string())
+    }
+
+    /// Register default helpers
+    fn register_default_helpers(mut self) {
+        self.helpers.insert("formatDate".to_string(),
+            Box::new(FormatDateHelper {}));
+        self.helpers.insert("formatNumber".to_string(),
+            Box::new(FormatNumberHelper {}));
+        self.helpers.insert("uppercase".to_string(),
+            Box::new(UppercaseHelper {}));
+        self.helpers.insert("lowercase".to_string(),
+            Box::new(LowercaseHelper {}));
+        self.helpers.insert("truncate".to_string(),
+            Box::new(TruncateHelper {}));
+        self.helpers.insert("pluralize".to_string(),
+            Box::new(PluralizeHelper {}));
+    }
+
+    /// Register default layouts
+    fn register_default_layouts(mut self) {
+        self.base_layouts.insert("email".to_string(), DEFAULT_EMAIL_LAYOUT.to_string());
+    }
+}
+
+/// Localized content for a template
+pub type LocalizedContent {
+    subject: Option<String>,
+    body_html: Option<String>,
+    body_text: Option<String>,
+}
+
+/// Template helper trait
+pub trait TemplateHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String;
+}
+
+/// Format date helper
+pub actor FormatDateHelper {}
+
+impl TemplateHelper for FormatDateHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String {
+        if args.is_empty() {
+            return String::new();
+        }
+
+        let date_str = &args[0];
+        let format = args.get(1).map(|s| s.as_str()).unwrap_or("%B %d, %Y");
+
+        if let Ok(dt) = DateTime::parse_iso8601(date_str) {
+            dt.format(format)
+        } else {
+            date_str.clone()
+        }
+    }
+}
+
+/// Format number helper
+pub actor FormatNumberHelper {}
+
+impl TemplateHelper for FormatNumberHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String {
+        if args.is_empty() {
+            return String::new();
+        }
+
+        if let Ok(num) = args[0].parse::<f64>() {
+            let decimals = args.get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+
+            format!("{:.1$}", num, decimals)
+        } else {
+            args[0].clone()
+        }
+    }
+}
+
+/// Uppercase helper
+pub actor UppercaseHelper {}
+
+impl TemplateHelper for UppercaseHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String {
+        args.get(0).map(|s| s.to_uppercase()).unwrap_or_default()
+    }
+}
+
+/// Lowercase helper
+pub actor LowercaseHelper {}
+
+impl TemplateHelper for LowercaseHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String {
+        args.get(0).map(|s| s.to_lowercase()).unwrap_or_default()
+    }
+}
+
+/// Truncate helper
+pub actor TruncateHelper {}
+
+impl TemplateHelper for TruncateHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String {
+        if args.is_empty() {
+            return String::new();
+        }
+
+        let text = &args[0];
+        let max_len = args.get(1)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100);
+        let suffix = args.get(2).map(|s| s.as_str()).unwrap_or("...");
+
+        if text.len() > max_len {
+            format!("{}{}", &text[..max_len], suffix)
+        } else {
+            text.clone()
+        }
+    }
+}
+
+/// Pluralize helper
+pub actor PluralizeHelper {}
+
+impl TemplateHelper for PluralizeHelper {
+    fn call(self, args: Vec<String>, context: &TemplateContext) -> String {
+        if args.len() < 3 {
+            return String::new();
+        }
+
+        let count = args[0].parse::<i64>().unwrap_or(0);
+        let singular = &args[1];
+        let plural = &args[2];
+
+        if count == 1 {
+            singular.clone()
+        } else {
+            plural.clone()
+        }
+    }
+}
+
+/// Format duration helper
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+
+    if total_secs < 60 {
+        format!("{} seconds", total_secs)
+    } else if total_secs < 3600 {
+        let mins = total_secs / 60;
+        format!("{} minute{}", mins, if mins == 1 { "" } else { "s" })
+    } else if total_secs < 86400 {
+        let hours = total_secs / 3600;
+        format!("{} hour{}", hours, if hours == 1 { "" } else { "s" })
+    } else {
+        let days = total_secs / 86400;
+        format!("{} day{}", days, if days == 1 { "" } else { "s" })
+    }
+}
+
+/// Default email layout
+const DEFAULT_EMAIL_LAYOUT: &str = r#"
+<!DOCTYPE html>
+<html lang="{{locale}}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>{{subject}}</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-size: 16px;
+            line-height: 1.5;
+            color: #333333;
+            background-color: #f5f5f5;
+        }
+        .wrapper {
+            width: 100%;
+            table-layout: fixed;
+            background-color: #f5f5f5;
+            padding: 40px 20px;
+        }
+        .main {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            padding: 30px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+        }
+        .logo {
+            max-width: 150px;
+            height: auto;
+        }
+        .content {
+            padding: 30px;
+        }
+        .footer {
+            padding: 20px 30px;
+            text-align: center;
+            font-size: 12px;
+            color: #666666;
+            background-color: #f9f9f9;
+            border-radius: 0 0 8px 8px;
+        }
+        .button {
+            display: inline-block;
+            padding: 12px 24px;
+            background-color: #0066cc;
+            color: #ffffff !important;
+            text-decoration: none;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .button:hover {
+            background-color: #0052a3;
+        }
+        h1, h2, h3 {
+            margin-top: 0;
+            color: #222222;
+        }
+        a {
+            color: #0066cc;
+        }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="main">
+            <div class="header">
+                {{#if logo_url}}
+                <img src="{{logo_url}}" alt="{{organization_name}}" class="logo">
+                {{else}}
+                <h2 style="margin: 0; color: #0066cc;">{{organization_name}}</h2>
+                {{/if}}
+            </div>
+            <div class="content">
+                {{{content}}}
+            </div>
+            <div class="footer">
+                <p>&copy; {{year}} {{organization_name}}. All rights reserved.</p>
+                {{#if unsubscribe_url}}
+                <p><a href="{{unsubscribe_url}}">Unsubscribe</a> from these emails.</p>
+                {{/if}}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"#;

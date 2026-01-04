@@ -1,0 +1,2296 @@
+// =============================================================================
+// Intelligo LMS - Security & Authorization System
+// =============================================================================
+// Comprehensive RBAC system with LMS-specific roles, course-scoped permissions,
+// field-level access control, and dynamic permission providers
+// =============================================================================
+
+module intelligo::core::security
+
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+use intelligo::core::types::*
+
+// =============================================================================
+// Type Aliases
+// =============================================================================
+
+type PolicyId = String
+type AccessRuleId = String
+type TeamId = String
+
+// =============================================================================
+// LMS Role Hierarchy
+// =============================================================================
+
+/// LMS-specific system roles with inheritance
+/// Role hierarchy: Anonymous < Authenticated < Student < TA < Teacher < CourseCoordinator
+///                 ContentDesigner (parallel to Teacher)
+///                 Administrator > all, TenantAdmin > Administrator (within tenant)
+enum SystemRole {
+    /// Unauthenticated visitor - can view public courses
+    Anonymous,
+    /// Logged in user - can browse catalog, manage profile
+    Authenticated,
+    /// Enrolled learner - can access enrolled courses, submit work
+    Student,
+    /// Teaching assistant - can grade, view student data in assigned courses
+    TeachingAssistant,
+    /// Instructor - full control over their courses
+    Teacher,
+    /// Manages multiple courses/programs - can assign teachers
+    CourseCoordinator,
+    /// Creates and manages course content templates
+    ContentDesigner,
+    /// System-wide administrator
+    Administrator,
+    /// Tenant-level super administrator
+    TenantAdmin
+}
+
+impl SystemRole {
+    /// Get the roles this role inherits from (role hierarchy)
+    fn inherits_from(&self) -> Set<SystemRole> {
+        match self {
+            SystemRole::Anonymous => Set::new(),
+            SystemRole::Authenticated => Set::from([SystemRole::Anonymous]),
+            SystemRole::Student => Set::from([SystemRole::Anonymous, SystemRole::Authenticated]),
+            SystemRole::TeachingAssistant => Set::from([
+                SystemRole::Anonymous,
+                SystemRole::Authenticated,
+                SystemRole::Student
+            ]),
+            SystemRole::Teacher => Set::from([
+                SystemRole::Anonymous,
+                SystemRole::Authenticated,
+                SystemRole::Student,
+                SystemRole::TeachingAssistant
+            ]),
+            SystemRole::CourseCoordinator => Set::from([
+                SystemRole::Anonymous,
+                SystemRole::Authenticated,
+                SystemRole::Student,
+                SystemRole::TeachingAssistant,
+                SystemRole::Teacher
+            ]),
+            SystemRole::ContentDesigner => Set::from([
+                SystemRole::Anonymous,
+                SystemRole::Authenticated
+            ]),
+            SystemRole::Administrator => Set::from([
+                SystemRole::Anonymous,
+                SystemRole::Authenticated,
+                SystemRole::Student,
+                SystemRole::TeachingAssistant,
+                SystemRole::Teacher,
+                SystemRole::CourseCoordinator,
+                SystemRole::ContentDesigner
+            ]),
+            SystemRole::TenantAdmin => Set::from([
+                SystemRole::Anonymous,
+                SystemRole::Authenticated,
+                SystemRole::Student,
+                SystemRole::TeachingAssistant,
+                SystemRole::Teacher,
+                SystemRole::CourseCoordinator,
+                SystemRole::ContentDesigner,
+                SystemRole::Administrator
+            ])
+        }
+    }
+
+    /// Get role weight for ordering (higher = more privileged)
+    fn weight(&self) -> i32 {
+        match self {
+            SystemRole::Anonymous => 0,
+            SystemRole::Authenticated => 10,
+            SystemRole::Student => 20,
+            SystemRole::TeachingAssistant => 30,
+            SystemRole::Teacher => 40,
+            SystemRole::ContentDesigner => 35,
+            SystemRole::CourseCoordinator => 50,
+            SystemRole::Administrator => 90,
+            SystemRole::TenantAdmin => 100
+        }
+    }
+
+    /// Convert to machine name string
+    fn to_string(&self) -> String {
+        match self {
+            SystemRole::Anonymous => "anonymous".to_string(),
+            SystemRole::Authenticated => "authenticated".to_string(),
+            SystemRole::Student => "student".to_string(),
+            SystemRole::TeachingAssistant => "teaching_assistant".to_string(),
+            SystemRole::Teacher => "teacher".to_string(),
+            SystemRole::CourseCoordinator => "course_coordinator".to_string(),
+            SystemRole::ContentDesigner => "content_designer".to_string(),
+            SystemRole::Administrator => "administrator".to_string(),
+            SystemRole::TenantAdmin => "tenant_admin".to_string()
+        }
+    }
+
+    /// Parse from string
+    fn from_string(s: &str) -> Option<SystemRole> {
+        match s {
+            "anonymous" => Some(SystemRole::Anonymous),
+            "authenticated" => Some(SystemRole::Authenticated),
+            "student" => Some(SystemRole::Student),
+            "teaching_assistant" => Some(SystemRole::TeachingAssistant),
+            "teacher" => Some(SystemRole::Teacher),
+            "course_coordinator" => Some(SystemRole::CourseCoordinator),
+            "content_designer" => Some(SystemRole::ContentDesigner),
+            "administrator" => Some(SystemRole::Administrator),
+            "tenant_admin" => Some(SystemRole::TenantAdmin),
+            _ => None
+        }
+    }
+}
+
+// =============================================================================
+// Role Definition
+// =============================================================================
+
+/// User role with hierarchical support
+type Role {
+    id: RoleId,
+    machine_name: String,
+    label: String,
+    description: Option<String>,
+    /// Inherits permissions from these roles
+    parent_roles: Set<RoleId>,
+    /// Base system role this custom role is derived from
+    base_system_role: Option<SystemRole>,
+    /// Sort order in UI
+    weight: i32,
+    /// System roles cannot be deleted
+    is_system: Bool,
+    /// Has all permissions (bypasses checks)
+    is_admin: Bool,
+    /// Tenant this role belongs to (None = global)
+    tenant_id: Option<TenantId>,
+    /// Visual customization
+    color: Option<String>,
+    icon: Option<String>,
+    /// Metadata
+    created_at: DateTime,
+    updated_at: DateTime,
+    metadata: Map<String, Dynamic>
+}
+
+type RoleUpdate {
+    label: Option<String>,
+    description: Option<String>,
+    parent_roles: Option<Set<RoleId>>,
+    weight: Option<i32>,
+    color: Option<String>,
+    icon: Option<String>
+}
+
+// =============================================================================
+// Permission Provider API
+// =============================================================================
+
+/// Permission provider interface - modules implement this to register permissions
+trait PermissionProvider {
+    /// Returns the module's machine name
+    fn module_name(&self) -> String
+
+    /// Returns all static permissions provided by this module
+    fn get_permissions(&self) -> List<PermissionDefinition>
+
+    /// Returns dynamic permissions (e.g., per-course, per-entity-type)
+    fn get_dynamic_permissions(&self, context: &PermissionContext) -> List<PermissionDefinition>
+
+    /// Validates if a permission is still valid
+    fn validate_permission(&self, permission_id: &PermissionId) -> Bool
+}
+
+/// Context for generating dynamic permissions
+type PermissionContext {
+    courses: List<CourseInfo>,
+    assessment_types: List<AssessmentTypeInfo>,
+    content_types: List<ContentTypeInfo>,
+    tenant_id: Option<TenantId>
+}
+
+type CourseInfo {
+    id: CourseId,
+    title: String,
+    code: String
+}
+
+type AssessmentTypeInfo {
+    id: String,
+    label: String,
+    machine_name: String
+}
+
+type ContentTypeInfo {
+    id: String,
+    label: String,
+    machine_name: String
+}
+
+// =============================================================================
+// Permission Definition
+// =============================================================================
+
+/// Full permission definition with LMS-specific metadata
+type PermissionDefinition {
+    id: PermissionId,
+    machine_name: String,
+    title: String,
+    description: String,
+    /// Module that provides this permission
+    provider: String,
+    provider_type: ProviderType,
+    /// Primary category
+    category: PermissionCategory,
+    /// Sub-category for grouping
+    subcategory: Option<String>,
+    /// Sort order within category
+    weight: i32,
+    /// Permissions required for this one
+    requires: Set<PermissionId>,
+    /// Permissions this one grants automatically
+    implies: Set<PermissionId>,
+    /// Mutually exclusive permissions
+    conflicts_with: Set<PermissionId>,
+    /// Warning in UI about security implications
+    restrict_access: Bool,
+    warning_message: Option<String>,
+    /// Risk level
+    risk_level: PermissionRiskLevel,
+    security_implications: Option<String>,
+    /// Dynamic permission support
+    is_dynamic: Bool,
+    /// Pattern like "grade_{course_id}_assessments"
+    dynamic_pattern: Option<String>,
+    /// Bound to specific course
+    course_binding: Option<CourseId>,
+    /// Bound to specific entity type
+    entity_type_binding: Option<String>,
+    /// Admin UI
+    icon: Option<String>,
+    help_url: Option<String>,
+    /// Timestamps
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+enum ProviderType {
+    Core,
+    Module,
+    Course,
+    Assessment,
+    Custom
+}
+
+enum PermissionCategory {
+    Courses,
+    Enrollments,
+    Assessments,
+    Grading,
+    Content,
+    Media,
+    Users,
+    AI,
+    Analytics,
+    System,
+    Tenant
+}
+
+impl PermissionCategory {
+    fn to_string(&self) -> String {
+        match self {
+            PermissionCategory::Courses => "courses".to_string(),
+            PermissionCategory::Enrollments => "enrollments".to_string(),
+            PermissionCategory::Assessments => "assessments".to_string(),
+            PermissionCategory::Grading => "grading".to_string(),
+            PermissionCategory::Content => "content".to_string(),
+            PermissionCategory::Media => "media".to_string(),
+            PermissionCategory::Users => "users".to_string(),
+            PermissionCategory::AI => "ai".to_string(),
+            PermissionCategory::Analytics => "analytics".to_string(),
+            PermissionCategory::System => "system".to_string(),
+            PermissionCategory::Tenant => "tenant".to_string()
+        }
+    }
+}
+
+enum PermissionRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+// =============================================================================
+// Permission Assignments
+// =============================================================================
+
+/// Role-permission assignment with conditions
+type RolePermissionAssignment {
+    role_id: RoleId,
+    permission_id: PermissionId,
+    granted: Bool,
+    granted_by: Option<UserId>,
+    granted_at: Option<DateTime>,
+    /// If inherited from parent role
+    inherited_from: Option<RoleId>,
+    /// Time-limited permission
+    expires_at: Option<DateTime>,
+    /// Conditions that must be met
+    conditions: List<PermissionCondition>
+}
+
+/// Conditional permission
+type PermissionCondition {
+    condition_type: PermissionConditionType,
+    operator: ConditionOperator,
+    value: Dynamic,
+    active: Bool
+}
+
+enum PermissionConditionType {
+    /// Only valid during specific time window
+    TimeWindow { start: DateTime, end: DateTime },
+    /// Only from specific IPs
+    IpRestriction { allowed_ips: List<String> },
+    /// Only for content user owns
+    ContentOwnership,
+    /// Only for specific content statuses
+    ContentStatus { statuses: Set<String> },
+    /// Only in specific workflow states
+    WorkflowState { states: Set<String> },
+    /// Only for specific course
+    CourseScope { course_id: CourseId },
+    /// Only for enrolled courses
+    EnrolledCourses,
+    /// Custom callback
+    CustomCallback { callback: String }
+}
+
+enum ConditionOperator {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    LessThan,
+    GreaterOrEqual,
+    LessOrEqual,
+    Contains,
+    NotContains,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull
+}
+
+// =============================================================================
+// Access Policy
+// =============================================================================
+
+/// Access policy - defines what roles can do
+type AccessPolicy {
+    id: PolicyId,
+    name: String,
+    description: Option<String>,
+    /// Roles this policy applies to
+    roles: Set<RoleId>,
+    /// Permissions granted by this policy
+    permissions: Set<PermissionId>,
+    /// Fine-grained rules
+    rules: List<AccessRule>,
+    /// Is policy active
+    enabled: Bool,
+    /// Higher priority overrides lower
+    priority: i32,
+    /// Tenant scope (None = global)
+    tenant_id: Option<TenantId>,
+    /// Audit info
+    created_by: UserId,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Fine-grained access rule
+type AccessRule {
+    id: AccessRuleId,
+    name: String,
+    /// What this rule applies to
+    resource_type: LmsResourceType,
+    resource_filter: Option<ResourceFilter>,
+    /// Allowed actions
+    allowed_actions: Set<LmsAction>,
+    /// Explicitly denied actions
+    denied_actions: Set<LmsAction>,
+    /// Conditions that must be met
+    conditions: List<AccessCondition>,
+    /// Field-level permissions
+    field_permissions: Map<String, FieldAccess>,
+    /// Effect when matched
+    effect: RuleEffect
+}
+
+/// LMS-specific resource types
+enum LmsResourceType {
+    Course { course_id: Option<CourseId> },
+    Module { course_id: Option<CourseId>, module_id: Option<ModuleId> },
+    Lesson { course_id: Option<CourseId>, lesson_id: Option<LessonId> },
+    Assessment { course_id: Option<CourseId>, assessment_id: Option<AssessmentId> },
+    Submission { course_id: Option<CourseId>, submission_id: Option<SubmissionId> },
+    Grade { course_id: Option<CourseId>, grade_id: Option<GradeId> },
+    Enrollment { course_id: Option<CourseId>, enrollment_id: Option<EnrollmentId> },
+    User { user_id: Option<UserId> },
+    Content { content_type: Option<String> },
+    Media { media_type: Option<String> },
+    Analytics { scope: Option<String> },
+    AIFeature { feature_id: Option<String> },
+    TenantSettings,
+    SystemSettings,
+    Any
+}
+
+/// LMS-specific actions
+enum LmsAction {
+    // Course actions
+    ViewCourse,
+    CreateCourse,
+    EditCourse,
+    DeleteCourse,
+    PublishCourse,
+    ArchiveCourse,
+    CloneCourse,
+
+    // Enrollment actions
+    ViewEnrollments,
+    EnrollStudent,
+    UnenrollStudent,
+    ApproveEnrollment,
+    BulkEnroll,
+
+    // Content actions
+    ViewContent,
+    CreateContent,
+    EditContent,
+    DeleteContent,
+    PublishContent,
+    ReorderContent,
+
+    // Assessment actions
+    ViewAssessment,
+    CreateAssessment,
+    EditAssessment,
+    DeleteAssessment,
+    TakeAssessment,
+    RetakeAssessment,
+    ViewQuestions,
+    ManageQuestionBank,
+
+    // Grading actions
+    ViewGrades,
+    ViewOwnGrades,
+    GradeSubmissions,
+    EditGrades,
+    ExportGrades,
+    ImportGrades,
+    OverrideGrade,
+    ViewGradingRubric,
+    ManageRubrics,
+
+    // Student data actions
+    ViewStudentProgress,
+    ViewStudentAnalytics,
+    ViewSubmissions,
+    DownloadSubmissions,
+
+    // AI feature actions
+    UseAITutor,
+    UseAIGrading,
+    UseAIContentGen,
+    UseAIAnalytics,
+    ConfigureAI,
+
+    // Analytics actions
+    ViewCourseAnalytics,
+    ViewStudentAnalytics,
+    ViewSystemAnalytics,
+    ExportAnalytics,
+
+    // Admin actions
+    ManageUsers,
+    ManageRoles,
+    ConfigureSystem,
+    ViewAuditLog,
+    ManageTenant,
+
+    // Generic
+    View,
+    Create,
+    Edit,
+    Delete,
+    Administer
+}
+
+/// Resource filter for selecting specific resources
+type ResourceFilter {
+    /// Filter by course
+    course_id: Option<CourseId>,
+    /// Filter by owner
+    owner_filter: Option<OwnerFilter>,
+    /// Filter by status
+    status_filter: Option<Set<String>>,
+    /// Custom query filters
+    query_filters: Map<String, Dynamic>,
+    /// Custom filter callback
+    custom_filter: Option<String>
+}
+
+enum OwnerFilter {
+    /// Current user is owner
+    Self_,
+    /// Owner has specific role
+    Role { role_id: RoleId },
+    /// Specific user
+    User { user_id: UserId },
+    /// Same course enrollment
+    SameCourse,
+    /// Same section
+    SameSection { section_id: SectionId }
+}
+
+/// Access conditions
+enum AccessCondition {
+    // Time-based
+    TimeRange { start: Option<DateTime>, end: Option<DateTime> },
+    DayOfWeek { days: Set<i32> },
+
+    // Authentication
+    Authenticated,
+    MfaVerified,
+    SessionAge { max_age: Duration },
+
+    // Location-based
+    IpRange { ranges: List<String> },
+
+    // Ownership
+    IsOwner,
+    IsInstructor,
+    IsEnrolled,
+    IsTAForCourse,
+
+    // Course-scoped
+    CourseStatus { statuses: Set<CourseStatus> },
+    EnrollmentStatus { statuses: Set<EnrollmentStatus> },
+    AssessmentWindow { assessment_id: AssessmentId },
+
+    // Content-based
+    FieldValue { field: String, operator: ConditionOperator, value: Dynamic },
+
+    // Custom
+    CustomCallback { callback: String, args: Map<String, Dynamic> }
+}
+
+/// Field-level access control
+type FieldAccess {
+    can_view: Bool,
+    can_edit: Bool,
+    /// Show masked value (e.g., *****)
+    mask_value: Bool,
+    mask_pattern: Option<String>,
+    /// Value to show when access denied
+    default_on_deny: Option<Dynamic>,
+    /// Conditions for this field access
+    conditions: List<AccessCondition>
+}
+
+/// Rule effect
+enum RuleEffect {
+    Allow,
+    Deny,
+    /// Allow but log for audit
+    AllowWithAudit,
+    /// Deny with custom message
+    DenyWithMessage { message: String }
+}
+
+// =============================================================================
+// Access Context & Results
+// =============================================================================
+
+/// Context for access checking
+type SecurityContext {
+    user_id: UserId,
+    tenant_id: TenantId,
+    session_id: Option<SessionId>,
+    roles: Set<RoleId>,
+    /// Course-specific roles (course_id -> role)
+    course_roles: Map<CourseId, CourseRole>,
+    /// Current course context
+    current_course: Option<CourseId>,
+    /// IP address
+    ip_address: Option<String>,
+    /// Authentication info
+    authenticated: Bool,
+    mfa_verified: Bool,
+    session_start: Option<DateTime>,
+    /// Additional context
+    metadata: Map<String, Dynamic>
+}
+
+/// Result of access check
+enum AccessResult {
+    Allowed { reason: String },
+    Denied { reason: String },
+    /// Need more info to determine
+    Indeterminate { missing: List<String> }
+}
+
+impl AccessResult {
+    fn is_allowed(&self) -> Bool {
+        match self {
+            AccessResult::Allowed { .. } => true,
+            _ => false
+        }
+    }
+
+    fn is_denied(&self) -> Bool {
+        match self {
+            AccessResult::Denied { .. } => true,
+            _ => false
+        }
+    }
+}
+
+/// Effective permissions for a user
+type EffectivePermissions {
+    user_id: UserId,
+    /// Global permissions
+    global_permissions: Set<PermissionId>,
+    /// Course-scoped permissions (course_id -> permissions)
+    course_permissions: Map<CourseId, Set<PermissionId>>,
+    /// Field-level access by entity type
+    field_access: Map<String, Map<String, FieldAccess>>,
+    /// Computed at
+    computed_at: DateTime
+}
+
+// =============================================================================
+// Audit Types
+// =============================================================================
+
+type AuditEntry {
+    id: String,
+    user_id: UserId,
+    tenant_id: TenantId,
+    action: LmsAction,
+    resource_type: LmsResourceType,
+    resource_id: Option<String>,
+    result: String,
+    reason: Option<String>,
+    ip_address: Option<String>,
+    user_agent: Option<String>,
+    timestamp: DateTime,
+    details: Map<String, Dynamic>
+}
+
+// =============================================================================
+// Security Error Types
+// =============================================================================
+
+enum SecurityError {
+    AccessDenied { reason: String },
+    RoleNotFound { id: RoleId },
+    RoleExists { name: String },
+    PermissionNotFound { id: PermissionId },
+    PolicyNotFound { id: PolicyId },
+    CannotModifySystemRole { id: RoleId },
+    CannotDeleteSystemRole { id: RoleId },
+    MissingRequiredPermission { permission: PermissionId, required: PermissionId },
+    ConflictingPermission { permission: PermissionId, conflicts_with: PermissionId },
+    InvalidCourseScope { course_id: CourseId },
+    TenantMismatch { expected: TenantId, actual: TenantId },
+    SessionExpired,
+    MfaRequired,
+    Internal { message: String }
+}
+
+impl SecurityError {
+    fn to_string(&self) -> String {
+        match self {
+            SecurityError::AccessDenied { reason } => format!("Access denied: {}", reason),
+            SecurityError::RoleNotFound { id } => format!("Role not found: {}", id),
+            SecurityError::RoleExists { name } => format!("Role already exists: {}", name),
+            SecurityError::PermissionNotFound { id } => format!("Permission not found: {}", id),
+            SecurityError::PolicyNotFound { id } => format!("Policy not found: {}", id),
+            SecurityError::CannotModifySystemRole { id } => format!("Cannot modify system role: {}", id),
+            SecurityError::CannotDeleteSystemRole { id } => format!("Cannot delete system role: {}", id),
+            SecurityError::MissingRequiredPermission { permission, required } =>
+                format!("Permission {} requires {}", permission, required),
+            SecurityError::ConflictingPermission { permission, conflicts_with } =>
+                format!("Permission {} conflicts with {}", permission, conflicts_with),
+            SecurityError::InvalidCourseScope { course_id } =>
+                format!("Invalid course scope: {}", course_id),
+            SecurityError::TenantMismatch { expected, actual } =>
+                format!("Tenant mismatch: expected {}, got {}", expected, actual),
+            SecurityError::SessionExpired => "Session expired".to_string(),
+            SecurityError::MfaRequired => "MFA verification required".to_string(),
+            SecurityError::Internal { message } => format!("Internal error: {}", message)
+        }
+    }
+}
+
+// =============================================================================
+// Permission Matrix Types (for admin UI)
+// =============================================================================
+
+type PermissionMatrix {
+    roles: List<RoleMatrixInfo>,
+    categories: List<PermissionCategoryMatrix>,
+    assignments: Map<RoleId, Map<PermissionId, PermissionAssignmentState>>,
+    generated_at: DateTime
+}
+
+type RoleMatrixInfo {
+    id: RoleId,
+    machine_name: String,
+    label: String,
+    description: Option<String>,
+    weight: i32,
+    is_system: Bool,
+    is_admin: Bool,
+    parent_roles: Set<RoleId>,
+    user_count: i64,
+    color: Option<String>
+}
+
+type PermissionCategoryMatrix {
+    id: String,
+    label: String,
+    description: String,
+    weight: i32,
+    permissions: List<PermissionMatrixInfo>
+}
+
+type PermissionMatrixInfo {
+    id: PermissionId,
+    machine_name: String,
+    title: String,
+    description: String,
+    provider: String,
+    risk_level: PermissionRiskLevel,
+    restrict_access: Bool,
+    warning_message: Option<String>,
+    requires: Set<PermissionId>,
+    implies: Set<PermissionId>,
+    is_dynamic: Bool,
+    course_scoped: Bool
+}
+
+enum PermissionAssignmentState {
+    /// Not assigned
+    NotSet,
+    /// Directly granted
+    Granted { by: Option<UserId>, at: Option<DateTime>, expires: Option<DateTime> },
+    /// Admin role has all permissions
+    GrantedAdmin,
+    /// Inherited from parent role
+    Inherited { from_role: RoleId },
+    /// Explicitly denied
+    Denied
+}
+
+type RolePermissionUpdateResult {
+    role_id: RoleId,
+    granted: i32,
+    revoked: i32,
+    errors: List<String>
+}
+
+type ProviderInfo {
+    module_name: String,
+    permission_count: i32,
+    has_dynamic_permissions: Bool
+}
+
+// =============================================================================
+// Security Manager Actor
+// =============================================================================
+
+/// Main security manager handling all access control for the LMS
+actor SecurityManager {
+    // Role management
+    var roles: Map<RoleId, Role> = {}
+    var user_roles: Map<UserId, Set<RoleId>> = {}
+    var course_user_roles: Map<CourseId, Map<UserId, CourseRole>> = {}
+
+    // Permission management
+    var permissions: Map<PermissionId, PermissionDefinition> = {}
+    var role_permissions: Map<RoleId, Set<RolePermissionAssignment>> = {}
+    var role_permissions_cache: Map<RoleId, Set<PermissionId>> = {}
+
+    // Policy management
+    var policies: Map<PolicyId, AccessPolicy> = {}
+
+    // Permission Provider System
+    var permission_providers: Map<String, Box<dyn PermissionProvider>> = {}
+    var permission_context: PermissionContext = PermissionContext::default()
+    var permission_matrix_cache: Option<PermissionMatrix> = None
+
+    // Tenant context
+    var tenant_id: TenantId
+
+    // Audit log
+    var audit_log: List<AuditEntry> = []
+    var audit_enabled: Bool = true
+
+    // Security callbacks for custom access control
+    var security_callbacks: Map<String, fn(&SecurityContext, &LmsResourceType, &Map<String, Dynamic>) -> Result<Bool, String>> = {}
+
+    fn new(tenant_id: TenantId) -> Self {
+        let mut manager = SecurityManager {
+            tenant_id,
+            ..Default::default()
+        }
+        manager.initialize_system_roles()
+        manager.register_core_permissions()
+        manager
+    }
+
+    fn initialize_system_roles(&mut self) {
+        let now = DateTime::now()
+
+        // Create all system roles
+        let system_roles = [
+            (SystemRole::Anonymous, "Anonymous User", None, false, "#9E9E9E"),
+            (SystemRole::Authenticated, "Authenticated User", Some(SystemRole::Anonymous), false, "#2196F3"),
+            (SystemRole::Student, "Student", Some(SystemRole::Authenticated), false, "#4CAF50"),
+            (SystemRole::TeachingAssistant, "Teaching Assistant", Some(SystemRole::Student), false, "#8BC34A"),
+            (SystemRole::Teacher, "Teacher/Instructor", Some(SystemRole::TeachingAssistant), false, "#FF9800"),
+            (SystemRole::CourseCoordinator, "Course Coordinator", Some(SystemRole::Teacher), false, "#FF5722"),
+            (SystemRole::ContentDesigner, "Content Designer", Some(SystemRole::Authenticated), false, "#9C27B0"),
+            (SystemRole::Administrator, "Administrator", None, true, "#F44336"),
+            (SystemRole::TenantAdmin, "Tenant Administrator", None, true, "#E91E63")
+        ]
+
+        for (role, label, parent, is_admin, color) in system_roles {
+            let parent_roles = parent.map(|p| Set::from([RoleId(p.to_string())]))
+                .unwrap_or_default();
+
+            let r = Role {
+                id: RoleId(role.to_string()),
+                machine_name: role.to_string(),
+                label: label.to_string(),
+                description: None,
+                parent_roles,
+                base_system_role: Some(role.clone()),
+                weight: role.weight(),
+                is_system: true,
+                is_admin,
+                tenant_id: Some(self.tenant_id.clone()),
+                color: Some(color.to_string()),
+                icon: None,
+                created_at: now,
+                updated_at: now,
+                metadata: Map::new()
+            }
+            self.roles.insert(r.id.clone(), r)
+        }
+    }
+
+    fn register_core_permissions(&mut self) {
+        let now = DateTime::now()
+
+        // Course permissions
+        let course_perms = [
+            ("courses.view", "View courses", PermissionCategory::Courses, PermissionRiskLevel::Low),
+            ("courses.view_unpublished", "View unpublished courses", PermissionCategory::Courses, PermissionRiskLevel::Medium),
+            ("courses.create", "Create courses", PermissionCategory::Courses, PermissionRiskLevel::Medium),
+            ("courses.edit_own", "Edit own courses", PermissionCategory::Courses, PermissionRiskLevel::Medium),
+            ("courses.edit_any", "Edit any course", PermissionCategory::Courses, PermissionRiskLevel::High),
+            ("courses.delete_own", "Delete own courses", PermissionCategory::Courses, PermissionRiskLevel::High),
+            ("courses.delete_any", "Delete any course", PermissionCategory::Courses, PermissionRiskLevel::Critical),
+            ("courses.publish", "Publish courses", PermissionCategory::Courses, PermissionRiskLevel::Medium),
+            ("courses.archive", "Archive courses", PermissionCategory::Courses, PermissionRiskLevel::Medium),
+            ("courses.clone", "Clone courses", PermissionCategory::Courses, PermissionRiskLevel::Medium),
+        ];
+
+        // Enrollment permissions
+        let enrollment_perms = [
+            ("enrollments.view", "View enrollments", PermissionCategory::Enrollments, PermissionRiskLevel::Low),
+            ("enrollments.view_own", "View own enrollments", PermissionCategory::Enrollments, PermissionRiskLevel::Low),
+            ("enrollments.self_enroll", "Self-enroll in courses", PermissionCategory::Enrollments, PermissionRiskLevel::Low),
+            ("enrollments.enroll_students", "Enroll students", PermissionCategory::Enrollments, PermissionRiskLevel::Medium),
+            ("enrollments.unenroll_students", "Unenroll students", PermissionCategory::Enrollments, PermissionRiskLevel::Medium),
+            ("enrollments.approve", "Approve enrollment requests", PermissionCategory::Enrollments, PermissionRiskLevel::Medium),
+            ("enrollments.bulk_manage", "Bulk enrollment management", PermissionCategory::Enrollments, PermissionRiskLevel::High),
+        ];
+
+        // Assessment permissions
+        let assessment_perms = [
+            ("assessments.view", "View assessments", PermissionCategory::Assessments, PermissionRiskLevel::Low),
+            ("assessments.create", "Create assessments", PermissionCategory::Assessments, PermissionRiskLevel::Medium),
+            ("assessments.edit", "Edit assessments", PermissionCategory::Assessments, PermissionRiskLevel::Medium),
+            ("assessments.delete", "Delete assessments", PermissionCategory::Assessments, PermissionRiskLevel::High),
+            ("assessments.take", "Take assessments", PermissionCategory::Assessments, PermissionRiskLevel::Low),
+            ("assessments.retake", "Retake assessments", PermissionCategory::Assessments, PermissionRiskLevel::Low),
+            ("assessments.view_questions", "View assessment questions", PermissionCategory::Assessments, PermissionRiskLevel::Medium),
+            ("assessments.manage_question_bank", "Manage question banks", PermissionCategory::Assessments, PermissionRiskLevel::Medium),
+            ("assessments.configure_proctoring", "Configure proctoring", PermissionCategory::Assessments, PermissionRiskLevel::High),
+        ];
+
+        // Grading permissions
+        let grading_perms = [
+            ("grading.view_own", "View own grades", PermissionCategory::Grading, PermissionRiskLevel::Low),
+            ("grading.view_all", "View all grades", PermissionCategory::Grading, PermissionRiskLevel::Medium),
+            ("grading.grade_submissions", "Grade submissions", PermissionCategory::Grading, PermissionRiskLevel::Medium),
+            ("grading.edit_grades", "Edit grades", PermissionCategory::Grading, PermissionRiskLevel::High),
+            ("grading.override", "Override grades", PermissionCategory::Grading, PermissionRiskLevel::High),
+            ("grading.export", "Export grades", PermissionCategory::Grading, PermissionRiskLevel::Medium),
+            ("grading.import", "Import grades", PermissionCategory::Grading, PermissionRiskLevel::High),
+            ("grading.manage_rubrics", "Manage rubrics", PermissionCategory::Grading, PermissionRiskLevel::Medium),
+            ("grading.view_submissions", "View student submissions", PermissionCategory::Grading, PermissionRiskLevel::Medium),
+            ("grading.download_submissions", "Download submissions", PermissionCategory::Grading, PermissionRiskLevel::Medium),
+        ];
+
+        // AI feature permissions
+        let ai_perms = [
+            ("ai.use_tutor", "Use AI tutor", PermissionCategory::AI, PermissionRiskLevel::Low),
+            ("ai.use_grading", "Use AI grading assistance", PermissionCategory::AI, PermissionRiskLevel::Medium),
+            ("ai.use_content_gen", "Use AI content generation", PermissionCategory::AI, PermissionRiskLevel::Medium),
+            ("ai.use_analytics", "Use AI analytics", PermissionCategory::AI, PermissionRiskLevel::Medium),
+            ("ai.configure", "Configure AI features", PermissionCategory::AI, PermissionRiskLevel::High),
+            ("ai.view_interactions", "View AI interaction logs", PermissionCategory::AI, PermissionRiskLevel::Medium),
+        ];
+
+        // Admin permissions
+        let admin_perms = [
+            ("admin.manage_users", "Manage users", PermissionCategory::Users, PermissionRiskLevel::High),
+            ("admin.manage_roles", "Manage roles", PermissionCategory::System, PermissionRiskLevel::Critical),
+            ("admin.view_audit_log", "View audit log", PermissionCategory::System, PermissionRiskLevel::Medium),
+            ("admin.configure_system", "Configure system settings", PermissionCategory::System, PermissionRiskLevel::Critical),
+            ("admin.manage_tenant", "Manage tenant settings", PermissionCategory::Tenant, PermissionRiskLevel::Critical),
+            ("admin.manage_integrations", "Manage integrations", PermissionCategory::System, PermissionRiskLevel::High),
+        ];
+
+        // Register all permissions
+        for (id, title, category, risk) in course_perms.iter()
+            .chain(enrollment_perms.iter())
+            .chain(assessment_perms.iter())
+            .chain(grading_perms.iter())
+            .chain(ai_perms.iter())
+            .chain(admin_perms.iter())
+        {
+            let perm = PermissionDefinition {
+                id: PermissionId(id.to_string()),
+                machine_name: id.to_string(),
+                title: title.to_string(),
+                description: title.to_string(),
+                provider: "core".to_string(),
+                provider_type: ProviderType::Core,
+                category: category.clone(),
+                subcategory: None,
+                weight: 0,
+                requires: Set::new(),
+                implies: Set::new(),
+                conflicts_with: Set::new(),
+                restrict_access: *risk == PermissionRiskLevel::Critical,
+                warning_message: if *risk == PermissionRiskLevel::Critical {
+                    Some("This permission grants significant system access".to_string())
+                } else { None },
+                risk_level: risk.clone(),
+                security_implications: None,
+                is_dynamic: false,
+                dynamic_pattern: None,
+                course_binding: None,
+                entity_type_binding: None,
+                icon: None,
+                help_url: None,
+                created_at: now,
+                updated_at: now
+            };
+            self.permissions.insert(perm.id.clone(), perm);
+        }
+
+        // Set up default role permissions
+        self.setup_default_role_permissions();
+    }
+
+    fn setup_default_role_permissions(&mut self) {
+        // Anonymous - view public courses only
+        self.assign_default_permissions(&RoleId("anonymous".to_string()), vec![
+            "courses.view"
+        ]);
+
+        // Authenticated - basic access
+        self.assign_default_permissions(&RoleId("authenticated".to_string()), vec![
+            "courses.view",
+            "enrollments.view_own",
+            "enrollments.self_enroll"
+        ]);
+
+        // Student - enrolled course access
+        self.assign_default_permissions(&RoleId("student".to_string()), vec![
+            "courses.view",
+            "enrollments.view_own",
+            "assessments.view",
+            "assessments.take",
+            "grading.view_own",
+            "ai.use_tutor"
+        ]);
+
+        // Teaching Assistant - grading and student view
+        self.assign_default_permissions(&RoleId("teaching_assistant".to_string()), vec![
+            "courses.view",
+            "courses.view_unpublished",
+            "enrollments.view",
+            "assessments.view",
+            "assessments.view_questions",
+            "grading.view_all",
+            "grading.grade_submissions",
+            "grading.view_submissions",
+            "ai.use_grading"
+        ]);
+
+        // Teacher - full course management
+        self.assign_default_permissions(&RoleId("teacher".to_string()), vec![
+            "courses.view",
+            "courses.view_unpublished",
+            "courses.edit_own",
+            "courses.publish",
+            "courses.clone",
+            "enrollments.view",
+            "enrollments.enroll_students",
+            "enrollments.unenroll_students",
+            "enrollments.approve",
+            "assessments.view",
+            "assessments.create",
+            "assessments.edit",
+            "assessments.delete",
+            "assessments.view_questions",
+            "assessments.manage_question_bank",
+            "grading.view_all",
+            "grading.grade_submissions",
+            "grading.edit_grades",
+            "grading.export",
+            "grading.manage_rubrics",
+            "grading.view_submissions",
+            "grading.download_submissions",
+            "ai.use_tutor",
+            "ai.use_grading",
+            "ai.use_content_gen",
+            "ai.use_analytics"
+        ]);
+
+        // Course Coordinator - multi-course management
+        self.assign_default_permissions(&RoleId("course_coordinator".to_string()), vec![
+            "courses.create",
+            "courses.edit_any",
+            "courses.archive",
+            "enrollments.bulk_manage",
+            "grading.override",
+            "grading.import",
+            "assessments.configure_proctoring"
+        ]);
+
+        // Content Designer - content creation
+        self.assign_default_permissions(&RoleId("content_designer".to_string()), vec![
+            "courses.view",
+            "courses.view_unpublished",
+            "courses.create",
+            "courses.edit_own",
+            "courses.clone",
+            "ai.use_content_gen"
+        ]);
+    }
+
+    fn assign_default_permissions(&mut self, role_id: &RoleId, perm_ids: Vec<&str>) {
+        let now = DateTime::now();
+        let assignments: Set<RolePermissionAssignment> = perm_ids.iter().map(|id| {
+            RolePermissionAssignment {
+                role_id: role_id.clone(),
+                permission_id: PermissionId(id.to_string()),
+                granted: true,
+                granted_by: None,
+                granted_at: Some(now),
+                inherited_from: None,
+                expires_at: None,
+                conditions: vec![]
+            }
+        }).collect();
+
+        self.role_permissions.insert(role_id.clone(), assignments);
+    }
+
+    // =========================================================================
+    // Access Checking
+    // =========================================================================
+
+    /// Main access check - can user perform action on resource?
+    receive CheckAccess(
+        context: SecurityContext,
+        action: LmsAction,
+        resource: LmsResourceType
+    ) -> AccessResult {
+        // Verify tenant
+        if context.tenant_id != self.tenant_id {
+            return AccessResult::Denied {
+                reason: "Tenant mismatch".to_string()
+            }
+        }
+
+        // Check if user is admin (bypasses all checks)
+        if self.is_admin(&context.roles) {
+            return AccessResult::Allowed {
+                reason: "Administrator access".to_string()
+            }
+        }
+
+        // Get effective permissions for user
+        let effective = self.get_effective_permissions_internal(&context);
+
+        // Check course-scoped permissions first if resource is course-scoped
+        if let Some(course_id) = self.get_resource_course(&resource) {
+            // Check course-level role
+            if let Some(course_role) = context.course_roles.get(&course_id) {
+                if self.course_role_allows(&course_role, &action, &resource) {
+                    return AccessResult::Allowed {
+                        reason: format!("Course role: {:?}", course_role)
+                    }
+                }
+            }
+
+            // Check course-scoped permissions
+            if let Some(course_perms) = effective.course_permissions.get(&course_id) {
+                if self.permissions_allow(&course_perms, &action, &resource) {
+                    return AccessResult::Allowed {
+                        reason: "Course-scoped permission".to_string()
+                    }
+                }
+            }
+        }
+
+        // Check global permissions
+        if self.permissions_allow(&effective.global_permissions, &action, &resource) {
+            return AccessResult::Allowed {
+                reason: "Global permission".to_string()
+            }
+        }
+
+        // Check policies
+        let applicable_policies = self.find_applicable_policies(&context.roles, &resource);
+        for policy in applicable_policies.iter().sorted_by_key(|p| -p.priority) {
+            for rule in &policy.rules {
+                if self.rule_matches(&rule, &resource, &action) {
+                    if self.evaluate_conditions(&rule.conditions, &context, &resource) {
+                        match &rule.effect {
+                            RuleEffect::Allow => {
+                                return AccessResult::Allowed {
+                                    reason: format!("Policy: {}", policy.name)
+                                }
+                            },
+                            RuleEffect::AllowWithAudit => {
+                                self.log_audit(&context, &action, &resource, "allowed_with_audit");
+                                return AccessResult::Allowed {
+                                    reason: format!("Policy: {} (audited)", policy.name)
+                                }
+                            },
+                            RuleEffect::Deny => {
+                                return AccessResult::Denied {
+                                    reason: format!("Denied by policy: {}", policy.name)
+                                }
+                            },
+                            RuleEffect::DenyWithMessage { message } => {
+                                return AccessResult::Denied {
+                                    reason: message.clone()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default deny
+        AccessResult::Denied {
+            reason: "No permission granted for this action".to_string()
+        }
+    }
+
+    /// Check if user can perform action in a specific course
+    receive CheckCourseAccess(
+        context: SecurityContext,
+        course_id: CourseId,
+        action: LmsAction
+    ) -> AccessResult {
+        let resource = LmsResourceType::Course { course_id: Some(course_id) };
+        send self <- CheckAccess(context, action, resource)
+    }
+
+    /// Check multiple actions at once (for UI rendering)
+    receive CheckMultipleAccess(
+        context: SecurityContext,
+        actions: List<LmsAction>,
+        resource: LmsResourceType
+    ) -> Map<LmsAction, AccessResult> {
+        let mut results = Map::new();
+        for action in actions {
+            let result = send self <- CheckAccess(context.clone(), action.clone(), resource.clone());
+            results.insert(action, result);
+        }
+        results
+    }
+
+    /// Get all effective permissions for a user
+    receive GetEffectivePermissions(context: SecurityContext) -> EffectivePermissions {
+        self.get_effective_permissions_internal(&context)
+    }
+
+    fn get_effective_permissions_internal(&self, context: &SecurityContext) -> EffectivePermissions {
+        let mut global_perms = Set::new();
+        let mut course_perms: Map<CourseId, Set<PermissionId>> = Map::new();
+
+        // Collect permissions from all roles
+        for role_id in &context.roles {
+            let role_perms = self.calculate_role_permissions(role_id);
+            global_perms = global_perms.union(&role_perms).cloned().collect();
+        }
+
+        // Collect course-specific permissions
+        for (course_id, course_role) in &context.course_roles {
+            let role_id = RoleId(format!("{:?}", course_role).to_lowercase());
+            if let Some(assignments) = self.role_permissions.get(&role_id) {
+                let perms: Set<PermissionId> = assignments.iter()
+                    .filter(|a| a.granted && !self.is_permission_expired(a))
+                    .map(|a| a.permission_id.clone())
+                    .collect();
+                course_perms.insert(course_id.clone(), perms);
+            }
+        }
+
+        // Calculate field-level access from policies
+        let field_access = self.calculate_field_access(context);
+
+        EffectivePermissions {
+            user_id: context.user_id.clone(),
+            global_permissions: global_perms,
+            course_permissions: course_perms,
+            field_access,
+            computed_at: DateTime::now()
+        }
+    }
+
+    fn calculate_role_permissions(&self, role_id: &RoleId) -> Set<PermissionId> {
+        // Check cache
+        if let Some(cached) = self.role_permissions_cache.get(role_id) {
+            return cached.clone();
+        }
+
+        let mut permissions = Set::new();
+
+        if let Some(role) = self.roles.get(role_id) {
+            // Get inherited permissions from parent roles
+            for parent_id in &role.parent_roles {
+                let parent_perms = self.calculate_role_permissions(parent_id);
+                permissions = permissions.union(&parent_perms).cloned().collect();
+            }
+
+            // Add direct permissions
+            if let Some(assignments) = self.role_permissions.get(role_id) {
+                for assignment in assignments {
+                    if assignment.granted && !self.is_permission_expired(assignment) {
+                        permissions.insert(assignment.permission_id.clone());
+                    }
+                }
+            }
+        }
+
+        permissions
+    }
+
+    fn is_permission_expired(&self, assignment: &RolePermissionAssignment) -> Bool {
+        if let Some(expires) = &assignment.expires_at {
+            DateTime::now() > *expires
+        } else {
+            false
+        }
+    }
+
+    /// Calculate field-level access permissions for all entity types
+    fn calculate_field_access(&self, context: &SecurityContext) -> Map<String, Map<String, FieldAccess>> {
+        let mut field_access: Map<String, Map<String, FieldAccess>> = Map::new();
+
+        // Define entity types and their fields with default access based on roles
+        let entity_field_configs = self.get_entity_field_configs();
+
+        for (entity_type, fields) in &entity_field_configs {
+            let mut entity_fields: Map<String, FieldAccess> = Map::new();
+
+            for (field_name, base_access) in fields {
+                // Start with the base access for this field
+                let mut final_access = base_access.clone();
+
+                // Apply role-based adjustments
+                for role_id in &context.roles {
+                    if let Some(role) = self.roles.get(role_id) {
+                        // Admins get full access
+                        if role.is_admin {
+                            final_access = FieldAccess {
+                                can_view: true,
+                                can_edit: true,
+                                mask_value: false,
+                                mask_pattern: None,
+                            };
+                            break;
+                        }
+                    }
+                }
+
+                // Apply policy-based field permissions (more specific overrides)
+                let applicable_policies = self.find_applicable_policies(&context.roles, &LmsResourceType::Any);
+                for policy in &applicable_policies {
+                    for rule in &policy.rules {
+                        if let Some(field_perm) = rule.field_permissions.get(field_name) {
+                            // Merge permissions - policy can only restrict, not expand
+                            final_access.can_view = final_access.can_view && field_perm.can_view;
+                            final_access.can_edit = final_access.can_edit && field_perm.can_edit;
+                            // Masking is applied if any rule requires it
+                            if field_perm.mask_value {
+                                final_access.mask_value = true;
+                                final_access.mask_pattern = field_perm.mask_pattern.clone();
+                            }
+                        }
+                    }
+                }
+
+                entity_fields.insert(field_name.clone(), final_access);
+            }
+
+            field_access.insert(entity_type.clone(), entity_fields);
+        }
+
+        field_access
+    }
+
+    /// Get default field configurations for each entity type
+    fn get_entity_field_configs(&self) -> Map<String, Map<String, FieldAccess>> {
+        let mut configs: Map<String, Map<String, FieldAccess>> = Map::new();
+
+        // User entity fields
+        let mut user_fields: Map<String, FieldAccess> = Map::new();
+        user_fields.insert("id".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        user_fields.insert("email".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        user_fields.insert("name".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        user_fields.insert("password_hash".to_string(), FieldAccess { can_view: false, can_edit: false, mask_value: true, mask_pattern: Some("********".to_string()) });
+        user_fields.insert("phone".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        user_fields.insert("ssn".to_string(), FieldAccess { can_view: false, can_edit: false, mask_value: true, mask_pattern: Some("***-**-****".to_string()) });
+        user_fields.insert("roles".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        user_fields.insert("created_at".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        configs.insert("User".to_string(), user_fields);
+
+        // Course entity fields
+        let mut course_fields: Map<String, FieldAccess> = Map::new();
+        course_fields.insert("id".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        course_fields.insert("title".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        course_fields.insert("description".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        course_fields.insert("status".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        course_fields.insert("enrollment_key".to_string(), FieldAccess { can_view: false, can_edit: true, mask_value: true, mask_pattern: Some("****".to_string()) });
+        course_fields.insert("instructor_notes".to_string(), FieldAccess { can_view: false, can_edit: true, mask_value: false, mask_pattern: None });
+        configs.insert("Course".to_string(), course_fields);
+
+        // Grade entity fields
+        let mut grade_fields: Map<String, FieldAccess> = Map::new();
+        grade_fields.insert("id".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        grade_fields.insert("score".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        grade_fields.insert("feedback".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        grade_fields.insert("grader_notes".to_string(), FieldAccess { can_view: false, can_edit: true, mask_value: false, mask_pattern: None });
+        grade_fields.insert("rubric_scores".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        configs.insert("Grade".to_string(), grade_fields);
+
+        // Submission entity fields
+        let mut submission_fields: Map<String, FieldAccess> = Map::new();
+        submission_fields.insert("id".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        submission_fields.insert("content".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        submission_fields.insert("submitted_at".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        submission_fields.insert("plagiarism_score".to_string(), FieldAccess { can_view: false, can_edit: false, mask_value: false, mask_pattern: None });
+        submission_fields.insert("ai_detection_score".to_string(), FieldAccess { can_view: false, can_edit: false, mask_value: false, mask_pattern: None });
+        configs.insert("Submission".to_string(), submission_fields);
+
+        // Assessment entity fields
+        let mut assessment_fields: Map<String, FieldAccess> = Map::new();
+        assessment_fields.insert("id".to_string(), FieldAccess { can_view: true, can_edit: false, mask_value: false, mask_pattern: None });
+        assessment_fields.insert("title".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        assessment_fields.insert("instructions".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        assessment_fields.insert("questions".to_string(), FieldAccess { can_view: true, can_edit: true, mask_value: false, mask_pattern: None });
+        assessment_fields.insert("answer_key".to_string(), FieldAccess { can_view: false, can_edit: true, mask_value: true, mask_pattern: Some("[HIDDEN]".to_string()) });
+        assessment_fields.insert("grading_rubric".to_string(), FieldAccess { can_view: false, can_edit: true, mask_value: false, mask_pattern: None });
+        configs.insert("Assessment".to_string(), assessment_fields);
+
+        configs
+    }
+
+    fn is_admin(&self, roles: &Set<RoleId>) -> Bool {
+        roles.iter().any(|r| {
+            self.roles.get(r).map(|role| role.is_admin).unwrap_or(false)
+        })
+    }
+
+    fn get_resource_course(&self, resource: &LmsResourceType) -> Option<CourseId> {
+        match resource {
+            LmsResourceType::Course { course_id } => course_id.clone(),
+            LmsResourceType::Module { course_id, .. } => course_id.clone(),
+            LmsResourceType::Lesson { course_id, .. } => course_id.clone(),
+            LmsResourceType::Assessment { course_id, .. } => course_id.clone(),
+            LmsResourceType::Submission { course_id, .. } => course_id.clone(),
+            LmsResourceType::Grade { course_id, .. } => course_id.clone(),
+            LmsResourceType::Enrollment { course_id, .. } => course_id.clone(),
+            _ => None
+        }
+    }
+
+    fn course_role_allows(&self, role: &CourseRole, action: &LmsAction, resource: &LmsResourceType) -> Bool {
+        match role {
+            CourseRole::Student => match action {
+                LmsAction::ViewCourse | LmsAction::ViewContent | LmsAction::ViewAssessment |
+                LmsAction::TakeAssessment | LmsAction::ViewOwnGrades | LmsAction::UseAITutor => true,
+                _ => false
+            },
+            CourseRole::TeachingAssistant | CourseRole::Grader => match action {
+                LmsAction::ViewCourse | LmsAction::ViewContent | LmsAction::ViewAssessment |
+                LmsAction::ViewQuestions | LmsAction::ViewGrades | LmsAction::GradeSubmissions |
+                LmsAction::ViewSubmissions | LmsAction::ViewStudentProgress => true,
+                _ => false
+            },
+            CourseRole::Teacher => match action {
+                LmsAction::ViewCourse | LmsAction::EditCourse | LmsAction::PublishCourse |
+                LmsAction::ViewContent | LmsAction::CreateContent | LmsAction::EditContent |
+                LmsAction::DeleteContent | LmsAction::PublishContent | LmsAction::ReorderContent |
+                LmsAction::ViewAssessment | LmsAction::CreateAssessment | LmsAction::EditAssessment |
+                LmsAction::DeleteAssessment | LmsAction::ViewQuestions | LmsAction::ManageQuestionBank |
+                LmsAction::ViewGrades | LmsAction::GradeSubmissions | LmsAction::EditGrades |
+                LmsAction::ExportGrades | LmsAction::ViewGradingRubric | LmsAction::ManageRubrics |
+                LmsAction::ViewSubmissions | LmsAction::DownloadSubmissions |
+                LmsAction::ViewEnrollments | LmsAction::EnrollStudent | LmsAction::UnenrollStudent |
+                LmsAction::ViewStudentProgress | LmsAction::ViewStudentAnalytics |
+                LmsAction::ViewCourseAnalytics | LmsAction::UseAIGrading | LmsAction::UseAIContentGen => true,
+                _ => false
+            },
+            CourseRole::Designer => match action {
+                LmsAction::ViewCourse | LmsAction::EditCourse |
+                LmsAction::ViewContent | LmsAction::CreateContent | LmsAction::EditContent |
+                LmsAction::DeleteContent | LmsAction::ReorderContent |
+                LmsAction::ViewAssessment | LmsAction::CreateAssessment | LmsAction::EditAssessment |
+                LmsAction::ViewQuestions | LmsAction::ManageQuestionBank |
+                LmsAction::ViewGradingRubric | LmsAction::ManageRubrics => true,
+                _ => false
+            },
+            CourseRole::Observer | CourseRole::Auditor => match action {
+                LmsAction::ViewCourse | LmsAction::ViewContent | LmsAction::ViewAssessment => true,
+                _ => false
+            }
+        }
+    }
+
+    fn permissions_allow(&self, permissions: &Set<PermissionId>, action: &LmsAction, resource: &LmsResourceType) -> Bool {
+        let required = self.action_to_permission(action, resource);
+        permissions.contains(&PermissionId(required))
+    }
+
+    fn action_to_permission(&self, action: &LmsAction, resource: &LmsResourceType) -> String {
+        match action {
+            LmsAction::ViewCourse => "courses.view".to_string(),
+            LmsAction::CreateCourse => "courses.create".to_string(),
+            LmsAction::EditCourse => "courses.edit_own".to_string(),
+            LmsAction::DeleteCourse => "courses.delete_own".to_string(),
+            LmsAction::PublishCourse => "courses.publish".to_string(),
+            LmsAction::ArchiveCourse => "courses.archive".to_string(),
+            LmsAction::CloneCourse => "courses.clone".to_string(),
+
+            LmsAction::ViewEnrollments => "enrollments.view".to_string(),
+            LmsAction::EnrollStudent => "enrollments.enroll_students".to_string(),
+            LmsAction::UnenrollStudent => "enrollments.unenroll_students".to_string(),
+            LmsAction::ApproveEnrollment => "enrollments.approve".to_string(),
+            LmsAction::BulkEnroll => "enrollments.bulk_manage".to_string(),
+
+            LmsAction::ViewAssessment => "assessments.view".to_string(),
+            LmsAction::CreateAssessment => "assessments.create".to_string(),
+            LmsAction::EditAssessment => "assessments.edit".to_string(),
+            LmsAction::DeleteAssessment => "assessments.delete".to_string(),
+            LmsAction::TakeAssessment => "assessments.take".to_string(),
+            LmsAction::RetakeAssessment => "assessments.retake".to_string(),
+            LmsAction::ViewQuestions => "assessments.view_questions".to_string(),
+            LmsAction::ManageQuestionBank => "assessments.manage_question_bank".to_string(),
+
+            LmsAction::ViewGrades => "grading.view_all".to_string(),
+            LmsAction::ViewOwnGrades => "grading.view_own".to_string(),
+            LmsAction::GradeSubmissions => "grading.grade_submissions".to_string(),
+            LmsAction::EditGrades => "grading.edit_grades".to_string(),
+            LmsAction::OverrideGrade => "grading.override".to_string(),
+            LmsAction::ExportGrades => "grading.export".to_string(),
+            LmsAction::ImportGrades => "grading.import".to_string(),
+            LmsAction::ViewGradingRubric => "grading.manage_rubrics".to_string(),
+            LmsAction::ManageRubrics => "grading.manage_rubrics".to_string(),
+            LmsAction::ViewSubmissions => "grading.view_submissions".to_string(),
+            LmsAction::DownloadSubmissions => "grading.download_submissions".to_string(),
+
+            LmsAction::UseAITutor => "ai.use_tutor".to_string(),
+            LmsAction::UseAIGrading => "ai.use_grading".to_string(),
+            LmsAction::UseAIContentGen => "ai.use_content_gen".to_string(),
+            LmsAction::UseAIAnalytics => "ai.use_analytics".to_string(),
+            LmsAction::ConfigureAI => "ai.configure".to_string(),
+
+            LmsAction::ManageUsers => "admin.manage_users".to_string(),
+            LmsAction::ManageRoles => "admin.manage_roles".to_string(),
+            LmsAction::ConfigureSystem => "admin.configure_system".to_string(),
+            LmsAction::ViewAuditLog => "admin.view_audit_log".to_string(),
+            LmsAction::ManageTenant => "admin.manage_tenant".to_string(),
+
+            _ => "".to_string()
+        }
+    }
+
+    fn find_applicable_policies(&self, roles: &Set<RoleId>, resource: &LmsResourceType) -> List<AccessPolicy> {
+        self.policies.values()
+            .filter(|p| p.enabled)
+            .filter(|p| !p.roles.is_disjoint(roles))
+            .filter(|p| p.tenant_id.as_ref() == Some(&self.tenant_id) || p.tenant_id.is_none())
+            .cloned()
+            .collect()
+    }
+
+    fn rule_matches(&self, rule: &AccessRule, resource: &LmsResourceType, action: &LmsAction) -> Bool {
+        // Check resource type match
+        let type_matches = match (&rule.resource_type, resource) {
+            (LmsResourceType::Any, _) => true,
+            (LmsResourceType::Course { course_id: None }, LmsResourceType::Course { .. }) => true,
+            (LmsResourceType::Course { course_id: Some(c1) }, LmsResourceType::Course { course_id: Some(c2) }) => c1 == c2,
+            (LmsResourceType::Assessment { course_id: None, .. }, LmsResourceType::Assessment { .. }) => true,
+            _ => false
+        };
+
+        if !type_matches {
+            return false;
+        }
+
+        // Check action
+        if !rule.allowed_actions.is_empty() && !rule.allowed_actions.contains(action) {
+            return false;
+        }
+        if rule.denied_actions.contains(action) {
+            return false;
+        }
+
+        true
+    }
+
+    fn evaluate_conditions(&self, conditions: &List<AccessCondition>, context: &SecurityContext, resource: &LmsResourceType) -> Bool {
+        for condition in conditions {
+            if !self.evaluate_condition(condition, context, resource) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn evaluate_condition(&self, condition: &AccessCondition, context: &SecurityContext, resource: &LmsResourceType) -> Bool {
+        match condition {
+            AccessCondition::TimeRange { start, end } => {
+                let now = DateTime::now();
+                if let Some(s) = start {
+                    if now < *s { return false; }
+                }
+                if let Some(e) = end {
+                    if now > *e { return false; }
+                }
+                true
+            },
+            AccessCondition::Authenticated => context.authenticated,
+            AccessCondition::MfaVerified => context.mfa_verified,
+            AccessCondition::SessionAge { max_age } => {
+                if let Some(start) = &context.session_start {
+                    DateTime::now().duration_since(*start) <= *max_age
+                } else {
+                    false
+                }
+            },
+            AccessCondition::IsOwner => {
+                // Would check resource ownership
+                true // Simplified
+            },
+            AccessCondition::IsEnrolled => {
+                if let Some(course_id) = self.get_resource_course(resource) {
+                    context.course_roles.contains_key(&course_id)
+                } else {
+                    false
+                }
+            },
+            AccessCondition::IsInstructor => {
+                if let Some(course_id) = self.get_resource_course(resource) {
+                    context.course_roles.get(&course_id)
+                        .map(|r| *r == CourseRole::Teacher)
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            },
+            AccessCondition::IsTAForCourse => {
+                if let Some(course_id) = self.get_resource_course(resource) {
+                    context.course_roles.get(&course_id)
+                        .map(|r| *r == CourseRole::TeachingAssistant || *r == CourseRole::Grader)
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            },
+            _ => true
+        }
+    }
+
+    fn log_audit(&mut self, context: &SecurityContext, action: &LmsAction, resource: &LmsResourceType, result: &str) {
+        if !self.audit_enabled {
+            return;
+        }
+
+        let entry = AuditEntry {
+            id: generate_uuid(),
+            user_id: context.user_id.clone(),
+            tenant_id: context.tenant_id.clone(),
+            action: action.clone(),
+            resource_type: resource.clone(),
+            resource_id: None,
+            result: result.to_string(),
+            reason: None,
+            ip_address: context.ip_address.clone(),
+            user_agent: None,
+            timestamp: DateTime::now(),
+            details: Map::new()
+        };
+
+        self.audit_log.push(entry);
+    }
+
+    // =========================================================================
+    // Field-Level Access Control
+    // =========================================================================
+
+    /// Get field-level access for an entity type
+    receive GetFieldAccess(
+        context: SecurityContext,
+        entity_type: String
+    ) -> Map<String, FieldAccess> {
+        let mut field_access = Map::new();
+
+        // Get from policies
+        let applicable_policies = self.find_applicable_policies(&context.roles, &LmsResourceType::Any);
+
+        for policy in &applicable_policies {
+            for rule in &policy.rules {
+                for (field, access) in &rule.field_permissions {
+                    field_access.entry(field.clone())
+                        .and_modify(|existing: &mut FieldAccess| {
+                            // More restrictive wins
+                            existing.can_view = existing.can_view && access.can_view;
+                            existing.can_edit = existing.can_edit && access.can_edit;
+                        })
+                        .or_insert(access.clone());
+                }
+            }
+        }
+
+        field_access
+    }
+
+    // =========================================================================
+    // Role Management
+    // =========================================================================
+
+    /// Create a new role
+    receive CreateRole(
+        machine_name: String,
+        label: String,
+        description: Option<String>,
+        parent_roles: Set<RoleId>,
+        base_system_role: Option<SystemRole>
+    ) -> Result<Role, SecurityError> {
+        if self.roles.values().any(|r| r.machine_name == machine_name) {
+            return Err(SecurityError::RoleExists { name: machine_name });
+        }
+
+        let now = DateTime::now();
+        let role = Role {
+            id: RoleId(generate_uuid()),
+            machine_name,
+            label,
+            description,
+            parent_roles,
+            base_system_role,
+            weight: 0,
+            is_system: false,
+            is_admin: false,
+            tenant_id: Some(self.tenant_id.clone()),
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            metadata: Map::new()
+        };
+
+        self.roles.insert(role.id.clone(), role.clone());
+        self.invalidate_cache();
+        checkpoint();
+        Ok(role)
+    }
+
+    /// Update a role
+    receive UpdateRole(id: RoleId, updates: RoleUpdate) -> Result<Role, SecurityError> {
+        let role = self.roles.get_mut(&id)
+            .ok_or(SecurityError::RoleNotFound { id: id.clone() })?;
+
+        if role.is_system {
+            return Err(SecurityError::CannotModifySystemRole { id });
+        }
+
+        if let Some(label) = updates.label {
+            role.label = label;
+        }
+        if let Some(description) = updates.description {
+            role.description = Some(description);
+        }
+        if let Some(parents) = updates.parent_roles {
+            role.parent_roles = parents;
+        }
+        if let Some(weight) = updates.weight {
+            role.weight = weight;
+        }
+        if let Some(color) = updates.color {
+            role.color = Some(color);
+        }
+        if let Some(icon) = updates.icon {
+            role.icon = Some(icon);
+        }
+
+        role.updated_at = DateTime::now();
+        self.invalidate_cache();
+        checkpoint();
+        Ok(role.clone())
+    }
+
+    /// Delete a role
+    receive DeleteRole(id: RoleId) -> Result<(), SecurityError> {
+        let role = self.roles.get(&id)
+            .ok_or(SecurityError::RoleNotFound { id: id.clone() })?;
+
+        if role.is_system {
+            return Err(SecurityError::CannotDeleteSystemRole { id });
+        }
+
+        // Remove role from all users
+        for user_roles in self.user_roles.values_mut() {
+            user_roles.remove(&id);
+        }
+
+        // Remove from child roles' parents
+        for other_role in self.roles.values_mut() {
+            other_role.parent_roles.remove(&id);
+        }
+
+        self.roles.remove(&id);
+        self.role_permissions.remove(&id);
+        self.invalidate_cache();
+        checkpoint();
+        Ok(())
+    }
+
+    /// List all roles
+    receive ListRoles() -> List<Role> {
+        self.roles.values()
+            .filter(|r| r.tenant_id.as_ref() == Some(&self.tenant_id) || r.is_system)
+            .cloned()
+            .collect()
+    }
+
+    /// Get a specific role
+    receive GetRole(id: RoleId) -> Option<Role> {
+        self.roles.get(&id).cloned()
+    }
+
+    // =========================================================================
+    // User Role Assignment
+    // =========================================================================
+
+    /// Assign roles to a user
+    receive AssignUserRoles(user_id: UserId, roles: Set<RoleId>) -> Result<(), SecurityError> {
+        // Validate all roles exist
+        for role_id in &roles {
+            if !self.roles.contains_key(role_id) {
+                return Err(SecurityError::RoleNotFound { id: role_id.clone() });
+            }
+        }
+
+        self.user_roles.insert(user_id, roles);
+        checkpoint();
+        Ok(())
+    }
+
+    /// Add a role to user
+    receive AddUserRole(user_id: UserId, role_id: RoleId) -> Result<(), SecurityError> {
+        if !self.roles.contains_key(&role_id) {
+            return Err(SecurityError::RoleNotFound { id: role_id });
+        }
+
+        self.user_roles.entry(user_id)
+            .or_default()
+            .insert(role_id);
+        checkpoint();
+        Ok(())
+    }
+
+    /// Remove a role from user
+    receive RemoveUserRole(user_id: UserId, role_id: RoleId) {
+        if let Some(roles) = self.user_roles.get_mut(&user_id) {
+            roles.remove(&role_id);
+            checkpoint();
+        }
+    }
+
+    /// Get user's roles
+    receive GetUserRoles(user_id: UserId) -> Set<RoleId> {
+        self.user_roles.get(&user_id).cloned().unwrap_or_default()
+    }
+
+    // =========================================================================
+    // Course Role Assignment
+    // =========================================================================
+
+    /// Assign a user's role within a specific course
+    receive AssignCourseRole(course_id: CourseId, user_id: UserId, role: CourseRole) {
+        self.course_user_roles
+            .entry(course_id)
+            .or_default()
+            .insert(user_id, role);
+        checkpoint();
+    }
+
+    /// Remove a user's role in a specific course
+    receive RemoveCourseRole(course_id: CourseId, user_id: UserId) {
+        if let Some(course_roles) = self.course_user_roles.get_mut(&course_id) {
+            course_roles.remove(&user_id);
+            checkpoint();
+        }
+    }
+
+    /// Get user's role in a specific course
+    receive GetCourseRole(course_id: CourseId, user_id: UserId) -> Option<CourseRole> {
+        self.course_user_roles.get(&course_id)
+            .and_then(|roles| roles.get(&user_id).cloned())
+    }
+
+    /// Get all course roles for a user
+    receive GetUserCourseRoles(user_id: UserId) -> Map<CourseId, CourseRole> {
+        let mut result = Map::new();
+        for (course_id, roles) in &self.course_user_roles {
+            if let Some(role) = roles.get(&user_id) {
+                result.insert(course_id.clone(), role.clone());
+            }
+        }
+        result
+    }
+
+    // =========================================================================
+    // Permission Management
+    // =========================================================================
+
+    /// Grant a permission to a role
+    receive GrantPermission(
+        role_id: RoleId,
+        permission_id: PermissionId,
+        granted_by: UserId,
+        expires_at: Option<DateTime>
+    ) -> Result<(), SecurityError> {
+        if !self.roles.contains_key(&role_id) {
+            return Err(SecurityError::RoleNotFound { id: role_id });
+        }
+
+        if !self.permissions.contains_key(&permission_id) {
+            return Err(SecurityError::PermissionNotFound { id: permission_id });
+        }
+
+        let assignment = RolePermissionAssignment {
+            role_id: role_id.clone(),
+            permission_id: permission_id.clone(),
+            granted: true,
+            granted_by: Some(granted_by),
+            granted_at: Some(DateTime::now()),
+            inherited_from: None,
+            expires_at,
+            conditions: vec![]
+        };
+
+        self.role_permissions
+            .entry(role_id)
+            .or_default()
+            .insert(assignment);
+
+        self.invalidate_cache();
+        checkpoint();
+        Ok(())
+    }
+
+    /// Revoke a permission from a role
+    receive RevokePermission(role_id: RoleId, permission_id: PermissionId) -> Result<(), SecurityError> {
+        if let Some(assignments) = self.role_permissions.get_mut(&role_id) {
+            assignments.retain(|a| a.permission_id != permission_id);
+            self.invalidate_cache();
+            checkpoint();
+        }
+        Ok(())
+    }
+
+    /// Get permission matrix for admin UI
+    receive GetPermissionMatrix() -> PermissionMatrix {
+        if let Some(cached) = &self.permission_matrix_cache {
+            return cached.clone();
+        }
+
+        let matrix = self.build_permission_matrix();
+        self.permission_matrix_cache = Some(matrix.clone());
+        matrix
+    }
+
+    fn build_permission_matrix(&self) -> PermissionMatrix {
+        let roles: List<RoleMatrixInfo> = self.roles.values()
+            .filter(|r| r.tenant_id.as_ref() == Some(&self.tenant_id) || r.is_system)
+            .map(|r| {
+                let user_count = self.user_roles.values()
+                    .filter(|roles| roles.contains(&r.id))
+                    .count() as i64;
+
+                RoleMatrixInfo {
+                    id: r.id.clone(),
+                    machine_name: r.machine_name.clone(),
+                    label: r.label.clone(),
+                    description: r.description.clone(),
+                    weight: r.weight,
+                    is_system: r.is_system,
+                    is_admin: r.is_admin,
+                    parent_roles: r.parent_roles.clone(),
+                    user_count,
+                    color: r.color.clone()
+                }
+            })
+            .collect();
+
+        // Group permissions by category
+        let mut categories_map: Map<String, List<PermissionMatrixInfo>> = Map::new();
+
+        for perm in self.permissions.values() {
+            let cat_name = perm.category.to_string();
+            let perm_info = PermissionMatrixInfo {
+                id: perm.id.clone(),
+                machine_name: perm.machine_name.clone(),
+                title: perm.title.clone(),
+                description: perm.description.clone(),
+                provider: perm.provider.clone(),
+                risk_level: perm.risk_level.clone(),
+                restrict_access: perm.restrict_access,
+                warning_message: perm.warning_message.clone(),
+                requires: perm.requires.clone(),
+                implies: perm.implies.clone(),
+                is_dynamic: perm.is_dynamic,
+                course_scoped: perm.course_binding.is_some()
+            };
+
+            categories_map.entry(cat_name)
+                .or_default()
+                .push(perm_info);
+        }
+
+        let categories: List<PermissionCategoryMatrix> = categories_map.into_iter()
+            .map(|(id, perms)| PermissionCategoryMatrix {
+                id: id.clone(),
+                label: id.clone(),
+                description: "".to_string(),
+                weight: 0,
+                permissions: perms
+            })
+            .collect();
+
+        // Build assignments matrix
+        let mut assignments: Map<RoleId, Map<PermissionId, PermissionAssignmentState>> = Map::new();
+
+        for role in &roles {
+            let mut role_assignments: Map<PermissionId, PermissionAssignmentState> = Map::new();
+
+            for cat in &categories {
+                for perm in &cat.permissions {
+                    let state = self.get_permission_state(&role.id, &perm.id);
+                    role_assignments.insert(perm.id.clone(), state);
+                }
+            }
+
+            assignments.insert(role.id.clone(), role_assignments);
+        }
+
+        PermissionMatrix {
+            roles,
+            categories,
+            assignments,
+            generated_at: DateTime::now()
+        }
+    }
+
+    fn get_permission_state(&self, role_id: &RoleId, perm_id: &PermissionId) -> PermissionAssignmentState {
+        // Check if role is admin
+        if let Some(role) = self.roles.get(role_id) {
+            if role.is_admin {
+                return PermissionAssignmentState::GrantedAdmin;
+            }
+        }
+
+        // Check direct assignment
+        if let Some(assignments) = self.role_permissions.get(role_id) {
+            if let Some(assignment) = assignments.iter().find(|a| &a.permission_id == perm_id) {
+                if assignment.granted {
+                    return PermissionAssignmentState::Granted {
+                        by: assignment.granted_by.clone(),
+                        at: assignment.granted_at,
+                        expires: assignment.expires_at.clone()
+                    };
+                } else {
+                    return PermissionAssignmentState::Denied;
+                }
+            }
+        }
+
+        // Check inherited from parent roles
+        if let Some(role) = self.roles.get(role_id) {
+            for parent_id in &role.parent_roles {
+                let parent_state = self.get_permission_state(parent_id, perm_id);
+                match parent_state {
+                    PermissionAssignmentState::Granted { .. } |
+                    PermissionAssignmentState::GrantedAdmin => {
+                        return PermissionAssignmentState::Inherited {
+                            from_role: parent_id.clone()
+                        };
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        PermissionAssignmentState::NotSet
+    }
+
+    fn invalidate_cache(&mut self) {
+        self.role_permissions_cache.clear();
+        self.permission_matrix_cache = None;
+    }
+
+    // =========================================================================
+    // Policy Management
+    // =========================================================================
+
+    /// Create a new access policy
+    receive CreatePolicy(
+        name: String,
+        description: Option<String>,
+        roles: Set<RoleId>,
+        rules: List<AccessRule>,
+        priority: i32,
+        created_by: UserId
+    ) -> Result<AccessPolicy, SecurityError> {
+        let now = DateTime::now();
+        let policy = AccessPolicy {
+            id: PolicyId(generate_uuid()),
+            name,
+            description,
+            roles,
+            permissions: Set::new(),
+            rules,
+            enabled: true,
+            priority,
+            tenant_id: Some(self.tenant_id.clone()),
+            created_by,
+            created_at: now,
+            updated_at: now
+        };
+
+        self.policies.insert(policy.id.clone(), policy.clone());
+        checkpoint();
+        Ok(policy)
+    }
+
+    /// Update a policy
+    receive UpdatePolicy(id: PolicyId, enabled: Option<Bool>, priority: Option<i32>) -> Result<AccessPolicy, SecurityError> {
+        let policy = self.policies.get_mut(&id)
+            .ok_or(SecurityError::PolicyNotFound { id: id.clone() })?;
+
+        if let Some(e) = enabled {
+            policy.enabled = e;
+        }
+        if let Some(p) = priority {
+            policy.priority = p;
+        }
+        policy.updated_at = DateTime::now();
+
+        checkpoint();
+        Ok(policy.clone())
+    }
+
+    /// Delete a policy
+    receive DeletePolicy(id: PolicyId) -> Result<(), SecurityError> {
+        self.policies.remove(&id)
+            .ok_or(SecurityError::PolicyNotFound { id })?;
+        checkpoint();
+        Ok(())
+    }
+
+    /// List all policies
+    receive ListPolicies() -> List<AccessPolicy> {
+        self.policies.values()
+            .filter(|p| p.tenant_id.as_ref() == Some(&self.tenant_id) || p.tenant_id.is_none())
+            .cloned()
+            .collect()
+    }
+
+    // =========================================================================
+    // Permission Provider API
+    // =========================================================================
+
+    /// Register a permission provider
+    receive RegisterProvider(provider: Box<dyn PermissionProvider>) {
+        let module_name = provider.module_name();
+
+        // Get static permissions
+        let perms = provider.get_permissions();
+        for perm in perms {
+            self.permissions.insert(perm.id.clone(), perm);
+        }
+
+        // Get dynamic permissions
+        let dynamic_perms = provider.get_dynamic_permissions(&self.permission_context);
+        for perm in dynamic_perms {
+            self.permissions.insert(perm.id.clone(), perm);
+        }
+
+        self.permission_providers.insert(module_name, provider);
+        self.invalidate_cache();
+        checkpoint();
+    }
+
+    /// Refresh dynamic permissions
+    receive RefreshDynamicPermissions(context: PermissionContext) {
+        self.permission_context = context.clone();
+
+        // Remove old dynamic permissions
+        self.permissions.retain(|_, p| !p.is_dynamic);
+
+        // Regenerate from all providers
+        for (_, provider) in &self.permission_providers {
+            let dynamic_perms = provider.get_dynamic_permissions(&context);
+            for perm in dynamic_perms {
+                self.permissions.insert(perm.id.clone(), perm);
+            }
+        }
+
+        self.invalidate_cache();
+        checkpoint();
+    }
+
+    // =========================================================================
+    // Audit Log
+    // =========================================================================
+
+    /// Get audit log entries
+    receive GetAuditLog(
+        user_id: Option<UserId>,
+        action: Option<LmsAction>,
+        start_date: Option<DateTime>,
+        end_date: Option<DateTime>,
+        limit: i32
+    ) -> List<AuditEntry> {
+        self.audit_log.iter()
+            .filter(|e| user_id.as_ref().map(|u| &e.user_id == u).unwrap_or(true))
+            .filter(|e| action.as_ref().map(|a| &e.action == a).unwrap_or(true))
+            .filter(|e| start_date.as_ref().map(|s| e.timestamp >= *s).unwrap_or(true))
+            .filter(|e| end_date.as_ref().map(|s| e.timestamp <= *s).unwrap_or(true))
+            .take(limit as usize)
+            .cloned()
+            .collect()
+    }
+}
+
+// =============================================================================
+// Core Permission Provider Implementation
+// =============================================================================
+
+type CorePermissionProvider {
+    module_name: String
+}
+
+impl CorePermissionProvider {
+    fn new() -> Self {
+        CorePermissionProvider {
+            module_name: "core".to_string()
+        }
+    }
+}
+
+impl PermissionProvider for CorePermissionProvider {
+    fn module_name(&self) -> String {
+        self.module_name.clone()
+    }
+
+    fn get_permissions(&self) -> List<PermissionDefinition> {
+        // Core permissions are registered in SecurityManager::register_core_permissions
+        vec![]
+    }
+
+    fn get_dynamic_permissions(&self, context: &PermissionContext) -> List<PermissionDefinition> {
+        let mut perms = vec![];
+        let now = DateTime::now();
+
+        // Generate per-course permissions
+        for course in &context.courses {
+            // Course-specific grading permission
+            perms.push(PermissionDefinition {
+                id: PermissionId(format!("grading.course_{}", course.id)),
+                machine_name: format!("grading.course_{}", course.id),
+                title: format!("Grade in course: {}", course.title),
+                description: format!("Allows grading submissions in {}", course.title),
+                provider: "core".to_string(),
+                provider_type: ProviderType::Course,
+                category: PermissionCategory::Grading,
+                subcategory: Some(course.code.clone()),
+                weight: 0,
+                requires: Set::new(),
+                implies: Set::new(),
+                conflicts_with: Set::new(),
+                restrict_access: false,
+                warning_message: None,
+                risk_level: PermissionRiskLevel::Medium,
+                security_implications: None,
+                is_dynamic: true,
+                dynamic_pattern: Some("grading.course_{course_id}".to_string()),
+                course_binding: Some(course.id.clone()),
+                entity_type_binding: None,
+                icon: None,
+                help_url: None,
+                created_at: now,
+                updated_at: now
+            });
+        }
+
+        perms
+    }
+
+    fn validate_permission(&self, permission_id: &PermissionId) -> Bool {
+        // Check if course-bound permission's course still exists
+        if permission_id.0.starts_with("grading.course_") {
+            // Would need to check course existence
+            true
+        } else {
+            true
+        }
+    }
+}

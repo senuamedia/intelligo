@@ -1,0 +1,326 @@
+/// Intelligo LMS - Learner Journey E2E Tests
+///
+/// End-to-end tests simulating complete learner workflows.
+
+module intelligo::tests::e2e::learner_journey
+
+use intelligo::chai::*
+use intelligo::entities::*
+use intelligo::api::*
+use intelligo::compliance::*
+
+pub fn register_tests() {
+    describe("Learner Journey E2E", || {
+        describe("new learner onboarding", || {
+            it("completes full onboarding flow", || {
+                // 1. Learner signs up
+                let user = create_test_user("learner@example.com");
+                expect(&user.is_ok()).to().be_true();
+
+                // 2. Completes profile
+                let user = user.unwrap();
+                let profile = update_profile(&user.id, ProfileUpdate {
+                    first_name: "John".to_string(),
+                    last_name: "Doe".to_string(),
+                    preferences: LearnerPreferences {
+                        learning_style: LearningStyle::Visual,
+                        preferred_language: "en".to_string(),
+                        notification_settings: NotificationSettings::default()
+                    }
+                });
+                expect(&profile.is_ok()).to().be_true();
+
+                // 3. Takes skill assessment
+                let assessment_result = take_skill_assessment(&user.id, "general");
+                expect(&assessment_result.is_ok()).to().be_true();
+
+                // 4. Gets personalized recommendations
+                let recommendations = get_recommendations(&user.id);
+                expect(&recommendations.len()).to().be_greater_than(&0);
+
+                // 5. Enrolls in recommended course
+                let enrollment = enroll(&user.id, &recommendations[0].course_id);
+                expect(&enrollment.is_ok()).to().be_true();
+            });
+        });
+
+        describe("course completion journey", || {
+            it("completes a full course with assessments", || {
+                // Setup
+                let user = TestUser::learner();
+                let course = TestCourse::published();
+                let enrollment = Enrollment::new(&course.tenant_id, &user.id, &course.id);
+
+                // 1. Start course
+                let mut enrollment = enrollment;
+                enrollment.activate().unwrap();
+
+                // 2. Complete modules sequentially
+                for module in get_course_modules(&course.id) {
+                    for lesson in get_module_lessons(&module.id) {
+                        // View lesson content
+                        record_lesson_view(&enrollment.id, &lesson.id);
+
+                        // If has assessment, take it
+                        if let Some(assessment_id) = lesson.assessment_id {
+                            let result = take_assessment(&user.id, &assessment_id);
+                            expect(&result.score >= 70.0).to().be_true();
+                        }
+                    }
+                }
+
+                // 3. Verify completion
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Completed);
+                expect(&enrollment.progress).to().equal(&100.0);
+
+                // 4. Check certificate generated
+                let certificate = get_certificate(&enrollment.id);
+                expect(&certificate.is_some()).to().be_true();
+            });
+
+            it("handles course with SCORM content", || {
+                let user = TestUser::learner();
+
+                // 1. Launch SCORM content
+                let scorm_session = launch_scorm_content(
+                    &user.id,
+                    "scorm_package_1"
+                );
+                expect(&scorm_session.is_ok()).to().be_true();
+
+                let mut session = scorm_session.unwrap();
+
+                // 2. Simulate SCORM interaction
+                session.lms_initialize("");
+                session.set_value("cmi.core.lesson_location", "chapter1");
+                session.set_value("cmi.core.lesson_status", "incomplete");
+                session.lms_commit("");
+
+                // 3. Suspend session
+                session.lms_finish("");
+
+                // 4. Resume later
+                let resumed_session = resume_scorm_session(&session.id);
+                expect(&resumed_session.is_ok()).to().be_true();
+
+                let mut resumed = resumed_session.unwrap();
+                let location = resumed.get_value("cmi.core.lesson_location");
+                expect(&location).to().equal(&Some("chapter1".to_string()));
+
+                // 5. Complete
+                resumed.lms_initialize("");
+                resumed.set_value("cmi.core.lesson_status", "completed");
+                resumed.set_value("cmi.core.score.raw", "85");
+                resumed.lms_finish("");
+
+                // 6. Verify xAPI statement generated
+                let statements = get_xapi_statements(&user.id, "scorm_package_1");
+                expect(&statements.len()).to().be_greater_than(&0);
+            });
+
+            it("tracks progress with xAPI activities", || {
+                let user = TestUser::learner();
+
+                // 1. Watch video (generates xAPI statements)
+                let video_result = watch_video(&user.id, "video_1", WatchProgress {
+                    duration_watched: Duration::from_secs(600),
+                    total_duration: Duration::from_secs(900),
+                    completed: false
+                });
+
+                // 2. Check xAPI statement recorded
+                let statements = get_xapi_statements(&user.id, "video_1");
+                let progressed = statements.iter()
+                    .any(|s| s.verb.id.contains("progressed"));
+                expect(&progressed).to().be_true();
+
+                // 3. Complete video
+                watch_video(&user.id, "video_1", WatchProgress {
+                    duration_watched: Duration::from_secs(900),
+                    total_duration: Duration::from_secs(900),
+                    completed: true
+                });
+
+                // 4. Check completion statement
+                let statements = get_xapi_statements(&user.id, "video_1");
+                let completed = statements.iter()
+                    .any(|s| s.verb.id.contains("completed"));
+                expect(&completed).to().be_true();
+            });
+        });
+
+        describe("AI-assisted learning", || {
+            it("uses AI tutor for help", || {
+                let user = TestUser::learner();
+
+                // 1. Ask tutor a question
+                let response = ask_tutor(&user.id, TutorRequest {
+                    question: "What is polymorphism?".to_string(),
+                    context: TutorContext {
+                        course_id: Some("oop_course".to_string()),
+                        topic: Some("object-oriented programming".to_string()),
+                        skill_level: Some(2)
+                    }
+                });
+
+                expect(&response.is_ok()).to().be_true();
+                let answer = response.unwrap();
+                expect(&answer.text.len()).to().be_greater_than(&50);
+
+                // 2. Request hint for exercise
+                let hint = get_hint(&user.id, "exercise_1", 1);
+                expect(&hint.is_ok()).to().be_true();
+
+                // 3. Get feedback on answer
+                let feedback = get_feedback(&user.id, FeedbackRequest {
+                    question: "Explain inheritance".to_string(),
+                    answer: "Inheritance is when a class gets stuff from another class".to_string(),
+                    rubric: None
+                });
+
+                expect(&feedback.is_ok()).to().be_true();
+                expect(&feedback.unwrap().suggestions.len()).to().be_greater_than(&0);
+            });
+
+            it("follows AI-generated learning path", || {
+                let user = TestUser::learner();
+
+                // 1. Set learning goal
+                let path = generate_learning_path(&user.id, LearningGoalRequest {
+                    goal: "Become proficient in Python".to_string(),
+                    target_timeframe_weeks: 8,
+                    hours_per_week: 10
+                });
+
+                expect(&path.is_ok()).to().be_true();
+                let path = path.unwrap();
+
+                // 2. Get current recommendation
+                let next = get_next_activity(&user.id, &path.id);
+                expect(&next.is_some()).to().be_true();
+
+                // 3. Complete activity
+                complete_activity(&user.id, &next.unwrap().id, CompletionData {
+                    score: Some(85.0),
+                    time_spent: Duration::from_secs(2700)
+                });
+
+                // 4. Check path adapted
+                let updated_path = get_learning_path(&path.id);
+                // Path may have been updated based on performance
+
+                // 5. Track skill progression
+                let skills = get_learner_skills(&user.id);
+                expect(&skills.get("python_basics").is_some()).to().be_true();
+            });
+        });
+
+        describe("social learning", || {
+            it("participates in discussion", || {
+                let user = TestUser::learner();
+
+                // 1. View discussion thread
+                let discussion = get_discussion("discussion_1");
+                expect(&discussion.is_ok()).to().be_true();
+
+                // 2. Post a reply
+                let reply = post_reply(&user.id, "discussion_1", ReplyContent {
+                    text: "Great explanation! I also found that...".to_string(),
+                    parent_id: None
+                });
+
+                expect(&reply.is_ok()).to().be_true();
+
+                // 3. Receive notification when someone replies
+                // (Would be tested in notification system)
+            });
+
+            it("completes peer review", || {
+                let reviewer = TestUser::learner();
+                let author = TestUser::learner();
+
+                // 1. Author submits assignment
+                let submission = submit_assignment(&author.id, "assignment_1", SubmissionContent {
+                    content: "My assignment submission...".to_string(),
+                    attachments: vec![]
+                });
+
+                // 2. Reviewer is assigned
+                assign_peer_review(&submission.id, &reviewer.id);
+
+                // 3. Reviewer completes review
+                let review = submit_peer_review(&reviewer.id, &submission.id, PeerReview {
+                    rating: 4,
+                    feedback: "Good work! Consider improving...".to_string(),
+                    rubric_scores: Map::new()
+                });
+
+                expect(&review.is_ok()).to().be_true();
+
+                // 4. Author sees feedback
+                let received_reviews = get_submission_reviews(&submission.id);
+                expect(&received_reviews.len()).to().equal(&1);
+            });
+        });
+
+        describe("mobile learning", || {
+            it("syncs offline progress", || {
+                let user = TestUser::learner();
+
+                // 1. Download content for offline
+                let download = download_for_offline(&user.id, "lesson_1");
+                expect(&download.is_ok()).to().be_true();
+
+                // 2. Simulate offline progress
+                let offline_progress = OfflineProgress {
+                    lesson_id: "lesson_1".to_string(),
+                    progress: 75.0,
+                    time_spent: Duration::from_secs(1200),
+                    interactions: vec![],
+                    captured_at: DateTime::now()
+                };
+
+                // 3. Sync when back online
+                let sync_result = sync_offline_progress(&user.id, vec![offline_progress]);
+                expect(&sync_result.is_ok()).to().be_true();
+
+                // 4. Verify progress updated
+                let enrollment = get_enrollment(&user.id, "course_1");
+                // Progress should reflect offline work
+            });
+        });
+    });
+}
+
+// Helper functions (would be implemented using actual API)
+fn create_test_user(email: &str) -> Result<User, String> { todo!() }
+fn update_profile(user_id: &str, update: ProfileUpdate) -> Result<Profile, String> { todo!() }
+fn take_skill_assessment(user_id: &str, assessment_type: &str) -> Result<AssessmentResult, String> { todo!() }
+fn get_recommendations(user_id: &str) -> Vec<CourseRecommendation> { todo!() }
+fn enroll(user_id: &str, course_id: &str) -> Result<Enrollment, String> { todo!() }
+fn get_course_modules(course_id: &str) -> Vec<Module> { todo!() }
+fn get_module_lessons(module_id: &str) -> Vec<Lesson> { todo!() }
+fn record_lesson_view(enrollment_id: &str, lesson_id: &str) { todo!() }
+fn take_assessment(user_id: &str, assessment_id: &str) -> AssessmentResult { todo!() }
+fn get_certificate(enrollment_id: &str) -> Option<Certificate> { todo!() }
+fn launch_scorm_content(user_id: &str, package_id: &str) -> Result<ScormSession, String> { todo!() }
+fn resume_scorm_session(session_id: &str) -> Result<ScormSession, String> { todo!() }
+fn get_xapi_statements(user_id: &str, activity_id: &str) -> Vec<XapiStatement> { todo!() }
+fn watch_video(user_id: &str, video_id: &str, progress: WatchProgress) -> Result<(), String> { todo!() }
+fn ask_tutor(user_id: &str, request: TutorRequest) -> Result<TutorResponse, String> { todo!() }
+fn get_hint(user_id: &str, exercise_id: &str, hint_num: i32) -> Result<Hint, String> { todo!() }
+fn get_feedback(user_id: &str, request: FeedbackRequest) -> Result<Feedback, String> { todo!() }
+fn generate_learning_path(user_id: &str, request: LearningGoalRequest) -> Result<LearningPath, String> { todo!() }
+fn get_next_activity(user_id: &str, path_id: &str) -> Option<Activity> { todo!() }
+fn complete_activity(user_id: &str, activity_id: &str, data: CompletionData) { todo!() }
+fn get_learning_path(path_id: &str) -> LearningPath { todo!() }
+fn get_learner_skills(user_id: &str) -> Map<String, i32> { todo!() }
+fn get_discussion(discussion_id: &str) -> Result<Discussion, String> { todo!() }
+fn post_reply(user_id: &str, discussion_id: &str, content: ReplyContent) -> Result<Reply, String> { todo!() }
+fn submit_assignment(user_id: &str, assignment_id: &str, content: SubmissionContent) -> Submission { todo!() }
+fn assign_peer_review(submission_id: &str, reviewer_id: &str) { todo!() }
+fn submit_peer_review(user_id: &str, submission_id: &str, review: PeerReview) -> Result<(), String> { todo!() }
+fn get_submission_reviews(submission_id: &str) -> Vec<PeerReview> { todo!() }
+fn download_for_offline(user_id: &str, lesson_id: &str) -> Result<(), String> { todo!() }
+fn sync_offline_progress(user_id: &str, progress: Vec<OfflineProgress>) -> Result<(), String> { todo!() }
+fn get_enrollment(user_id: &str, course_id: &str) -> Enrollment { todo!() }

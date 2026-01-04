@@ -1,0 +1,2135 @@
+/// Intelligo LMS - Static Site Generator
+///
+/// Generates static HTML5 sites from course content for high-performance
+/// delivery. Follows Aether CMS patterns for SSG.
+
+module intelligo::publishing::generator
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::fs::{File, Directory}
+use std::path::Path
+
+// =============================================================================
+// GENERATOR CONFIGURATION
+// =============================================================================
+
+/// Static site generator configuration
+type GeneratorConfig {
+    /// Output directory
+    output_dir: String,
+
+    /// Base URL for the site
+    base_url: String,
+
+    /// Theme to use
+    theme: String,
+
+    /// Enable minification
+    minify: Bool,
+
+    /// Generate source maps
+    source_maps: Bool,
+
+    /// Assets configuration
+    assets: AssetsConfig,
+
+    /// CDN configuration
+    cdn: Option<CdnConfig>,
+
+    /// Build optimization level
+    optimization_level: OptimizationLevel,
+
+    /// Parallel build workers
+    parallel_workers: i32,
+
+    /// Cache configuration
+    cache: CacheConfig,
+
+    /// Include draft content
+    include_drafts: Bool
+}
+
+/// Assets configuration
+type AssetsConfig {
+    /// Assets output directory (relative to output_dir)
+    output_dir: String,
+
+    /// Image optimization
+    optimize_images: Bool,
+
+    /// Maximum image width
+    max_image_width: i32,
+
+    /// Image formats to generate
+    image_formats: List<ImageFormat>,
+
+    /// Hash asset filenames for cache busting
+    hash_filenames: Bool,
+
+    /// Inline small assets
+    inline_threshold_bytes: i32
+}
+
+/// Image format for generation
+enum ImageFormat {
+    Jpeg,
+    Png,
+    WebP,
+    Avif
+}
+
+/// CDN configuration
+type CdnConfig {
+    /// CDN URL prefix
+    url_prefix: String,
+
+    /// S3 bucket (if S3 CDN)
+    bucket: Option<String>,
+
+    /// CloudFront distribution
+    distribution_id: Option<String>,
+
+    /// Invalidate on deploy
+    invalidate_on_deploy: Bool
+}
+
+/// Optimization level
+enum OptimizationLevel {
+    /// No optimization
+    None,
+    /// Basic optimization
+    Basic,
+    /// Full optimization
+    Full
+}
+
+/// Cache configuration
+type CacheConfig {
+    /// Enable build cache
+    enabled: Bool,
+
+    /// Cache directory
+    cache_dir: String,
+
+    /// Cache TTL
+    ttl: Duration
+}
+
+impl GeneratorConfig {
+    fn default() -> GeneratorConfig {
+        GeneratorConfig {
+            output_dir: "dist".to_string(),
+            base_url: "https://example.com".to_string(),
+            theme: "default".to_string(),
+            minify: true,
+            source_maps: false,
+            assets: AssetsConfig {
+                output_dir: "assets".to_string(),
+                optimize_images: true,
+                max_image_width: 1920,
+                image_formats: vec![ImageFormat::WebP, ImageFormat::Jpeg],
+                hash_filenames: true,
+                inline_threshold_bytes: 4096
+            },
+            cdn: None,
+            optimization_level: OptimizationLevel::Full,
+            parallel_workers: 4,
+            cache: CacheConfig {
+                enabled: true,
+                cache_dir: ".cache".to_string(),
+                ttl: Duration::hours(24)
+            },
+            include_drafts: false
+        }
+    }
+}
+
+// =============================================================================
+// BUILD TYPES
+// =============================================================================
+
+/// Build context
+type BuildContext {
+    /// Configuration
+    config: GeneratorConfig,
+
+    /// Tenant being built
+    tenant_id: TenantId,
+
+    /// Theme configuration
+    theme: ThemeConfig,
+
+    /// Site data (global)
+    site_data: SiteData,
+
+    /// Build timestamp
+    build_time: DateTime,
+
+    /// Build ID
+    build_id: String,
+
+    /// Collected assets
+    assets: Map<String, AssetInfo>,
+
+    /// Collected pages
+    pages: List<PageInfo>,
+
+    /// Errors encountered
+    errors: List<BuildError>,
+
+    /// Warnings
+    warnings: List<BuildWarning>
+}
+
+/// Site-wide data
+type SiteData {
+    /// Site title
+    title: String,
+
+    /// Site description
+    description: String,
+
+    /// Site URL
+    url: String,
+
+    /// Branding
+    branding: Branding,
+
+    /// Navigation
+    navigation: List<NavItem>,
+
+    /// Footer links
+    footer_links: List<FooterSection>,
+
+    /// Social links
+    social_links: List<SocialLink>,
+
+    /// Custom metadata
+    metadata: Map<String, Dynamic>
+}
+
+/// Branding configuration
+type Branding {
+    logo: Option<String>,
+    favicon: Option<String>,
+    primary_color: String,
+    secondary_color: String,
+    font_family: String
+}
+
+/// Navigation item
+type NavItem {
+    label: String,
+    url: String,
+    children: List<NavItem>,
+    icon: Option<String>,
+    active: Bool
+}
+
+/// Footer section
+type FooterSection {
+    title: String,
+    links: List<FooterLink>
+}
+
+/// Footer link
+type FooterLink {
+    label: String,
+    url: String,
+    external: Bool
+}
+
+/// Social link
+type SocialLink {
+    platform: String,
+    url: String,
+    icon: String
+}
+
+/// Theme configuration
+type ThemeConfig {
+    /// Theme name
+    name: String,
+
+    /// Theme version
+    version: String,
+
+    /// Template directory
+    template_dir: String,
+
+    /// Asset directory
+    asset_dir: String,
+
+    /// Available layouts
+    layouts: List<String>,
+
+    /// Theme variables
+    variables: Map<String, String>
+}
+
+/// Asset information
+type AssetInfo {
+    /// Source path
+    source: String,
+
+    /// Output path (with hash if enabled)
+    output: String,
+
+    /// Asset type
+    asset_type: AssetType,
+
+    /// File size
+    size: i64,
+
+    /// Content hash
+    hash: String,
+
+    /// Whether to inline
+    inline: Bool
+}
+
+/// Asset type
+enum AssetType {
+    Image,
+    Stylesheet,
+    JavaScript,
+    Font,
+    Video,
+    Audio,
+    Document,
+    Other
+}
+
+/// Page information
+type PageInfo {
+    /// Route/URL path
+    route: String,
+
+    /// Output file path
+    output_path: String,
+
+    /// Page title
+    title: String,
+
+    /// Template used
+    template: String,
+
+    /// Source entity
+    source: PageSource,
+
+    /// Last modified
+    last_modified: DateTime,
+
+    /// Dependencies (assets, other pages)
+    dependencies: List<String>
+}
+
+/// Page source
+enum PageSource {
+    /// Course catalog page
+    Catalog,
+    /// Course landing page
+    Course { course_id: CourseId },
+    /// Module page
+    Module { module_id: ModuleId },
+    /// Lesson page
+    Lesson { lesson_id: LessonId },
+    /// Assessment page
+    Assessment { assessment_id: AssessmentId },
+    /// Static page
+    Static { page_id: String },
+    /// Custom page
+    Custom { template: String, data: Map<String, Dynamic> }
+}
+
+/// Build error
+type BuildError {
+    /// Error code
+    code: String,
+
+    /// Error message
+    message: String,
+
+    /// Source file/entity
+    source: Option<String>,
+
+    /// Line number
+    line: Option<i32>,
+
+    /// Timestamp
+    timestamp: DateTime
+}
+
+/// Build warning
+type BuildWarning {
+    code: String,
+    message: String,
+    source: Option<String>
+}
+
+// =============================================================================
+// BUILD RESULT
+// =============================================================================
+
+/// Result of a build operation
+type BuildResult {
+    /// Success status
+    success: Bool,
+
+    /// Build ID
+    build_id: String,
+
+    /// Total pages generated
+    page_count: i32,
+
+    /// Total assets processed
+    asset_count: i32,
+
+    /// Total output size in bytes
+    total_size: i64,
+
+    /// Build duration
+    duration: Duration,
+
+    /// Errors
+    errors: List<BuildError>,
+
+    /// Warnings
+    warnings: List<BuildWarning>,
+
+    /// Output directory
+    output_dir: String,
+
+    /// Pages generated
+    pages: List<PageResult>,
+
+    /// Manifest
+    manifest: BuildManifest
+}
+
+/// Result for a single page
+type PageResult {
+    route: String,
+    output_path: String,
+    size: i64,
+    duration_ms: i64,
+    status: PageStatus
+}
+
+/// Page build status
+enum PageStatus {
+    Success,
+    Cached,
+    Skipped,
+    Failed { error: String }
+}
+
+/// Build manifest (for incremental builds)
+type BuildManifest {
+    build_id: String,
+    build_time: DateTime,
+    pages: Map<String, ManifestEntry>,
+    assets: Map<String, ManifestEntry>
+}
+
+/// Manifest entry
+type ManifestEntry {
+    source_hash: String,
+    output_hash: String,
+    output_path: String,
+    dependencies: List<String>,
+    built_at: DateTime
+}
+
+// =============================================================================
+// CONTENT COLLECTION
+// =============================================================================
+
+/// Content to be rendered
+type RenderableContent {
+    /// Courses to render
+    courses: List<CourseContent>,
+
+    /// Static pages
+    static_pages: List<StaticPage>,
+
+    /// Catalog configuration
+    catalog: CatalogConfig
+}
+
+/// Course content for rendering
+type CourseContent {
+    course: Course,
+    modules: List<ModuleContent>,
+    instructor: InstructorInfo,
+    pricing: Option<CoursePricing>,
+    enrollment_count: i32,
+    rating: Option<CourseRating>
+}
+
+/// Module content for rendering
+type ModuleContent {
+    module: Module,
+    lessons: List<LessonContent>,
+    assessments: List<AssessmentContent>
+}
+
+/// Lesson content for rendering
+type LessonContent {
+    lesson: Lesson,
+    rendered_content: String,
+    resources: List<ResourceInfo>,
+    estimated_time: i32
+}
+
+/// Assessment content for rendering
+type AssessmentContent {
+    assessment: Assessment,
+    question_count: i32,
+    estimated_time: i32,
+    is_graded: Bool
+}
+
+/// Instructor information
+type InstructorInfo {
+    id: UserId,
+    name: String,
+    title: Option<String>,
+    bio: Option<String>,
+    avatar: Option<String>,
+    course_count: i32
+}
+
+/// Course pricing
+type CoursePricing {
+    is_free: Bool,
+    price: Option<f64>,
+    currency: String,
+    subscription_available: Bool,
+    discount: Option<DiscountInfo>
+}
+
+/// Discount information
+type DiscountInfo {
+    percent: f64,
+    original_price: f64,
+    expires_at: Option<DateTime>
+}
+
+/// Course rating
+type CourseRating {
+    average: f32,
+    count: i32,
+    distribution: Map<i32, i32>
+}
+
+/// Resource information
+type ResourceInfo {
+    id: String,
+    title: String,
+    resource_type: String,
+    url: String,
+    size: Option<i64>
+}
+
+/// Static page
+type StaticPage {
+    id: String,
+    title: String,
+    slug: String,
+    content: String,
+    template: String,
+    metadata: Map<String, Dynamic>
+}
+
+/// Catalog configuration
+type CatalogConfig {
+    title: String,
+    description: String,
+    categories: List<CategoryInfo>,
+    featured_courses: List<CourseId>,
+    filters_enabled: Bool,
+    search_enabled: Bool,
+    pagination_size: i32
+}
+
+/// Category information
+type CategoryInfo {
+    id: TermId,
+    name: String,
+    slug: String,
+    course_count: i32,
+    children: List<CategoryInfo>
+}
+
+// =============================================================================
+// TEMPLATE RENDERING
+// =============================================================================
+
+/// Template engine abstraction
+type TemplateEngine {
+    /// Template cache
+    templates: Map<String, CompiledTemplate>,
+
+    /// Helper functions
+    helpers: Map<String, HelperFunction>,
+
+    /// Global context
+    global_context: Map<String, Dynamic>
+}
+
+/// Compiled template
+type CompiledTemplate {
+    name: String,
+    source: String,
+    compiled: String,
+    dependencies: List<String>
+}
+
+/// Helper function type
+type HelperFunction = fn(List<Dynamic>) -> String
+
+impl TemplateEngine {
+    /// Create new template engine
+    fn new() -> TemplateEngine {
+        let mut helpers = Map::new();
+
+        // Register default helpers
+        helpers.insert("date".to_string(), helper_date);
+        helpers.insert("time".to_string(), helper_time);
+        helpers.insert("duration".to_string(), helper_duration);
+        helpers.insert("currency".to_string(), helper_currency);
+        helpers.insert("truncate".to_string(), helper_truncate);
+        helpers.insert("url".to_string(), helper_url);
+        helpers.insert("asset".to_string(), helper_asset);
+        helpers.insert("markdown".to_string(), helper_markdown);
+
+        TemplateEngine {
+            templates: Map::new(),
+            helpers,
+            global_context: Map::new()
+        }
+    }
+
+    /// Load template from file
+    fn load_template(&mut self, name: &str, path: &str) -> Result<(), BuildError> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| BuildError {
+                code: "TEMPLATE_LOAD_ERROR".to_string(),
+                message: e.to_string(),
+                source: Some(path.to_string()),
+                line: None,
+                timestamp: DateTime::now()
+            })?;
+
+        let compiled = self.compile(&source)?;
+        let deps = self.extract_dependencies(&source);
+
+        self.templates.insert(name.to_string(), CompiledTemplate {
+            name: name.to_string(),
+            source,
+            compiled,
+            dependencies: deps
+        });
+
+        Ok(())
+    }
+
+    /// Compile template source
+    fn compile(&self, source: &str) -> Result<String, BuildError> {
+        // Template compilation (simplified - would use actual template engine)
+        Ok(source.to_string())
+    }
+
+    /// Extract template dependencies
+    fn extract_dependencies(&self, source: &str) -> List<String> {
+        // Extract {% include %}, {% extends %}, etc.
+        vec![]
+    }
+
+    /// Render template with context
+    fn render(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let tmpl = self.templates.get(template)
+            .ok_or(BuildError {
+                code: "TEMPLATE_NOT_FOUND".to_string(),
+                message: format!("Template '{}' not found", template),
+                source: None,
+                line: None,
+                timestamp: DateTime::now()
+            })?;
+
+        // Merge global context with page context
+        let mut full_context = self.global_context.clone();
+        for (k, v) in context {
+            full_context.insert(k.clone(), v.clone());
+        }
+
+        // Render template (simplified)
+        self.render_compiled(&tmpl.compiled, &full_context)
+    }
+
+    /// Render compiled template
+    fn render_compiled(&self, compiled: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let mut result = compiled.to_string();
+
+        // Process template directives in order:
+        // 1. Extends (layout inheritance)
+        // 2. Includes (partials)
+        // 3. Blocks
+        // 4. Loops and conditionals
+        // 5. Variable interpolation
+
+        // Process extends directives: {% extends "layout" %}
+        result = self.process_extends(&result, context)?;
+
+        // Process include directives: {% include "partial" %}
+        result = self.process_includes(&result, context)?;
+
+        // Process for loops: {% for item in items %}...{% endfor %}
+        result = self.process_loops(&result, context)?;
+
+        // Process conditionals: {% if condition %}...{% endif %}
+        result = self.process_conditionals(&result, context)?;
+
+        // Process variable interpolation: {{ variable }}
+        result = self.process_variables(&result, context)?;
+
+        // Process helper calls: {{ helper(args) }}
+        result = self.process_helpers(&result, context)?;
+
+        Ok(result)
+    }
+
+    /// Process extends directive
+    fn process_extends(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let extends_re = regex::Regex::new(r#"\{%\s*extends\s+"([^"]+)"\s*%\}"#).unwrap();
+
+        if let Some(caps) = extends_re.captures(template) {
+            let layout_name = &caps[1];
+
+            // Get the layout template
+            let layout = self.templates.get(layout_name)
+                .ok_or(BuildError {
+                    code: "LAYOUT_NOT_FOUND".to_string(),
+                    message: format!("Layout '{}' not found", layout_name),
+                    source: None,
+                    line: None,
+                    timestamp: DateTime::now()
+                })?;
+
+            // Extract blocks from child template
+            let blocks = self.extract_blocks(template)?;
+
+            // Replace blocks in layout
+            let mut result = layout.compiled.clone();
+            for (block_name, block_content) in blocks {
+                let block_pattern = format!(r#"\{{% block {} %}}\n?([\s\S]*?)\{{% endblock %}}"#, block_name);
+                let block_re = regex::Regex::new(&block_pattern).unwrap();
+                result = block_re.replace(&result, block_content.as_str()).to_string();
+            }
+
+            Ok(result)
+        } else {
+            Ok(template.to_string())
+        }
+    }
+
+    /// Extract blocks from template
+    fn extract_blocks(&self, template: &str) -> Result<Map<String, String>, BuildError> {
+        let mut blocks = Map::new();
+        let block_re = regex::Regex::new(r#"\{%\s*block\s+(\w+)\s*%\}([\s\S]*?)\{%\s*endblock\s*%\}"#).unwrap();
+
+        for caps in block_re.captures_iter(template) {
+            let name = caps[1].to_string();
+            let content = caps[2].to_string();
+            blocks.insert(name, content);
+        }
+
+        Ok(blocks)
+    }
+
+    /// Process include directives
+    fn process_includes(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let include_re = regex::Regex::new(r#"\{%\s*include\s+"([^"]+)"\s*%\}"#).unwrap();
+        let mut result = template.to_string();
+
+        for caps in include_re.captures_iter(template) {
+            let partial_name = &caps[1];
+            let full_match = &caps[0];
+
+            let partial = self.templates.get(partial_name)
+                .ok_or(BuildError {
+                    code: "PARTIAL_NOT_FOUND".to_string(),
+                    message: format!("Partial '{}' not found", partial_name),
+                    source: None,
+                    line: None,
+                    timestamp: DateTime::now()
+                })?;
+
+            // Render the partial with current context
+            let rendered = self.render_compiled(&partial.compiled, context)?;
+            result = result.replace(full_match, &rendered);
+        }
+
+        Ok(result)
+    }
+
+    /// Process for loops
+    fn process_loops(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let for_re = regex::Regex::new(r#"\{%\s*for\s+(\w+)\s+in\s+(\w+(?:\.\w+)*)\s*%\}([\s\S]*?)\{%\s*endfor\s*%\}"#).unwrap();
+        let mut result = template.to_string();
+
+        for caps in for_re.captures_iter(template) {
+            let item_name = &caps[1];
+            let collection_path = &caps[2];
+            let loop_body = &caps[3];
+            let full_match = &caps[0];
+
+            // Get collection from context
+            if let Some(collection) = self.get_value_by_path(context, collection_path) {
+                if let Some(items) = collection.as_array() {
+                    let mut loop_output = String::new();
+
+                    for (index, item) in items.iter().enumerate() {
+                        // Create loop context with item and loop variables
+                        let mut item_context = context.clone();
+                        item_context.insert(item_name.to_string(), item.clone());
+                        item_context.insert("loop.index".to_string(), Dynamic::from(index + 1));
+                        item_context.insert("loop.index0".to_string(), Dynamic::from(index));
+                        item_context.insert("loop.first".to_string(), Dynamic::from(index == 0));
+                        item_context.insert("loop.last".to_string(), Dynamic::from(index == items.len() - 1));
+
+                        // Process loop body with item context
+                        let rendered_body = self.process_variables(loop_body, &item_context)?;
+                        let rendered_body = self.process_conditionals(&rendered_body, &item_context)?;
+                        loop_output.push_str(&rendered_body);
+                    }
+
+                    result = result.replace(full_match, &loop_output);
+                } else {
+                    result = result.replace(full_match, "");
+                }
+            } else {
+                result = result.replace(full_match, "");
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Process conditionals
+    fn process_conditionals(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        // Process if/elif/else/endif
+        let if_re = regex::Regex::new(r#"\{%\s*if\s+(.+?)\s*%\}([\s\S]*?)(?:\{%\s*else\s*%\}([\s\S]*?))?\{%\s*endif\s*%\}"#).unwrap();
+        let mut result = template.to_string();
+
+        for caps in if_re.captures_iter(template) {
+            let condition = &caps[1];
+            let true_body = &caps[2];
+            let false_body = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let full_match = &caps[0];
+
+            let condition_result = self.evaluate_condition(condition, context);
+
+            let output = if condition_result {
+                true_body
+            } else {
+                false_body
+            };
+
+            result = result.replace(full_match, output);
+        }
+
+        Ok(result)
+    }
+
+    /// Evaluate a condition expression
+    fn evaluate_condition(&self, condition: &str, context: &Map<String, Dynamic>) -> bool {
+        let condition = condition.trim();
+
+        // Handle negation
+        if condition.starts_with("not ") {
+            return !self.evaluate_condition(&condition[4..], context);
+        }
+
+        // Handle comparison operators
+        if condition.contains("==") {
+            let parts: Vec<&str> = condition.split("==").map(|s| s.trim()).collect();
+            if parts.len() == 2 {
+                let left = self.get_value_string(parts[0], context);
+                let right = parts[1].trim_matches('"').to_string();
+                return left == right;
+            }
+        }
+
+        if condition.contains("!=") {
+            let parts: Vec<&str> = condition.split("!=").map(|s| s.trim()).collect();
+            if parts.len() == 2 {
+                let left = self.get_value_string(parts[0], context);
+                let right = parts[1].trim_matches('"').to_string();
+                return left != right;
+            }
+        }
+
+        // Handle simple truthiness check
+        if let Some(value) = self.get_value_by_path(context, condition) {
+            return value.is_truthy();
+        }
+
+        false
+    }
+
+    /// Get value as string for comparison
+    fn get_value_string(&self, path: &str, context: &Map<String, Dynamic>) -> String {
+        self.get_value_by_path(context, path)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Process variable interpolation
+    fn process_variables(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let var_re = regex::Regex::new(r#"\{\{\s*([\w.]+)(?:\s*\|\s*(\w+)(?:\(([^)]*)\))?)?\s*\}\}"#).unwrap();
+        let mut result = template.to_string();
+
+        for caps in var_re.captures_iter(template) {
+            let var_path = &caps[1];
+            let filter = caps.get(2).map(|m| m.as_str());
+            let filter_args = caps.get(3).map(|m| m.as_str());
+            let full_match = &caps[0];
+
+            let value = self.get_value_by_path(context, var_path)
+                .map(|v| self.value_to_string(&v))
+                .unwrap_or_default();
+
+            // Apply filter if present
+            let filtered = if let Some(filter_name) = filter {
+                self.apply_filter(&value, filter_name, filter_args)
+            } else {
+                value
+            };
+
+            result = result.replace(full_match, &filtered);
+        }
+
+        Ok(result)
+    }
+
+    /// Get value by dot-separated path
+    fn get_value_by_path(&self, context: &Map<String, Dynamic>, path: &str) -> Option<Dynamic> {
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut current = context.get(parts[0])?.clone();
+
+        for part in parts.iter().skip(1) {
+            current = current.get_field(part)?;
+        }
+
+        Some(current)
+    }
+
+    /// Convert Dynamic to string
+    fn value_to_string(&self, value: &Dynamic) -> String {
+        match value {
+            Dynamic::String(s) => s.clone(),
+            Dynamic::Int(i) => i.to_string(),
+            Dynamic::Float(f) => f.to_string(),
+            Dynamic::Bool(b) => b.to_string(),
+            _ => format!("{:?}", value)
+        }
+    }
+
+    /// Apply a filter to a value
+    fn apply_filter(&self, value: &str, filter: &str, args: Option<&str>) -> String {
+        match filter {
+            "upper" => value.to_uppercase(),
+            "lower" => value.to_lowercase(),
+            "capitalize" => {
+                let mut chars = value.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + chars.as_str()
+                }
+            }
+            "trim" => value.trim().to_string(),
+            "truncate" => {
+                let len: usize = args.and_then(|a| a.parse().ok()).unwrap_or(100);
+                if value.len() > len {
+                    format!("{}...", &value[..len])
+                } else {
+                    value.to_string()
+                }
+            }
+            "default" => {
+                if value.is_empty() {
+                    args.unwrap_or("").trim_matches('"').to_string()
+                } else {
+                    value.to_string()
+                }
+            }
+            "escape" | "e" => html_escape(value),
+            "safe" => value.to_string(), // Already safe, no escaping
+            "json" => serde_json::to_string(value).unwrap_or_default(),
+            _ => value.to_string()
+        }
+    }
+
+    /// Process helper function calls
+    fn process_helpers(&self, template: &str, context: &Map<String, Dynamic>) -> Result<String, BuildError> {
+        let helper_re = regex::Regex::new(r#"\{\{\s*(\w+)\(([^)]*)\)\s*\}\}"#).unwrap();
+        let mut result = template.to_string();
+
+        for caps in helper_re.captures_iter(template) {
+            let helper_name = &caps[1];
+            let args_str = &caps[2];
+            let full_match = &caps[0];
+
+            if let Some(helper) = self.helpers.get(helper_name) {
+                // Parse arguments
+                let args: Vec<Dynamic> = args_str.split(',')
+                    .map(|a| a.trim())
+                    .filter(|a| !a.is_empty())
+                    .map(|a| {
+                        if a.starts_with('"') && a.ends_with('"') {
+                            Dynamic::from(&a[1..a.len()-1])
+                        } else if let Some(val) = self.get_value_by_path(context, a) {
+                            val
+                        } else {
+                            Dynamic::from(a)
+                        }
+                    })
+                    .collect();
+
+                let output = helper(args);
+                result = result.replace(full_match, &output);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Register helper function
+    fn register_helper(&mut self, name: &str, helper: HelperFunction) {
+        self.helpers.insert(name.to_string(), helper);
+    }
+
+    /// Set global context
+    fn set_global(&mut self, key: &str, value: Dynamic) {
+        self.global_context.insert(key.to_string(), value);
+    }
+}
+
+// Template helper functions
+
+/// Format a date value
+fn helper_date(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let date_str = match &args[0] {
+        Dynamic::String(s) => s.clone(),
+        _ => return String::new()
+    };
+
+    let format = args.get(1)
+        .and_then(|d| d.as_str())
+        .unwrap_or("%B %d, %Y"); // Default: "January 01, 2024"
+
+    match DateTime::parse_iso8601(&date_str) {
+        Ok(dt) => dt.format(format),
+        Err(_) => date_str
+    }
+}
+
+/// Format a time value
+fn helper_time(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let time_str = match &args[0] {
+        Dynamic::String(s) => s.clone(),
+        _ => return String::new()
+    };
+
+    let format = args.get(1)
+        .and_then(|d| d.as_str())
+        .unwrap_or("%H:%M"); // Default: "14:30"
+
+    match DateTime::parse_iso8601(&time_str) {
+        Ok(dt) => dt.format(format),
+        Err(_) => time_str
+    }
+}
+
+/// Format duration (minutes to human-readable)
+fn helper_duration(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let minutes = match &args[0] {
+        Dynamic::Int(i) => *i,
+        Dynamic::Float(f) => *f as i64,
+        Dynamic::String(s) => s.parse().unwrap_or(0),
+        _ => return String::new()
+    };
+
+    if minutes < 60 {
+        if minutes == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{} minutes", minutes)
+        }
+    } else {
+        let hours = minutes / 60;
+        let remaining_mins = minutes % 60;
+
+        if remaining_mins == 0 {
+            if hours == 1 {
+                "1 hour".to_string()
+            } else {
+                format!("{} hours", hours)
+            }
+        } else {
+            let hour_str = if hours == 1 { "1 hour" } else { &format!("{} hours", hours) };
+            let min_str = if remaining_mins == 1 { "1 minute" } else { &format!("{} minutes", remaining_mins) };
+            format!("{} {}", hour_str, min_str)
+        }
+    }
+}
+
+/// Format currency value
+fn helper_currency(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let amount = match &args[0] {
+        Dynamic::Int(i) => *i as f64,
+        Dynamic::Float(f) => *f,
+        Dynamic::String(s) => s.parse().unwrap_or(0.0),
+        _ => return String::new()
+    };
+
+    let currency = args.get(1)
+        .and_then(|d| d.as_str())
+        .unwrap_or("USD");
+
+    let locale = args.get(2)
+        .and_then(|d| d.as_str())
+        .unwrap_or("en-US");
+
+    // Format based on currency
+    let symbol = match currency {
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "JPY" => "¥",
+        "CAD" => "CA$",
+        "AUD" => "A$",
+        _ => currency
+    };
+
+    // Format with proper decimal places
+    let decimals = if currency == "JPY" { 0 } else { 2 };
+
+    if decimals == 0 {
+        format!("{}{:.0}", symbol, amount)
+    } else {
+        format!("{}{:.2}", symbol, amount)
+    }
+}
+
+/// Truncate text to specified length
+fn helper_truncate(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let text = match &args[0] {
+        Dynamic::String(s) => s.clone(),
+        _ => return String::new()
+    };
+
+    let max_length = args.get(1)
+        .and_then(|d| match d {
+            Dynamic::Int(i) => Some(*i as usize),
+            Dynamic::String(s) => s.parse().ok(),
+            _ => None
+        })
+        .unwrap_or(100);
+
+    let suffix = args.get(2)
+        .and_then(|d| d.as_str())
+        .unwrap_or("...");
+
+    if text.len() <= max_length {
+        text
+    } else {
+        // Find word boundary
+        let truncated = &text[..max_length];
+        match truncated.rfind(' ') {
+            Some(last_space) if last_space > max_length / 2 => {
+                format!("{}{}", &truncated[..last_space], suffix)
+            }
+            _ => format!("{}{}", truncated, suffix)
+        }
+    }
+}
+
+/// Build URL from base and path
+fn helper_url(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let path = match &args[0] {
+        Dynamic::String(s) => s.clone(),
+        _ => return String::new()
+    };
+
+    // Get base URL from global context (set during init)
+    let base_url = args.get(1)
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+
+    if path.starts_with("http://") || path.starts_with("https://") {
+        // Already absolute URL
+        path
+    } else if path.starts_with('/') {
+        // Root-relative path
+        format!("{}{}", base_url.trim_end_matches('/'), path)
+    } else {
+        // Relative path
+        format!("{}/{}", base_url.trim_end_matches('/'), path)
+    }
+}
+
+/// Get asset URL with cache-busting hash
+fn helper_asset(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let asset_path = match &args[0] {
+        Dynamic::String(s) => s.clone(),
+        _ => return String::new()
+    };
+
+    // In a full implementation, this would look up the asset in the asset manifest
+    // to get the hashed filename
+    let base_url = args.get(1)
+        .and_then(|d| d.as_str())
+        .unwrap_or("/assets");
+
+    format!("{}/{}", base_url.trim_end_matches('/'), asset_path.trim_start_matches('/'))
+}
+
+/// Render markdown to HTML
+fn helper_markdown(args: List<Dynamic>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+
+    let markdown = match &args[0] {
+        Dynamic::String(s) => s.clone(),
+        _ => return String::new()
+    };
+
+    // Simple markdown to HTML conversion
+    markdown_to_html(&markdown)
+}
+
+/// Convert markdown to HTML
+fn markdown_to_html(markdown: &str) -> String {
+    let mut html = String::new();
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut in_paragraph = false;
+    let mut in_code_block = false;
+    let mut in_list = false;
+
+    for line in lines {
+        // Code blocks
+        if line.starts_with("```") {
+            if in_code_block {
+                html.push_str("</code></pre>\n");
+                in_code_block = false;
+            } else {
+                let lang = line.trim_start_matches("```");
+                html.push_str(&format!("<pre><code class=\"language-{}\">", lang));
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            html.push_str(&html_escape(line));
+            html.push('\n');
+            continue;
+        }
+
+        // Blank lines
+        if line.trim().is_empty() {
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
+            if in_list {
+                html.push_str("</ul>\n");
+                in_list = false;
+            }
+            continue;
+        }
+
+        // Headers
+        if line.starts_with("# ") {
+            html.push_str(&format!("<h1>{}</h1>\n", process_inline_markdown(&line[2..])));
+            continue;
+        }
+        if line.starts_with("## ") {
+            html.push_str(&format!("<h2>{}</h2>\n", process_inline_markdown(&line[3..])));
+            continue;
+        }
+        if line.starts_with("### ") {
+            html.push_str(&format!("<h3>{}</h3>\n", process_inline_markdown(&line[4..])));
+            continue;
+        }
+        if line.starts_with("#### ") {
+            html.push_str(&format!("<h4>{}</h4>\n", process_inline_markdown(&line[5..])));
+            continue;
+        }
+
+        // Unordered lists
+        if line.starts_with("- ") || line.starts_with("* ") {
+            if !in_list {
+                html.push_str("<ul>\n");
+                in_list = true;
+            }
+            html.push_str(&format!("<li>{}</li>\n", process_inline_markdown(&line[2..])));
+            continue;
+        }
+
+        // Ordered lists
+        if let Some(idx) = line.find(". ") {
+            if idx > 0 && line[..idx].chars().all(|c| c.is_numeric()) {
+                if !in_list {
+                    html.push_str("<ol>\n");
+                    in_list = true;
+                }
+                html.push_str(&format!("<li>{}</li>\n", process_inline_markdown(&line[idx + 2..])));
+                continue;
+            }
+        }
+
+        // Blockquotes
+        if line.starts_with("> ") {
+            html.push_str(&format!("<blockquote>{}</blockquote>\n", process_inline_markdown(&line[2..])));
+            continue;
+        }
+
+        // Horizontal rules
+        if line == "---" || line == "***" || line == "___" {
+            html.push_str("<hr>\n");
+            continue;
+        }
+
+        // Regular paragraphs
+        if !in_paragraph {
+            html.push_str("<p>");
+            in_paragraph = true;
+        } else {
+            html.push(' ');
+        }
+        html.push_str(&process_inline_markdown(line));
+    }
+
+    // Close any open tags
+    if in_paragraph {
+        html.push_str("</p>\n");
+    }
+    if in_list {
+        html.push_str("</ul>\n");
+    }
+    if in_code_block {
+        html.push_str("</code></pre>\n");
+    }
+
+    html
+}
+
+/// Process inline markdown (bold, italic, links, code)
+fn process_inline_markdown(text: &str) -> String {
+    let mut result = text.to_string();
+
+    // Inline code
+    let code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
+    result = code_re.replace_all(&result, "<code>$1</code>").to_string();
+
+    // Bold
+    let bold_re = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
+    result = bold_re.replace_all(&result, "<strong>$1</strong>").to_string();
+
+    let bold_re2 = regex::Regex::new(r"__([^_]+)__").unwrap();
+    result = bold_re2.replace_all(&result, "<strong>$1</strong>").to_string();
+
+    // Italic
+    let italic_re = regex::Regex::new(r"\*([^*]+)\*").unwrap();
+    result = italic_re.replace_all(&result, "<em>$1</em>").to_string();
+
+    let italic_re2 = regex::Regex::new(r"_([^_]+)_").unwrap();
+    result = italic_re2.replace_all(&result, "<em>$1</em>").to_string();
+
+    // Links
+    let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
+    result = link_re.replace_all(&result, "<a href=\"$2\">$1</a>").to_string();
+
+    // Images
+    let img_re = regex::Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap();
+    result = img_re.replace_all(&result, "<img src=\"$2\" alt=\"$1\">").to_string();
+
+    result
+}
+
+/// HTML escape special characters
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Generate a responsive iframe wrapper
+fn generate_responsive_wrapper(iframe_html: String, aspect_ratio: f64) -> String {
+    let padding_percent = (1.0 / aspect_ratio) * 100.0;
+    format!(
+        r#"<div style="position:relative;padding-bottom:{:.2}%;height:0;overflow:hidden;">{}</div>"#,
+        padding_percent,
+        iframe_html
+    )
+}
+
+// =============================================================================
+// GENERATOR ACTOR
+// =============================================================================
+
+/// Static site generator actor
+actor GeneratorActor {
+    state {
+        /// Configuration
+        config: GeneratorConfig,
+
+        /// Template engine
+        template_engine: TemplateEngine,
+
+        /// Build history
+        build_history: List<BuildResult>,
+
+        /// Current build (if running)
+        current_build: Option<BuildContext>,
+
+        /// Build manifest cache
+        manifest_cache: Map<TenantId, BuildManifest>
+    }
+
+    /// Initialize generator
+    fn init(config: GeneratorConfig) -> GeneratorActor {
+        GeneratorActor {
+            state: GeneratorActorState {
+                config,
+                template_engine: TemplateEngine::new(),
+                build_history: vec![],
+                current_build: None,
+                manifest_cache: Map::new()
+            }
+        }
+    }
+
+    /// Build site for tenant
+    fn build(&mut self, tenant_id: TenantId, content: RenderableContent) -> Result<BuildResult, BuildError> {
+        let start_time = std::time::Instant::now();
+        let build_id = generate_uuid();
+
+        // Create build context
+        let context = BuildContext {
+            config: self.state.config.clone(),
+            tenant_id: tenant_id.clone(),
+            theme: self.load_theme(&self.state.config.theme)?,
+            site_data: self.build_site_data(&content)?,
+            build_time: DateTime::now(),
+            build_id: build_id.clone(),
+            assets: Map::new(),
+            pages: vec![],
+            errors: vec![],
+            warnings: vec![]
+        };
+
+        self.state.current_build = Some(context.clone());
+
+        // Prepare output directory
+        self.prepare_output_dir(&context)?;
+
+        // Load templates
+        self.load_templates(&context)?;
+
+        // Process assets
+        let asset_results = self.process_assets(&context, &content)?;
+
+        // Generate pages
+        let page_results = self.generate_pages(&context, &content)?;
+
+        // Generate sitemap and other meta files
+        self.generate_meta_files(&context)?;
+
+        // Create manifest
+        let manifest = self.create_manifest(&context)?;
+
+        let duration = start_time.elapsed();
+
+        let result = BuildResult {
+            success: context.errors.is_empty(),
+            build_id,
+            page_count: page_results.len() as i32,
+            asset_count: asset_results.len() as i32,
+            total_size: self.calculate_total_size(&page_results, &asset_results),
+            duration,
+            errors: context.errors,
+            warnings: context.warnings,
+            output_dir: context.config.output_dir.clone(),
+            pages: page_results,
+            manifest: manifest.clone()
+        };
+
+        // Store manifest
+        self.state.manifest_cache.insert(tenant_id, manifest);
+
+        // Store build history
+        self.state.build_history.push(result.clone());
+        if self.state.build_history.len() > 100 {
+            self.state.build_history.remove(0);
+        }
+
+        self.state.current_build = None;
+
+        Ok(result)
+    }
+
+    /// Incremental build (only changed content)
+    fn incremental_build(
+        &mut self,
+        tenant_id: TenantId,
+        content: RenderableContent,
+        changed_ids: Set<String>
+    ) -> Result<BuildResult, BuildError> {
+        // Get previous manifest
+        let prev_manifest = self.state.manifest_cache.get(&tenant_id);
+
+        if prev_manifest.is_none() {
+            // No previous build, do full build
+            return self.build(tenant_id, content)
+        }
+
+        // Filter content to only changed items
+        let filtered_content = self.filter_changed_content(&content, &changed_ids);
+
+        // Build only changed pages
+        self.build(tenant_id, filtered_content)
+    }
+
+    /// Load theme configuration
+    fn load_theme(&self, theme_name: &str) -> Result<ThemeConfig, BuildError> {
+        // Would load theme from themes directory
+        Ok(ThemeConfig {
+            name: theme_name.to_string(),
+            version: "1.0.0".to_string(),
+            template_dir: format!("themes/{}/templates", theme_name),
+            asset_dir: format!("themes/{}/assets", theme_name),
+            layouts: vec!["default".to_string(), "course".to_string(), "lesson".to_string()],
+            variables: Map::new()
+        })
+    }
+
+    /// Build site-wide data
+    fn build_site_data(&self, content: &RenderableContent) -> Result<SiteData, BuildError> {
+        Ok(SiteData {
+            title: "Intelligo LMS".to_string(),
+            description: "Learn anything, anywhere".to_string(),
+            url: self.state.config.base_url.clone(),
+            branding: Branding {
+                logo: None,
+                favicon: None,
+                primary_color: "#3B82F6".to_string(),
+                secondary_color: "#10B981".to_string(),
+                font_family: "Inter, sans-serif".to_string()
+            },
+            navigation: self.build_navigation(content),
+            footer_links: vec![],
+            social_links: vec![],
+            metadata: Map::new()
+        })
+    }
+
+    /// Build navigation from content
+    fn build_navigation(&self, content: &RenderableContent) -> List<NavItem> {
+        vec![
+            NavItem {
+                label: "Courses".to_string(),
+                url: "/courses".to_string(),
+                children: vec![],
+                icon: Some("book".to_string()),
+                active: false
+            },
+            NavItem {
+                label: "Categories".to_string(),
+                url: "/categories".to_string(),
+                children: content.catalog.categories.iter().map(|c| NavItem {
+                    label: c.name.clone(),
+                    url: format!("/categories/{}", c.slug),
+                    children: vec![],
+                    icon: None,
+                    active: false
+                }).collect(),
+                icon: Some("folder".to_string()),
+                active: false
+            }
+        ]
+    }
+
+    /// Prepare output directory
+    fn prepare_output_dir(&self, context: &BuildContext) -> Result<(), BuildError> {
+        let output_dir = Path::new(&context.config.output_dir);
+
+        // Create directory if it doesn't exist
+        if !output_dir.exists() {
+            std::fs::create_dir_all(output_dir)
+                .map_err(|e| BuildError {
+                    code: "OUTPUT_DIR_ERROR".to_string(),
+                    message: e.to_string(),
+                    source: Some(context.config.output_dir.clone()),
+                    line: None,
+                    timestamp: DateTime::now()
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Load all templates
+    fn load_templates(&mut self, context: &BuildContext) -> Result<(), BuildError> {
+        let template_dir = Path::new(&context.theme.template_dir);
+
+        // Load layout templates
+        for layout in &context.theme.layouts {
+            let path = template_dir.join(format!("{}.html", layout));
+            self.state.template_engine.load_template(layout, path.to_str().unwrap())?;
+        }
+
+        // Load partial templates
+        let partials_dir = template_dir.join("partials");
+        if partials_dir.exists() {
+            for entry in std::fs::read_dir(partials_dir).map_err(|e| BuildError {
+                code: "TEMPLATE_DIR_ERROR".to_string(),
+                message: e.to_string(),
+                source: None,
+                line: None,
+                timestamp: DateTime::now()
+            })? {
+                let entry = entry.map_err(|e| BuildError {
+                    code: "TEMPLATE_READ_ERROR".to_string(),
+                    message: e.to_string(),
+                    source: None,
+                    line: None,
+                    timestamp: DateTime::now()
+                })?;
+                let path = entry.path();
+                if path.extension().map(|e| e == "html").unwrap_or(false) {
+                    let name = path.file_stem().unwrap().to_str().unwrap();
+                    self.state.template_engine.load_template(
+                        &format!("partials/{}", name),
+                        path.to_str().unwrap()
+                    )?;
+                }
+            }
+        }
+
+        // Set global context
+        self.state.template_engine.set_global("site", Dynamic::from(&context.site_data));
+        self.state.template_engine.set_global("build_time", Dynamic::from(context.build_time.to_string()));
+        self.state.template_engine.set_global("build_id", Dynamic::from(&context.build_id));
+
+        Ok(())
+    }
+
+    /// Process and copy assets
+    fn process_assets(&mut self, context: &BuildContext, content: &RenderableContent) -> Result<List<AssetInfo>, BuildError> {
+        let mut assets = vec![];
+
+        // Copy theme assets
+        let theme_assets = self.copy_theme_assets(context)?;
+        assets.extend(theme_assets);
+
+        // Process course images and media
+        for course in &content.courses {
+            if let Some(thumbnail) = &course.course.thumbnail {
+                let asset = self.process_image(context, thumbnail)?;
+                assets.push(asset);
+            }
+            if let Some(banner) = &course.course.banner_image {
+                let asset = self.process_image(context, banner)?;
+                assets.push(asset);
+            }
+        }
+
+        Ok(assets)
+    }
+
+    /// Copy theme assets
+    fn copy_theme_assets(&self, context: &BuildContext) -> Result<List<AssetInfo>, BuildError> {
+        // Would copy all theme assets to output directory
+        Ok(vec![])
+    }
+
+    /// Process an image
+    fn process_image(&self, context: &BuildContext, media_id: &MediaId) -> Result<AssetInfo, BuildError> {
+        // Would optimize and copy image
+        Ok(AssetInfo {
+            source: media_id.clone(),
+            output: format!("assets/images/{}", media_id),
+            asset_type: AssetType::Image,
+            size: 0,
+            hash: "".to_string(),
+            inline: false
+        })
+    }
+
+    /// Generate all pages
+    fn generate_pages(&mut self, context: &BuildContext, content: &RenderableContent) -> Result<List<PageResult>, BuildError> {
+        let mut results = vec![];
+
+        // Generate catalog page
+        results.push(self.generate_catalog_page(context, content)?);
+
+        // Generate course pages
+        for course_content in &content.courses {
+            results.push(self.generate_course_page(context, course_content)?);
+
+            // Generate module pages
+            for module_content in &course_content.modules {
+                results.push(self.generate_module_page(context, course_content, module_content)?);
+
+                // Generate lesson pages
+                for lesson_content in &module_content.lessons {
+                    results.push(self.generate_lesson_page(context, course_content, module_content, lesson_content)?);
+                }
+            }
+        }
+
+        // Generate static pages
+        for page in &content.static_pages {
+            results.push(self.generate_static_page(context, page)?);
+        }
+
+        // Generate category pages
+        for category in &content.catalog.categories {
+            results.push(self.generate_category_page(context, category, content)?);
+        }
+
+        Ok(results)
+    }
+
+    /// Generate catalog page
+    fn generate_catalog_page(&self, context: &BuildContext, content: &RenderableContent) -> Result<PageResult, BuildError> {
+        let start = std::time::Instant::now();
+
+        let mut page_context = Map::new();
+        page_context.insert("title".to_string(), Dynamic::from("Course Catalog"));
+        page_context.insert("courses".to_string(), Dynamic::from(&content.courses));
+        page_context.insert("categories".to_string(), Dynamic::from(&content.catalog.categories));
+        page_context.insert("featured".to_string(), Dynamic::from(&content.catalog.featured_courses));
+
+        let html = self.state.template_engine.render("catalog", &page_context)?;
+        let output_path = format!("{}/courses/index.html", context.config.output_dir);
+
+        self.write_page(&output_path, &html)?;
+
+        Ok(PageResult {
+            route: "/courses".to_string(),
+            output_path,
+            size: html.len() as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            status: PageStatus::Success
+        })
+    }
+
+    /// Generate course landing page
+    fn generate_course_page(&self, context: &BuildContext, course_content: &CourseContent) -> Result<PageResult, BuildError> {
+        let start = std::time::Instant::now();
+
+        let mut page_context = Map::new();
+        page_context.insert("title".to_string(), Dynamic::from(&course_content.course.title));
+        page_context.insert("course".to_string(), Dynamic::from(course_content));
+        page_context.insert("instructor".to_string(), Dynamic::from(&course_content.instructor));
+        page_context.insert("pricing".to_string(), Dynamic::from(&course_content.pricing));
+        page_context.insert("modules".to_string(), Dynamic::from(&course_content.modules));
+
+        let html = self.state.template_engine.render("course", &page_context)?;
+        let slug = self.slugify(&course_content.course.title);
+        let output_path = format!("{}/courses/{}/index.html", context.config.output_dir, slug);
+
+        self.write_page(&output_path, &html)?;
+
+        Ok(PageResult {
+            route: format!("/courses/{}", slug),
+            output_path,
+            size: html.len() as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            status: PageStatus::Success
+        })
+    }
+
+    /// Generate module page
+    fn generate_module_page(
+        &self,
+        context: &BuildContext,
+        course: &CourseContent,
+        module: &ModuleContent
+    ) -> Result<PageResult, BuildError> {
+        let start = std::time::Instant::now();
+
+        let mut page_context = Map::new();
+        page_context.insert("title".to_string(), Dynamic::from(&module.module.title));
+        page_context.insert("course".to_string(), Dynamic::from(course));
+        page_context.insert("module".to_string(), Dynamic::from(module));
+        page_context.insert("lessons".to_string(), Dynamic::from(&module.lessons));
+
+        let html = self.state.template_engine.render("module", &page_context)?;
+        let course_slug = self.slugify(&course.course.title);
+        let module_slug = self.slugify(&module.module.title);
+        let output_path = format!("{}/courses/{}/{}/index.html", context.config.output_dir, course_slug, module_slug);
+
+        self.write_page(&output_path, &html)?;
+
+        Ok(PageResult {
+            route: format!("/courses/{}/{}", course_slug, module_slug),
+            output_path,
+            size: html.len() as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            status: PageStatus::Success
+        })
+    }
+
+    /// Generate lesson page
+    fn generate_lesson_page(
+        &self,
+        context: &BuildContext,
+        course: &CourseContent,
+        module: &ModuleContent,
+        lesson: &LessonContent
+    ) -> Result<PageResult, BuildError> {
+        let start = std::time::Instant::now();
+
+        let mut page_context = Map::new();
+        page_context.insert("title".to_string(), Dynamic::from(&lesson.lesson.title));
+        page_context.insert("course".to_string(), Dynamic::from(course));
+        page_context.insert("module".to_string(), Dynamic::from(module));
+        page_context.insert("lesson".to_string(), Dynamic::from(lesson));
+        page_context.insert("content".to_string(), Dynamic::from(&lesson.rendered_content));
+        page_context.insert("resources".to_string(), Dynamic::from(&lesson.resources));
+
+        let html = self.state.template_engine.render("lesson", &page_context)?;
+        let course_slug = self.slugify(&course.course.title);
+        let module_slug = self.slugify(&module.module.title);
+        let lesson_slug = self.slugify(&lesson.lesson.title);
+        let output_path = format!("{}/courses/{}/{}/{}/index.html",
+            context.config.output_dir, course_slug, module_slug, lesson_slug);
+
+        self.write_page(&output_path, &html)?;
+
+        Ok(PageResult {
+            route: format!("/courses/{}/{}/{}", course_slug, module_slug, lesson_slug),
+            output_path,
+            size: html.len() as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            status: PageStatus::Success
+        })
+    }
+
+    /// Generate static page
+    fn generate_static_page(&self, context: &BuildContext, page: &StaticPage) -> Result<PageResult, BuildError> {
+        let start = std::time::Instant::now();
+
+        let mut page_context = Map::new();
+        page_context.insert("title".to_string(), Dynamic::from(&page.title));
+        page_context.insert("content".to_string(), Dynamic::from(&page.content));
+        for (k, v) in &page.metadata {
+            page_context.insert(k.clone(), v.clone());
+        }
+
+        let html = self.state.template_engine.render(&page.template, &page_context)?;
+        let output_path = format!("{}/{}/index.html", context.config.output_dir, page.slug);
+
+        self.write_page(&output_path, &html)?;
+
+        Ok(PageResult {
+            route: format!("/{}", page.slug),
+            output_path,
+            size: html.len() as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            status: PageStatus::Success
+        })
+    }
+
+    /// Generate category page
+    fn generate_category_page(
+        &self,
+        context: &BuildContext,
+        category: &CategoryInfo,
+        content: &RenderableContent
+    ) -> Result<PageResult, BuildError> {
+        let start = std::time::Instant::now();
+
+        // Filter courses by category
+        let category_courses: Vec<_> = content.courses.iter()
+            .filter(|c| c.course.categories.contains(&category.id))
+            .collect();
+
+        let mut page_context = Map::new();
+        page_context.insert("title".to_string(), Dynamic::from(&category.name));
+        page_context.insert("category".to_string(), Dynamic::from(category));
+        page_context.insert("courses".to_string(), Dynamic::from(&category_courses));
+
+        let html = self.state.template_engine.render("category", &page_context)?;
+        let output_path = format!("{}/categories/{}/index.html", context.config.output_dir, category.slug);
+
+        self.write_page(&output_path, &html)?;
+
+        Ok(PageResult {
+            route: format!("/categories/{}", category.slug),
+            output_path,
+            size: html.len() as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            status: PageStatus::Success
+        })
+    }
+
+    /// Generate meta files (sitemap, robots.txt, etc.)
+    fn generate_meta_files(&self, context: &BuildContext) -> Result<(), BuildError> {
+        // Generate sitemap.xml
+        self.generate_sitemap(context)?;
+
+        // Generate robots.txt
+        self.generate_robots(context)?;
+
+        // Generate manifest.json
+        self.generate_manifest(context)?;
+
+        Ok(())
+    }
+
+    /// Generate sitemap.xml
+    fn generate_sitemap(&self, context: &BuildContext) -> Result<(), BuildError> {
+        let mut sitemap = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sitemap.push_str("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+
+        for page in &context.pages {
+            sitemap.push_str(&format!(
+                "  <url>\n    <loc>{}{}</loc>\n    <lastmod>{}</lastmod>\n  </url>\n",
+                context.config.base_url,
+                page.route,
+                page.last_modified.to_rfc3339()
+            ));
+        }
+
+        sitemap.push_str("</urlset>");
+
+        let output_path = format!("{}/sitemap.xml", context.config.output_dir);
+        std::fs::write(&output_path, &sitemap)
+            .map_err(|e| BuildError {
+                code: "SITEMAP_WRITE_ERROR".to_string(),
+                message: e.to_string(),
+                source: Some(output_path),
+                line: None,
+                timestamp: DateTime::now()
+            })?;
+
+        Ok(())
+    }
+
+    /// Generate robots.txt
+    fn generate_robots(&self, context: &BuildContext) -> Result<(), BuildError> {
+        let robots = format!(
+            "User-agent: *\nAllow: /\n\nSitemap: {}/sitemap.xml\n",
+            context.config.base_url
+        );
+
+        let output_path = format!("{}/robots.txt", context.config.output_dir);
+        std::fs::write(&output_path, &robots)
+            .map_err(|e| BuildError {
+                code: "ROBOTS_WRITE_ERROR".to_string(),
+                message: e.to_string(),
+                source: Some(output_path),
+                line: None,
+                timestamp: DateTime::now()
+            })?;
+
+        Ok(())
+    }
+
+    /// Generate web manifest
+    fn generate_manifest(&self, context: &BuildContext) -> Result<(), BuildError> {
+        let manifest = format!(r#"{{
+  "name": "{}",
+  "short_name": "{}",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "{}",
+  "icons": []
+}}"#,
+            context.site_data.title,
+            context.site_data.title,
+            context.site_data.branding.primary_color
+        );
+
+        let output_path = format!("{}/manifest.json", context.config.output_dir);
+        std::fs::write(&output_path, &manifest)
+            .map_err(|e| BuildError {
+                code: "MANIFEST_WRITE_ERROR".to_string(),
+                message: e.to_string(),
+                source: Some(output_path),
+                line: None,
+                timestamp: DateTime::now()
+            })?;
+
+        Ok(())
+    }
+
+    /// Write page to file
+    fn write_page(&self, output_path: &str, html: &str) -> Result<(), BuildError> {
+        // Ensure directory exists
+        let path = Path::new(output_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BuildError {
+                    code: "DIR_CREATE_ERROR".to_string(),
+                    message: e.to_string(),
+                    source: Some(output_path.to_string()),
+                    line: None,
+                    timestamp: DateTime::now()
+                })?;
+        }
+
+        // Minify if enabled
+        let content = if self.state.config.minify {
+            self.minify_html(html)
+        } else {
+            html.to_string()
+        };
+
+        std::fs::write(output_path, &content)
+            .map_err(|e| BuildError {
+                code: "PAGE_WRITE_ERROR".to_string(),
+                message: e.to_string(),
+                source: Some(output_path.to_string()),
+                line: None,
+                timestamp: DateTime::now()
+            })?;
+
+        Ok(())
+    }
+
+    /// Minify HTML
+    fn minify_html(&self, html: &str) -> String {
+        // Simple minification (would use proper minifier in production)
+        html.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Create build manifest
+    fn create_manifest(&self, context: &BuildContext) -> Result<BuildManifest, BuildError> {
+        let mut pages = Map::new();
+        let mut assets = Map::new();
+
+        for page in &context.pages {
+            pages.insert(page.route.clone(), ManifestEntry {
+                source_hash: "".to_string(), // Would be computed
+                output_hash: "".to_string(),
+                output_path: page.output_path.clone(),
+                dependencies: page.dependencies.clone(),
+                built_at: context.build_time
+            });
+        }
+
+        for (id, asset) in &context.assets {
+            assets.insert(id.clone(), ManifestEntry {
+                source_hash: asset.hash.clone(),
+                output_hash: asset.hash.clone(),
+                output_path: asset.output.clone(),
+                dependencies: vec![],
+                built_at: context.build_time
+            });
+        }
+
+        Ok(BuildManifest {
+            build_id: context.build_id.clone(),
+            build_time: context.build_time,
+            pages,
+            assets
+        })
+    }
+
+    /// Calculate total output size
+    fn calculate_total_size(&self, pages: &List<PageResult>, assets: &List<AssetInfo>) -> i64 {
+        let page_size: i64 = pages.iter().map(|p| p.size).sum();
+        let asset_size: i64 = assets.iter().map(|a| a.size).sum();
+        page_size + asset_size
+    }
+
+    /// Filter content to only changed items
+    fn filter_changed_content(&self, content: &RenderableContent, changed_ids: &Set<String>) -> RenderableContent {
+        // Filter courses that have changed
+        let courses: Vec<_> = content.courses.iter()
+            .filter(|c| changed_ids.contains(&c.course.id))
+            .cloned()
+            .collect();
+
+        RenderableContent {
+            courses,
+            static_pages: content.static_pages.iter()
+                .filter(|p| changed_ids.contains(&p.id))
+                .cloned()
+                .collect(),
+            catalog: content.catalog.clone()
+        }
+    }
+
+    /// Create URL-safe slug from text
+    fn slugify(&self, text: &str) -> String {
+        text.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// Get last build result
+    fn get_last_build(&self, tenant_id: &TenantId) -> Option<&BuildResult> {
+        self.state.build_history.iter()
+            .rev()
+            .find(|r| r.output_dir.contains(&tenant_id.to_string()))
+    }
+
+    /// Get build by ID
+    fn get_build(&self, build_id: &str) -> Option<&BuildResult> {
+        self.state.build_history.iter()
+            .find(|r| r.build_id == build_id)
+    }
+}

@@ -1,0 +1,769 @@
+/// Intelligo LMS - Configuration Core
+///
+/// Core configuration loading and management from environment variables,
+/// configuration files, and database-backed settings.
+
+module intelligo::config::core
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::env
+use std::fs
+use std::path::Path
+
+// =============================================================================
+// CONFIGURATION SOURCES
+// =============================================================================
+
+/// Configuration source priority (lower = higher priority)
+enum ConfigSource {
+    /// Environment variables (highest priority)
+    Environment { prefix: String },
+    /// Command-line arguments
+    CommandLine,
+    /// Configuration file
+    File { path: String, format: ConfigFormat },
+    /// Database-backed configuration
+    Database { connection: String },
+    /// Remote configuration service
+    Remote { url: String, poll_interval: Duration },
+    /// Default values (lowest priority)
+    Default
+}
+
+/// Configuration file format
+enum ConfigFormat {
+    Json,
+    Yaml,
+    Toml,
+    Env
+}
+
+impl ConfigFormat {
+    fn from_extension(ext: &str) -> Option<ConfigFormat> {
+        match ext.to_lowercase().as_str() {
+            "json" => Some(ConfigFormat::Json),
+            "yaml" | "yml" => Some(ConfigFormat::Yaml),
+            "toml" => Some(ConfigFormat::Toml),
+            "env" => Some(ConfigFormat::Env),
+            _ => None
+        }
+    }
+}
+
+// =============================================================================
+// CONFIGURATION VALUE
+// =============================================================================
+
+/// A configuration value with metadata
+type ConfigValue {
+    /// The actual value
+    value: Dynamic,
+    /// Source of this value
+    source: String,
+    /// When this value was loaded/set
+    loaded_at: DateTime,
+    /// Whether this value is sensitive
+    sensitive: Bool,
+    /// Description of this setting
+    description: Option<String>,
+    /// Validation schema
+    schema: Option<ValueSchema>
+}
+
+impl ConfigValue {
+    fn new(value: Dynamic, source: String) -> ConfigValue {
+        ConfigValue {
+            value,
+            source,
+            loaded_at: DateTime::now(),
+            sensitive: false,
+            description: None,
+            schema: None
+        }
+    }
+
+    fn as_string(&self) -> Option<String> {
+        match &self.value {
+            Dynamic::String(s) => Some(s.clone()),
+            Dynamic::Int(i) => Some(i.to_string()),
+            Dynamic::Float(f) => Some(f.to_string()),
+            Dynamic::Bool(b) => Some(b.to_string()),
+            _ => None
+        }
+    }
+
+    fn as_int(&self) -> Option<i64> {
+        match &self.value {
+            Dynamic::Int(i) => Some(*i),
+            Dynamic::String(s) => s.parse().ok(),
+            Dynamic::Float(f) => Some(*f as i64),
+            _ => None
+        }
+    }
+
+    fn as_float(&self) -> Option<f64> {
+        match &self.value {
+            Dynamic::Float(f) => Some(*f),
+            Dynamic::Int(i) => Some(*i as f64),
+            Dynamic::String(s) => s.parse().ok(),
+            _ => None
+        }
+    }
+
+    fn as_bool(&self) -> Option<Bool> {
+        match &self.value {
+            Dynamic::Bool(b) => Some(*b),
+            Dynamic::String(s) => match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                _ => None
+            },
+            Dynamic::Int(i) => Some(*i != 0),
+            _ => None
+        }
+    }
+
+    fn as_list(&self) -> Option<List<Dynamic>> {
+        match &self.value {
+            Dynamic::List(l) => Some(l.clone()),
+            Dynamic::String(s) => Some(s.split(',').map(|v| Dynamic::String(v.trim().to_string())).collect()),
+            _ => None
+        }
+    }
+}
+
+/// Value schema for validation
+type ValueSchema {
+    value_type: ValueType,
+    required: Bool,
+    min: Option<f64>,
+    max: Option<f64>,
+    min_length: Option<i32>,
+    max_length: Option<i32>,
+    pattern: Option<String>,
+    allowed_values: Option<List<Dynamic>>,
+    default: Option<Dynamic>
+}
+
+/// Value type for schema
+enum ValueType {
+    String,
+    Int,
+    Float,
+    Bool,
+    List,
+    Map,
+    Duration,
+    Url,
+    Email,
+    Path
+}
+
+// =============================================================================
+// CONFIGURATION MANAGER
+// =============================================================================
+
+/// Configuration manager actor
+actor ConfigManager {
+    var config: Map<String, ConfigValue> = Map::new()
+    var sources: List<ConfigSource> = vec![]
+    var watchers: Map<String, List<ConfigWatcher>> = Map::new()
+    var loaded: Bool = false
+    var env_prefix: String = "INTELLIGO_".to_string()
+
+    fn new() -> Self {
+        ConfigManager::default()
+    }
+
+    /// Load configuration from all sources
+    receive Load(sources: List<ConfigSource>) -> Result<(), ConfigError> {
+        self.sources = sources.clone();
+
+        // Load in reverse priority order (defaults first)
+        let mut ordered = sources.clone();
+        ordered.reverse();
+
+        for source in ordered {
+            self.load_source(&source)?;
+        }
+
+        self.loaded = true;
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Load from environment with prefix
+    receive LoadFromEnv(prefix: String) -> Result<i32, ConfigError> {
+        self.env_prefix = prefix.clone();
+        let count = self.load_environment(&prefix)?;
+        checkpoint();
+        Ok(count)
+    }
+
+    /// Load from file
+    receive LoadFromFile(path: String) -> Result<i32, ConfigError> {
+        let count = self.load_file(&path)?;
+        checkpoint();
+        Ok(count)
+    }
+
+    /// Get configuration value
+    receive Get(key: String) -> Option<ConfigValue> {
+        self.config.get(&key).cloned()
+    }
+
+    /// Get string value with default
+    receive GetString(key: String, default: String) -> String {
+        self.config.get(&key)
+            .and_then(|v| v.as_string())
+            .unwrap_or(default)
+    }
+
+    /// Get int value with default
+    receive GetInt(key: String, default: i64) -> i64 {
+        self.config.get(&key)
+            .and_then(|v| v.as_int())
+            .unwrap_or(default)
+    }
+
+    /// Get float value with default
+    receive GetFloat(key: String, default: f64) -> f64 {
+        self.config.get(&key)
+            .and_then(|v| v.as_float())
+            .unwrap_or(default)
+    }
+
+    /// Get bool value with default
+    receive GetBool(key: String, default: Bool) -> Bool {
+        self.config.get(&key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
+    }
+
+    /// Get list value
+    receive GetList(key: String) -> Option<List<Dynamic>> {
+        self.config.get(&key)
+            .and_then(|v| v.as_list())
+    }
+
+    /// Set configuration value
+    receive Set(key: String, value: Dynamic, source: String) {
+        let config_value = ConfigValue::new(value, source);
+        self.config.insert(key.clone(), config_value);
+
+        // Notify watchers
+        self.notify_watchers(&key);
+
+        checkpoint();
+    }
+
+    /// Set value with metadata
+    receive SetWithMeta(key: String, value: ConfigValue) {
+        self.config.insert(key.clone(), value);
+        self.notify_watchers(&key);
+        checkpoint();
+    }
+
+    /// Check if key exists
+    receive Has(key: String) -> Bool {
+        self.config.contains_key(&key)
+    }
+
+    /// Get all keys
+    receive Keys() -> List<String> {
+        self.config.keys().cloned().collect()
+    }
+
+    /// Get all keys matching prefix
+    receive KeysWithPrefix(prefix: String) -> List<String> {
+        self.config.keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    /// Get configuration as map
+    receive GetSection(prefix: String) -> Map<String, ConfigValue> {
+        self.config.iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| {
+                let key = k.strip_prefix(&prefix)
+                    .map(|s| s.strip_prefix('.').unwrap_or(s))
+                    .unwrap_or(k)
+                    .to_string();
+                (key, v.clone())
+            })
+            .collect()
+    }
+
+    /// Register a watcher for changes
+    receive Watch(key: String, watcher: ConfigWatcher) {
+        self.watchers.entry(key).or_insert(vec![]).push(watcher);
+    }
+
+    /// Reload configuration
+    receive Reload() -> Result<(), ConfigError> {
+        for source in self.sources.clone() {
+            self.load_source(&source)?;
+        }
+        checkpoint();
+        Ok(())
+    }
+
+    /// Validate configuration against schema
+    receive Validate(schemas: Map<String, ValueSchema>) -> List<ValidationError> {
+        let mut errors = vec![];
+
+        for (key, schema) in &schemas {
+            match self.config.get(key) {
+                Some(value) => {
+                    if let Err(e) = self.validate_value(key, value, schema) {
+                        errors.push(e);
+                    }
+                },
+                None if schema.required => {
+                    errors.push(ValidationError {
+                        key: key.clone(),
+                        message: "Required configuration key not found".to_string()
+                    });
+                },
+                None => {
+                    // Apply default if exists
+                    if let Some(ref default) = schema.default {
+                        let config_value = ConfigValue::new(default.clone(), "default".to_string());
+                        self.config.insert(key.clone(), config_value);
+                    }
+                }
+            }
+        }
+
+        errors
+    }
+
+    /// Export configuration (excluding sensitive values)
+    receive Export() -> Map<String, Dynamic> {
+        self.config.iter()
+            .filter(|(_, v)| !v.sensitive)
+            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .collect()
+    }
+
+    // Internal methods
+
+    fn load_source(&mut self, source: &ConfigSource) -> Result<(), ConfigError> {
+        match source {
+            ConfigSource::Environment { prefix } => {
+                self.load_environment(prefix)?;
+            },
+            ConfigSource::File { path, format } => {
+                self.load_file_with_format(path, format)?;
+            },
+            ConfigSource::Database { connection } => {
+                self.load_database(connection)?;
+            },
+            ConfigSource::Remote { url, .. } => {
+                self.load_remote(url)?;
+            },
+            ConfigSource::Default => {
+                self.load_defaults();
+            },
+            ConfigSource::CommandLine => {
+                self.load_command_line()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn load_environment(&mut self, prefix: &str) -> Result<i32, ConfigError> {
+        let mut count = 0;
+
+        for (key, value) in env::vars() {
+            if key.starts_with(prefix) {
+                let config_key = key[prefix.len()..]
+                    .to_lowercase()
+                    .replace("__", ".");
+
+                let config_value = ConfigValue::new(
+                    Dynamic::String(value),
+                    "environment".to_string()
+                );
+
+                self.config.insert(config_key, config_value);
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    fn load_file(&mut self, path: &str) -> Result<i32, ConfigError> {
+        let path = Path::new(path);
+        let format = path.extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(|ext| ConfigFormat::from_extension(ext))
+            .ok_or(ConfigError::InvalidFormat {
+                message: "Unknown file format".to_string()
+            })?;
+
+        self.load_file_with_format(path.to_str().unwrap(), &format)
+    }
+
+    fn load_file_with_format(&mut self, path: &str, format: &ConfigFormat) -> Result<i32, ConfigError> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| ConfigError::LoadFailed {
+                source: path.to_string(),
+                message: e.to_string()
+            })?;
+
+        let values = match format {
+            ConfigFormat::Json => parse_json_config(&content)?,
+            ConfigFormat::Yaml => parse_yaml_config(&content)?,
+            ConfigFormat::Toml => parse_toml_config(&content)?,
+            ConfigFormat::Env => parse_env_config(&content)?
+        };
+
+        let count = values.len();
+
+        for (key, value) in values {
+            let config_value = ConfigValue::new(value, format!("file:{}", path));
+            self.config.insert(key, config_value);
+        }
+
+        Ok(count as i32)
+    }
+
+    fn load_database(&mut self, _connection: &str) -> Result<i32, ConfigError> {
+        // Would load from database
+        Ok(0)
+    }
+
+    fn load_remote(&mut self, _url: &str) -> Result<i32, ConfigError> {
+        // Would load from remote config service
+        Ok(0)
+    }
+
+    fn load_command_line(&mut self) -> Result<i32, ConfigError> {
+        // Would parse command-line arguments
+        Ok(0)
+    }
+
+    fn load_defaults(&mut self) {
+        // Load default values
+        let defaults = vec![
+            ("app.name", Dynamic::String("Intelligo LMS".to_string())),
+            ("app.version", Dynamic::String("1.0.0".to_string())),
+            ("app.env", Dynamic::String("development".to_string())),
+            ("app.debug", Dynamic::Bool(false)),
+            ("server.host", Dynamic::String("0.0.0.0".to_string())),
+            ("server.port", Dynamic::Int(8080)),
+            ("database.pool_size", Dynamic::Int(10)),
+            ("database.timeout", Dynamic::Int(30)),
+            ("cache.enabled", Dynamic::Bool(true)),
+            ("cache.ttl", Dynamic::Int(3600)),
+            ("logging.level", Dynamic::String("info".to_string())),
+            ("logging.format", Dynamic::String("json".to_string())),
+        ];
+
+        for (key, value) in defaults {
+            if !self.config.contains_key(key) {
+                let config_value = ConfigValue::new(value, "default".to_string());
+                self.config.insert(key.to_string(), config_value);
+            }
+        }
+    }
+
+    fn validate_value(&self, key: &str, value: &ConfigValue, schema: &ValueSchema) -> Result<(), ValidationError> {
+        // Type validation
+        let type_valid = match &schema.value_type {
+            ValueType::String => value.as_string().is_some(),
+            ValueType::Int => value.as_int().is_some(),
+            ValueType::Float => value.as_float().is_some(),
+            ValueType::Bool => value.as_bool().is_some(),
+            ValueType::List => value.as_list().is_some(),
+            _ => true
+        };
+
+        if !type_valid {
+            return Err(ValidationError {
+                key: key.to_string(),
+                message: format!("Invalid type for key '{}', expected {:?}", key, schema.value_type)
+            });
+        }
+
+        // Range validation for numbers
+        if let (Some(v), Some(min)) = (value.as_float(), schema.min) {
+            if v < min {
+                return Err(ValidationError {
+                    key: key.to_string(),
+                    message: format!("Value {} is below minimum {}", v, min)
+                });
+            }
+        }
+
+        if let (Some(v), Some(max)) = (value.as_float(), schema.max) {
+            if v > max {
+                return Err(ValidationError {
+                    key: key.to_string(),
+                    message: format!("Value {} is above maximum {}", v, max)
+                });
+            }
+        }
+
+        // String length validation
+        if let (Some(v), Some(min_len)) = (value.as_string(), schema.min_length) {
+            if v.len() < min_len as usize {
+                return Err(ValidationError {
+                    key: key.to_string(),
+                    message: format!("String length {} is below minimum {}", v.len(), min_len)
+                });
+            }
+        }
+
+        if let (Some(v), Some(max_len)) = (value.as_string(), schema.max_length) {
+            if v.len() > max_len as usize {
+                return Err(ValidationError {
+                    key: key.to_string(),
+                    message: format!("String length {} is above maximum {}", v.len(), max_len)
+                });
+            }
+        }
+
+        // Allowed values validation
+        if let Some(ref allowed) = schema.allowed_values {
+            if !allowed.contains(&value.value) {
+                return Err(ValidationError {
+                    key: key.to_string(),
+                    message: format!("Value not in allowed values")
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn notify_watchers(&self, key: &str) {
+        if let Some(watchers) = self.watchers.get(key) {
+            for watcher in watchers {
+                watcher.on_change(key, self.config.get(key));
+            }
+        }
+
+        // Also notify wildcard watchers
+        if let Some(watchers) = self.watchers.get("*") {
+            for watcher in watchers {
+                watcher.on_change(key, self.config.get(key));
+            }
+        }
+    }
+}
+
+// =============================================================================
+// WATCHER
+// =============================================================================
+
+/// Configuration change watcher
+trait ConfigWatcher {
+    fn on_change(&self, key: &str, value: Option<&ConfigValue>);
+}
+
+/// Validation error
+type ValidationError {
+    key: String,
+    message: String
+}
+
+// =============================================================================
+// ERRORS
+// =============================================================================
+
+/// Configuration errors
+enum ConfigError {
+    LoadFailed { source: String, message: String },
+    InvalidFormat { message: String },
+    ParseError { message: String },
+    ValidationFailed { errors: List<ValidationError> },
+    NotFound { key: String }
+}
+
+impl ConfigError {
+    fn to_string(&self) -> String {
+        match self {
+            ConfigError::LoadFailed { source, message } =>
+                format!("Failed to load config from {}: {}", source, message),
+            ConfigError::InvalidFormat { message } =>
+                format!("Invalid configuration format: {}", message),
+            ConfigError::ParseError { message } =>
+                format!("Failed to parse configuration: {}", message),
+            ConfigError::ValidationFailed { errors } =>
+                format!("Configuration validation failed: {} errors", errors.len()),
+            ConfigError::NotFound { key } =>
+                format!("Configuration key not found: {}", key)
+        }
+    }
+}
+
+// =============================================================================
+// PARSING HELPERS
+// =============================================================================
+
+fn parse_json_config(content: &str) -> Result<Map<String, Dynamic>, ConfigError> {
+    std::json::parse(content)
+        .map(|v| flatten_json(&v, ""))
+        .map_err(|e| ConfigError::ParseError { message: e.to_string() })
+}
+
+fn parse_yaml_config(content: &str) -> Result<Map<String, Dynamic>, ConfigError> {
+    std::yaml::parse(content)
+        .map(|v| flatten_json(&v, ""))
+        .map_err(|e| ConfigError::ParseError { message: e.to_string() })
+}
+
+fn parse_toml_config(content: &str) -> Result<Map<String, Dynamic>, ConfigError> {
+    std::toml::parse(content)
+        .map(|v| flatten_json(&v, ""))
+        .map_err(|e| ConfigError::ParseError { message: e.to_string() })
+}
+
+fn parse_env_config(content: &str) -> Result<Map<String, Dynamic>, ConfigError> {
+    let mut result = Map::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim().to_lowercase().replace('_', ".");
+            let value = line[eq_pos + 1..].trim();
+
+            // Remove quotes if present
+            let value = if (value.starts_with('"') && value.ends_with('"')) ||
+                        (value.starts_with('\'') && value.ends_with('\'')) {
+                &value[1..value.len()-1]
+            } else {
+                value
+            };
+
+            result.insert(key, Dynamic::String(value.to_string()));
+        }
+    }
+
+    Ok(result)
+}
+
+fn flatten_json(value: &Dynamic, prefix: &str) -> Map<String, Dynamic> {
+    let mut result = Map::new();
+
+    match value {
+        Dynamic::Map(m) => {
+            for (k, v) in m {
+                let new_key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", prefix, k)
+                };
+
+                if matches!(v, Dynamic::Map(_)) {
+                    result.extend(flatten_json(v, &new_key));
+                } else {
+                    result.insert(new_key, v.clone());
+                }
+            }
+        },
+        _ => {
+            if !prefix.is_empty() {
+                result.insert(prefix.to_string(), value.clone());
+            }
+        }
+    }
+
+    result
+}
+
+// =============================================================================
+// ENVIRONMENT CONFIGURATION
+// =============================================================================
+
+/// Environment-specific configuration profiles
+enum Environment {
+    Development,
+    Testing,
+    Staging,
+    Production
+}
+
+impl Environment {
+    fn from_string(s: &str) -> Environment {
+        match s.to_lowercase().as_str() {
+            "development" | "dev" => Environment::Development,
+            "testing" | "test" => Environment::Testing,
+            "staging" | "stage" => Environment::Staging,
+            "production" | "prod" => Environment::Production,
+            _ => Environment::Development
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            Environment::Development => "development",
+            Environment::Testing => "testing",
+            Environment::Staging => "staging",
+            Environment::Production => "production"
+        }.to_string()
+    }
+
+    fn is_development(&self) -> Bool {
+        matches!(self, Environment::Development)
+    }
+
+    fn is_production(&self) -> Bool {
+        matches!(self, Environment::Production)
+    }
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_config_value_conversions() {
+        let str_value = ConfigValue::new(Dynamic::String("hello".to_string()), "test".to_string());
+        assert_eq!(str_value.as_string(), Some("hello".to_string()));
+
+        let int_value = ConfigValue::new(Dynamic::Int(42), "test".to_string());
+        assert_eq!(int_value.as_int(), Some(42));
+        assert_eq!(int_value.as_float(), Some(42.0));
+
+        let bool_value = ConfigValue::new(Dynamic::String("true".to_string()), "test".to_string());
+        assert_eq!(bool_value.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_environment() {
+        assert!(Environment::from_string("dev").is_development());
+        assert!(Environment::from_string("production").is_production());
+        assert!(!Environment::Development.is_production());
+    }
+
+    #[test]
+    fn test_parse_env_config() {
+        let content = r#"
+# Comment
+APP_NAME=Test
+DATABASE_URL="postgres://localhost/db"
+DEBUG=true
+"#;
+        let result = parse_env_config(content).unwrap();
+        assert_eq!(result.get("app.name"), Some(&Dynamic::String("Test".to_string())));
+    }
+}

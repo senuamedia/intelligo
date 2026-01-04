@@ -1,0 +1,657 @@
+/// Intelligo LMS - Learning Objectives
+///
+/// Provides learning objective definition based on Bloom's taxonomy
+/// and other pedagogical frameworks.
+
+module intelligo::taxonomy::learning_objectives
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock}
+use std::time::DateTime
+
+// =============================================================================
+// LEARNING OBJECTIVE
+// =============================================================================
+
+/// A learning objective
+pub type LearningObjective {
+    id: String,
+    tenant_id: String,
+    code: String,                   // Unique code like "LO-PROG-001"
+    statement: String,              // The objective statement
+    description: Option<String>,
+    bloom_level: BloomLevel,
+    knowledge_dimension: KnowledgeDimension,
+    skills: List<String>,           // Related skill IDs
+    competencies: List<String>,     // Related competency IDs
+    action_verbs: List<String>,
+    conditions: Option<String>,     // Under what conditions
+    criteria: Option<String>,       // Success criteria
+    time_frame: Option<String>,     // Expected time to achieve
+    measurable: bool,
+    parent_id: Option<String>,
+    children: List<String>,
+    metadata: Map<String, String>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Bloom's Taxonomy cognitive levels
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BloomLevel {
+    Remember = 1,       // Recall facts and basic concepts
+    Understand = 2,     // Explain ideas or concepts
+    Apply = 3,          // Use information in new situations
+    Analyze = 4,        // Draw connections among ideas
+    Evaluate = 5,       // Justify a decision or course of action
+    Create = 6          // Produce new or original work
+}
+
+impl BloomLevel {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BloomLevel::Remember => "Remember",
+            BloomLevel::Understand => "Understand",
+            BloomLevel::Apply => "Apply",
+            BloomLevel::Analyze => "Analyze",
+            BloomLevel::Evaluate => "Evaluate",
+            BloomLevel::Create => "Create"
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            BloomLevel::Remember => "Recall facts and basic concepts",
+            BloomLevel::Understand => "Explain ideas or concepts",
+            BloomLevel::Apply => "Use information in new situations",
+            BloomLevel::Analyze => "Draw connections among ideas",
+            BloomLevel::Evaluate => "Justify a decision or course of action",
+            BloomLevel::Create => "Produce new or original work"
+        }
+    }
+
+    pub fn action_verbs(&self) -> Vec<&'static str> {
+        match self {
+            BloomLevel::Remember => vec![
+                "define", "duplicate", "list", "memorize", "recall",
+                "repeat", "reproduce", "state", "identify", "name"
+            ],
+            BloomLevel::Understand => vec![
+                "classify", "describe", "discuss", "explain", "identify",
+                "locate", "recognize", "report", "select", "translate",
+                "paraphrase", "summarize"
+            ],
+            BloomLevel::Apply => vec![
+                "execute", "implement", "solve", "use", "demonstrate",
+                "interpret", "operate", "schedule", "sketch", "apply",
+                "illustrate", "calculate"
+            ],
+            BloomLevel::Analyze => vec![
+                "differentiate", "organize", "relate", "compare", "contrast",
+                "distinguish", "examine", "experiment", "question", "test",
+                "analyze", "categorize", "investigate"
+            ],
+            BloomLevel::Evaluate => vec![
+                "appraise", "argue", "defend", "judge", "select",
+                "support", "value", "critique", "evaluate", "assess",
+                "justify", "recommend", "prioritize"
+            ],
+            BloomLevel::Create => vec![
+                "design", "assemble", "construct", "conjecture", "develop",
+                "formulate", "author", "investigate", "create", "compose",
+                "synthesize", "generate", "plan", "produce"
+            ]
+        }
+    }
+
+    pub fn from_verb(verb: &str) -> Option<BloomLevel> {
+        let verb_lower = verb.to_lowercase();
+        for level in [
+            BloomLevel::Create,
+            BloomLevel::Evaluate,
+            BloomLevel::Analyze,
+            BloomLevel::Apply,
+            BloomLevel::Understand,
+            BloomLevel::Remember,
+        ] {
+            if level.action_verbs().iter().any(|v| verb_lower.contains(v)) {
+                return Some(level);
+            }
+        }
+        None
+    }
+}
+
+/// Knowledge dimension (revised Bloom's)
+#[derive(Clone, PartialEq)]
+pub enum KnowledgeDimension {
+    Factual,        // Basic elements
+    Conceptual,     // Interrelationships
+    Procedural,     // How to do something
+    Metacognitive   // Awareness of own cognition
+}
+
+impl KnowledgeDimension {
+    pub fn name(&self) -> &'static str {
+        match self {
+            KnowledgeDimension::Factual => "Factual",
+            KnowledgeDimension::Conceptual => "Conceptual",
+            KnowledgeDimension::Procedural => "Procedural",
+            KnowledgeDimension::Metacognitive => "Metacognitive"
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            KnowledgeDimension::Factual => "Basic elements students must know",
+            KnowledgeDimension::Conceptual => "Interrelationships among basic elements",
+            KnowledgeDimension::Procedural => "How to do something",
+            KnowledgeDimension::Metacognitive => "Awareness and knowledge of one's own cognition"
+        }
+    }
+}
+
+impl LearningObjective {
+    pub fn new(tenant_id: &str, code: &str, statement: &str) -> LearningObjective {
+        // Try to infer Bloom level from statement
+        let bloom_level = statement.split_whitespace()
+            .next()
+            .and_then(|verb| BloomLevel::from_verb(verb))
+            .unwrap_or(BloomLevel::Understand);
+
+        LearningObjective {
+            id: generate_id("lo"),
+            tenant_id: tenant_id.to_string(),
+            code: code.to_string(),
+            statement: statement.to_string(),
+            description: None,
+            bloom_level,
+            knowledge_dimension: KnowledgeDimension::Conceptual,
+            skills: vec![],
+            competencies: vec![],
+            action_verbs: vec![],
+            conditions: None,
+            criteria: None,
+            time_frame: None,
+            measurable: true,
+            parent_id: None,
+            children: vec![],
+            metadata: Map::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn with_bloom_level(mut self, level: BloomLevel) -> Self {
+        self.bloom_level = level;
+        self
+    }
+
+    pub fn with_knowledge_dimension(mut self, dimension: KnowledgeDimension) -> Self {
+        self.knowledge_dimension = dimension;
+        self
+    }
+
+    pub fn with_conditions(mut self, conditions: &str) -> Self {
+        self.conditions = Some(conditions.to_string());
+        self
+    }
+
+    pub fn with_criteria(mut self, criteria: &str) -> Self {
+        self.criteria = Some(criteria.to_string());
+        self
+    }
+
+    pub fn link_skill(&mut self, skill_id: &str) {
+        self.skills.push(skill_id.to_string());
+    }
+
+    pub fn link_competency(&mut self, competency_id: &str) {
+        self.competencies.push(competency_id.to_string());
+    }
+
+    /// Generate a SMART objective statement
+    pub fn to_smart_statement(&self) -> String {
+        let mut parts = vec![self.statement.clone()];
+
+        if let Some(ref conditions) = self.conditions {
+            parts.push(format!("Given {}", conditions));
+        }
+
+        if let Some(ref criteria) = self.criteria {
+            parts.push(format!("to a standard of {}", criteria));
+        }
+
+        if let Some(ref time_frame) = self.time_frame {
+            parts.push(format!("within {}", time_frame));
+        }
+
+        parts.join(", ")
+    }
+
+    /// Check if the objective follows ABCD format
+    /// (Audience, Behavior, Condition, Degree)
+    pub fn is_abcd_compliant(&self) -> bool {
+        // Check for action verb (Behavior)
+        let has_action_verb = self.statement.split_whitespace()
+            .next()
+            .and_then(|v| BloomLevel::from_verb(v))
+            .is_some();
+
+        // Check for Condition and Degree
+        let has_condition = self.conditions.is_some();
+        let has_degree = self.criteria.is_some();
+
+        has_action_verb && has_condition && has_degree
+    }
+}
+
+// =============================================================================
+// OBJECTIVE ALIGNMENT
+// =============================================================================
+
+/// Alignment between objectives and content
+pub type ObjectiveAlignment {
+    objective_id: String,
+    aligned_items: List<AlignedItem>,
+    coverage: f64,              // 0.0 to 1.0
+    alignment_score: f64,
+    gaps: List<AlignmentGap>
+}
+
+#[derive(Clone)]
+pub type AlignedItem {
+    item_id: String,
+    item_type: AlignedItemType,
+    alignment_strength: f64,    // 0.0 to 1.0
+    bloom_level_match: bool,
+    notes: Option<String>
+}
+
+#[derive(Clone)]
+pub enum AlignedItemType {
+    Activity,
+    Assessment,
+    Resource,
+    Module,
+    Lesson
+}
+
+#[derive(Clone)]
+pub type AlignmentGap {
+    objective_id: String,
+    gap_type: GapType,
+    description: String,
+    recommendation: String
+}
+
+#[derive(Clone)]
+pub enum GapType {
+    NoContent,              // No content addresses this objective
+    InsufficientDepth,      // Content doesn't reach required Bloom level
+    NoAssessment,           // Objective not assessed
+    MisalignedAssessment    // Assessment doesn't match objective level
+}
+
+// =============================================================================
+// OBJECTIVE HIERARCHY
+// =============================================================================
+
+/// Terminal objective (course-level)
+pub type TerminalObjective {
+    objective: LearningObjective,
+    enabling_objectives: List<String>
+}
+
+/// Enabling objective (lesson-level, supports terminal)
+pub type EnablingObjective {
+    objective: LearningObjective,
+    terminal_objective_id: String,
+    sequence: i32
+}
+
+// =============================================================================
+// OBJECTIVE SERVICE
+// =============================================================================
+
+/// Actor for managing learning objectives
+pub actor ObjectiveService {
+    objectives: Arc<RwLock<Map<String, LearningObjective>>>,
+    alignments: Arc<RwLock<Map<String, ObjectiveAlignment>>>,
+    tenant_id: String
+}
+
+impl ObjectiveService {
+    pub fn new(tenant_id: &str) -> ObjectiveService {
+        ObjectiveService {
+            objectives: Arc::new(RwLock::new(Map::new())),
+            alignments: Arc::new(RwLock::new(Map::new())),
+            tenant_id: tenant_id.to_string()
+        }
+    }
+
+    /// Create an objective
+    pub async fn create(&mut self, objective: LearningObjective) -> Result<LearningObjective, String> {
+        // Validate
+        if objective.statement.is_empty() {
+            return Err("Objective statement is required".to_string());
+        }
+
+        // Check for action verb
+        let first_word = objective.statement.split_whitespace().next().unwrap_or("");
+        if BloomLevel::from_verb(first_word).is_none() {
+            // Warning, not error - objective might still be valid
+            println!("Warning: Objective may not have a measurable action verb");
+        }
+
+        self.objectives.write().unwrap().insert(objective.id.clone(), objective.clone());
+        Ok(objective)
+    }
+
+    /// Get objective by ID
+    pub fn get(&self, id: &str) -> Option<LearningObjective> {
+        self.objectives.read().unwrap().get(id).cloned()
+    }
+
+    /// Get objectives by Bloom level
+    pub fn get_by_bloom_level(&self, level: BloomLevel) -> List<LearningObjective> {
+        self.objectives.read().unwrap()
+            .values()
+            .filter(|o| o.bloom_level == level)
+            .cloned()
+            .collect()
+    }
+
+    /// Get objectives for a skill
+    pub fn get_for_skill(&self, skill_id: &str) -> List<LearningObjective> {
+        self.objectives.read().unwrap()
+            .values()
+            .filter(|o| o.skills.contains(&skill_id.to_string()))
+            .cloned()
+            .collect()
+    }
+
+    /// Get child objectives
+    pub fn get_children(&self, parent_id: &str) -> List<LearningObjective> {
+        if let Some(parent) = self.objectives.read().unwrap().get(parent_id) {
+            let objs = self.objectives.read().unwrap();
+            parent.children.iter()
+                .filter_map(|id| objs.get(id).cloned())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Add enabling objective
+    pub async fn add_enabling_objective(
+        &mut self,
+        terminal_id: &str,
+        enabling: LearningObjective
+    ) -> Result<LearningObjective, String> {
+        // Validate Bloom level - enabling should be same or lower
+        let terminal = self.objectives.read().unwrap()
+            .get(terminal_id)
+            .cloned()
+            .ok_or("Terminal objective not found")?;
+
+        if enabling.bloom_level > terminal.bloom_level {
+            return Err("Enabling objective cannot have higher Bloom level than terminal".to_string());
+        }
+
+        // Create and link
+        let mut enabling = enabling;
+        enabling.parent_id = Some(terminal_id.to_string());
+
+        self.objectives.write().unwrap().insert(enabling.id.clone(), enabling.clone());
+
+        // Update terminal
+        if let Some(t) = self.objectives.write().unwrap().get_mut(terminal_id) {
+            t.children.push(enabling.id.clone());
+        }
+
+        Ok(enabling)
+    }
+
+    /// Align objective to content
+    pub async fn align(&mut self, objective_id: &str, item: AlignedItem) -> Result<(), String> {
+        let mut alignments = self.alignments.write().unwrap();
+        let alignment = alignments.entry(objective_id.to_string())
+            .or_insert_with(|| ObjectiveAlignment {
+                objective_id: objective_id.to_string(),
+                aligned_items: vec![],
+                coverage: 0.0,
+                alignment_score: 0.0,
+                gaps: vec![]
+            });
+
+        alignment.aligned_items.push(item);
+        self.recalculate_alignment(alignment);
+
+        Ok(())
+    }
+
+    fn recalculate_alignment(&self, alignment: &mut ObjectiveAlignment) {
+        if alignment.aligned_items.is_empty() {
+            alignment.coverage = 0.0;
+            alignment.alignment_score = 0.0;
+            return;
+        }
+
+        // Calculate coverage - need activities and assessments
+        let has_activity = alignment.aligned_items.iter()
+            .any(|i| matches!(i.item_type, AlignedItemType::Activity | AlignedItemType::Resource));
+        let has_assessment = alignment.aligned_items.iter()
+            .any(|i| matches!(i.item_type, AlignedItemType::Assessment));
+
+        alignment.coverage = match (has_activity, has_assessment) {
+            (true, true) => 1.0,
+            (true, false) | (false, true) => 0.5,
+            (false, false) => 0.0
+        };
+
+        // Calculate alignment score - average of alignment strengths
+        let total: f64 = alignment.aligned_items.iter()
+            .map(|i| i.alignment_strength)
+            .sum();
+        alignment.alignment_score = total / alignment.aligned_items.len() as f64;
+
+        // Identify gaps
+        alignment.gaps.clear();
+
+        if !has_activity {
+            alignment.gaps.push(AlignmentGap {
+                objective_id: alignment.objective_id.clone(),
+                gap_type: GapType::NoContent,
+                description: "No learning activities address this objective".to_string(),
+                recommendation: "Add activities that help learners achieve this objective".to_string()
+            });
+        }
+
+        if !has_assessment {
+            alignment.gaps.push(AlignmentGap {
+                objective_id: alignment.objective_id.clone(),
+                gap_type: GapType::NoAssessment,
+                description: "This objective is not assessed".to_string(),
+                recommendation: "Add assessment items that measure this objective".to_string()
+            });
+        }
+
+        // Check Bloom level alignment
+        let misaligned: Vec<_> = alignment.aligned_items.iter()
+            .filter(|i| !i.bloom_level_match)
+            .collect();
+
+        if !misaligned.is_empty() {
+            alignment.gaps.push(AlignmentGap {
+                objective_id: alignment.objective_id.clone(),
+                gap_type: GapType::MisalignedAssessment,
+                description: format!("{} items may not assess at the correct cognitive level", misaligned.len()),
+                recommendation: "Review assessments to ensure they match the objective's Bloom level".to_string()
+            });
+        }
+    }
+
+    /// Get alignment report
+    pub fn get_alignment_report(&self, objective_id: &str) -> Option<ObjectiveAlignment> {
+        self.alignments.read().unwrap().get(objective_id).cloned()
+    }
+
+    /// Validate objectives for a course
+    pub async fn validate_course_objectives(&self, objective_ids: &[String]) -> ObjectiveValidationReport {
+        let objectives = self.objectives.read().unwrap();
+        let alignments = self.alignments.read().unwrap();
+
+        let mut report = ObjectiveValidationReport {
+            total_objectives: objective_ids.len(),
+            measurable: 0,
+            abcd_compliant: 0,
+            fully_aligned: 0,
+            bloom_distribution: Map::new(),
+            issues: vec![],
+            recommendations: vec![]
+        };
+
+        for id in objective_ids {
+            if let Some(obj) = objectives.get(id) {
+                // Check measurability
+                if obj.measurable {
+                    report.measurable += 1;
+                }
+
+                // Check ABCD compliance
+                if obj.is_abcd_compliant() {
+                    report.abcd_compliant += 1;
+                }
+
+                // Check alignment
+                if let Some(alignment) = alignments.get(id) {
+                    if alignment.coverage >= 1.0 {
+                        report.fully_aligned += 1;
+                    }
+                }
+
+                // Track Bloom distribution
+                let level = obj.bloom_level.name().to_string();
+                *report.bloom_distribution.entry(level).or_insert(0) += 1;
+            }
+        }
+
+        // Generate recommendations
+        if report.measurable < report.total_objectives {
+            report.recommendations.push(
+                "Some objectives may not be measurable. Consider adding specific action verbs.".to_string()
+            );
+        }
+
+        if report.fully_aligned < report.total_objectives {
+            report.recommendations.push(
+                "Some objectives lack full content/assessment alignment.".to_string()
+            );
+        }
+
+        // Check Bloom distribution
+        let high_level_count = report.bloom_distribution.get("Analyze").unwrap_or(&0)
+            + report.bloom_distribution.get("Evaluate").unwrap_or(&0)
+            + report.bloom_distribution.get("Create").unwrap_or(&0);
+
+        if *high_level_count == 0 {
+            report.recommendations.push(
+                "Consider adding objectives at higher cognitive levels (Analyze, Evaluate, Create).".to_string()
+            );
+        }
+
+        report
+    }
+
+    /// Suggest objectives based on content
+    pub async fn suggest_objectives(&self, content_description: &str) -> List<ObjectiveSuggestion> {
+        // Simple keyword-based suggestions - in production, use AI
+        let mut suggestions = vec![];
+
+        // Extract potential topics
+        let words: Vec<&str> = content_description.split_whitespace().collect();
+
+        for level in [BloomLevel::Remember, BloomLevel::Understand, BloomLevel::Apply] {
+            let verbs = level.action_verbs();
+            if let Some(verb) = verbs.first() {
+                suggestions.push(ObjectiveSuggestion {
+                    statement: format!("{} key concepts from this content", verb),
+                    bloom_level: level,
+                    confidence: 0.7,
+                    rationale: format!("Basic {} level objective for content comprehension", level.name())
+                });
+            }
+        }
+
+        suggestions
+    }
+}
+
+/// Objective validation report
+pub type ObjectiveValidationReport {
+    total_objectives: usize,
+    measurable: usize,
+    abcd_compliant: usize,
+    fully_aligned: usize,
+    bloom_distribution: Map<String, i32>,
+    issues: List<String>,
+    recommendations: List<String>
+}
+
+/// Objective suggestion
+pub type ObjectiveSuggestion {
+    statement: String,
+    bloom_level: BloomLevel,
+    confidence: f64,
+    rationale: String
+}
+
+// =============================================================================
+// BLOOM'S TAXONOMY MATRIX
+// =============================================================================
+
+/// Full Bloom's taxonomy matrix (cognitive x knowledge)
+pub type BloomMatrix {
+    cells: Map<(BloomLevel, KnowledgeDimension), List<String>>
+}
+
+impl BloomMatrix {
+    pub fn new() -> BloomMatrix {
+        BloomMatrix {
+            cells: Map::new()
+        }
+    }
+
+    pub fn classify(&mut self, objective_id: &str, cognitive: BloomLevel, knowledge: KnowledgeDimension) {
+        self.cells.entry((cognitive, knowledge))
+            .or_insert_with(Vec::new)
+            .push(objective_id.to_string());
+    }
+
+    pub fn get_objectives(&self, cognitive: BloomLevel, knowledge: KnowledgeDimension) -> List<String> {
+        self.cells.get(&(cognitive, knowledge)).cloned().unwrap_or_default()
+    }
+
+    /// Get distribution across the matrix
+    pub fn get_distribution(&self) -> Map<String, i32> {
+        let mut distribution = Map::new();
+        for ((cog, know), objectives) in &self.cells {
+            let key = format!("{}:{}", cog.name(), know.name());
+            distribution.insert(key, objectives.len() as i32);
+        }
+        distribution
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id(prefix: &str) -> String {
+    use std::time::SystemTime;
+    format!("{}_{:x}", prefix, SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}

@@ -1,0 +1,2070 @@
+/// Intelligo LMS - Submissions API
+///
+/// HTTP endpoints for managing student submissions, including
+/// starting attempts, submitting content, auto-save, plagiarism
+/// results, and proctoring session management.
+
+module intelligo::api::submissions
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission, TenantContext}
+use intelligo::core::storage::Database
+use intelligo::entities::submission::*
+use intelligo::api::middleware::{
+    ApiError, ApiResponse, RequestContext, PaginationParams,
+    auth_middleware, rate_limit
+}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER SETUP
+// =============================================================================
+
+/// Build the submissions router
+pub fn build_router() -> Router {
+    Router::new()
+        // Submission CRUD
+        .get("/", list_submissions)
+        .post("/", create_submission)
+        .get("/:id", get_submission)
+        .put("/:id", update_submission)
+        .delete("/:id", delete_submission)
+
+        // Attempt management
+        .post("/attempts/start", start_attempt)
+        .get("/attempts/:attempt_id", get_attempt)
+        .post("/attempts/:attempt_id/submit", submit_attempt)
+        .post("/attempts/:attempt_id/save", save_progress)
+        .post("/attempts/:attempt_id/extend", extend_time)
+        .get("/attempts/:attempt_id/time-remaining", get_time_remaining)
+
+        // Question responses
+        .get("/:id/responses", get_responses)
+        .put("/:id/responses/:question_id", save_response)
+        .post("/:id/responses/bulk", save_bulk_responses)
+        .put("/:id/responses/:question_id/flag", toggle_flag)
+
+        // Files and content
+        .post("/:id/files", upload_file)
+        .delete("/:id/files/:file_id", delete_file)
+        .get("/:id/files/:file_id", download_file)
+
+        // Plagiarism
+        .get("/:id/plagiarism", get_plagiarism_result)
+        .post("/:id/plagiarism/check", trigger_plagiarism_check)
+        .get("/:id/plagiarism/report", get_plagiarism_report)
+
+        // Proctoring
+        .get("/:id/proctoring", get_proctoring_session)
+        .post("/:id/proctoring/start", start_proctoring)
+        .post("/:id/proctoring/end", end_proctoring)
+        .post("/:id/proctoring/event", record_proctoring_event)
+        .get("/:id/proctoring/flags", get_proctoring_flags)
+        .put("/:id/proctoring/flags/:flag_id", review_proctoring_flag)
+        .post("/:id/proctoring/verify-identity", verify_identity)
+        .post("/:id/proctoring/room-scan", submit_room_scan)
+
+        // Late submissions
+        .get("/:id/late-info", get_late_info)
+        .post("/:id/late-exception", grant_late_exception)
+
+        // Batch operations
+        .get("/needs-grading", get_needs_grading)
+        .get("/by-assessment/:assessment_id", get_by_assessment)
+        .get("/by-student/:student_id", get_by_student)
+
+        // Statistics
+        .get("/stats/assessment/:assessment_id", get_assessment_submission_stats)
+        .get("/stats/course/:course_id", get_course_submission_stats)
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Response for submission details
+type SubmissionResponse {
+    submission: Submission,
+    assessment_title: Option<String>,
+    student_name: Option<String>,
+    grade_summary: Option<GradeSummary>,
+    can_resubmit: Bool,
+    remaining_attempts: Option<i32>
+}
+
+/// Response for attempt details
+type AttemptResponse {
+    attempt: Attempt,
+    submission: Submission,
+    questions: Option<List<QuestionWithResponse>>,
+    time_remaining_seconds: Option<i64>,
+    can_submit: Bool
+}
+
+/// Question with current response
+type QuestionWithResponse {
+    question_id: String,
+    question_type: String,
+    question_text: String,
+    options: Option<List<QuestionOption>>,
+    max_points: f32,
+    response: Option<QuestionResponse>,
+    flagged: Bool
+}
+
+/// Question option
+type QuestionOption {
+    id: String,
+    text: String,
+    position: i32
+}
+
+/// Request to start an attempt
+type StartAttemptRequest {
+    assessment_id: AssessmentId,
+    access_code: Option<String>,
+    resume_attempt: Option<Bool>
+}
+
+/// Request to submit attempt
+type SubmitAttemptRequest {
+    force_submit: Option<Bool>
+}
+
+/// Request to save progress
+type SaveProgressRequest {
+    responses: List<QuestionResponseInput>,
+    current_question_id: Option<String>
+}
+
+/// Input for a question response
+type QuestionResponseInput {
+    question_id: String,
+    response: ResponseContent,
+    time_spent_seconds: i64,
+    flagged: Option<Bool>
+}
+
+/// Request to extend time
+type ExtendTimeRequest {
+    additional_minutes: i32,
+    reason: String
+}
+
+/// Request to upload file
+type UploadFileRequest {
+    file: UploadedFile,
+    description: Option<String>
+}
+
+/// Uploaded file info
+type UploadedFile {
+    filename: String,
+    content_type: String,
+    size: i64,
+    data: Bytes
+}
+
+/// Request to trigger plagiarism check
+type TriggerPlagiarismRequest {
+    provider: Option<PlagiarismProvider>,
+    check_ai: Option<Bool>
+}
+
+/// Request to start proctoring
+type StartProctoringRequest {
+    provider: ProctoringProvider,
+    settings: ProctoringSettings
+}
+
+/// Proctoring settings
+type ProctoringSettings {
+    require_webcam: Bool,
+    require_screen_share: Bool,
+    require_id_verification: Bool,
+    require_room_scan: Bool,
+    allow_breaks: Bool,
+    max_violations: Option<i32>
+}
+
+/// Proctoring event request
+type ProctoringEventRequest {
+    event_type: ProctoringEventType,
+    data: Map<String, Dynamic>,
+    screenshot: Option<Bytes>
+}
+
+/// Request to review proctoring flag
+type ReviewFlagRequest {
+    decision: FlagDecision,
+    notes: Option<String>
+}
+
+/// Request to verify identity
+type VerifyIdentityRequest {
+    method: VerificationMethod,
+    photo_id: Option<Bytes>,
+    selfie: Option<Bytes>
+}
+
+/// Request to submit room scan
+type RoomScanRequest {
+    recording_url: String,
+    duration_seconds: i32
+}
+
+/// Request to grant late exception
+type GrantLateExceptionRequest {
+    extended_due_date: Option<DateTime>,
+    penalty_waived: Bool,
+    reason: String
+}
+
+/// Late submission info response
+type LateInfoResponse {
+    is_late: Bool,
+    late_duration: Option<Duration>,
+    penalty_applied: Option<LatePenaltyInfo>,
+    exception_granted: Option<LateException>,
+    original_due_date: DateTime,
+    effective_due_date: DateTime
+}
+
+/// Late penalty info
+type LatePenaltyInfo {
+    penalty_type: PenaltyType,
+    percentage_deducted: f32,
+    points_deducted: f32
+}
+
+/// Needs grading filter
+type NeedsGradingFilter {
+    course_id: Option<CourseId>,
+    assessment_id: Option<AssessmentId>,
+    priority: Option<String>,
+    limit: Option<i32>
+}
+
+/// Submission statistics
+type SubmissionStats {
+    total_submissions: i32,
+    submitted_count: i32,
+    in_progress_count: i32,
+    graded_count: i32,
+    late_count: i32,
+    average_time_seconds: f64,
+    average_score: Option<f32>,
+    plagiarism_flags: i32,
+    proctoring_flags: i32
+}
+
+/// Grade summary for submission
+type GradeSummary {
+    grade_id: GradeId,
+    score: f32,
+    max_points: f32,
+    percentage: f32,
+    letter_grade: Option<String>,
+    is_published: Bool
+}
+
+// =============================================================================
+// SUBMISSION CRUD HANDLERS
+// =============================================================================
+
+/// List submissions with filtering
+async fn list_submissions(
+    ctx: RequestContext,
+    query: SubmissionFilter,
+    pagination: PaginationParams
+) -> Result<ApiResponse<List<Submission>>, ApiError> {
+    // Check permission
+    check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    // Build query with tenant scoping
+    let mut filter = query;
+    filter.tenant_id = Some(ctx.tenant.id.clone());
+
+    // Students can only see their own submissions
+    if !ctx.user.has_permission(Permission::ViewAllSubmissions) {
+        filter.student_id = Some(ctx.user.id.clone());
+    }
+
+    let submissions = db.submissions()
+        .filter(filter)
+        .order_by("submitted_at", Descending)
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+        .fetch()
+        .await?;
+
+    let total = db.submissions().filter(filter).count().await?;
+
+    Ok(ApiResponse::paginated(submissions, total, pagination))
+}
+
+/// Create a new submission (admin/instructor use)
+async fn create_submission(
+    ctx: RequestContext,
+    body: CreateSubmissionRequest
+) -> Result<ApiResponse<Submission>, ApiError> {
+    check_permission(&ctx.user, Permission::ManageSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    // Validate assessment exists
+    let assessment = db.assessments()
+        .get(body.assessment_id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Assessment not found".into()))?;
+
+    // Validate enrollment exists
+    let enrollment = db.enrollments()
+        .get(body.enrollment_id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Enrollment not found".into()))?;
+
+    // Determine attempt number
+    let existing_attempts = db.submissions()
+        .filter(SubmissionFilter {
+            assessment_id: Some(body.assessment_id.clone()),
+            student_id: Some(body.student_id.clone()),
+            ..Default::default()
+        })
+        .count()
+        .await?;
+
+    let attempt_number = (existing_attempts + 1) as i32;
+
+    let submission = Submission::new(
+        body.bundle.unwrap_or("submission".into()),
+        body.assessment_id,
+        body.course_id,
+        body.enrollment_id,
+        body.student_id,
+        ctx.tenant.id.clone(),
+        attempt_number,
+        assessment.max_points
+    );
+
+    db.submissions().insert(&submission).await?;
+
+    // Log activity
+    ctx.log_activity("submission_created", &submission.id);
+
+    Ok(ApiResponse::created(submission))
+}
+
+/// Create submission request
+type CreateSubmissionRequest {
+    assessment_id: AssessmentId,
+    course_id: CourseId,
+    enrollment_id: EnrollmentId,
+    student_id: StudentId,
+    bundle: Option<String>
+}
+
+/// Get submission by ID
+async fn get_submission(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<SubmissionResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Check permission - students can view their own
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    // Verify tenant
+    if submission.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Submission not found".into()));
+    }
+
+    // Fetch related data
+    let assessment = db.assessments().get(submission.assessment_id.clone()).await?;
+    let student = db.users().get(submission.student_id.clone()).await?;
+    let grade = if let Some(grade_id) = &submission.grade_id {
+        db.grades().get(grade_id.clone()).await?
+    } else {
+        None
+    };
+
+    // Check resubmission eligibility
+    let (can_resubmit, remaining_attempts) = if let Some(assessment) = &assessment {
+        let max_attempts = assessment.settings.max_attempts.unwrap_or(1);
+        let can = submission.attempt_number < max_attempts;
+        let remaining = max_attempts - submission.attempt_number;
+        (can, Some(remaining))
+    } else {
+        (false, None)
+    };
+
+    let response = SubmissionResponse {
+        submission,
+        assessment_title: assessment.map(|a| a.title),
+        student_name: student.map(|s| s.display_name),
+        grade_summary: grade.map(|g| GradeSummary {
+            grade_id: g.id,
+            score: g.points_earned,
+            max_points: g.max_points,
+            percentage: g.percentage,
+            letter_grade: g.letter_grade,
+            is_published: g.is_published
+        }),
+        can_resubmit,
+        remaining_attempts
+    };
+
+    Ok(ApiResponse::ok(response))
+}
+
+/// Update submission
+async fn update_submission(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: UpdateSubmissionRequest
+) -> Result<ApiResponse<Submission>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Check permission
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ManageSubmissions, &ctx.tenant)?;
+    }
+
+    // Verify tenant
+    if submission.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Submission not found".into()));
+    }
+
+    // Only allow updates if not submitted
+    if submission.status == SubmissionStatus::Submitted && !ctx.user.has_permission(Permission::ManageSubmissions) {
+        return Err(ApiError::BadRequest("Cannot update submitted submission".into()));
+    }
+
+    // Apply updates
+    if let Some(content) = body.content {
+        submission.content = content;
+    }
+    if let Some(responses) = body.question_responses {
+        submission.question_responses = responses;
+    }
+    if let Some(metadata) = body.metadata {
+        submission.metadata.extend(metadata);
+    }
+
+    submission.updated_at = DateTime::now();
+
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::ok(submission))
+}
+
+/// Update submission request
+type UpdateSubmissionRequest {
+    content: Option<SubmissionContent>,
+    question_responses: Option<List<QuestionResponse>>,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Delete submission
+async fn delete_submission(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<()>, ApiError> {
+    check_permission(&ctx.user, Permission::DeleteSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify tenant
+    if submission.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Submission not found".into()));
+    }
+
+    // Don't allow deleting graded submissions
+    if submission.is_graded {
+        return Err(ApiError::BadRequest("Cannot delete graded submission".into()));
+    }
+
+    db.submissions().delete(id).await?;
+
+    ctx.log_activity("submission_deleted", &submission.id);
+
+    Ok(ApiResponse::no_content())
+}
+
+// =============================================================================
+// ATTEMPT MANAGEMENT
+// =============================================================================
+
+/// Start a new attempt
+async fn start_attempt(
+    ctx: RequestContext,
+    body: StartAttemptRequest
+) -> Result<ApiResponse<AttemptResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    // Get assessment
+    let assessment = db.assessments()
+        .get(body.assessment_id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Assessment not found".into()))?;
+
+    // Verify tenant
+    if assessment.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Assessment not found".into()));
+    }
+
+    // Check enrollment
+    let enrollment = db.enrollments()
+        .filter(EnrollmentFilter {
+            course_id: Some(assessment.course_id.clone()),
+            user_id: Some(ctx.user.id.clone()),
+            status: Some(EnrollmentStatus::Active),
+            ..Default::default()
+        })
+        .first()
+        .await?
+        .ok_or(ApiError::Forbidden("Not enrolled in course".into()))?;
+
+    // Check access code if required
+    if let Some(required_code) = &assessment.settings.access_code {
+        let provided_code = body.access_code.as_ref()
+            .ok_or(ApiError::BadRequest("Access code required".into()))?;
+        if provided_code != required_code {
+            return Err(ApiError::BadRequest("Invalid access code".into()));
+        }
+    }
+
+    // Check for existing in-progress attempt to resume
+    if body.resume_attempt.unwrap_or(false) {
+        let existing = db.submissions()
+            .filter(SubmissionFilter {
+                assessment_id: Some(body.assessment_id.clone()),
+                student_id: Some(ctx.user.id.clone()),
+                status: Some(SubmissionStatus::InProgress),
+                ..Default::default()
+            })
+            .first()
+            .await?;
+
+        if let Some(submission) = existing {
+            let attempt = db.attempts().get(submission.attempt_id.clone()).await?
+                .ok_or(ApiError::Internal("Attempt not found".into()))?;
+
+            // Check if time expired
+            if attempt.is_time_expired() {
+                // Auto-submit
+                return auto_submit_attempt(&ctx, &db, submission, attempt).await;
+            }
+
+            return build_attempt_response(&db, submission, attempt, &assessment).await;
+        }
+    }
+
+    // Check max attempts
+    let attempt_count = db.submissions()
+        .filter(SubmissionFilter {
+            assessment_id: Some(body.assessment_id.clone()),
+            student_id: Some(ctx.user.id.clone()),
+            ..Default::default()
+        })
+        .count()
+        .await?;
+
+    let max_attempts = assessment.settings.max_attempts.unwrap_or(1);
+    if attempt_count >= max_attempts as i64 {
+        return Err(ApiError::BadRequest("Maximum attempts reached".into()));
+    }
+
+    // Check availability window
+    let now = DateTime::now();
+    if let Some(available_from) = &assessment.settings.available_from {
+        if now < *available_from {
+            return Err(ApiError::BadRequest("Assessment not yet available".into()));
+        }
+    }
+    if let Some(available_until) = &assessment.settings.available_until {
+        if now > *available_until {
+            return Err(ApiError::BadRequest("Assessment availability window has closed".into()));
+        }
+    }
+
+    // Calculate time limit with accommodations
+    let time_limit = if let Some(limit) = &assessment.settings.time_limit {
+        Some(enrollment.accommodations
+            .as_ref()
+            .map(|a| a.adjust_time_limit(*limit))
+            .unwrap_or(*limit))
+    } else {
+        None
+    };
+
+    // Create submission
+    let mut submission = Submission::new(
+        "quiz_submission".into(),
+        body.assessment_id.clone(),
+        assessment.course_id.clone(),
+        enrollment.id.clone(),
+        ctx.user.id.clone(),
+        ctx.tenant.id.clone(),
+        (attempt_count + 1) as i32,
+        assessment.max_points
+    );
+
+    submission.time_limit = time_limit;
+    submission.ip_address = ctx.ip_address.clone();
+    submission.user_agent = ctx.user_agent.clone();
+
+    // Create attempt
+    let attempt = Attempt::new(
+        submission.id.clone(),
+        body.assessment_id.clone(),
+        ctx.user.id.clone(),
+        submission.attempt_number,
+        time_limit
+    );
+
+    submission.attempt_id = attempt.id.clone();
+
+    // Randomize questions if needed
+    if assessment.settings.shuffle_questions {
+        // Question randomization logic
+    }
+
+    db.submissions().insert(&submission).await?;
+    db.attempts().insert(&attempt).await?;
+
+    ctx.log_activity("attempt_started", &submission.id);
+
+    build_attempt_response(&db, submission, attempt, &assessment).await
+}
+
+/// Build attempt response helper
+async fn build_attempt_response(
+    db: &Database,
+    submission: Submission,
+    attempt: Attempt,
+    assessment: &Assessment
+) -> Result<ApiResponse<AttemptResponse>, ApiError> {
+    // Load questions if quiz/exam
+    let questions = if matches!(assessment.assessment_type, AssessmentType::Quiz | AssessmentType::Exam) {
+        let mut q_list = Vec::new();
+        for question in &assessment.questions {
+            let response = submission.question_responses
+                .iter()
+                .find(|r| r.question_id == question.id)
+                .cloned();
+
+            q_list.push(QuestionWithResponse {
+                question_id: question.id.clone(),
+                question_type: format!("{:?}", question.question_type),
+                question_text: question.question_text.clone(),
+                options: question.options.clone().map(|opts| {
+                    opts.into_iter().map(|o| QuestionOption {
+                        id: o.id,
+                        text: o.text,
+                        position: o.position
+                    }).collect()
+                }),
+                max_points: question.points,
+                response,
+                flagged: response.map(|r| r.flagged_for_review).unwrap_or(false)
+            });
+        }
+        Some(q_list)
+    } else {
+        None
+    };
+
+    let time_remaining = attempt.remaining_time().map(|d| d.as_seconds());
+
+    let response = AttemptResponse {
+        attempt,
+        submission,
+        questions,
+        time_remaining_seconds: time_remaining,
+        can_submit: true
+    };
+
+    Ok(ApiResponse::ok(response))
+}
+
+/// Auto-submit an expired attempt
+async fn auto_submit_attempt(
+    ctx: &RequestContext,
+    db: &Database,
+    mut submission: Submission,
+    mut attempt: Attempt
+) -> Result<ApiResponse<AttemptResponse>, ApiError> {
+    attempt.end(true);
+    submission.submit(None);
+    submission.auto_submitted = true;
+
+    db.attempts().update(&attempt).await?;
+    db.submissions().update(&submission).await?;
+
+    ctx.log_activity("attempt_auto_submitted", &submission.id);
+
+    let response = AttemptResponse {
+        attempt,
+        submission,
+        questions: None,
+        time_remaining_seconds: Some(0),
+        can_submit: false
+    };
+
+    Ok(ApiResponse::ok(response))
+}
+
+/// Get attempt details
+async fn get_attempt(
+    ctx: RequestContext,
+    attempt_id: AttemptId
+) -> Result<ApiResponse<Attempt>, ApiError> {
+    let db = ctx.get_db();
+
+    let attempt = db.attempts()
+        .get(attempt_id)
+        .await?
+        .ok_or(ApiError::NotFound("Attempt not found".into()))?;
+
+    // Verify ownership or permission
+    if attempt.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    Ok(ApiResponse::ok(attempt))
+}
+
+/// Submit an attempt
+async fn submit_attempt(
+    ctx: RequestContext,
+    attempt_id: AttemptId,
+    body: SubmitAttemptRequest
+) -> Result<ApiResponse<SubmissionResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut attempt = db.attempts()
+        .get(attempt_id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Attempt not found".into()))?;
+
+    // Verify ownership
+    if attempt.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your attempt".into()));
+    }
+
+    // Check if already submitted
+    if attempt.ended_at.is_some() {
+        return Err(ApiError::BadRequest("Attempt already submitted".into()));
+    }
+
+    let mut submission = db.submissions()
+        .get(attempt.submission_id.clone())
+        .await?
+        .ok_or(ApiError::Internal("Submission not found".into()))?;
+
+    // Get assessment for due date
+    let assessment = db.assessments()
+        .get(submission.assessment_id.clone())
+        .await?
+        .ok_or(ApiError::Internal("Assessment not found".into()))?;
+
+    // Check time limit (unless force submit by instructor)
+    let is_expired = attempt.is_time_expired();
+    if is_expired && !body.force_submit.unwrap_or(false) {
+        // Check if user has permission to force submit
+        if !ctx.user.has_permission(Permission::ManageSubmissions) {
+            return Err(ApiError::BadRequest("Time limit exceeded".into()));
+        }
+    }
+
+    // End attempt
+    attempt.end(is_expired);
+
+    // Submit submission
+    submission.submit(assessment.settings.due_date);
+    submission.time_spent_seconds = attempt.time_spent_seconds;
+
+    // Auto-grade if applicable
+    if assessment.grading_method == GradingMethod::AutoGraded {
+        auto_grade_submission(&db, &mut submission, &assessment).await?;
+    }
+
+    db.attempts().update(&attempt).await?;
+    db.submissions().update(&submission).await?;
+
+    // Trigger plagiarism check if enabled
+    if assessment.settings.enable_plagiarism_detection {
+        trigger_plagiarism_check_async(&submission.id).await;
+    }
+
+    ctx.log_activity("attempt_submitted", &submission.id);
+
+    // Return submission response
+    get_submission(ctx, submission.id).await
+}
+
+/// Auto-grade a submission
+async fn auto_grade_submission(
+    db: &Database,
+    submission: &mut Submission,
+    assessment: &Assessment
+) -> Result<(), ApiError> {
+    let mut total_points = 0.0;
+
+    for response in &mut submission.question_responses {
+        let question = assessment.questions
+            .iter()
+            .find(|q| q.id == response.question_id);
+
+        if let Some(q) = question {
+            let (is_correct, points) = grade_question_response(q, &response.response);
+            response.is_correct = Some(is_correct);
+            response.points_earned = Some(points);
+            total_points += points;
+        }
+    }
+
+    submission.score = Some(total_points);
+    submission.is_graded = true;
+
+    Ok(())
+}
+
+/// Grade a single question response
+fn grade_question_response(question: &Question, response: &ResponseContent) -> (Bool, f32) {
+    // Simplified auto-grading logic
+    match response {
+        ResponseContent::SingleChoice { selected_option_id } => {
+            if let Some(correct) = &question.correct_answer {
+                let is_correct = selected_option_id == correct;
+                (is_correct, if is_correct { question.points } else { 0.0 })
+            } else {
+                (false, 0.0)
+            }
+        },
+        ResponseContent::MultipleChoice { selected_option_ids } => {
+            if let Some(correct_ids) = &question.correct_answers {
+                let correct_set: Set<_> = correct_ids.iter().collect();
+                let selected_set: Set<_> = selected_option_ids.iter().collect();
+                let is_correct = correct_set == selected_set;
+                (is_correct, if is_correct { question.points } else { 0.0 })
+            } else {
+                (false, 0.0)
+            }
+        },
+        ResponseContent::TrueFalse { value } => {
+            if let Some(correct) = question.correct_bool {
+                let is_correct = *value == correct;
+                (is_correct, if is_correct { question.points } else { 0.0 })
+            } else {
+                (false, 0.0)
+            }
+        },
+        ResponseContent::Numeric { value, .. } => {
+            if let Some(correct) = question.correct_numeric {
+                let tolerance = question.numeric_tolerance.unwrap_or(0.0);
+                let is_correct = (*value - correct).abs() <= tolerance;
+                (is_correct, if is_correct { question.points } else { 0.0 })
+            } else {
+                (false, 0.0)
+            }
+        },
+        _ => (false, 0.0) // Manual grading required
+    }
+}
+
+/// Save progress (auto-save)
+async fn save_progress(
+    ctx: RequestContext,
+    attempt_id: AttemptId,
+    body: SaveProgressRequest
+) -> Result<ApiResponse<SaveProgressResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let attempt = db.attempts()
+        .get(attempt_id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Attempt not found".into()))?;
+
+    // Verify ownership
+    if attempt.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your attempt".into()));
+    }
+
+    // Check if already submitted
+    if attempt.ended_at.is_some() {
+        return Err(ApiError::BadRequest("Attempt already submitted".into()));
+    }
+
+    // Check time limit
+    if attempt.is_time_expired() {
+        return Err(ApiError::BadRequest("Time limit exceeded".into()));
+    }
+
+    let mut submission = db.submissions()
+        .get(attempt.submission_id.clone())
+        .await?
+        .ok_or(ApiError::Internal("Submission not found".into()))?;
+
+    // Update responses
+    for input in body.responses {
+        let existing = submission.question_responses
+            .iter_mut()
+            .find(|r| r.question_id == input.question_id);
+
+        if let Some(response) = existing {
+            response.update_response(input.response);
+            response.time_spent_seconds += input.time_spent_seconds;
+            if let Some(flagged) = input.flagged {
+                response.flagged_for_review = flagged;
+            }
+        } else {
+            let mut new_response = QuestionResponse::new(
+                input.question_id,
+                0.0 // Will be set during grading
+            );
+            new_response.response = input.response;
+            new_response.time_spent_seconds = input.time_spent_seconds;
+            if let Some(flagged) = input.flagged {
+                new_response.flagged_for_review = flagged;
+            }
+            submission.question_responses.push(new_response);
+        }
+    }
+
+    submission.updated_at = DateTime::now();
+
+    db.submissions().update(&submission).await?;
+
+    let time_remaining = attempt.remaining_time().map(|d| d.as_seconds());
+
+    Ok(ApiResponse::ok(SaveProgressResponse {
+        saved: true,
+        time_remaining_seconds: time_remaining,
+        responses_saved: body.responses.len() as i32
+    }))
+}
+
+/// Save progress response
+type SaveProgressResponse {
+    saved: Bool,
+    time_remaining_seconds: Option<i64>,
+    responses_saved: i32
+}
+
+/// Extend time for an attempt
+async fn extend_time(
+    ctx: RequestContext,
+    attempt_id: AttemptId,
+    body: ExtendTimeRequest
+) -> Result<ApiResponse<Attempt>, ApiError> {
+    check_permission(&ctx.user, Permission::ManageSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let mut attempt = db.attempts()
+        .get(attempt_id)
+        .await?
+        .ok_or(ApiError::NotFound("Attempt not found".into()))?;
+
+    // Add time
+    if let Some(current_limit) = attempt.time_limit {
+        attempt.time_limit = Some(current_limit + Duration::minutes(body.additional_minutes as i64));
+    } else {
+        // If no time limit, set one
+        let elapsed = DateTime::now() - attempt.started_at;
+        attempt.time_limit = Some(elapsed + Duration::minutes(body.additional_minutes as i64));
+    }
+
+    // Record event
+    let mut data = Map::new();
+    data.insert("additional_minutes".into(), Dynamic::Int(body.additional_minutes as i64));
+    data.insert("reason".into(), Dynamic::String(body.reason));
+    data.insert("extended_by".into(), Dynamic::String(ctx.user.id.clone()));
+    attempt.record_event(AttemptEventType::Custom { name: "time_extended".into() }, data);
+
+    db.attempts().update(&attempt).await?;
+
+    ctx.log_activity("attempt_time_extended", &attempt.id);
+
+    Ok(ApiResponse::ok(attempt))
+}
+
+/// Get remaining time for attempt
+async fn get_time_remaining(
+    ctx: RequestContext,
+    attempt_id: AttemptId
+) -> Result<ApiResponse<TimeRemainingResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let attempt = db.attempts()
+        .get(attempt_id)
+        .await?
+        .ok_or(ApiError::NotFound("Attempt not found".into()))?;
+
+    // Verify ownership
+    if attempt.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    let remaining = attempt.remaining_time();
+    let is_expired = attempt.is_time_expired();
+
+    Ok(ApiResponse::ok(TimeRemainingResponse {
+        seconds_remaining: remaining.map(|d| d.as_seconds()),
+        is_expired,
+        has_time_limit: attempt.time_limit.is_some()
+    }))
+}
+
+/// Time remaining response
+type TimeRemainingResponse {
+    seconds_remaining: Option<i64>,
+    is_expired: Bool,
+    has_time_limit: Bool
+}
+
+// =============================================================================
+// QUESTION RESPONSES
+// =============================================================================
+
+/// Get all responses for a submission
+async fn get_responses(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<List<QuestionResponse>>, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify access
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    Ok(ApiResponse::ok(submission.question_responses))
+}
+
+/// Save a single response
+async fn save_response(
+    ctx: RequestContext,
+    id: SubmissionId,
+    question_id: String,
+    body: QuestionResponseInput
+) -> Result<ApiResponse<QuestionResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify ownership
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    // Check if submitted
+    if submission.status == SubmissionStatus::Submitted {
+        return Err(ApiError::BadRequest("Cannot modify submitted submission".into()));
+    }
+
+    // Find or create response
+    let response = if let Some(r) = submission.question_responses.iter_mut().find(|r| r.question_id == question_id) {
+        r.update_response(body.response);
+        r.time_spent_seconds += body.time_spent_seconds;
+        if let Some(flagged) = body.flagged {
+            r.flagged_for_review = flagged;
+        }
+        r.clone()
+    } else {
+        let mut new_response = QuestionResponse::new(question_id, 0.0);
+        new_response.response = body.response;
+        new_response.time_spent_seconds = body.time_spent_seconds;
+        if let Some(flagged) = body.flagged {
+            new_response.flagged_for_review = flagged;
+        }
+        submission.question_responses.push(new_response.clone());
+        new_response
+    };
+
+    submission.updated_at = DateTime::now();
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::ok(response))
+}
+
+/// Save multiple responses at once
+async fn save_bulk_responses(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: SaveProgressRequest
+) -> Result<ApiResponse<i32>, ApiError> {
+    // Reuse save_progress logic with the submission directly
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify ownership
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    if submission.status == SubmissionStatus::Submitted {
+        return Err(ApiError::BadRequest("Cannot modify submitted submission".into()));
+    }
+
+    let count = body.responses.len() as i32;
+
+    for input in body.responses {
+        let existing = submission.question_responses
+            .iter_mut()
+            .find(|r| r.question_id == input.question_id);
+
+        if let Some(response) = existing {
+            response.update_response(input.response);
+            response.time_spent_seconds += input.time_spent_seconds;
+        } else {
+            let mut new_response = QuestionResponse::new(input.question_id, 0.0);
+            new_response.response = input.response;
+            new_response.time_spent_seconds = input.time_spent_seconds;
+            submission.question_responses.push(new_response);
+        }
+    }
+
+    submission.updated_at = DateTime::now();
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::ok(count))
+}
+
+/// Toggle question flag
+async fn toggle_flag(
+    ctx: RequestContext,
+    id: SubmissionId,
+    question_id: String
+) -> Result<ApiResponse<Bool>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    if submission.status == SubmissionStatus::Submitted {
+        return Err(ApiError::BadRequest("Cannot modify submitted submission".into()));
+    }
+
+    let response = submission.question_responses
+        .iter_mut()
+        .find(|r| r.question_id == question_id)
+        .ok_or(ApiError::NotFound("Response not found".into()))?;
+
+    response.flagged_for_review = !response.flagged_for_review;
+    let flagged = response.flagged_for_review;
+
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::ok(flagged))
+}
+
+// =============================================================================
+// FILE HANDLING
+// =============================================================================
+
+/// Upload a file to submission
+async fn upload_file(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: UploadFileRequest
+) -> Result<ApiResponse<SubmittedFile>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    if submission.status == SubmissionStatus::Submitted {
+        return Err(ApiError::BadRequest("Cannot modify submitted submission".into()));
+    }
+
+    // Validate file size and type
+    let max_size = 50 * 1024 * 1024; // 50MB
+    if body.file.size > max_size {
+        return Err(ApiError::BadRequest("File too large".into()));
+    }
+
+    // Upload to storage
+    let media_id = ctx.storage()
+        .upload(body.file.data, body.file.content_type.clone())
+        .await?;
+
+    let submitted_file = SubmittedFile {
+        id: generate_uuid(),
+        media_id,
+        filename: body.file.filename,
+        file_size: body.file.size,
+        mime_type: body.file.content_type,
+        uploaded_at: DateTime::now(),
+        file_hash: None,
+        preview_url: None
+    };
+
+    // Add to submission content
+    match &mut submission.content {
+        SubmissionContent::Files { files } => {
+            files.push(submitted_file.clone());
+        },
+        _ => {
+            submission.content = SubmissionContent::Files {
+                files: vec![submitted_file.clone()]
+            };
+        }
+    }
+
+    submission.updated_at = DateTime::now();
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::created(submitted_file))
+}
+
+/// Delete a file from submission
+async fn delete_file(
+    ctx: RequestContext,
+    id: SubmissionId,
+    file_id: String
+) -> Result<ApiResponse<()>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    if submission.status == SubmissionStatus::Submitted {
+        return Err(ApiError::BadRequest("Cannot modify submitted submission".into()));
+    }
+
+    // Remove file from content
+    if let SubmissionContent::Files { files } = &mut submission.content {
+        let original_len = files.len();
+        files.retain(|f| f.id != file_id);
+
+        if files.len() == original_len {
+            return Err(ApiError::NotFound("File not found".into()));
+        }
+    }
+
+    submission.updated_at = DateTime::now();
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::no_content())
+}
+
+/// Download a file from submission
+async fn download_file(
+    ctx: RequestContext,
+    id: SubmissionId,
+    file_id: String
+) -> Result<FileDownload, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify access
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    let file = match &submission.content {
+        SubmissionContent::Files { files } => {
+            files.iter().find(|f| f.id == file_id)
+        },
+        _ => None
+    }.ok_or(ApiError::NotFound("File not found".into()))?;
+
+    let data = ctx.storage().download(file.media_id.clone()).await?;
+
+    Ok(FileDownload {
+        filename: file.filename.clone(),
+        content_type: file.mime_type.clone(),
+        data
+    })
+}
+
+/// File download response
+type FileDownload {
+    filename: String,
+    content_type: String,
+    data: Bytes
+}
+
+// =============================================================================
+// PLAGIARISM DETECTION
+// =============================================================================
+
+/// Get plagiarism result
+async fn get_plagiarism_result(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<Option<PlagiarismResult>>, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Check permission - students can see their own results
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewPlagiarismResults, &ctx.tenant)?;
+    }
+
+    Ok(ApiResponse::ok(submission.plagiarism))
+}
+
+/// Trigger plagiarism check
+async fn trigger_plagiarism_check(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: TriggerPlagiarismRequest
+) -> Result<ApiResponse<PlagiarismCheckStatus>, ApiError> {
+    check_permission(&ctx.user, Permission::ManagePlagiarism, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify tenant
+    if submission.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Submission not found".into()));
+    }
+
+    // Initialize plagiarism result
+    submission.plagiarism = Some(PlagiarismResult {
+        provider: body.provider.unwrap_or(PlagiarismProvider::Builtin),
+        similarity_score: 0.0,
+        ai_probability: if body.check_ai.unwrap_or(false) { Some(0.0) } else { None },
+        matches: vec![],
+        sources: vec![],
+        report_url: None,
+        status: PlagiarismStatus::Pending,
+        checked_at: DateTime::now(),
+        error_message: None
+    });
+
+    db.submissions().update(&submission).await?;
+
+    // Trigger async check
+    trigger_plagiarism_check_async(&id).await;
+
+    Ok(ApiResponse::ok(PlagiarismCheckStatus {
+        submission_id: id,
+        status: PlagiarismStatus::Pending,
+        estimated_completion: Some(DateTime::now() + Duration::minutes(5))
+    }))
+}
+
+/// Trigger plagiarism check async (background job)
+async fn trigger_plagiarism_check_async(submission_id: &SubmissionId) {
+    // Queue background job for plagiarism check
+    // This would integrate with Turnitin, Copyleaks, etc.
+}
+
+/// Plagiarism check status
+type PlagiarismCheckStatus {
+    submission_id: SubmissionId,
+    status: PlagiarismStatus,
+    estimated_completion: Option<DateTime>
+}
+
+/// Get plagiarism report URL
+async fn get_plagiarism_report(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<PlagiarismReportResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Only instructors can see full report
+    check_permission(&ctx.user, Permission::ViewPlagiarismResults, &ctx.tenant)?;
+
+    let plagiarism = submission.plagiarism
+        .ok_or(ApiError::NotFound("No plagiarism check found".into()))?;
+
+    if plagiarism.status != PlagiarismStatus::Complete {
+        return Err(ApiError::BadRequest("Plagiarism check not complete".into()));
+    }
+
+    Ok(ApiResponse::ok(PlagiarismReportResponse {
+        report_url: plagiarism.report_url,
+        similarity_score: plagiarism.similarity_score,
+        ai_probability: plagiarism.ai_probability,
+        top_sources: plagiarism.sources.into_iter().take(5).collect(),
+        match_count: plagiarism.matches.len() as i32
+    }))
+}
+
+/// Plagiarism report response
+type PlagiarismReportResponse {
+    report_url: Option<String>,
+    similarity_score: f32,
+    ai_probability: Option<f32>,
+    top_sources: List<PlagiarismSource>,
+    match_count: i32
+}
+
+// =============================================================================
+// PROCTORING
+// =============================================================================
+
+/// Get proctoring session
+async fn get_proctoring_session(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<Option<ProctoringSession>>, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify access
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewProctoring, &ctx.tenant)?;
+    }
+
+    Ok(ApiResponse::ok(submission.proctoring_session))
+}
+
+/// Start proctoring session
+async fn start_proctoring(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: StartProctoringRequest
+) -> Result<ApiResponse<ProctoringSession>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify ownership
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    // Check if already started
+    if submission.proctoring_session.is_some() {
+        return Err(ApiError::BadRequest("Proctoring session already exists".into()));
+    }
+
+    let session = ProctoringSession::new(body.provider);
+    submission.proctoring_session = Some(session.clone());
+    submission.proctoring_status = Some(ProctoringStatus::PendingReview);
+
+    db.submissions().update(&submission).await?;
+
+    ctx.log_activity("proctoring_started", &id);
+
+    Ok(ApiResponse::created(session))
+}
+
+/// End proctoring session
+async fn end_proctoring(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<ProctoringSession>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify ownership
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    let session = submission.proctoring_session
+        .as_mut()
+        .ok_or(ApiError::NotFound("No proctoring session".into()))?;
+
+    session.end();
+
+    db.submissions().update(&submission).await?;
+
+    ctx.log_activity("proctoring_ended", &id);
+
+    Ok(ApiResponse::ok(submission.proctoring_session.unwrap()))
+}
+
+/// Record proctoring event
+async fn record_proctoring_event(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: ProctoringEventRequest
+) -> Result<ApiResponse<()>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Events can come from student or system
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ManageProctoring, &ctx.tenant)?;
+    }
+
+    let session = submission.proctoring_session
+        .as_mut()
+        .ok_or(ApiError::NotFound("No proctoring session".into()))?;
+
+    // Determine severity
+    let severity = match &body.event_type {
+        ProctoringEventType::MultipleFaces => RiskLevel::High,
+        ProctoringEventType::PhoneDetected => RiskLevel::High,
+        ProctoringEventType::TabSwitch => RiskLevel::Medium,
+        ProctoringEventType::FocusLost => RiskLevel::Low,
+        _ => RiskLevel::Low
+    };
+
+    let event = ProctoringEvent {
+        event_type: body.event_type.clone(),
+        timestamp: DateTime::now(),
+        severity: severity.clone(),
+        data: body.data.clone(),
+        screenshot_url: None // Would upload screenshot if provided
+    };
+
+    session.events.push(event);
+
+    // Create flag for significant events
+    if matches!(severity, RiskLevel::Medium | RiskLevel::High | RiskLevel::Critical) {
+        let flag = ProctoringFlag {
+            id: generate_uuid(),
+            flag_type: body.event_type,
+            severity,
+            detected_at: DateTime::now(),
+            description: format!("Proctoring event detected"),
+            evidence: None,
+            reviewed: false,
+            decision: None,
+            reviewer_notes: None,
+            reviewed_by: None,
+            reviewed_at: None
+        };
+        submission.proctoring_flags.push(flag);
+    }
+
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::no_content())
+}
+
+/// Get proctoring flags
+async fn get_proctoring_flags(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<List<ProctoringFlag>>, ApiError> {
+    check_permission(&ctx.user, Permission::ViewProctoring, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id)
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    Ok(ApiResponse::ok(submission.proctoring_flags))
+}
+
+/// Review proctoring flag
+async fn review_proctoring_flag(
+    ctx: RequestContext,
+    id: SubmissionId,
+    flag_id: String,
+    body: ReviewFlagRequest
+) -> Result<ApiResponse<ProctoringFlag>, ApiError> {
+    check_permission(&ctx.user, Permission::ManageProctoring, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    let flag = submission.proctoring_flags
+        .iter_mut()
+        .find(|f| f.id == flag_id)
+        .ok_or(ApiError::NotFound("Flag not found".into()))?;
+
+    flag.reviewed = true;
+    flag.decision = Some(body.decision);
+    flag.reviewer_notes = body.notes;
+    flag.reviewed_by = Some(ctx.user.id.clone());
+    flag.reviewed_at = Some(DateTime::now());
+
+    let updated_flag = flag.clone();
+
+    db.submissions().update(&submission).await?;
+
+    ctx.log_activity("proctoring_flag_reviewed", &flag_id);
+
+    Ok(ApiResponse::ok(updated_flag))
+}
+
+/// Verify student identity
+async fn verify_identity(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: VerifyIdentityRequest
+) -> Result<ApiResponse<IdentityVerification>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    let session = submission.proctoring_session
+        .as_mut()
+        .ok_or(ApiError::NotFound("No proctoring session".into()))?;
+
+    // Perform identity verification (simplified)
+    let verification = IdentityVerification {
+        verified: true, // Would integrate with actual verification service
+        method: body.method,
+        confidence: 0.95,
+        verified_at: DateTime::now(),
+        photo_id_url: None,
+        face_match_score: Some(0.95)
+    };
+
+    session.identity_verification = Some(verification.clone());
+
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::ok(verification))
+}
+
+/// Submit room scan
+async fn submit_room_scan(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: RoomScanRequest
+) -> Result<ApiResponse<RoomScanResult>, ApiError> {
+    let db = ctx.get_db();
+
+    let mut submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    if submission.student_id != ctx.user.id {
+        return Err(ApiError::Forbidden("Not your submission".into()));
+    }
+
+    let session = submission.proctoring_session
+        .as_mut()
+        .ok_or(ApiError::NotFound("No proctoring session".into()))?;
+
+    let result = RoomScanResult {
+        completed: true,
+        completed_at: Some(DateTime::now()),
+        recording_url: Some(body.recording_url),
+        flags: vec![]
+    };
+
+    session.room_scan = Some(result.clone());
+
+    db.submissions().update(&submission).await?;
+
+    Ok(ApiResponse::ok(result))
+}
+
+// =============================================================================
+// LATE SUBMISSIONS
+// =============================================================================
+
+/// Get late submission info
+async fn get_late_info(
+    ctx: RequestContext,
+    id: SubmissionId
+) -> Result<ApiResponse<LateInfoResponse>, ApiError> {
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify access
+    if submission.student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    let assessment = db.assessments()
+        .get(submission.assessment_id.clone())
+        .await?
+        .ok_or(ApiError::Internal("Assessment not found".into()))?;
+
+    let due_date = assessment.settings.due_date
+        .ok_or(ApiError::BadRequest("No due date set".into()))?;
+
+    // Check for accommodation
+    let enrollment = db.enrollments()
+        .get(submission.enrollment_id.clone())
+        .await?;
+
+    let effective_due_date = enrollment
+        .and_then(|e| e.accommodations)
+        .map(|a| a.adjust_due_date(due_date))
+        .unwrap_or(due_date);
+
+    let exception = db.late_exceptions()
+        .filter(LateExceptionFilter {
+            submission_id: Some(id),
+            ..Default::default()
+        })
+        .first()
+        .await?;
+
+    let final_due_date = exception.as_ref()
+        .and_then(|e| e.extended_due_date)
+        .unwrap_or(effective_due_date);
+
+    let submitted_at = submission.submitted_at.unwrap_or(DateTime::now());
+    let is_late = submitted_at > final_due_date;
+    let late_duration = if is_late {
+        Some(submitted_at - final_due_date)
+    } else {
+        None
+    };
+
+    Ok(ApiResponse::ok(LateInfoResponse {
+        is_late,
+        late_duration,
+        penalty_applied: None, // Would calculate based on policy
+        exception_granted: exception,
+        original_due_date: due_date,
+        effective_due_date: final_due_date
+    }))
+}
+
+/// Grant late exception
+async fn grant_late_exception(
+    ctx: RequestContext,
+    id: SubmissionId,
+    body: GrantLateExceptionRequest
+) -> Result<ApiResponse<LateException>, ApiError> {
+    check_permission(&ctx.user, Permission::ManageSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let submission = db.submissions()
+        .get(id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Submission not found".into()))?;
+
+    // Verify tenant
+    if submission.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Submission not found".into()));
+    }
+
+    let exception = LateException {
+        reason: body.reason,
+        extended_due_date: body.extended_due_date,
+        penalty_waived: body.penalty_waived,
+        granted_by: ctx.user.id.clone(),
+        granted_at: DateTime::now()
+    };
+
+    db.late_exceptions().insert(id.clone(), &exception).await?;
+
+    ctx.log_activity("late_exception_granted", &id);
+
+    Ok(ApiResponse::created(exception))
+}
+
+// =============================================================================
+// BATCH OPERATIONS
+// =============================================================================
+
+/// Get submissions needing grading
+async fn get_needs_grading(
+    ctx: RequestContext,
+    query: NeedsGradingFilter
+) -> Result<ApiResponse<List<Submission>>, ApiError> {
+    check_permission(&ctx.user, Permission::GradeSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let submissions = db.submissions()
+        .filter(SubmissionFilter {
+            tenant_id: Some(ctx.tenant.id.clone()),
+            course_id: query.course_id,
+            assessment_id: query.assessment_id,
+            needs_grading: Some(true),
+            ..Default::default()
+        })
+        .order_by("submitted_at", Ascending)
+        .limit(query.limit.unwrap_or(50))
+        .fetch()
+        .await?;
+
+    Ok(ApiResponse::ok(submissions))
+}
+
+/// Get submissions by assessment
+async fn get_by_assessment(
+    ctx: RequestContext,
+    assessment_id: AssessmentId,
+    pagination: PaginationParams
+) -> Result<ApiResponse<List<Submission>>, ApiError> {
+    check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    // Verify assessment tenant
+    let assessment = db.assessments()
+        .get(assessment_id.clone())
+        .await?
+        .ok_or(ApiError::NotFound("Assessment not found".into()))?;
+
+    if assessment.tenant_id != ctx.tenant.id {
+        return Err(ApiError::NotFound("Assessment not found".into()));
+    }
+
+    let submissions = db.submissions()
+        .filter(SubmissionFilter {
+            assessment_id: Some(assessment_id),
+            tenant_id: Some(ctx.tenant.id.clone()),
+            ..Default::default()
+        })
+        .order_by("submitted_at", Descending)
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+        .fetch()
+        .await?;
+
+    let total = db.submissions()
+        .filter(SubmissionFilter {
+            assessment_id: Some(assessment_id),
+            ..Default::default()
+        })
+        .count()
+        .await?;
+
+    Ok(ApiResponse::paginated(submissions, total, pagination))
+}
+
+/// Get submissions by student
+async fn get_by_student(
+    ctx: RequestContext,
+    student_id: StudentId,
+    pagination: PaginationParams
+) -> Result<ApiResponse<List<Submission>>, ApiError> {
+    // Students can view their own, instructors can view all
+    if student_id != ctx.user.id {
+        check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+    }
+
+    let db = ctx.get_db();
+
+    let submissions = db.submissions()
+        .filter(SubmissionFilter {
+            student_id: Some(student_id),
+            tenant_id: Some(ctx.tenant.id.clone()),
+            ..Default::default()
+        })
+        .order_by("submitted_at", Descending)
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+        .fetch()
+        .await?;
+
+    let total = db.submissions()
+        .filter(SubmissionFilter {
+            student_id: Some(student_id),
+            ..Default::default()
+        })
+        .count()
+        .await?;
+
+    Ok(ApiResponse::paginated(submissions, total, pagination))
+}
+
+// =============================================================================
+// STATISTICS
+// =============================================================================
+
+/// Get submission stats for an assessment
+async fn get_assessment_submission_stats(
+    ctx: RequestContext,
+    assessment_id: AssessmentId
+) -> Result<ApiResponse<SubmissionStats>, ApiError> {
+    check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let submissions = db.submissions()
+        .filter(SubmissionFilter {
+            assessment_id: Some(assessment_id.clone()),
+            tenant_id: Some(ctx.tenant.id.clone()),
+            ..Default::default()
+        })
+        .fetch()
+        .await?;
+
+    let total = submissions.len() as i32;
+    let submitted = submissions.iter().filter(|s| s.status == SubmissionStatus::Submitted).count() as i32;
+    let in_progress = submissions.iter().filter(|s| s.status == SubmissionStatus::InProgress).count() as i32;
+    let graded = submissions.iter().filter(|s| s.is_graded).count() as i32;
+    let late = submissions.iter().filter(|s| s.is_late).count() as i32;
+
+    let total_time: i64 = submissions.iter().map(|s| s.time_spent_seconds).sum();
+    let avg_time = if total > 0 { total_time as f64 / total as f64 } else { 0.0 };
+
+    let scores: Vec<f32> = submissions.iter().filter_map(|s| s.score).collect();
+    let avg_score = if !scores.is_empty() {
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
+    } else {
+        None
+    };
+
+    let plagiarism_flags = submissions.iter()
+        .filter(|s| s.plagiarism.as_ref().map(|p| p.similarity_score > 25.0).unwrap_or(false))
+        .count() as i32;
+
+    let proctoring_flags = submissions.iter()
+        .filter(|s| !s.proctoring_flags.is_empty())
+        .count() as i32;
+
+    Ok(ApiResponse::ok(SubmissionStats {
+        total_submissions: total,
+        submitted_count: submitted,
+        in_progress_count: in_progress,
+        graded_count: graded,
+        late_count: late,
+        average_time_seconds: avg_time,
+        average_score: avg_score,
+        plagiarism_flags,
+        proctoring_flags
+    }))
+}
+
+/// Get submission stats for a course
+async fn get_course_submission_stats(
+    ctx: RequestContext,
+    course_id: CourseId
+) -> Result<ApiResponse<SubmissionStats>, ApiError> {
+    check_permission(&ctx.user, Permission::ViewSubmissions, &ctx.tenant)?;
+
+    let db = ctx.get_db();
+
+    let submissions = db.submissions()
+        .filter(SubmissionFilter {
+            course_id: Some(course_id),
+            tenant_id: Some(ctx.tenant.id.clone()),
+            ..Default::default()
+        })
+        .fetch()
+        .await?;
+
+    // Same calculation as assessment stats
+    let total = submissions.len() as i32;
+    let submitted = submissions.iter().filter(|s| s.status == SubmissionStatus::Submitted).count() as i32;
+    let in_progress = submissions.iter().filter(|s| s.status == SubmissionStatus::InProgress).count() as i32;
+    let graded = submissions.iter().filter(|s| s.is_graded).count() as i32;
+    let late = submissions.iter().filter(|s| s.is_late).count() as i32;
+
+    let total_time: i64 = submissions.iter().map(|s| s.time_spent_seconds).sum();
+    let avg_time = if total > 0 { total_time as f64 / total as f64 } else { 0.0 };
+
+    let scores: Vec<f32> = submissions.iter().filter_map(|s| s.score).collect();
+    let avg_score = if !scores.is_empty() {
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
+    } else {
+        None
+    };
+
+    let plagiarism_flags = submissions.iter()
+        .filter(|s| s.plagiarism.as_ref().map(|p| p.similarity_score > 25.0).unwrap_or(false))
+        .count() as i32;
+
+    let proctoring_flags = submissions.iter()
+        .filter(|s| !s.proctoring_flags.is_empty())
+        .count() as i32;
+
+    Ok(ApiResponse::ok(SubmissionStats {
+        total_submissions: total,
+        submitted_count: submitted,
+        in_progress_count: in_progress,
+        graded_count: graded,
+        late_count: late,
+        average_time_seconds: avg_time,
+        average_score: avg_score,
+        plagiarism_flags,
+        proctoring_flags
+    }))
+}

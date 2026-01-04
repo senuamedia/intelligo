@@ -1,0 +1,2180 @@
+/// Intelligo LMS - Courses API
+///
+/// This module provides course management endpoints:
+/// - Course CRUD operations
+/// - Course publishing and versioning
+/// - Course settings and configuration
+/// - Course duplication and templates
+
+module intelligo::api::courses
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::entities::course::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the courses router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Course CRUD
+        .get("/", move |req| list_courses(req, db.clone()))
+        .get("/:course_id", move |req| get_course(req, db.clone()))
+        .post("/", move |req| create_course(req, db.clone()))
+        .patch("/:course_id", move |req| update_course(req, db.clone()))
+        .delete("/:course_id", move |req| delete_course(req, db.clone()))
+
+        // Course publishing
+        .post("/:course_id/publish", move |req| publish_course(req, db.clone()))
+        .post("/:course_id/unpublish", move |req| unpublish_course(req, db.clone()))
+        .post("/:course_id/archive", move |req| archive_course(req, db.clone()))
+
+        // Course structure
+        .get("/:course_id/structure", move |req| get_course_structure(req, db.clone()))
+        .put("/:course_id/structure", move |req| update_course_structure(req, db.clone()))
+
+        // Course modules (nested)
+        .get("/:course_id/modules", move |req| get_course_modules(req, db.clone()))
+        .post("/:course_id/modules", move |req| add_module_to_course(req, db.clone()))
+        .put("/:course_id/modules/order", move |req| reorder_modules(req, db.clone()))
+
+        // Course settings
+        .get("/:course_id/settings", move |req| get_course_settings(req, db.clone()))
+        .patch("/:course_id/settings", move |req| update_course_settings(req, db.clone()))
+
+        // Course enrollments summary
+        .get("/:course_id/enrollments", move |req| get_course_enrollments(req, db.clone()))
+        .get("/:course_id/enrollments/stats", move |req| get_enrollment_stats(req, db.clone()))
+
+        // Course analytics
+        .get("/:course_id/analytics", move |req| get_course_analytics(req, db.clone()))
+        .get("/:course_id/analytics/engagement", move |req| get_engagement_analytics(req, db.clone()))
+        .get("/:course_id/analytics/completion", move |req| get_completion_analytics(req, db.clone()))
+
+        // Course content
+        .get("/:course_id/syllabus", move |req| get_syllabus(req, db.clone()))
+        .put("/:course_id/syllabus", move |req| update_syllabus(req, db.clone()))
+
+        // Course media
+        .post("/:course_id/thumbnail", move |req| upload_thumbnail(req, db.clone()))
+        .delete("/:course_id/thumbnail", move |req| delete_thumbnail(req, db.clone()))
+        .post("/:course_id/banner", move |req| upload_banner(req, db.clone()))
+
+        // Course duplication and templates
+        .post("/:course_id/duplicate", move |req| duplicate_course(req, db.clone()))
+        .post("/:course_id/export", move |req| export_course(req, db.clone()))
+        .post("/import", move |req| import_course(req, db.clone()))
+
+        // Course versioning
+        .get("/:course_id/versions", move |req| list_versions(req, db.clone()))
+        .post("/:course_id/versions", move |req| create_version(req, db.clone()))
+        .get("/:course_id/versions/:version_id", move |req| get_version(req, db.clone()))
+        .post("/:course_id/versions/:version_id/restore", move |req| restore_version(req, db.clone()))
+
+        // Grading configuration
+        .get("/:course_id/grading", move |req| get_grading_config(req, db.clone()))
+        .put("/:course_id/grading", move |req| update_grading_config(req, db.clone()))
+
+        // Announcements
+        .get("/:course_id/announcements", move |req| list_announcements(req, db.clone()))
+        .post("/:course_id/announcements", move |req| create_announcement(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Course list response item
+type CourseListItem {
+    id: CourseId,
+    code: String,
+    title: String,
+    short_description: Option<String>,
+    thumbnail_url: Option<String>,
+    status: CourseStatus,
+    visibility: CourseVisibility,
+    enrollment_count: i32,
+    instructor_names: List<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Full course response
+type CourseResponse {
+    id: CourseId,
+    code: String,
+    title: String,
+    short_description: Option<String>,
+    description: Option<String>,
+    thumbnail_url: Option<String>,
+    banner_url: Option<String>,
+    status: CourseStatus,
+    visibility: CourseVisibility,
+    category_id: Option<String>,
+    tags: List<String>,
+    level: Option<CourseLevel>,
+    duration_hours: Option<f32>,
+    language: String,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    enrollment_start: Option<DateTime>,
+    enrollment_end: Option<DateTime>,
+    self_enrollment: Bool,
+    enrollment_cap: Option<i32>,
+    enrollment_count: i32,
+    instructors: List<InstructorInfo>,
+    grading_scheme: Option<GradingSchemeInfo>,
+    settings: CourseSettingsSummary,
+    created_at: DateTime,
+    updated_at: DateTime,
+    published_at: Option<DateTime>
+}
+
+/// Instructor info for course
+type InstructorInfo {
+    user_id: UserId,
+    name: String,
+    email: String,
+    avatar_url: Option<String>,
+    role: CourseRole,
+    is_primary: Bool
+}
+
+/// Grading scheme summary
+type GradingSchemeInfo {
+    id: String,
+    name: String,
+    aggregation_type: String,
+    passing_grade: f32
+}
+
+/// Course settings summary
+type CourseSettingsSummary {
+    allow_self_enrollment: Bool,
+    require_enrollment_approval: Bool,
+    show_gradebook_to_students: Bool,
+    allow_discussions: Bool,
+    enable_announcements: Bool,
+    timezone: String
+}
+
+/// Create course request
+type CreateCourseRequest {
+    code: String,
+    title: String,
+    short_description: Option<String>,
+    description: Option<String>,
+    category_id: Option<String>,
+    tags: Option<List<String>>,
+    level: Option<CourseLevel>,
+    language: Option<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    self_enrollment: Option<Bool>,
+    visibility: Option<CourseVisibility>,
+    template_id: Option<CourseId>
+}
+
+/// Update course request
+type UpdateCourseRequest {
+    code: Option<String>,
+    title: Option<String>,
+    short_description: Option<String>,
+    description: Option<String>,
+    category_id: Option<String>,
+    tags: Option<List<String>>,
+    level: Option<CourseLevel>,
+    duration_hours: Option<f32>,
+    language: Option<String>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    enrollment_start: Option<DateTime>,
+    enrollment_end: Option<DateTime>,
+    self_enrollment: Option<Bool>,
+    enrollment_cap: Option<i32>,
+    visibility: Option<CourseVisibility>
+}
+
+/// Course structure response
+type CourseStructure {
+    course_id: CourseId,
+    modules: List<ModuleStructure>,
+    total_lessons: i32,
+    total_assessments: i32,
+    total_duration_minutes: i32
+}
+
+/// Module structure in course
+type ModuleStructure {
+    id: ModuleId,
+    title: String,
+    position: i32,
+    is_published: Bool,
+    lessons: List<LessonStructure>,
+    assessments: List<AssessmentStructure>
+}
+
+/// Lesson in structure
+type LessonStructure {
+    id: LessonId,
+    title: String,
+    lesson_type: String,
+    position: i32,
+    duration_minutes: Option<i32>,
+    is_published: Bool,
+    is_required: Bool
+}
+
+/// Assessment in structure
+type AssessmentStructure {
+    id: AssessmentId,
+    title: String,
+    assessment_type: String,
+    position: i32,
+    points: f32,
+    is_published: Bool,
+    due_date: Option<DateTime>
+}
+
+/// Course settings
+type CourseSettings {
+    course_id: CourseId,
+    enrollment: EnrollmentSettings,
+    grading: GradingSettings,
+    communication: CommunicationSettings,
+    display: DisplaySettings,
+    completion: CompletionSettings,
+    accessibility: AccessibilitySettings,
+    integrations: IntegrationSettings
+}
+
+/// Enrollment settings
+type EnrollmentSettings {
+    allow_self_enrollment: Bool,
+    require_approval: Bool,
+    enrollment_code: Option<String>,
+    enrollment_cap: Option<i32>,
+    waitlist_enabled: Bool,
+    allow_late_enrollment: Bool,
+    enrollment_start: Option<DateTime>,
+    enrollment_end: Option<DateTime>
+}
+
+/// Grading settings
+type GradingSettings {
+    grading_scheme_id: String,
+    show_grade_to_students: Bool,
+    show_grade_summary: Bool,
+    allow_grade_passback: Bool,
+    late_penalty_type: String,
+    late_penalty_value: f32,
+    grade_passback_url: Option<String>
+}
+
+/// Communication settings
+type CommunicationSettings {
+    allow_discussions: Bool,
+    require_post_before_viewing: Bool,
+    allow_anonymous_posts: Bool,
+    enable_announcements: Bool,
+    announcement_notifications: Bool,
+    enable_messaging: Bool
+}
+
+/// Display settings
+type DisplaySettings {
+    theme: Option<String>,
+    navigation_style: String,
+    show_progress_bar: Bool,
+    show_estimated_time: Bool,
+    content_layout: String,
+    timezone: String
+}
+
+/// Completion settings
+type CompletionSettings {
+    completion_type: String,
+    minimum_grade: Option<f32>,
+    required_activities: List<String>,
+    issue_certificate: Bool,
+    certificate_template_id: Option<String>
+}
+
+/// Accessibility settings
+type AccessibilitySettings {
+    closed_captions_required: Bool,
+    alt_text_required: Bool,
+    screen_reader_optimized: Bool
+}
+
+/// Integration settings
+type IntegrationSettings {
+    lti_enabled: Bool,
+    scorm_enabled: Bool,
+    xapi_enabled: Bool,
+    calendar_sync: Bool,
+    sis_sync: Bool
+}
+
+/// Course analytics response
+type CourseAnalytics {
+    course_id: CourseId,
+    period: AnalyticsPeriod,
+    enrollment_stats: EnrollmentAnalytics,
+    engagement_stats: EngagementAnalytics,
+    completion_stats: CompletionAnalytics,
+    grade_stats: GradeAnalytics
+}
+
+/// Analytics period
+type AnalyticsPeriod {
+    start_date: DateTime,
+    end_date: DateTime,
+    granularity: String
+}
+
+/// Enrollment analytics
+type EnrollmentAnalytics {
+    total_enrolled: i32,
+    active_enrollments: i32,
+    completed_enrollments: i32,
+    withdrawn_enrollments: i32,
+    enrollment_trend: List<TrendPoint>
+}
+
+/// Engagement analytics
+type EngagementAnalytics {
+    total_time_hours: f32,
+    average_time_per_student: f32,
+    active_students_count: i32,
+    inactive_students_count: i32,
+    at_risk_students_count: i32,
+    daily_active_users: List<TrendPoint>
+}
+
+/// Completion analytics
+type CompletionAnalytics {
+    average_progress: f32,
+    completion_rate: f32,
+    average_completion_time_hours: f32,
+    module_completion_rates: Map<ModuleId, f32>
+}
+
+/// Grade analytics
+type GradeAnalytics {
+    average_grade: f32,
+    median_grade: f32,
+    grade_distribution: List<GradeBucket>,
+    passing_rate: f32
+}
+
+/// Trend data point
+type TrendPoint {
+    date: DateTime,
+    value: f32
+}
+
+/// Grade distribution bucket
+type GradeBucket {
+    label: String,
+    min: f32,
+    max: f32,
+    count: i32
+}
+
+/// Announcement
+type Announcement {
+    id: String,
+    course_id: CourseId,
+    title: String,
+    content: String,
+    author_id: UserId,
+    author_name: String,
+    is_pinned: Bool,
+    created_at: DateTime,
+    updated_at: DateTime,
+    published_at: Option<DateTime>
+}
+
+// =============================================================================
+// LIST COURSES
+// =============================================================================
+
+/// List courses with pagination and filtering
+async fn list_courses(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Parse pagination
+    let pagination = PaginationParams::from_request(&req);
+
+    // Parse filters
+    let status = req.query_param("status").and_then(|s| parse_course_status(&s));
+    let visibility = req.query_param("visibility").and_then(|v| parse_course_visibility(&v));
+    let category_id = req.query_param("category_id");
+    let instructor_id = req.query_param("instructor_id");
+    let search = req.query_param("search");
+
+    // Determine access scope
+    let scope = if ctx.has_permission(Permission::ViewAllCourses) {
+        CourseScope::All
+    } else if let Some(user_id) = ctx.user_id() {
+        CourseScope::UserEnrolledOrInstructing(user_id)
+    } else {
+        CourseScope::PublicOnly
+    };
+
+    // Query courses
+    let filter = CourseFilter {
+        status,
+        visibility,
+        category_id,
+        instructor_id,
+        search,
+        tenant_id: ctx.tenant_id(),
+        scope
+    };
+
+    let (courses, total) = db.courses()
+        .list_with_filter(&filter, pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Convert to list items
+    let items: List<CourseListItem> = courses.iter().map(course_to_list_item).collect();
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(items, meta, &ctx)))
+}
+
+// =============================================================================
+// GET COURSE
+// =============================================================================
+
+/// Get a specific course
+async fn get_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let course = db.courses()
+        .find_by_id(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.clone()
+        })?;
+
+    // Check access
+    if !can_view_course(&ctx, &course, &db).await {
+        return Err(ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id
+        })
+    }
+
+    // Get additional data
+    let instructors = db.enrollments()
+        .get_instructors(&course_id)
+        .await
+        .unwrap_or_default();
+
+    let enrollment_count = db.enrollments()
+        .count_by_course(&course_id)
+        .await
+        .unwrap_or(0);
+
+    let response = course_to_response(&course, &instructors, enrollment_count);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// CREATE COURSE
+// =============================================================================
+
+/// Create a new course
+async fn create_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::CreateCourses)?;
+
+    let body: CreateCourseRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate input
+    validate_create_course_input(&body)?;
+
+    // Check code uniqueness
+    let existing = db.courses()
+        .find_by_code(&body.code, ctx.tenant_id().as_ref())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if existing.is_some() {
+        return Err(ApiError::Conflict {
+            message: "A course with this code already exists".to_string()
+        })
+    }
+
+    // Create course
+    let course = db.courses()
+        .create(CreateCourseInput {
+            code: body.code,
+            title: body.title,
+            short_description: body.short_description,
+            description: body.description,
+            category_id: body.category_id,
+            tags: body.tags.unwrap_or_default(),
+            level: body.level,
+            language: body.language.unwrap_or("en".to_string()),
+            start_date: body.start_date,
+            end_date: body.end_date,
+            self_enrollment: body.self_enrollment.unwrap_or(false),
+            visibility: body.visibility.unwrap_or(CourseVisibility::Private),
+            tenant_id: ctx.tenant_id(),
+            created_by: ctx.user_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Add creator as instructor
+    if let Some(user_id) = ctx.user_id() {
+        db.enrollments()
+            .create(CreateEnrollmentInput {
+                course_id: course.id.clone(),
+                user_id: user_id.clone(),
+                role: CourseRole::Teacher,
+                section_id: None,
+                start_date: None,
+                end_date: None,
+                source: EnrollmentSource::Manual,
+                external_id: None,
+                metadata: None
+            })
+            .await
+            .ok();
+    }
+
+    // If template provided, copy structure
+    if let Some(template_id) = body.template_id {
+        copy_course_structure(&db, &template_id, &course.id).await.ok();
+    }
+
+    let instructors = vec![];
+    let response = course_to_response(&course, &instructors, 0);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// UPDATE COURSE
+// =============================================================================
+
+/// Update a course
+async fn update_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    // Get course
+    let course = db.courses()
+        .find_by_id(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.clone()
+        })?;
+
+    // Check permission
+    if !can_edit_course(&ctx, &course, &db).await {
+        return Err(ApiError::Forbidden {
+            message: "You don't have permission to edit this course".to_string(),
+            required_permission: Some("EditCourses".to_string())
+        })
+    }
+
+    let body: UpdateCourseRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Check code uniqueness if changing
+    if let Some(new_code) = &body.code {
+        if new_code != &course.code {
+            let existing = db.courses()
+                .find_by_code(new_code, ctx.tenant_id().as_ref())
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                    trace_id: ctx.trace_id.clone()
+                })?;
+
+            if existing.is_some() {
+                return Err(ApiError::Conflict {
+                    message: "A course with this code already exists".to_string()
+                })
+            }
+        }
+    }
+
+    // Update course
+    let updated = db.courses()
+        .update(&course_id, UpdateCourseInput::from(body))
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let instructors = db.enrollments()
+        .get_instructors(&course_id)
+        .await
+        .unwrap_or_default();
+
+    let enrollment_count = db.enrollments()
+        .count_by_course(&course_id)
+        .await
+        .unwrap_or(0);
+
+    let response = course_to_response(&updated, &instructors, enrollment_count);
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// DELETE COURSE
+// =============================================================================
+
+/// Delete a course
+async fn delete_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    // Get course
+    let course = db.courses()
+        .find_by_id(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.clone()
+        })?;
+
+    // Check permission
+    ctx.require_permission(Permission::DeleteCourses)?;
+
+    // Check if course has active enrollments
+    let enrollment_count = db.enrollments()
+        .count_active_by_course(&course_id)
+        .await
+        .unwrap_or(0);
+
+    if enrollment_count > 0 {
+        let force = req.query_param("force").map(|v| v == "true").unwrap_or(false);
+        if !force {
+            return Err(ApiError::Conflict {
+                message: format!("Course has {} active enrollments. Use ?force=true to delete anyway.", enrollment_count)
+            })
+        }
+    }
+
+    // Soft delete
+    db.courses()
+        .soft_delete(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Course deleted successfully".to_string()))
+    ])))
+}
+
+// =============================================================================
+// PUBLISH/UNPUBLISH
+// =============================================================================
+
+/// Publish a course
+async fn publish_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let course = get_editable_course(&db, &course_id, &ctx).await?;
+
+    // Validate course is ready for publishing
+    validate_for_publishing(&db, &course).await?;
+
+    // Publish
+    let updated = db.courses()
+        .publish(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Course published successfully".to_string())),
+        ("status".to_string(), Dynamic::String(format!("{:?}", updated.status)))
+    ])))
+}
+
+/// Unpublish a course
+async fn unpublish_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    db.courses()
+        .unpublish(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Course unpublished".to_string()))
+    ])))
+}
+
+/// Archive a course
+async fn archive_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    db.courses()
+        .archive(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Course archived".to_string()))
+    ])))
+}
+
+// =============================================================================
+// COURSE STRUCTURE
+// =============================================================================
+
+/// Get course structure (modules, lessons, assessments hierarchy)
+async fn get_course_structure(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let course = get_viewable_course(&db, &course_id, &ctx).await?;
+
+    let modules = db.modules()
+        .find_by_course(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let mut structure_modules = vec![];
+    let mut total_lessons = 0;
+    let mut total_assessments = 0;
+    let mut total_duration = 0;
+
+    for module in modules {
+        let lessons = db.lessons()
+            .find_by_module(&module.id)
+            .await
+            .unwrap_or_default();
+
+        let assessments = db.assessments()
+            .find_by_module(&module.id)
+            .await
+            .unwrap_or_default();
+
+        total_lessons += lessons.len() as i32;
+        total_assessments += assessments.len() as i32;
+
+        for lesson in &lessons {
+            if let Some(duration) = lesson.duration_minutes {
+                total_duration += duration;
+            }
+        }
+
+        structure_modules.push(ModuleStructure {
+            id: module.id.clone(),
+            title: module.title.clone(),
+            position: module.position,
+            is_published: module.is_published,
+            lessons: lessons.iter().map(|l| LessonStructure {
+                id: l.id.clone(),
+                title: l.title.clone(),
+                lesson_type: format!("{:?}", l.lesson_type),
+                position: l.position,
+                duration_minutes: l.duration_minutes,
+                is_published: l.is_published,
+                is_required: l.is_required
+            }).collect(),
+            assessments: assessments.iter().map(|a| AssessmentStructure {
+                id: a.id.clone(),
+                title: a.title.clone(),
+                assessment_type: format!("{:?}", a.assessment_type),
+                position: a.position,
+                points: a.max_points,
+                is_published: a.is_published,
+                due_date: a.due_date
+            }).collect()
+        });
+    }
+
+    let structure = CourseStructure {
+        course_id: course_id.clone(),
+        modules: structure_modules,
+        total_lessons,
+        total_assessments,
+        total_duration_minutes: total_duration
+    };
+
+    Ok(Response::json(ApiResponse::success(structure, &ctx)))
+}
+
+/// Update course structure (reorder modules, lessons)
+async fn update_course_structure(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct UpdateStructureRequest {
+        modules: List<ModuleOrderItem>
+    }
+
+    #[derive(Deserialize)]
+    struct ModuleOrderItem {
+        id: ModuleId,
+        position: i32,
+        lessons: Option<List<LessonOrderItem>>,
+        assessments: Option<List<AssessmentOrderItem>>
+    }
+
+    #[derive(Deserialize)]
+    struct LessonOrderItem {
+        id: LessonId,
+        position: i32
+    }
+
+    #[derive(Deserialize)]
+    struct AssessmentOrderItem {
+        id: AssessmentId,
+        position: i32
+    }
+
+    let body: UpdateStructureRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Update module positions
+    for module_item in &body.modules {
+        db.modules()
+            .update_position(&module_item.id, module_item.position)
+            .await
+            .ok();
+
+        // Update lesson positions
+        if let Some(lessons) = &module_item.lessons {
+            for lesson_item in lessons {
+                db.lessons()
+                    .update_position(&lesson_item.id, lesson_item.position)
+                    .await
+                    .ok();
+            }
+        }
+
+        // Update assessment positions
+        if let Some(assessments) = &module_item.assessments {
+            for assessment_item in assessments {
+                db.assessments()
+                    .update_position(&assessment_item.id, assessment_item.position)
+                    .await
+                    .ok();
+            }
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Course structure updated".to_string()))
+    ])))
+}
+
+// =============================================================================
+// COURSE MODULES
+// =============================================================================
+
+/// Get course modules
+async fn get_course_modules(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_viewable_course(&db, &course_id, &ctx).await?;
+
+    let modules = db.modules()
+        .find_by_course(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(modules, &ctx)))
+}
+
+/// Add module to course
+async fn add_module_to_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct AddModuleRequest {
+        title: String,
+        description: Option<String>,
+        position: Option<i32>
+    }
+
+    let body: AddModuleRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Get next position if not specified
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.modules()
+            .get_next_position(&course_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let module = db.modules()
+        .create(CreateModuleInput {
+            course_id: course_id.clone(),
+            title: body.title,
+            description: body.description,
+            position,
+            tenant_id: ctx.tenant_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(module, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Reorder modules
+async fn reorder_modules(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct ReorderRequest {
+        module_ids: List<ModuleId>
+    }
+
+    let body: ReorderRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    for (position, module_id) in body.module_ids.iter().enumerate() {
+        db.modules()
+            .update_position(module_id, position as i32)
+            .await
+            .ok();
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Modules reordered".to_string()))
+    ])))
+}
+
+// =============================================================================
+// COURSE SETTINGS
+// =============================================================================
+
+/// Get course settings
+async fn get_course_settings(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let settings = db.course_settings()
+        .find_by_course(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .unwrap_or_else(|| CourseSettings::default_for(&course_id));
+
+    Ok(Response::json(ApiResponse::success(settings, &ctx)))
+}
+
+/// Update course settings
+async fn update_course_settings(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let body: CourseSettings = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let settings = db.course_settings()
+        .upsert(&course_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(settings, &ctx)))
+}
+
+// =============================================================================
+// COURSE ENROLLMENTS
+// =============================================================================
+
+/// Get course enrollments
+async fn get_course_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    // Must be instructor or admin
+    let course = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let pagination = PaginationParams::from_request(&req);
+    let role = req.query_param("role").and_then(|r| parse_course_role(&r));
+    let status = req.query_param("status").and_then(|s| parse_enrollment_status(&s));
+
+    let (enrollments, total) = db.enrollments()
+        .list_by_course(&course_id, role.as_ref(), status.as_ref(), pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(enrollments, meta, &ctx)))
+}
+
+/// Get enrollment statistics
+async fn get_enrollment_stats(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let stats = db.enrollments()
+        .get_stats_for_course(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(stats, &ctx)))
+}
+
+// =============================================================================
+// COURSE ANALYTICS
+// =============================================================================
+
+/// Get course analytics
+async fn get_course_analytics(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let start_date = req.query_param("start_date")
+        .and_then(|d| DateTime::parse(&d).ok())
+        .unwrap_or_else(|| DateTime::now() - Duration::days(30));
+
+    let end_date = req.query_param("end_date")
+        .and_then(|d| DateTime::parse(&d).ok())
+        .unwrap_or_else(|| DateTime::now());
+
+    let analytics = db.analytics()
+        .get_course_analytics(&course_id, &start_date, &end_date)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(analytics, &ctx)))
+}
+
+/// Get engagement analytics
+async fn get_engagement_analytics(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let analytics = db.analytics()
+        .get_engagement_analytics(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(analytics, &ctx)))
+}
+
+/// Get completion analytics
+async fn get_completion_analytics(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let analytics = db.analytics()
+        .get_completion_analytics(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(analytics, &ctx)))
+}
+
+// =============================================================================
+// SYLLABUS
+// =============================================================================
+
+/// Get course syllabus
+async fn get_syllabus(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_viewable_course(&db, &course_id, &ctx).await?;
+
+    let syllabus = db.courses()
+        .get_syllabus(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(syllabus, &ctx)))
+}
+
+/// Update course syllabus
+async fn update_syllabus(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct UpdateSyllabusRequest {
+        content: String,
+        format: Option<String>
+    }
+
+    let body: UpdateSyllabusRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    db.courses()
+        .update_syllabus(&course_id, &body.content, body.format.as_deref())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Syllabus updated".to_string()))
+    ])))
+}
+
+// =============================================================================
+// COURSE MEDIA
+// =============================================================================
+
+/// Upload course thumbnail
+async fn upload_thumbnail(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let file = req.file("thumbnail").await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid file upload: {}", e)
+    })?;
+
+    // Validate file
+    if !file.content_type.starts_with("image/") {
+        return Err(ApiError::ValidationError {
+            field: "thumbnail".to_string(),
+            message: "File must be an image".to_string(),
+            errors: vec![]
+        })
+    }
+
+    let url = db.storage()
+        .upload_course_thumbnail(&course_id, &file)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    db.courses()
+        .update_thumbnail(&course_id, &url)
+        .await
+        .ok();
+
+    Ok(Response::json(Map::from([
+        ("thumbnail_url".to_string(), Dynamic::String(url))
+    ])))
+}
+
+/// Delete course thumbnail
+async fn delete_thumbnail(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    db.storage().delete_course_thumbnail(&course_id).await.ok();
+    db.courses().update_thumbnail(&course_id, "").await.ok();
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Thumbnail deleted".to_string()))
+    ])))
+}
+
+/// Upload course banner
+async fn upload_banner(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let file = req.file("banner").await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid file upload: {}", e)
+    })?;
+
+    let url = db.storage()
+        .upload_course_banner(&course_id, &file)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    db.courses().update_banner(&course_id, &url).await.ok();
+
+    Ok(Response::json(Map::from([
+        ("banner_url".to_string(), Dynamic::String(url))
+    ])))
+}
+
+// =============================================================================
+// COURSE DUPLICATION
+// =============================================================================
+
+/// Duplicate a course
+async fn duplicate_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::CreateCourses)?;
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let source = get_viewable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct DuplicateRequest {
+        new_code: String,
+        new_title: String,
+        include_content: Option<Bool>,
+        include_assessments: Option<Bool>,
+        include_enrollments: Option<Bool>
+    }
+
+    let body: DuplicateRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Check code uniqueness
+    let existing = db.courses()
+        .find_by_code(&body.new_code, ctx.tenant_id().as_ref())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if existing.is_some() {
+        return Err(ApiError::Conflict {
+            message: "A course with this code already exists".to_string()
+        })
+    }
+
+    let new_course = db.courses()
+        .duplicate(
+            &course_id,
+            &body.new_code,
+            &body.new_title,
+            ctx.tenant_id().as_ref(),
+            ctx.user_id().as_ref(),
+            body.include_content.unwrap_or(true),
+            body.include_assessments.unwrap_or(true)
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(course_to_list_item(&new_course), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Export course
+async fn export_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct ExportRequest {
+        format: Option<String>,  // "imscc", "scorm", "json"
+        include_media: Option<Bool>
+    }
+
+    let body: ExportRequest = req.json().await.unwrap_or(ExportRequest {
+        format: Some("imscc".to_string()),
+        include_media: Some(true)
+    });
+
+    let format = body.format.unwrap_or("imscc".to_string());
+
+    let export_url = db.courses()
+        .export(&course_id, &format, body.include_media.unwrap_or(true))
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("download_url".to_string(), Dynamic::String(export_url)),
+        ("format".to_string(), Dynamic::String(format)),
+        ("message".to_string(), Dynamic::String("Export started. Download will be available shortly.".to_string()))
+    ])))
+}
+
+/// Import course
+async fn import_course(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::CreateCourses)?;
+
+    let file = req.file("package").await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid file upload: {}", e)
+    })?;
+
+    #[derive(Deserialize)]
+    struct ImportOptions {
+        code: String,
+        title: Option<String>
+    }
+
+    let options: ImportOptions = req.form_field("options")
+        .and_then(|o| serde_json::from_str(&o).ok())
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "Import options required".to_string()
+        })?;
+
+    // Check code uniqueness
+    let existing = db.courses()
+        .find_by_code(&options.code, ctx.tenant_id().as_ref())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if existing.is_some() {
+        return Err(ApiError::Conflict {
+            message: "A course with this code already exists".to_string()
+        })
+    }
+
+    let course = db.courses()
+        .import(&file, &options.code, options.title.as_deref(), ctx.tenant_id().as_ref(), ctx.user_id().as_ref())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(course_to_list_item(&course), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// VERSIONING
+// =============================================================================
+
+/// List course versions
+async fn list_versions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let versions = db.course_versions()
+        .list_by_course(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(versions, &ctx)))
+}
+
+/// Create a version snapshot
+async fn create_version(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct CreateVersionRequest {
+        name: Option<String>,
+        description: Option<String>
+    }
+
+    let body: CreateVersionRequest = req.json().await.unwrap_or(CreateVersionRequest {
+        name: None,
+        description: None
+    });
+
+    let version = db.course_versions()
+        .create_snapshot(&course_id, body.name.as_deref(), body.description.as_deref(), ctx.user_id().as_ref())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(version, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Get a specific version
+async fn get_version(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let version_id = req.param("version_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Version ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let version = db.course_versions()
+        .find_by_id(&version_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Version".to_string(),
+            id: version_id
+        })?;
+
+    Ok(Response::json(ApiResponse::success(version, &ctx)))
+}
+
+/// Restore a version
+async fn restore_version(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let version_id = req.param("version_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Version ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    db.course_versions()
+        .restore(&course_id, &version_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Version restored".to_string()))
+    ])))
+}
+
+// =============================================================================
+// GRADING CONFIGURATION
+// =============================================================================
+
+/// Get grading configuration
+async fn get_grading_config(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_viewable_course(&db, &course_id, &ctx).await?;
+
+    let config = db.grading_configs()
+        .find_by_course(&course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(config, &ctx)))
+}
+
+/// Update grading configuration
+async fn update_grading_config(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    let body: GradingConfig = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let config = db.grading_configs()
+        .upsert(&course_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(config, &ctx)))
+}
+
+// =============================================================================
+// ANNOUNCEMENTS
+// =============================================================================
+
+/// List course announcements
+async fn list_announcements(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_viewable_course(&db, &course_id, &ctx).await?;
+
+    let pagination = PaginationParams::from_request(&req);
+
+    let (announcements, total) = db.announcements()
+        .list_by_course(&course_id, pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(announcements, meta, &ctx)))
+}
+
+/// Create announcement
+async fn create_announcement(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let course_id = req.param("course_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Course ID required".to_string()
+    })?;
+
+    let _ = get_editable_course(&db, &course_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct CreateAnnouncementRequest {
+        title: String,
+        content: String,
+        is_pinned: Option<Bool>,
+        publish_at: Option<DateTime>,
+        send_notification: Option<Bool>
+    }
+
+    let body: CreateAnnouncementRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let announcement = db.announcements()
+        .create(CreateAnnouncementInput {
+            course_id: course_id.clone(),
+            title: body.title,
+            content: body.content,
+            author_id: ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+                message: "User ID required".to_string()
+            })?,
+            is_pinned: body.is_pinned.unwrap_or(false),
+            publish_at: body.publish_at
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Send notifications if requested
+    if body.send_notification.unwrap_or(true) && body.publish_at.is_none() {
+        send_announcement_notifications(&db, &course_id, &announcement).await.ok();
+    }
+
+    Ok(Response::json(ApiResponse::success(announcement, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn course_to_list_item(course: &Course) -> CourseListItem {
+    CourseListItem {
+        id: course.id.clone(),
+        code: course.code.clone(),
+        title: course.title.clone(),
+        short_description: course.short_description.clone(),
+        thumbnail_url: course.thumbnail_url.clone(),
+        status: course.status.clone(),
+        visibility: course.visibility.clone(),
+        enrollment_count: 0, // Would be populated from join
+        instructor_names: vec![],
+        start_date: course.start_date,
+        end_date: course.end_date,
+        created_at: course.created_at,
+        updated_at: course.updated_at
+    }
+}
+
+fn course_to_response(course: &Course, instructors: &List<Enrollment>, enrollment_count: i32) -> CourseResponse {
+    CourseResponse {
+        id: course.id.clone(),
+        code: course.code.clone(),
+        title: course.title.clone(),
+        short_description: course.short_description.clone(),
+        description: course.description.clone(),
+        thumbnail_url: course.thumbnail_url.clone(),
+        banner_url: course.banner_url.clone(),
+        status: course.status.clone(),
+        visibility: course.visibility.clone(),
+        category_id: course.category_id.clone(),
+        tags: course.tags.clone(),
+        level: course.level.clone(),
+        duration_hours: course.duration_hours,
+        language: course.language.clone(),
+        start_date: course.start_date,
+        end_date: course.end_date,
+        enrollment_start: course.enrollment_start,
+        enrollment_end: course.enrollment_end,
+        self_enrollment: course.self_enrollment,
+        enrollment_cap: course.enrollment_cap,
+        enrollment_count,
+        instructors: vec![], // Would map from enrollments
+        grading_scheme: None,
+        settings: CourseSettingsSummary {
+            allow_self_enrollment: course.self_enrollment,
+            require_enrollment_approval: false,
+            show_gradebook_to_students: true,
+            allow_discussions: true,
+            enable_announcements: true,
+            timezone: "UTC".to_string()
+        },
+        created_at: course.created_at,
+        updated_at: course.updated_at,
+        published_at: course.published_at
+    }
+}
+
+fn validate_create_course_input(input: &CreateCourseRequest) -> Result<(), ApiError> {
+    let mut errors = vec![];
+
+    if input.code.is_empty() {
+        errors.push(FieldError {
+            field: "code".to_string(),
+            code: "required".to_string(),
+            message: "Course code is required".to_string()
+        });
+    }
+
+    if input.title.is_empty() {
+        errors.push(FieldError {
+            field: "title".to_string(),
+            code: "required".to_string(),
+            message: "Course title is required".to_string()
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "".to_string(),
+            message: "Validation failed".to_string(),
+            errors
+        })
+    }
+
+    Ok(())
+}
+
+async fn can_view_course(ctx: &RequestContext, course: &Course, db: &Database) -> Bool {
+    // Public courses are viewable by all
+    if course.visibility == CourseVisibility::Public && course.status == CourseStatus::Published {
+        return true
+    }
+
+    // Admins can view all
+    if ctx.has_permission(Permission::ViewAllCourses) {
+        return true
+    }
+
+    // Check enrollment
+    if let Some(user_id) = ctx.user_id() {
+        let enrolled = db.enrollments()
+            .is_enrolled(&user_id, &course.id)
+            .await
+            .unwrap_or(false);
+        if enrolled {
+            return true
+        }
+    }
+
+    false
+}
+
+async fn can_edit_course(ctx: &RequestContext, course: &Course, db: &Database) -> Bool {
+    // Admins can edit all
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return true
+    }
+
+    // Check if instructor
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, &course.id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            return e.can_edit_content()
+        }
+    }
+
+    false
+}
+
+async fn get_viewable_course(db: &Database, course_id: &str, ctx: &RequestContext) -> Result<Course, ApiError> {
+    let course = db.courses()
+        .find_by_id(course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.to_string()
+        })?;
+
+    if !can_view_course(ctx, &course, db).await {
+        return Err(ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.to_string()
+        })
+    }
+
+    Ok(course)
+}
+
+async fn get_editable_course(db: &Database, course_id: &str, ctx: &RequestContext) -> Result<Course, ApiError> {
+    let course = db.courses()
+        .find_by_id(course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Course".to_string(),
+            id: course_id.to_string()
+        })?;
+
+    if !can_edit_course(ctx, &course, db).await {
+        return Err(ApiError::Forbidden {
+            message: "You don't have permission to edit this course".to_string(),
+            required_permission: Some("EditCourses".to_string())
+        })
+    }
+
+    Ok(course)
+}
+
+async fn validate_for_publishing(db: &Database, course: &Course) -> Result<(), ApiError> {
+    let mut errors = vec![];
+
+    // Check has at least one module
+    let module_count = db.modules()
+        .count_by_course(&course.id)
+        .await
+        .unwrap_or(0);
+
+    if module_count == 0 {
+        errors.push(FieldError {
+            field: "modules".to_string(),
+            code: "required".to_string(),
+            message: "Course must have at least one module".to_string()
+        });
+    }
+
+    // Check has title and description
+    if course.title.is_empty() {
+        errors.push(FieldError {
+            field: "title".to_string(),
+            code: "required".to_string(),
+            message: "Course must have a title".to_string()
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "".to_string(),
+            message: "Course is not ready for publishing".to_string(),
+            errors
+        })
+    }
+
+    Ok(())
+}
+
+async fn copy_course_structure(db: &Database, source_id: &CourseId, target_id: &CourseId) -> Result<(), String> {
+    // Would copy modules, lessons, assessments from source to target
+    Ok(())
+}
+
+async fn send_announcement_notifications(db: &Database, course_id: &CourseId, announcement: &Announcement) -> Result<(), String> {
+    // Would send notifications to enrolled students
+    Ok(())
+}
+
+fn parse_course_status(s: &str) -> Option<CourseStatus> {
+    match s.to_lowercase().as_str() {
+        "draft" => Some(CourseStatus::Draft),
+        "published" => Some(CourseStatus::Published),
+        "archived" => Some(CourseStatus::Archived),
+        _ => None
+    }
+}
+
+fn parse_course_visibility(s: &str) -> Option<CourseVisibility> {
+    match s.to_lowercase().as_str() {
+        "public" => Some(CourseVisibility::Public),
+        "private" => Some(CourseVisibility::Private),
+        "institution" => Some(CourseVisibility::Institution),
+        _ => None
+    }
+}
+
+fn parse_course_role(s: &str) -> Option<CourseRole> {
+    match s.to_lowercase().as_str() {
+        "student" => Some(CourseRole::Student),
+        "teacher" | "instructor" => Some(CourseRole::Teacher),
+        "ta" | "teaching_assistant" => Some(CourseRole::TeachingAssistant),
+        "grader" => Some(CourseRole::Grader),
+        "auditor" => Some(CourseRole::Auditor),
+        _ => None
+    }
+}
+
+fn parse_enrollment_status(s: &str) -> Option<EnrollmentStatus> {
+    match s.to_lowercase().as_str() {
+        "active" => Some(EnrollmentStatus::Active),
+        "completed" => Some(EnrollmentStatus::Completed),
+        "withdrawn" => Some(EnrollmentStatus::Withdrawn),
+        "inactive" => Some(EnrollmentStatus::Inactive),
+        _ => None
+    }
+}
+
+impl CourseSettings {
+    fn default_for(course_id: &CourseId) -> CourseSettings {
+        CourseSettings {
+            course_id: course_id.clone(),
+            enrollment: EnrollmentSettings {
+                allow_self_enrollment: false,
+                require_approval: false,
+                enrollment_code: None,
+                enrollment_cap: None,
+                waitlist_enabled: false,
+                allow_late_enrollment: true,
+                enrollment_start: None,
+                enrollment_end: None
+            },
+            grading: GradingSettings {
+                grading_scheme_id: "default".to_string(),
+                show_grade_to_students: true,
+                show_grade_summary: true,
+                allow_grade_passback: false,
+                late_penalty_type: "none".to_string(),
+                late_penalty_value: 0.0,
+                grade_passback_url: None
+            },
+            communication: CommunicationSettings {
+                allow_discussions: true,
+                require_post_before_viewing: false,
+                allow_anonymous_posts: false,
+                enable_announcements: true,
+                announcement_notifications: true,
+                enable_messaging: true
+            },
+            display: DisplaySettings {
+                theme: None,
+                navigation_style: "sidebar".to_string(),
+                show_progress_bar: true,
+                show_estimated_time: true,
+                content_layout: "default".to_string(),
+                timezone: "UTC".to_string()
+            },
+            completion: CompletionSettings {
+                completion_type: "progress".to_string(),
+                minimum_grade: None,
+                required_activities: vec![],
+                issue_certificate: false,
+                certificate_template_id: None
+            },
+            accessibility: AccessibilitySettings {
+                closed_captions_required: false,
+                alt_text_required: true,
+                screen_reader_optimized: true
+            },
+            integrations: IntegrationSettings {
+                lti_enabled: false,
+                scorm_enabled: false,
+                xapi_enabled: false,
+                calendar_sync: true,
+                sis_sync: false
+            }
+        }
+    }
+}
+
+// Types referenced but not defined
+type GradingConfig {
+    course_id: CourseId,
+    scheme_id: String,
+    categories: List<GradingCategory>,
+    late_policy: LatePolicy
+}
+
+type GradingCategory {
+    id: String,
+    name: String,
+    weight: f32,
+    drop_lowest: i32
+}
+
+type LatePolicy {
+    penalty_type: String,
+    penalty_per_day: f32,
+    max_penalty: f32,
+    grace_period_hours: i32
+}
+
+type CreateAnnouncementInput {
+    course_id: CourseId,
+    title: String,
+    content: String,
+    author_id: UserId,
+    is_pinned: Bool,
+    publish_at: Option<DateTime>
+}
+
+enum CourseScope {
+    All,
+    UserEnrolledOrInstructing(UserId),
+    PublicOnly
+}
+
+type CourseFilter {
+    status: Option<CourseStatus>,
+    visibility: Option<CourseVisibility>,
+    category_id: Option<String>,
+    instructor_id: Option<UserId>,
+    search: Option<String>,
+    tenant_id: Option<TenantId>,
+    scope: CourseScope
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use CourseResponse;
+pub use CourseListItem;
+pub use CourseStructure;
+pub use CourseSettings;
+pub use CourseAnalytics;

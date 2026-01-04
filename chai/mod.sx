@@ -1,0 +1,23 @@
+/// Intelligo LMS - Chai Testing Library
+///
+/// A BDD/TDD assertion library for the Simplex/Modulus runtime.
+/// Provides expressive assertions for testing LMS components.
+
+module intelligo::chai
+
+pub use intelligo::chai::assertions::*
+pub use intelligo::chai::matchers::*
+pub use intelligo::chai::mocks::*
+pub use intelligo::chai::fixtures::*
+pub use intelligo::chai::runner::*
+
+// Re-export commonly used items
+pub use Expect
+pub use Assert
+pub use Should
+pub use describe
+pub use it
+pub use before
+pub use after
+pub use beforeEach
+pub use afterEach

@@ -1,0 +1,784 @@
+/// Intelligo LMS - Core Type Definitions
+///
+/// This module contains all identity types, enums, and common types
+/// used throughout the Intelligo LMS system.
+
+module intelligo::core::types
+
+use std::time::{Instant, Duration, DateTime}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for a course
+type CourseId = String
+
+/// Unique identifier for a course module
+type ModuleId = String
+
+/// Unique identifier for a lesson
+type LessonId = String
+
+/// Unique identifier for an assessment (quiz, assignment, exam)
+type AssessmentId = String
+
+/// Unique identifier for a student submission
+type SubmissionId = String
+
+/// Unique identifier for a grade record
+type GradeId = String
+
+/// Unique identifier for an enrollment
+type EnrollmentId = String
+
+/// Unique identifier for a user
+type UserId = String
+
+/// Unique identifier for a student (alias for UserId in student context)
+type StudentId = String
+
+/// Unique identifier for an instructor
+type InstructorId = String
+
+/// Unique identifier for a tenant (multi-tenancy)
+type TenantId = String
+
+/// Unique identifier for a learning progress record
+type ProgressId = String
+
+/// Unique identifier for an assessment attempt
+type AttemptId = String
+
+/// Unique identifier for a competency
+type CompetencyId = String
+
+/// Unique identifier for a skill
+type SkillId = String
+
+/// Unique identifier for a badge/achievement
+type BadgeId = String
+
+/// Unique identifier for a certificate
+type CertificateId = String
+
+/// Unique identifier for a taxonomy term
+type TermId = String
+
+/// Unique identifier for a course section
+type SectionId = String
+
+/// Unique identifier for a rubric
+type RubricId = String
+
+/// Unique identifier for a question bank
+type QuestionBankId = String
+
+/// Unique identifier for a learning objective
+type LearningObjectiveId = String
+
+/// Unique identifier for a learning path
+type PathId = String
+
+/// Unique identifier for a SCORM package
+type ScormPackageId = String
+
+/// Unique identifier for a media asset
+type MediaId = String
+
+/// Unique identifier for a revision
+type RevisionId = String
+
+/// Unique identifier for a role
+type RoleId = String
+
+/// Unique identifier for a permission
+type PermissionId = String
+
+/// Unique identifier for a session
+type SessionId = String
+
+/// Unique identifier for a workflow
+type WorkflowId = String
+
+/// Unique identifier for a workflow state
+type StateId = String
+
+// =============================================================================
+// COURSE ENUMS
+// =============================================================================
+
+/// Status of a course in its lifecycle
+enum CourseStatus {
+    /// Course is being developed, not visible to students
+    Draft,
+    /// Course is live and available to enrolled students
+    Published,
+    /// Course has ended and is no longer active
+    Archived,
+    /// Course is a template for creating other courses
+    Template
+}
+
+/// Type of learning path structure within a course
+enum LearningPathType {
+    /// Students must progress through content in order
+    Linear,
+    /// Students can choose different paths based on performance
+    Branching,
+    /// AI-driven personalized path for each student
+    Adaptive,
+    /// Students can access any content in any order
+    SelfPaced,
+    /// Instructor controls content release
+    Instructor
+}
+
+/// How students can enroll in a course
+enum EnrollmentType {
+    /// Anyone can self-enroll
+    Open,
+    /// Enrollment requires instructor/admin approval
+    Approval,
+    /// Students must be invited
+    Invitation,
+    /// Enrollment requires payment
+    Payment,
+    /// Enrollment managed by SIS integration
+    SisManaged
+}
+
+/// Visibility of a course
+enum Visibility {
+    /// Visible to everyone
+    Public,
+    /// Only visible to enrolled users
+    Private,
+    /// Accessible via direct link only
+    Unlisted,
+    /// Only visible within the tenant
+    TenantOnly
+}
+
+// =============================================================================
+// ENROLLMENT ENUMS
+// =============================================================================
+
+/// Status of a student's enrollment
+enum EnrollmentStatus {
+    /// Enrollment is pending approval
+    Pending,
+    /// Student is actively enrolled
+    Active,
+    /// Student has completed the course
+    Completed,
+    /// Student has withdrawn from the course
+    Withdrawn,
+    /// Student failed to complete requirements
+    Failed,
+    /// Enrollment has expired
+    Expired
+}
+
+/// Role a user plays within a course
+enum CourseRole {
+    /// Learner taking the course
+    Student,
+    /// Primary instructor
+    Teacher,
+    /// Assists with instruction and grading
+    TeachingAssistant,
+    /// Can grade but not edit content
+    Grader,
+    /// Can view but not participate
+    Observer,
+    /// Can edit content but not manage students
+    Designer,
+    /// Taking course without credit
+    Auditor
+}
+
+/// Source of an enrollment
+enum EnrollmentSource {
+    /// User enrolled themselves
+    SelfEnroll,
+    /// Admin/instructor enrolled the user
+    AdminEnroll,
+    /// Synced from Student Information System
+    SisSync,
+    /// Created via LTI launch
+    LtiLaunch,
+    /// User was invited
+    Invitation,
+    /// Enrollment through payment
+    Payment
+}
+
+// =============================================================================
+// ASSESSMENT ENUMS
+// =============================================================================
+
+/// Type of assessment
+enum AssessmentType {
+    /// Multiple short questions, often auto-graded
+    Quiz,
+    /// Formal examination, often timed and proctored
+    Exam,
+    /// Work submitted by student (file, text, etc.)
+    Assignment,
+    /// Forum-based discussion assessment
+    Discussion,
+    /// Multi-part deliverable over time
+    Project,
+    /// Students evaluate each other's work
+    PeerReview,
+    /// Student evaluates their own work
+    SelfAssessment,
+    /// Survey or feedback collection (not graded)
+    Survey
+}
+
+/// Type of question in an assessment
+enum QuestionType {
+    /// Select one or more correct answers
+    MultipleChoice { single_answer: Bool },
+    /// True or false
+    TrueFalse,
+    /// Short text answer
+    ShortAnswer,
+    /// Long-form written response
+    Essay,
+    /// Fill in missing words/phrases
+    FillInBlank,
+    /// Match items from two columns
+    Matching,
+    /// Arrange items in correct order
+    Ordering,
+    /// Click on correct area of an image
+    Hotspot,
+    /// Upload a file as answer
+    FileUpload,
+    /// Numeric answer with optional tolerance
+    Numeric,
+    /// Likert scale rating
+    Likert,
+    /// Custom question type
+    Custom { handler: String }
+}
+
+/// How to score multiple attempts
+enum AttemptScoring {
+    /// Use the highest score
+    Highest,
+    /// Use the most recent score
+    Latest,
+    /// Average all attempts
+    Average,
+    /// Use the first attempt
+    First
+}
+
+/// Status of a submission
+enum SubmissionStatus {
+    /// Student hasn't started
+    NotStarted,
+    /// Student is working on it
+    InProgress,
+    /// Student has submitted
+    Submitted,
+    /// Submission is being graded
+    Grading,
+    /// Grading is complete
+    Graded,
+    /// Returned to student for revision
+    Returned,
+    /// Student has resubmitted
+    Resubmit
+}
+
+/// Type of submission content
+enum SubmissionType {
+    /// Plain text submission
+    Text,
+    /// File upload
+    FileUpload,
+    /// URL link
+    Url,
+    /// Media recording
+    Media,
+    /// Google Docs integration
+    GoogleDocs,
+    /// Office Online integration
+    OfficeOnline
+}
+
+// =============================================================================
+// GRADING ENUMS
+// =============================================================================
+
+/// Type of grading scale
+enum GradingType {
+    /// Numeric points (e.g., 85/100)
+    Points,
+    /// Percentage (e.g., 85%)
+    Percentage,
+    /// Letter grade (e.g., A, B+)
+    Letter,
+    /// Pass/Fail only
+    PassFail,
+    /// Competency-based (mastery levels)
+    Competency,
+    /// Custom grading scale
+    Custom { scale_id: String }
+}
+
+/// How an assessment was graded
+enum GradingMethod {
+    /// Automatically graded by system
+    AutoGraded,
+    /// Manually graded by instructor
+    ManualGraded,
+    /// Graded by AI
+    AiGraded,
+    /// Graded using rubric
+    RubricGraded,
+    /// Graded by peers
+    PeerGraded
+}
+
+/// When to show correct answers
+enum ShowAnswersPolicy {
+    /// Never show answers
+    Never,
+    /// Show immediately after submission
+    AfterSubmission,
+    /// Show after due date passes
+    AfterDueDate,
+    /// Show after all attempts used
+    AfterAllAttempts,
+    /// Instructor manually releases
+    Manual
+}
+
+/// When to show feedback
+enum ShowFeedbackPolicy {
+    /// Show immediately
+    Immediately,
+    /// Show after submission
+    AfterSubmission,
+    /// Show after grading complete
+    AfterGrading,
+    /// Show after due date
+    AfterDueDate,
+    /// Never show
+    Never
+}
+
+// =============================================================================
+// CONTENT ENUMS
+// =============================================================================
+
+/// Type of lesson content
+enum ContentType {
+    /// Video content
+    Video,
+    /// Audio content
+    Audio,
+    /// Document (PDF, Word, etc.)
+    Document,
+    /// Presentation slides
+    Presentation,
+    /// Interactive content (H5P, etc.)
+    Interactive,
+    /// SCORM package
+    ScormPackage,
+    /// xAPI activity
+    xApiActivity,
+    /// External URL
+    ExternalUrl,
+    /// HTML content
+    Html,
+    /// Embedded content (iframe)
+    Embed
+}
+
+/// How lesson completion is determined
+enum CompletionType {
+    /// Just view the content
+    Viewed,
+    /// Spend minimum time
+    TimeSpent,
+    /// Progress through content (video %, page scroll)
+    ContentProgress,
+    /// Pass linked assessment
+    AssessmentPass,
+    /// Instructor marks complete
+    Manual
+}
+
+/// How module unlock conditions work
+enum UnlockType {
+    /// Always available
+    Always,
+    /// Available on specific date
+    Date,
+    /// Requires prerequisite completion
+    Prerequisite,
+    /// Requires minimum score
+    Score,
+    /// Instructor manually unlocks
+    Manual
+}
+
+// =============================================================================
+// LEARNING ENUMS
+// =============================================================================
+
+/// Learning style preference
+enum LearningStyle {
+    /// Prefers visual content (diagrams, videos)
+    Visual,
+    /// Prefers audio content (lectures, podcasts)
+    Auditory,
+    /// Prefers reading and writing
+    ReadingWriting,
+    /// Prefers hands-on activities
+    Kinesthetic,
+    /// No strong preference
+    Mixed
+}
+
+/// Skill proficiency level
+enum SkillLevel {
+    /// Just starting
+    Novice,
+    /// Basic understanding
+    Beginner,
+    /// Can apply independently
+    Intermediate,
+    /// Deep expertise
+    Advanced,
+    /// Mastery level
+    Expert
+}
+
+/// Bloom's taxonomy levels
+enum BloomLevel {
+    /// Recall facts and basic concepts
+    Remember,
+    /// Explain ideas or concepts
+    Understand,
+    /// Use information in new situations
+    Apply,
+    /// Draw connections among ideas
+    Analyze,
+    /// Justify a decision or course of action
+    Evaluate,
+    /// Produce new or original work
+    Create
+}
+
+// =============================================================================
+// ENTITY STATUS ENUMS
+// =============================================================================
+
+/// General entity status
+enum EntityStatus {
+    /// Entity is in draft state
+    Draft,
+    /// Entity is published and active
+    Published,
+    /// Entity is archived
+    Archived,
+    /// Entity is scheduled for future
+    Scheduled,
+    /// Entity is under review
+    Review,
+    /// Entity was rejected
+    Rejected
+}
+
+/// Workflow state types
+enum StateType {
+    /// Initial draft state
+    Draft,
+    /// Under review
+    Review,
+    /// Approved but not published
+    Approved,
+    /// Live and active
+    Published,
+    /// No longer active
+    Archived,
+    /// Scheduled for future
+    Scheduled,
+    /// Rejected in review
+    Rejected,
+    /// Custom state
+    Custom { name: String }
+}
+
+// =============================================================================
+// RISK AND ALERT ENUMS
+// =============================================================================
+
+/// Risk level for student early warning
+enum RiskLevel {
+    /// No risk detected
+    None,
+    /// Minor concerns
+    Low,
+    /// Moderate concerns
+    Medium,
+    /// Significant concerns
+    High,
+    /// Immediate attention needed
+    Critical
+}
+
+/// Type of engagement concern
+enum EngagementConcern {
+    /// Engagement is declining
+    DecliningEngagement,
+    /// Student has been inactive
+    Inactivity,
+    /// Surface-level engagement only
+    ShallowEngagement,
+    /// Missed deadlines
+    MissedDeadlines,
+    /// Low assessment scores
+    LowScores
+}
+
+// =============================================================================
+// COMPLIANCE ENUMS
+// =============================================================================
+
+/// SCORM version
+enum ScormVersion {
+    /// SCORM 1.2
+    Scorm12,
+    /// SCORM 2004 2nd Edition
+    Scorm2004_2nd,
+    /// SCORM 2004 3rd Edition
+    Scorm2004_3rd,
+    /// SCORM 2004 4th Edition
+    Scorm2004_4th
+}
+
+/// SCORM completion status
+enum ScormCompletionStatus {
+    Unknown,
+    NotAttempted,
+    Incomplete,
+    Completed
+}
+
+/// SCORM success status
+enum ScormSuccessStatus {
+    Unknown,
+    Passed,
+    Failed
+}
+
+// =============================================================================
+// MULTI-TENANCY ENUMS
+// =============================================================================
+
+/// Tenant status
+enum TenantStatus {
+    /// Tenant is active
+    Active,
+    /// Tenant is suspended
+    Suspended { reason: String, until: Option<DateTime> },
+    /// Tenant has been deleted
+    Deleted { deleted_at: DateTime }
+}
+
+/// Subscription status
+enum SubscriptionStatus {
+    /// In trial period
+    Trial,
+    /// Active subscription
+    Active,
+    /// Payment overdue
+    PastDue,
+    /// Subscription cancelled
+    Cancelled,
+    /// Account suspended
+    Suspended
+}
+
+/// Billing cycle
+enum BillingCycle {
+    Monthly,
+    Annual,
+    Enterprise
+}
+
+// =============================================================================
+// COMMON TYPES
+// =============================================================================
+
+/// Pagination parameters
+type Pagination {
+    page: i32,
+    per_page: i32,
+    sort_by: Option<String>,
+    sort_order: Option<SortOrder>
+}
+
+/// Sort order
+enum SortOrder {
+    Ascending,
+    Descending
+}
+
+/// Query result with pagination info
+type QueryResult<T> {
+    items: List<T>,
+    total: i64,
+    page: i32,
+    per_page: i32,
+    total_pages: i32
+}
+
+/// Bulk operation result
+type BulkResult<T> {
+    succeeded: List<T>,
+    failed: List<BulkFailure>,
+    total_processed: i32
+}
+
+/// Failure in bulk operation
+type BulkFailure {
+    index: i32,
+    id: Option<String>,
+    error: String
+}
+
+/// Date range filter
+type DateRange {
+    start: Option<DateTime>,
+    end: Option<DateTime>
+}
+
+/// Access context for permission checking
+type AccessContext {
+    user_id: UserId,
+    tenant_id: TenantId,
+    roles: Set<RoleId>,
+    permissions: Set<PermissionId>,
+    ip_address: Option<String>,
+    session_id: Option<SessionId>
+}
+
+/// SEO metadata
+type SeoData {
+    title: Option<String>,
+    description: Option<String>,
+    keywords: List<String>,
+    og_image: Option<String>,
+    canonical_url: Option<String>
+}
+
+/// Audit information
+type AuditInfo {
+    created_by: UserId,
+    created_at: DateTime,
+    updated_by: Option<UserId>,
+    updated_at: DateTime
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// LMS-specific errors
+enum LmsError {
+    /// Entity not found
+    NotFound { entity_type: String, id: String },
+    /// Access denied
+    AccessDenied { reason: String },
+    /// Validation failed
+    ValidationFailed { errors: List<ValidationError> },
+    /// Conflict with existing data
+    Conflict { message: String },
+    /// Invalid state transition
+    InvalidState { current: String, attempted: String },
+    /// Enrollment error
+    EnrollmentError { reason: String },
+    /// Assessment error
+    AssessmentError { reason: String },
+    /// Grading error
+    GradingError { reason: String },
+    /// SCORM error
+    ScormError { code: String, message: String },
+    /// Integration error
+    IntegrationError { provider: String, message: String },
+    /// AI service error
+    AiError { service: String, message: String },
+    /// Tenant error
+    TenantError { reason: String },
+    /// Rate limit exceeded
+    RateLimitExceeded { retry_after: Duration },
+    /// Internal error
+    Internal { message: String }
+}
+
+/// Validation error detail
+type ValidationError {
+    field: String,
+    message: String,
+    code: String
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+/// Generate a new UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+/// Generate a course ID
+fn generate_course_id() -> CourseId {
+    format!("course_{}", generate_uuid())
+}
+
+/// Generate a module ID
+fn generate_module_id() -> ModuleId {
+    format!("module_{}", generate_uuid())
+}
+
+/// Generate a lesson ID
+fn generate_lesson_id() -> LessonId {
+    format!("lesson_{}", generate_uuid())
+}
+
+/// Generate an assessment ID
+fn generate_assessment_id() -> AssessmentId {
+    format!("assessment_{}", generate_uuid())
+}
+
+/// Generate a submission ID
+fn generate_submission_id() -> SubmissionId {
+    format!("submission_{}", generate_uuid())
+}
+
+/// Generate a grade ID
+fn generate_grade_id() -> GradeId {
+    format!("grade_{}", generate_uuid())
+}
+
+/// Generate an enrollment ID
+fn generate_enrollment_id() -> EnrollmentId {
+    format!("enrollment_{}", generate_uuid())
+}
+
+/// Generate a tenant ID
+fn generate_tenant_id() -> TenantId {
+    format!("tenant_{}", generate_uuid())
+}

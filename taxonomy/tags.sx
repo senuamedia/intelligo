@@ -1,0 +1,561 @@
+/// Intelligo LMS - Tagging System
+///
+/// Provides flexible tagging for content discovery and organization.
+
+module intelligo::taxonomy::tags
+
+use std::collections::{Map, List, HashSet}
+use std::sync::{Arc, RwLock}
+use std::time::DateTime
+
+// =============================================================================
+// TAG
+// =============================================================================
+
+/// A tag for content classification
+pub type Tag {
+    id: String,
+    tenant_id: String,
+    name: String,
+    slug: String,
+    description: Option<String>,
+    tag_type: TagType,
+    color: Option<String>,
+    icon: Option<String>,
+    parent_id: Option<String>,
+    synonyms: List<String>,
+    usage_count: i32,
+    is_featured: bool,
+    is_system: bool,
+    metadata: Map<String, String>,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Type of tag
+#[derive(Clone, PartialEq)]
+pub enum TagType {
+    Topic,          // Subject matter
+    Skill,          // Related skill
+    Difficulty,     // Difficulty level
+    Duration,       // Time commitment
+    Format,         // Content format
+    Audience,       // Target audience
+    Industry,       // Industry vertical
+    Technology,     // Technology/tool
+    Certification,  // Related certification
+    Custom(String)
+}
+
+impl Tag {
+    pub fn new(tenant_id: &str, name: &str, tag_type: TagType) -> Tag {
+        Tag {
+            id: generate_id("tag"),
+            tenant_id: tenant_id.to_string(),
+            name: name.to_string(),
+            slug: slugify(name),
+            description: None,
+            tag_type,
+            color: None,
+            icon: None,
+            parent_id: None,
+            synonyms: vec![],
+            usage_count: 0,
+            is_featured: false,
+            is_system: false,
+            metadata: Map::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn system_tag(tenant_id: &str, name: &str, tag_type: TagType) -> Tag {
+        let mut tag = Tag::new(tenant_id, name, tag_type);
+        tag.is_system = true;
+        tag
+    }
+
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+
+    pub fn with_color(mut self, color: &str) -> Self {
+        self.color = Some(color.to_string());
+        self
+    }
+
+    pub fn with_synonyms(mut self, synonyms: Vec<&str>) -> Self {
+        self.synonyms = synonyms.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_parent(mut self, parent_id: &str) -> Self {
+        self.parent_id = Some(parent_id.to_string());
+        self
+    }
+
+    pub fn increment_usage(&mut self) {
+        self.usage_count += 1;
+        self.updated_at = DateTime::now();
+    }
+
+    pub fn decrement_usage(&mut self) {
+        if self.usage_count > 0 {
+            self.usage_count -= 1;
+        }
+        self.updated_at = DateTime::now();
+    }
+}
+
+// =============================================================================
+// TAGGED ENTITY
+// =============================================================================
+
+/// An entity with tags
+pub type TaggedEntity {
+    entity_id: String,
+    entity_type: EntityType,
+    tags: List<String>,     // Tag IDs
+    auto_tags: List<String>, // AI-generated tag IDs
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+#[derive(Clone, PartialEq)]
+pub enum EntityType {
+    Course,
+    Module,
+    Lesson,
+    Activity,
+    Assessment,
+    Resource,
+    User,
+    LearningPath
+}
+
+impl TaggedEntity {
+    pub fn new(entity_id: &str, entity_type: EntityType) -> TaggedEntity {
+        TaggedEntity {
+            entity_id: entity_id.to_string(),
+            entity_type,
+            tags: vec![],
+            auto_tags: vec![],
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        }
+    }
+
+    pub fn add_tag(&mut self, tag_id: &str) {
+        if !self.tags.contains(&tag_id.to_string()) {
+            self.tags.push(tag_id.to_string());
+            self.updated_at = DateTime::now();
+        }
+    }
+
+    pub fn remove_tag(&mut self, tag_id: &str) {
+        self.tags.retain(|t| t != tag_id);
+        self.updated_at = DateTime::now();
+    }
+
+    pub fn add_auto_tag(&mut self, tag_id: &str) {
+        if !self.auto_tags.contains(&tag_id.to_string()) {
+            self.auto_tags.push(tag_id.to_string());
+            self.updated_at = DateTime::now();
+        }
+    }
+
+    pub fn all_tags(&self) -> List<String> {
+        let mut all = self.tags.clone();
+        for tag in &self.auto_tags {
+            if !all.contains(tag) {
+                all.push(tag.clone());
+            }
+        }
+        all
+    }
+
+    pub fn has_tag(&self, tag_id: &str) -> bool {
+        self.tags.contains(&tag_id.to_string()) || self.auto_tags.contains(&tag_id.to_string())
+    }
+}
+
+// =============================================================================
+// TAG SERVICE
+// =============================================================================
+
+/// Actor for managing tags
+pub actor TagService {
+    tags: Arc<RwLock<Map<String, Tag>>>,
+    entities: Arc<RwLock<Map<String, TaggedEntity>>>,
+    slug_index: Arc<RwLock<Map<String, String>>>,  // slug -> id
+    tenant_id: String
+}
+
+impl TagService {
+    pub fn new(tenant_id: &str) -> TagService {
+        let service = TagService {
+            tags: Arc::new(RwLock::new(Map::new())),
+            entities: Arc::new(RwLock::new(Map::new())),
+            slug_index: Arc::new(RwLock::new(Map::new())),
+            tenant_id: tenant_id.to_string()
+        };
+
+        // Create default system tags
+        service.create_default_tags();
+        service
+    }
+
+    fn create_default_tags(&self) {
+        let defaults = vec![
+            // Difficulty tags
+            ("Beginner", TagType::Difficulty, "#4CAF50"),
+            ("Intermediate", TagType::Difficulty, "#FF9800"),
+            ("Advanced", TagType::Difficulty, "#F44336"),
+            // Duration tags
+            ("< 1 hour", TagType::Duration, "#2196F3"),
+            ("1-3 hours", TagType::Duration, "#2196F3"),
+            ("3-8 hours", TagType::Duration, "#2196F3"),
+            ("8+ hours", TagType::Duration, "#2196F3"),
+            // Format tags
+            ("Video", TagType::Format, "#9C27B0"),
+            ("Interactive", TagType::Format, "#9C27B0"),
+            ("Reading", TagType::Format, "#9C27B0"),
+            ("Hands-on", TagType::Format, "#9C27B0"),
+            ("Quiz", TagType::Format, "#9C27B0"),
+        ];
+
+        let mut tags = self.tags.write().unwrap();
+        let mut index = self.slug_index.write().unwrap();
+
+        for (name, tag_type, color) in defaults {
+            let tag = Tag::system_tag(&self.tenant_id, name, tag_type)
+                .with_color(color);
+            index.insert(tag.slug.clone(), tag.id.clone());
+            tags.insert(tag.id.clone(), tag);
+        }
+    }
+
+    /// Create a tag
+    pub async fn create(&mut self, tag: Tag) -> Result<Tag, String> {
+        // Check for duplicate slug
+        if self.slug_index.read().unwrap().contains_key(&tag.slug) {
+            return Err(format!("Tag with slug '{}' already exists", tag.slug));
+        }
+
+        self.slug_index.write().unwrap().insert(tag.slug.clone(), tag.id.clone());
+        self.tags.write().unwrap().insert(tag.id.clone(), tag.clone());
+        Ok(tag)
+    }
+
+    /// Get tag by ID
+    pub fn get(&self, id: &str) -> Option<Tag> {
+        self.tags.read().unwrap().get(id).cloned()
+    }
+
+    /// Get tag by slug
+    pub fn get_by_slug(&self, slug: &str) -> Option<Tag> {
+        let id = self.slug_index.read().unwrap().get(slug)?.clone();
+        self.get(&id)
+    }
+
+    /// Search tags
+    pub fn search(&self, query: &str) -> List<Tag> {
+        let query_lower = query.to_lowercase();
+        self.tags.read().unwrap()
+            .values()
+            .filter(|t| {
+                t.name.to_lowercase().contains(&query_lower) ||
+                t.synonyms.iter().any(|s| s.to_lowercase().contains(&query_lower))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Get tags by type
+    pub fn get_by_type(&self, tag_type: &TagType) -> List<Tag> {
+        self.tags.read().unwrap()
+            .values()
+            .filter(|t| &t.tag_type == tag_type)
+            .cloned()
+            .collect()
+    }
+
+    /// Get popular tags
+    pub fn get_popular(&self, limit: usize) -> List<Tag> {
+        let mut tags: Vec<_> = self.tags.read().unwrap().values().cloned().collect();
+        tags.sort_by(|a, b| b.usage_count.cmp(&a.usage_count));
+        tags.into_iter().take(limit).collect()
+    }
+
+    /// Get featured tags
+    pub fn get_featured(&self) -> List<Tag> {
+        self.tags.read().unwrap()
+            .values()
+            .filter(|t| t.is_featured)
+            .cloned()
+            .collect()
+    }
+
+    /// Tag an entity
+    pub async fn tag_entity(&mut self, entity_id: &str, entity_type: EntityType, tag_ids: List<String>) -> Result<TaggedEntity, String> {
+        let key = format!("{}:{}", entity_type_to_string(&entity_type), entity_id);
+
+        let mut entities = self.entities.write().unwrap();
+        let entity = entities.entry(key.clone())
+            .or_insert_with(|| TaggedEntity::new(entity_id, entity_type));
+
+        // Update tags
+        let old_tags: HashSet<_> = entity.tags.iter().cloned().collect();
+        let new_tags: HashSet<_> = tag_ids.iter().cloned().collect();
+
+        // Decrement usage for removed tags
+        for tag_id in old_tags.difference(&new_tags) {
+            if let Some(tag) = self.tags.write().unwrap().get_mut(tag_id) {
+                tag.decrement_usage();
+            }
+        }
+
+        // Increment usage for added tags
+        for tag_id in new_tags.difference(&old_tags) {
+            if let Some(tag) = self.tags.write().unwrap().get_mut(tag_id) {
+                tag.increment_usage();
+            }
+        }
+
+        entity.tags = tag_ids;
+        entity.updated_at = DateTime::now();
+
+        Ok(entity.clone())
+    }
+
+    /// Get entity tags
+    pub fn get_entity_tags(&self, entity_id: &str, entity_type: EntityType) -> List<Tag> {
+        let key = format!("{}:{}", entity_type_to_string(&entity_type), entity_id);
+
+        if let Some(entity) = self.entities.read().unwrap().get(&key) {
+            let tags = self.tags.read().unwrap();
+            entity.all_tags().iter()
+                .filter_map(|id| tags.get(id).cloned())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Find entities by tags
+    pub fn find_by_tags(&self, tag_ids: &[String], entity_type: Option<EntityType>) -> List<String> {
+        let entities = self.entities.read().unwrap();
+        entities.values()
+            .filter(|e| {
+                // Filter by entity type if specified
+                if let Some(ref et) = entity_type {
+                    if &e.entity_type != et {
+                        return false;
+                    }
+                }
+                // Check if entity has all required tags
+                tag_ids.iter().all(|tag_id| e.has_tag(tag_id))
+            })
+            .map(|e| e.entity_id.clone())
+            .collect()
+    }
+
+    /// Find entities by any tag
+    pub fn find_by_any_tag(&self, tag_ids: &[String], entity_type: Option<EntityType>) -> List<String> {
+        let entities = self.entities.read().unwrap();
+        entities.values()
+            .filter(|e| {
+                if let Some(ref et) = entity_type {
+                    if &e.entity_type != et {
+                        return false;
+                    }
+                }
+                tag_ids.iter().any(|tag_id| e.has_tag(tag_id))
+            })
+            .map(|e| e.entity_id.clone())
+            .collect()
+    }
+
+    /// Get related tags (tags that appear together)
+    pub fn get_related_tags(&self, tag_id: &str, limit: usize) -> List<(Tag, i32)> {
+        let entities = self.entities.read().unwrap();
+        let mut co_occurrences: Map<String, i32> = Map::new();
+
+        // Count co-occurrences
+        for entity in entities.values() {
+            if entity.has_tag(tag_id) {
+                for other_tag in entity.all_tags() {
+                    if other_tag != tag_id {
+                        *co_occurrences.entry(other_tag).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Sort and return
+        let mut results: Vec<_> = co_occurrences.into_iter().collect();
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let tags = self.tags.read().unwrap();
+        results.into_iter()
+            .take(limit)
+            .filter_map(|(id, count)| tags.get(&id).map(|t| (t.clone(), count)))
+            .collect()
+    }
+
+    /// Suggest tags based on content
+    pub async fn suggest_tags(&self, content: &str) -> List<Tag> {
+        // Simple keyword matching - in production, use AI
+        let content_lower = content.to_lowercase();
+        let tags = self.tags.read().unwrap();
+
+        tags.values()
+            .filter(|tag| {
+                content_lower.contains(&tag.name.to_lowercase()) ||
+                tag.synonyms.iter().any(|s| content_lower.contains(&s.to_lowercase()))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Merge tags
+    pub async fn merge(&mut self, source_id: &str, target_id: &str) -> Result<(), String> {
+        // Get source tag
+        let source = self.tags.read().unwrap().get(source_id).cloned()
+            .ok_or("Source tag not found")?;
+
+        if source.is_system {
+            return Err("Cannot merge system tags".to_string());
+        }
+
+        // Update all entities
+        let mut entities = self.entities.write().unwrap();
+        for entity in entities.values_mut() {
+            if entity.has_tag(source_id) {
+                entity.tags.retain(|t| t != source_id);
+                if !entity.tags.contains(&target_id.to_string()) {
+                    entity.tags.push(target_id.to_string());
+                }
+            }
+            if entity.auto_tags.contains(&source_id.to_string()) {
+                entity.auto_tags.retain(|t| t != source_id);
+                if !entity.auto_tags.contains(&target_id.to_string()) {
+                    entity.auto_tags.push(target_id.to_string());
+                }
+            }
+        }
+
+        // Update target usage count
+        if let Some(target) = self.tags.write().unwrap().get_mut(target_id) {
+            target.usage_count += source.usage_count;
+            // Add source synonyms
+            for synonym in source.synonyms {
+                if !target.synonyms.contains(&synonym) {
+                    target.synonyms.push(synonym);
+                }
+            }
+            // Add source name as synonym
+            if !target.synonyms.contains(&source.name) {
+                target.synonyms.push(source.name);
+            }
+        }
+
+        // Remove source tag
+        self.tags.write().unwrap().remove(source_id);
+        self.slug_index.write().unwrap().remove(&source.slug);
+
+        Ok(())
+    }
+
+    /// Delete a tag
+    pub async fn delete(&mut self, tag_id: &str) -> Result<(), String> {
+        let tag = self.tags.read().unwrap().get(tag_id).cloned()
+            .ok_or("Tag not found")?;
+
+        if tag.is_system {
+            return Err("Cannot delete system tags".to_string());
+        }
+
+        // Remove from all entities
+        let mut entities = self.entities.write().unwrap();
+        for entity in entities.values_mut() {
+            entity.tags.retain(|t| t != tag_id);
+            entity.auto_tags.retain(|t| t != tag_id);
+        }
+
+        self.tags.write().unwrap().remove(tag_id);
+        self.slug_index.write().unwrap().remove(&tag.slug);
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// TAG CLOUD
+// =============================================================================
+
+/// Generate a tag cloud
+pub fn generate_tag_cloud(tags: &[Tag], max_size: f64, min_size: f64) -> List<TagCloudItem> {
+    if tags.is_empty() {
+        return vec![];
+    }
+
+    let max_count = tags.iter().map(|t| t.usage_count).max().unwrap_or(1) as f64;
+    let min_count = tags.iter().map(|t| t.usage_count).min().unwrap_or(0) as f64;
+    let range = (max_count - min_count).max(1.0);
+
+    tags.iter().map(|tag| {
+        let normalized = (tag.usage_count as f64 - min_count) / range;
+        let size = min_size + normalized * (max_size - min_size);
+
+        TagCloudItem {
+            tag: tag.clone(),
+            size,
+            weight: normalized
+        }
+    }).collect()
+}
+
+/// Item in a tag cloud
+pub type TagCloudItem {
+    tag: Tag,
+    size: f64,
+    weight: f64
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id(prefix: &str) -> String {
+    use std::time::SystemTime;
+    format!("{}_{:x}", prefix, SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<&str>>()
+        .join("-")
+}
+
+fn entity_type_to_string(et: &EntityType) -> &'static str {
+    match et {
+        EntityType::Course => "course",
+        EntityType::Module => "module",
+        EntityType::Lesson => "lesson",
+        EntityType::Activity => "activity",
+        EntityType::Assessment => "assessment",
+        EntityType::Resource => "resource",
+        EntityType::User => "user",
+        EntityType::LearningPath => "learning_path"
+    }
+}

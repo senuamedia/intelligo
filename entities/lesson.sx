@@ -1,0 +1,659 @@
+/// Intelligo LMS - Lesson Entity
+///
+/// Lessons are the atomic learning units within a course.
+/// They contain various content types (video, text, interactive, SCORM, etc.)
+
+module intelligo::entities::lesson
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// LESSON ENTITY
+// =============================================================================
+
+/// A lesson is an atomic learning unit
+type Lesson {
+    /// Unique identifier
+    id: LessonId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Bundle type (video, reading, interactive, scorm_sco, etc.)
+    bundle: String,
+
+    /// Parent module
+    module_id: ModuleId,
+
+    /// Parent course
+    course_id: CourseId,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    // =========================================================================
+    // Core Fields
+    // =========================================================================
+
+    /// Lesson title
+    title: String,
+
+    /// Lesson description
+    description: Option<String>,
+
+    /// Brief summary
+    summary: Option<String>,
+
+    // =========================================================================
+    // Content
+    // =========================================================================
+
+    /// Primary content type
+    content_type: ContentType,
+
+    /// The actual content
+    content: LessonContent,
+
+    /// Supplementary resources
+    resources: List<LessonResource>,
+
+    // =========================================================================
+    // Structure
+    // =========================================================================
+
+    /// Position within module (0-indexed)
+    position: i32,
+
+    /// Estimated duration in minutes
+    estimated_duration_minutes: Option<i32>,
+
+    // =========================================================================
+    // Completion
+    // =========================================================================
+
+    /// How completion is determined
+    completion_type: CompletionType,
+
+    /// Specific completion criteria
+    completion_criteria: Option<CompletionCriteria>,
+
+    /// Whether this lesson is required
+    is_required: Bool,
+
+    // =========================================================================
+    // Assessments
+    // =========================================================================
+
+    /// Assessments linked to this lesson
+    assessments: List<AssessmentId>,
+
+    // =========================================================================
+    // Learning Objectives
+    // =========================================================================
+
+    /// Learning objectives for this lesson
+    learning_objectives: List<LearningObjective>,
+
+    /// Competencies addressed
+    competencies: List<CompetencyId>,
+
+    // =========================================================================
+    // AI Features
+    // =========================================================================
+
+    /// AI-generated summary
+    ai_summary: Option<String>,
+
+    /// AI-extracted keywords
+    ai_keywords: List<String>,
+
+    /// AI-generated transcript (for video/audio)
+    ai_transcript: Option<String>,
+
+    // =========================================================================
+    // Accessibility
+    // =========================================================================
+
+    /// Accessibility features
+    accessibility: AccessibilityInfo,
+
+    // =========================================================================
+    // Status
+    // =========================================================================
+
+    /// Lesson status
+    status: EntityStatus,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+// =============================================================================
+// LESSON CONTENT
+// =============================================================================
+
+/// The actual content of a lesson
+enum LessonContent {
+    /// Video content
+    Video {
+        video_id: MediaId,
+        duration_seconds: i32,
+        thumbnail: Option<MediaId>,
+        transcript: Option<String>,
+        captions: Map<String, String>, // language -> caption file URL
+        chapters: List<VideoChapter>
+    },
+
+    /// Audio content (podcast, lecture recording)
+    Audio {
+        audio_id: MediaId,
+        duration_seconds: i32,
+        transcript: Option<String>
+    },
+
+    /// Document content (PDF, Word, etc.)
+    Document {
+        file_id: MediaId,
+        file_type: String,
+        page_count: Option<i32>,
+        inline_view: Bool
+    },
+
+    /// Presentation slides
+    Presentation {
+        file_id: MediaId,
+        slide_count: i32,
+        converted_images: List<MediaId>, // slides as images
+        speaker_notes: Option<String>
+    },
+
+    /// HTML content
+    Html {
+        content: String,
+        styles: Option<String>,
+        scripts: Option<String>
+    },
+
+    /// Rich text content
+    RichText {
+        content: String, // Markdown or structured content
+        format: RichTextFormat
+    },
+
+    /// Interactive content (H5P, etc.)
+    Interactive {
+        interactive_type: String,
+        config: Map<String, Dynamic>,
+        embed_code: Option<String>,
+        library_version: Option<String>
+    },
+
+    /// SCORM SCO
+    ScormSco {
+        package_id: ScormPackageId,
+        sco_id: String,
+        launch_url: String,
+        launch_data: Option<String>,
+        mastery_score: Option<f32>,
+        time_limit: Option<Duration>
+    },
+
+    /// xAPI Activity
+    xApiActivity {
+        activity_id: String,
+        activity_type: String,
+        launch_url: String,
+        context: Option<Map<String, Dynamic>>
+    },
+
+    /// External URL
+    External {
+        url: String,
+        embed: Bool,
+        open_in_new_tab: Bool,
+        preview_image: Option<String>
+    },
+
+    /// Embedded content (iframe)
+    Embed {
+        provider: EmbedProvider,
+        embed_url: String,
+        embed_code: Option<String>,
+        aspect_ratio: Option<String>
+    },
+
+    /// Multiple content items
+    Mixed {
+        items: List<ContentItem>
+    }
+}
+
+/// A chapter/section in a video
+type VideoChapter {
+    title: String,
+    start_seconds: i32,
+    end_seconds: Option<i32>,
+    description: Option<String>
+}
+
+/// Rich text format
+enum RichTextFormat {
+    Markdown,
+    Html,
+    PlainText,
+    Structured
+}
+
+/// Embed provider
+enum EmbedProvider {
+    YouTube,
+    Vimeo,
+    Wistia,
+    Loom,
+    Miro,
+    Figma,
+    CodePen,
+    Custom { name: String }
+}
+
+/// An item in mixed content
+type ContentItem {
+    id: String,
+    content_type: ContentType,
+    content: LessonContent,
+    position: i32
+}
+
+// =============================================================================
+// LESSON RESOURCE
+// =============================================================================
+
+/// A supplementary resource attached to a lesson
+type LessonResource {
+    id: String,
+    title: String,
+    description: Option<String>,
+    resource_type: ResourceType,
+    url: Option<String>,
+    file_id: Option<MediaId>,
+    is_required: Bool,
+    position: i32
+}
+
+/// Type of supplementary resource
+enum ResourceType {
+    ReadingMaterial,
+    Worksheet,
+    Template,
+    CodeSample,
+    Dataset,
+    ExternalLink,
+    Bibliography,
+    Glossary,
+    Other { label: String }
+}
+
+// =============================================================================
+// COMPLETION CRITERIA
+// =============================================================================
+
+/// Specific criteria for lesson completion
+type CompletionCriteria {
+    /// Minimum time spent (seconds)
+    min_time_seconds: Option<i64>,
+
+    /// Minimum progress percentage
+    min_progress_percent: Option<f32>,
+
+    /// Minimum score (if assessment attached)
+    min_score: Option<f32>,
+
+    /// Must view all pages/slides
+    require_all_pages: Bool,
+
+    /// Must watch entire video
+    require_full_video: Bool,
+
+    /// Must complete all interactive elements
+    require_interactions: Bool,
+
+    /// Custom completion callback
+    custom_callback: Option<String>
+}
+
+// =============================================================================
+// ACCESSIBILITY INFO
+// =============================================================================
+
+/// Accessibility information for a lesson
+type AccessibilityInfo {
+    /// Has closed captions
+    has_captions: Bool,
+
+    /// Has audio description
+    has_audio_description: Bool,
+
+    /// Has transcript
+    has_transcript: Bool,
+
+    /// Has alternative text for images
+    has_alt_text: Bool,
+
+    /// Keyboard navigable
+    keyboard_accessible: Bool,
+
+    /// Screen reader compatible
+    screen_reader_compatible: Bool,
+
+    /// Color contrast compliant
+    color_contrast_compliant: Bool,
+
+    /// Languages available
+    available_languages: List<String>,
+
+    /// Accessibility notes
+    notes: Option<String>
+}
+
+// =============================================================================
+// LESSON PROGRESS
+// =============================================================================
+
+/// Progress tracking for a lesson
+type LessonProgress {
+    /// Lesson ID
+    lesson_id: LessonId,
+
+    /// User ID
+    user_id: UserId,
+
+    /// Enrollment ID
+    enrollment_id: EnrollmentId,
+
+    /// Progress percentage (0-100)
+    progress_percent: f32,
+
+    /// Total time spent (seconds)
+    time_spent_seconds: i64,
+
+    /// Is completed
+    is_completed: Bool,
+
+    /// Completion date
+    completed_at: Option<DateTime>,
+
+    /// Number of views
+    view_count: i32,
+
+    /// Last position (for resuming)
+    last_position: Option<ContentPosition>,
+
+    /// Interaction data
+    interactions: List<LessonInteraction>,
+
+    /// First accessed
+    first_accessed_at: DateTime,
+
+    /// Last accessed
+    last_accessed_at: DateTime
+}
+
+/// Position within content (for resuming)
+type ContentPosition {
+    /// For video/audio: seconds
+    time_seconds: Option<i32>,
+
+    /// For documents: page number
+    page_number: Option<i32>,
+
+    /// For scrollable: scroll position
+    scroll_position: Option<f32>,
+
+    /// For SCORM: bookmark
+    bookmark: Option<String>
+}
+
+/// A recorded interaction with lesson content
+type LessonInteraction {
+    interaction_type: InteractionType,
+    timestamp: DateTime,
+    data: Map<String, Dynamic>
+}
+
+/// Type of interaction
+enum InteractionType {
+    Play,
+    Pause,
+    Seek,
+    Complete,
+    PageView,
+    Click,
+    Scroll,
+    Download,
+    ExternalLink,
+    InteractiveElement,
+    Custom { name: String }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating a lesson
+type CreateLessonInput {
+    bundle: String,
+    module_id: ModuleId,
+    course_id: CourseId,
+    title: String,
+    description: Option<String>,
+    content_type: ContentType,
+    content: LessonContent,
+    position: Option<i32>,
+    completion_type: Option<CompletionType>,
+    is_required: Option<Bool>
+}
+
+/// Input for updating a lesson
+type UpdateLessonInput {
+    title: Option<String>,
+    description: Option<String>,
+    summary: Option<String>,
+    content_type: Option<ContentType>,
+    content: Option<LessonContent>,
+    resources: Option<List<LessonResource>>,
+    position: Option<i32>,
+    estimated_duration_minutes: Option<i32>,
+    completion_type: Option<CompletionType>,
+    completion_criteria: Option<CompletionCriteria>,
+    is_required: Option<Bool>,
+    learning_objectives: Option<List<LearningObjective>>,
+    competencies: Option<List<CompetencyId>>,
+    accessibility: Option<AccessibilityInfo>,
+    status: Option<EntityStatus>
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Lesson {
+    /// Create a new lesson with defaults
+    fn new(
+        bundle: String,
+        module_id: ModuleId,
+        course_id: CourseId,
+        tenant_id: TenantId,
+        title: String,
+        content_type: ContentType,
+        content: LessonContent,
+        position: i32
+    ) -> Lesson {
+        let now = DateTime::now();
+        Lesson {
+            id: generate_lesson_id(),
+            uuid: generate_uuid(),
+            bundle,
+            module_id,
+            course_id,
+            tenant_id,
+            title,
+            description: None,
+            summary: None,
+            content_type,
+            content,
+            resources: vec![],
+            position,
+            estimated_duration_minutes: None,
+            completion_type: CompletionType::Viewed,
+            completion_criteria: None,
+            is_required: true,
+            assessments: vec![],
+            learning_objectives: vec![],
+            competencies: vec![],
+            ai_summary: None,
+            ai_keywords: vec![],
+            ai_transcript: None,
+            accessibility: AccessibilityInfo::default(),
+            status: EntityStatus::Draft,
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Get content duration in minutes
+    fn get_duration_minutes(&self) -> Option<i32> {
+        if let Some(duration) = self.estimated_duration_minutes {
+            return Some(duration)
+        }
+
+        match &self.content {
+            LessonContent::Video { duration_seconds, .. } => Some(*duration_seconds / 60),
+            LessonContent::Audio { duration_seconds, .. } => Some(*duration_seconds / 60),
+            _ => None
+        }
+    }
+
+    /// Check if lesson has video content
+    fn has_video(&self) -> Bool {
+        matches!(self.content_type, ContentType::Video)
+    }
+
+    /// Check if lesson is SCORM-based
+    fn is_scorm(&self) -> Bool {
+        matches!(self.content, LessonContent::ScormSco { .. })
+    }
+
+    /// Check if lesson is xAPI-based
+    fn is_xapi(&self) -> Bool {
+        matches!(self.content, LessonContent::xApiActivity { .. })
+    }
+}
+
+impl AccessibilityInfo {
+    fn default() -> AccessibilityInfo {
+        AccessibilityInfo {
+            has_captions: false,
+            has_audio_description: false,
+            has_transcript: false,
+            has_alt_text: false,
+            keyboard_accessible: true,
+            screen_reader_compatible: true,
+            color_contrast_compliant: true,
+            available_languages: vec!["en".to_string()],
+            notes: None
+        }
+    }
+}
+
+impl LessonProgress {
+    fn new(lesson_id: LessonId, user_id: UserId, enrollment_id: EnrollmentId) -> LessonProgress {
+        let now = DateTime::now();
+        LessonProgress {
+            lesson_id,
+            user_id,
+            enrollment_id,
+            progress_percent: 0.0,
+            time_spent_seconds: 0,
+            is_completed: false,
+            completed_at: None,
+            view_count: 0,
+            last_position: None,
+            interactions: vec![],
+            first_accessed_at: now,
+            last_accessed_at: now
+        }
+    }
+
+    /// Mark as completed
+    fn complete(&mut self) {
+        self.is_completed = true;
+        self.progress_percent = 100.0;
+        self.completed_at = Some(DateTime::now());
+    }
+
+    /// Update progress
+    fn update_progress(&mut self, progress: f32, time_seconds: i64) {
+        self.progress_percent = progress.min(100.0).max(0.0);
+        self.time_spent_seconds += time_seconds;
+        self.last_accessed_at = DateTime::now();
+    }
+
+    /// Record an interaction
+    fn record_interaction(&mut self, interaction_type: InteractionType, data: Map<String, Dynamic>) {
+        self.interactions.push(LessonInteraction {
+            interaction_type,
+            timestamp: DateTime::now(),
+            data
+        });
+    }
+}
+
+impl CompletionCriteria {
+    fn default() -> CompletionCriteria {
+        CompletionCriteria {
+            min_time_seconds: None,
+            min_progress_percent: None,
+            min_score: None,
+            require_all_pages: false,
+            require_full_video: false,
+            require_interactions: false,
+            custom_callback: None
+        }
+    }
+
+    /// Check if progress meets criteria
+    fn is_met(&self, progress: &LessonProgress, score: Option<f32>) -> Bool {
+        if let Some(min_time) = self.min_time_seconds {
+            if progress.time_spent_seconds < min_time {
+                return false
+            }
+        }
+
+        if let Some(min_progress) = self.min_progress_percent {
+            if progress.progress_percent < min_progress {
+                return false
+            }
+        }
+
+        if let Some(min_score) = self.min_score {
+            if let Some(actual_score) = score {
+                if actual_score < min_score {
+                    return false
+                }
+            } else {
+                return false
+            }
+        }
+
+        true
+    }
+}

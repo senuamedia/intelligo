@@ -1,0 +1,19 @@
+/// Intelligo LMS - Integrations Module
+///
+/// Exports all third-party integrations: SSO, video, payments, SIS, etc.
+
+module intelligo::integrations
+
+pub mod sso { pub use intelligo::integrations::sso::*; }
+pub mod video { pub use intelligo::integrations::video::*; }
+pub mod payments { pub use intelligo::integrations::payments::*; }
+pub mod sis { pub use intelligo::integrations::sis::*; }
+pub mod communication { pub use intelligo::integrations::communication::*; }
+pub mod social { pub use intelligo::integrations::social::*; }
+
+// Re-export commonly used types
+pub use sso::SamlProvider
+pub use sso::OidcProvider
+pub use video::VideoProvider
+pub use payments::PaymentProcessor
+pub use sis::SisSync

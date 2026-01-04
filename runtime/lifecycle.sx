@@ -1,0 +1,633 @@
+/// Intelligo LMS - Application Lifecycle
+///
+/// Provides lifecycle management for the LMS application.
+
+module intelligo::runtime::lifecycle
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock, Mutex}
+use std::time::{Duration, Instant}
+
+// =============================================================================
+// APPLICATION
+// =============================================================================
+
+/// Main application container
+pub type Application {
+    name: String,
+    version: String,
+    state: Arc<RwLock<AppState>>,
+    components: Arc<RwLock<Map<String, Box<dyn Component>>>>,
+    hooks: Arc<RwLock<LifecycleHooks>>,
+    config: AppConfig,
+    started_at: Arc<Mutex<Option<Instant>>>,
+    metrics: Arc<AppMetrics>
+}
+
+/// Application state
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppState {
+    Created,
+    Initializing,
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed(String)
+}
+
+/// Application configuration
+pub type AppConfig {
+    environment: Environment,
+    graceful_shutdown_timeout: Duration,
+    health_check_interval: Duration,
+    component_start_timeout: Duration
+}
+
+impl Default for AppConfig {
+    fn default() -> AppConfig {
+        AppConfig {
+            environment: Environment::Development,
+            graceful_shutdown_timeout: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(30),
+            component_start_timeout: Duration::from_secs(60)
+        }
+    }
+}
+
+/// Application environment
+#[derive(Clone, Debug, PartialEq)]
+pub enum Environment {
+    Development,
+    Testing,
+    Staging,
+    Production
+}
+
+impl Environment {
+    pub fn from_str(s: &str) -> Environment {
+        match s.to_lowercase().as_str() {
+            "production" | "prod" => Environment::Production,
+            "staging" | "stage" => Environment::Staging,
+            "testing" | "test" => Environment::Testing,
+            _ => Environment::Development
+        }
+    }
+
+    pub fn is_production(&self) -> bool {
+        matches!(self, Environment::Production)
+    }
+
+    pub fn is_development(&self) -> bool {
+        matches!(self, Environment::Development)
+    }
+}
+
+/// Lifecycle hooks
+pub type LifecycleHooks {
+    on_init: List<Box<dyn Fn(&Application) -> Result<(), String> + Send + Sync>>,
+    on_start: List<Box<dyn Fn(&Application) -> Result<(), String> + Send + Sync>>,
+    on_ready: List<Box<dyn Fn(&Application) + Send + Sync>>,
+    on_stop: List<Box<dyn Fn(&Application) + Send + Sync>>,
+    on_error: List<Box<dyn Fn(&Application, &str) + Send + Sync>>
+}
+
+impl Default for LifecycleHooks {
+    fn default() -> LifecycleHooks {
+        LifecycleHooks {
+            on_init: vec![],
+            on_start: vec![],
+            on_ready: vec![],
+            on_stop: vec![],
+            on_error: vec![]
+        }
+    }
+}
+
+impl Application {
+    /// Create a new application
+    pub fn new(name: &str, version: &str) -> Application {
+        Application::with_config(name, version, AppConfig::default())
+    }
+
+    /// Create with custom configuration
+    pub fn with_config(name: &str, version: &str, config: AppConfig) -> Application {
+        Application {
+            name: name.to_string(),
+            version: version.to_string(),
+            state: Arc::new(RwLock::new(AppState::Created)),
+            components: Arc::new(RwLock::new(Map::new())),
+            hooks: Arc::new(RwLock::new(LifecycleHooks::default())),
+            config,
+            started_at: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(AppMetrics::new())
+        }
+    }
+
+    /// Register a component
+    pub fn register<C: Component + 'static>(&self, name: &str, component: C) {
+        self.components.write().unwrap().insert(name.to_string(), Box::new(component));
+    }
+
+    /// Get a component
+    pub fn get<C: Component + 'static>(&self, name: &str) -> Option<&C> {
+        self.components.read().unwrap()
+            .get(name)
+            .and_then(|c| c.as_any().downcast_ref::<C>())
+    }
+
+    /// Add lifecycle hook
+    pub fn on_init<F>(&self, hook: F)
+    where
+        F: Fn(&Application) -> Result<(), String> + Send + Sync + 'static
+    {
+        self.hooks.write().unwrap().on_init.push(Box::new(hook));
+    }
+
+    pub fn on_start<F>(&self, hook: F)
+    where
+        F: Fn(&Application) -> Result<(), String> + Send + Sync + 'static
+    {
+        self.hooks.write().unwrap().on_start.push(Box::new(hook));
+    }
+
+    pub fn on_ready<F>(&self, hook: F)
+    where
+        F: Fn(&Application) + Send + Sync + 'static
+    {
+        self.hooks.write().unwrap().on_ready.push(Box::new(hook));
+    }
+
+    pub fn on_stop<F>(&self, hook: F)
+    where
+        F: Fn(&Application) + Send + Sync + 'static
+    {
+        self.hooks.write().unwrap().on_stop.push(Box::new(hook));
+    }
+
+    pub fn on_error<F>(&self, hook: F)
+    where
+        F: Fn(&Application, &str) + Send + Sync + 'static
+    {
+        self.hooks.write().unwrap().on_error.push(Box::new(hook));
+    }
+
+    /// Initialize the application
+    pub fn init(&self) -> Result<(), String> {
+        self.set_state(AppState::Initializing);
+
+        // Run init hooks
+        for hook in self.hooks.read().unwrap().on_init.iter() {
+            hook(self)?;
+        }
+
+        // Initialize components
+        for (name, component) in self.components.write().unwrap().iter_mut() {
+            if let Err(e) = component.init() {
+                self.set_state(AppState::Failed(e.clone()));
+                return Err(format!("Component '{}' failed to initialize: {}", name, e));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start the application
+    pub fn start(&self) -> Result<(), String> {
+        // Initialize first if needed
+        if *self.state.read().unwrap() == AppState::Created {
+            self.init()?;
+        }
+
+        self.set_state(AppState::Starting);
+
+        // Run start hooks
+        for hook in self.hooks.read().unwrap().on_start.iter() {
+            hook(self)?;
+        }
+
+        // Start components in order
+        for (name, component) in self.components.write().unwrap().iter_mut() {
+            if let Err(e) = component.start() {
+                self.set_state(AppState::Failed(e.clone()));
+                return Err(format!("Component '{}' failed to start: {}", name, e));
+            }
+        }
+
+        *self.started_at.lock().unwrap() = Some(Instant::now());
+        self.set_state(AppState::Running);
+
+        // Run ready hooks
+        for hook in self.hooks.read().unwrap().on_ready.iter() {
+            hook(self);
+        }
+
+        Ok(())
+    }
+
+    /// Stop the application
+    pub fn stop(&self) -> Result<(), String> {
+        self.set_state(AppState::Stopping);
+
+        // Run stop hooks
+        for hook in self.hooks.read().unwrap().on_stop.iter() {
+            hook(self);
+        }
+
+        // Stop components in reverse order
+        let component_names: Vec<String> = self.components.read().unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        for name in component_names.iter().rev() {
+            if let Some(component) = self.components.write().unwrap().get_mut(name) {
+                if let Err(e) = component.stop() {
+                    eprintln!("Warning: Component '{}' stop error: {}", name, e);
+                }
+            }
+        }
+
+        self.set_state(AppState::Stopped);
+        Ok(())
+    }
+
+    /// Restart the application
+    pub fn restart(&self) -> Result<(), String> {
+        self.stop()?;
+        self.start()
+    }
+
+    fn set_state(&self, state: AppState) {
+        *self.state.write().unwrap() = state;
+    }
+
+    /// Get current state
+    pub fn state(&self) -> AppState {
+        self.state.read().unwrap().clone()
+    }
+
+    /// Check if running
+    pub fn is_running(&self) -> bool {
+        matches!(*self.state.read().unwrap(), AppState::Running)
+    }
+
+    /// Get uptime
+    pub fn uptime(&self) -> Option<Duration> {
+        self.started_at.lock().unwrap().map(|t| t.elapsed())
+    }
+
+    /// Get metrics
+    pub fn metrics(&self) -> &AppMetrics {
+        &self.metrics
+    }
+
+    /// Health check
+    pub fn health_check(&self) -> HealthStatus {
+        let mut component_health = Map::new();
+        let mut overall = HealthState::Healthy;
+
+        for (name, component) in self.components.read().unwrap().iter() {
+            let health = component.health();
+            if health.state == HealthState::Unhealthy {
+                overall = HealthState::Unhealthy;
+            } else if health.state == HealthState::Degraded && overall == HealthState::Healthy {
+                overall = HealthState::Degraded;
+            }
+            component_health.insert(name.clone(), health);
+        }
+
+        HealthStatus {
+            state: overall,
+            uptime: self.uptime(),
+            components: component_health
+        }
+    }
+}
+
+/// Application metrics
+pub type AppMetrics {
+    request_count: Arc<Mutex<i64>>,
+    error_count: Arc<Mutex<i64>>,
+    custom: Arc<RwLock<Map<String, MetricValue>>>
+}
+
+#[derive(Clone)]
+pub enum MetricValue {
+    Counter(i64),
+    Gauge(f64),
+    Histogram(Vec<f64>)
+}
+
+impl AppMetrics {
+    pub fn new() -> AppMetrics {
+        AppMetrics {
+            request_count: Arc::new(Mutex::new(0)),
+            error_count: Arc::new(Mutex::new(0)),
+            custom: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    pub fn increment_requests(&self) {
+        *self.request_count.lock().unwrap() += 1;
+    }
+
+    pub fn increment_errors(&self) {
+        *self.error_count.lock().unwrap() += 1;
+    }
+
+    pub fn set_gauge(&self, name: &str, value: f64) {
+        self.custom.write().unwrap().insert(name.to_string(), MetricValue::Gauge(value));
+    }
+
+    pub fn increment_counter(&self, name: &str) {
+        let mut custom = self.custom.write().unwrap();
+        let counter = custom.entry(name.to_string()).or_insert(MetricValue::Counter(0));
+        if let MetricValue::Counter(ref mut c) = counter {
+            *c += 1;
+        }
+    }
+
+    pub fn record_histogram(&self, name: &str, value: f64) {
+        let mut custom = self.custom.write().unwrap();
+        let histogram = custom.entry(name.to_string()).or_insert(MetricValue::Histogram(vec![]));
+        if let MetricValue::Histogram(ref mut h) = histogram {
+            h.push(value);
+        }
+    }
+}
+
+// =============================================================================
+// COMPONENT
+// =============================================================================
+
+/// Trait for application components
+pub trait Component: Send + Sync {
+    /// Initialize the component
+    fn init(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Start the component
+    fn start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Stop the component
+    fn stop(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Health check
+    fn health(&self) -> ComponentHealth {
+        ComponentHealth::healthy()
+    }
+
+    /// For downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Component health status
+#[derive(Clone)]
+pub type ComponentHealth {
+    state: HealthState,
+    message: Option<String>,
+    details: Map<String, String>
+}
+
+impl ComponentHealth {
+    pub fn healthy() -> ComponentHealth {
+        ComponentHealth {
+            state: HealthState::Healthy,
+            message: None,
+            details: Map::new()
+        }
+    }
+
+    pub fn degraded(message: &str) -> ComponentHealth {
+        ComponentHealth {
+            state: HealthState::Degraded,
+            message: Some(message.to_string()),
+            details: Map::new()
+        }
+    }
+
+    pub fn unhealthy(message: &str) -> ComponentHealth {
+        ComponentHealth {
+            state: HealthState::Unhealthy,
+            message: Some(message.to_string()),
+            details: Map::new()
+        }
+    }
+
+    pub fn with_detail(mut self, key: &str, value: &str) -> Self {
+        self.details.insert(key.to_string(), value.to_string());
+        self
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum HealthState {
+    Healthy,
+    Degraded,
+    Unhealthy
+}
+
+/// Overall health status
+pub type HealthStatus {
+    state: HealthState,
+    uptime: Option<Duration>,
+    components: Map<String, ComponentHealth>
+}
+
+// =============================================================================
+// SERVICE REGISTRY
+// =============================================================================
+
+/// Service registry for dependency injection
+pub type ServiceRegistry {
+    services: Arc<RwLock<Map<String, Arc<dyn std::any::Any + Send + Sync>>>>
+}
+
+impl ServiceRegistry {
+    pub fn new() -> ServiceRegistry {
+        ServiceRegistry {
+            services: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    /// Register a service
+    pub fn register<T: Send + Sync + 'static>(&self, name: &str, service: T) {
+        self.services.write().unwrap().insert(
+            name.to_string(),
+            Arc::new(service) as Arc<dyn std::any::Any + Send + Sync>
+        );
+    }
+
+    /// Get a service
+    pub fn get<T: 'static>(&self, name: &str) -> Option<Arc<T>> {
+        self.services.read().unwrap()
+            .get(name)
+            .and_then(|s| s.clone().downcast::<T>().ok())
+    }
+
+    /// Check if service exists
+    pub fn has(&self, name: &str) -> bool {
+        self.services.read().unwrap().contains_key(name)
+    }
+}
+
+// =============================================================================
+// GRACEFUL SHUTDOWN
+// =============================================================================
+
+/// Graceful shutdown handler
+pub type ShutdownHandler {
+    handlers: Arc<Mutex<List<Box<dyn FnOnce() + Send>>>>,
+    triggered: Arc<Mutex<bool>>
+}
+
+impl ShutdownHandler {
+    pub fn new() -> ShutdownHandler {
+        ShutdownHandler {
+            handlers: Arc::new(Mutex::new(vec![])),
+            triggered: Arc::new(Mutex::new(false))
+        }
+    }
+
+    /// Register a shutdown handler
+    pub fn on_shutdown<F: FnOnce() + Send + 'static>(&self, handler: F) {
+        self.handlers.lock().unwrap().push(Box::new(handler));
+    }
+
+    /// Trigger shutdown
+    pub fn shutdown(&self, timeout: Duration) {
+        let mut triggered = self.triggered.lock().unwrap();
+        if *triggered {
+            return;
+        }
+        *triggered = true;
+
+        let start = Instant::now();
+        let handlers: Vec<_> = self.handlers.lock().unwrap().drain(..).collect();
+
+        for handler in handlers {
+            if start.elapsed() >= timeout {
+                eprintln!("Shutdown timeout exceeded");
+                break;
+            }
+            handler();
+        }
+    }
+
+    /// Check if shutdown triggered
+    pub fn is_shutting_down(&self) -> bool {
+        *self.triggered.lock().unwrap()
+    }
+}
+
+// =============================================================================
+// FEATURE FLAGS
+// =============================================================================
+
+/// Feature flag manager for runtime feature toggles
+pub type FeatureFlags {
+    flags: Arc<RwLock<Map<String, FeatureFlag>>>
+}
+
+/// A feature flag
+#[derive(Clone)]
+pub type FeatureFlag {
+    name: String,
+    enabled: bool,
+    rollout_percentage: Option<f64>,
+    allowed_tenants: Option<List<String>>,
+    metadata: Map<String, String>
+}
+
+impl FeatureFlags {
+    pub fn new() -> FeatureFlags {
+        FeatureFlags {
+            flags: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    /// Define a feature flag
+    pub fn define(&self, name: &str, enabled: bool) {
+        self.flags.write().unwrap().insert(name.to_string(), FeatureFlag {
+            name: name.to_string(),
+            enabled,
+            rollout_percentage: None,
+            allowed_tenants: None,
+            metadata: Map::new()
+        });
+    }
+
+    /// Check if feature is enabled
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.flags.read().unwrap()
+            .get(name)
+            .map(|f| f.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Check if enabled for tenant
+    pub fn is_enabled_for_tenant(&self, name: &str, tenant_id: &str) -> bool {
+        self.flags.read().unwrap()
+            .get(name)
+            .map(|f| {
+                if !f.enabled {
+                    return false;
+                }
+                if let Some(ref tenants) = f.allowed_tenants {
+                    return tenants.contains(&tenant_id.to_string());
+                }
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Check if enabled with rollout
+    pub fn is_enabled_with_rollout(&self, name: &str, user_id: &str) -> bool {
+        self.flags.read().unwrap()
+            .get(name)
+            .map(|f| {
+                if !f.enabled {
+                    return false;
+                }
+                if let Some(percentage) = f.rollout_percentage {
+                    // Simple hash-based rollout
+                    let hash = user_id.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+                    return (hash % 100) as f64 <= percentage;
+                }
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Enable a feature
+    pub fn enable(&self, name: &str) {
+        if let Some(flag) = self.flags.write().unwrap().get_mut(name) {
+            flag.enabled = true;
+        }
+    }
+
+    /// Disable a feature
+    pub fn disable(&self, name: &str) {
+        if let Some(flag) = self.flags.write().unwrap().get_mut(name) {
+            flag.enabled = false;
+        }
+    }
+
+    /// Set rollout percentage
+    pub fn set_rollout(&self, name: &str, percentage: f64) {
+        if let Some(flag) = self.flags.write().unwrap().get_mut(name) {
+            flag.rollout_percentage = Some(percentage.max(0.0).min(100.0));
+        }
+    }
+
+    /// List all flags
+    pub fn list(&self) -> List<FeatureFlag> {
+        self.flags.read().unwrap().values().cloned().collect()
+    }
+}

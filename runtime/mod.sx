@@ -1,0 +1,20 @@
+/// Intelligo LMS - Runtime Module
+///
+/// Provides core runtime utilities for the Simplex/Modulus runtime.
+/// Includes actor system, messaging, async utilities, and lifecycle management.
+
+module intelligo::runtime
+
+pub use intelligo::runtime::actor::*
+pub use intelligo::runtime::messaging::*
+pub use intelligo::runtime::scheduler::*
+pub use intelligo::runtime::lifecycle::*
+pub use intelligo::runtime::logging::*
+pub use intelligo::runtime::errors::*
+
+// Re-export commonly used items
+pub use ActorSystem
+pub use ActorRef
+pub use Message
+pub use Scheduler
+pub use Logger

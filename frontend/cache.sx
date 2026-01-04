@@ -1,0 +1,877 @@
+/// Intelligo LMS - Frontend Caching
+///
+/// Service worker caching, browser cache management, and offline support.
+/// Follows Aether CMS patterns for progressive caching strategies.
+
+module intelligo::frontend::cache
+
+use intelligo::frontend::*
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Cache Manager
+// ============================================================================
+
+/// Central cache manager for frontend caching strategies
+pub actor CacheManager {
+    config: FrontendCacheConfig,
+    caches: Map<String, CacheInstance>,
+    strategy_matcher: StrategyMatcher,
+}
+
+impl CacheManager {
+    pub fn new(config: FrontendCacheConfig) -> Self {
+        CacheManager {
+            config,
+            caches: Map::new(),
+            strategy_matcher: StrategyMatcher::new(&config.strategies),
+        }
+    }
+
+    /// Get or create a cache instance
+    pub fn get_cache(mut self, name: &str) -> CacheInstance {
+        if let Some(cache) = self.caches.get(name) {
+            return cache.clone();
+        }
+
+        let cache = CacheInstance::new(name, self.config.max_cache_size);
+        self.caches.insert(name.to_string(), cache.clone());
+        cache
+    }
+
+    /// Get caching strategy for a URL
+    pub fn get_strategy(self, url: &str) -> CacheStrategyType {
+        self.strategy_matcher.match_url(url)
+    }
+
+    /// Handle a fetch request with caching
+    pub async fn fetch_with_cache(mut self, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        let strategy = self.get_strategy(&request.url);
+        let cache = self.get_cache(&self.get_cache_name(&request.url));
+
+        match strategy {
+            CacheStrategyType::CacheFirst => {
+                self.cache_first(cache, request).await
+            }
+            CacheStrategyType::NetworkFirst => {
+                self.network_first(cache, request).await
+            }
+            CacheStrategyType::StaleWhileRevalidate => {
+                self.stale_while_revalidate(cache, request).await
+            }
+            CacheStrategyType::NetworkOnly => {
+                self.network_only(request).await
+            }
+            CacheStrategyType::CacheOnly => {
+                self.cache_only(cache, request).await
+            }
+        }
+    }
+
+    /// Cache-first strategy: serve from cache, fall back to network
+    async fn cache_first(self, mut cache: CacheInstance, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        // Check cache first
+        if let Some(cached) = cache.get(&request.url) {
+            if !cached.is_expired() {
+                return Ok(cached);
+            }
+        }
+
+        // Fall back to network
+        let response = self.fetch_from_network(request).await?;
+        cache.put(&request.url, response.clone());
+        Ok(response)
+    }
+
+    /// Network-first strategy: try network, fall back to cache
+    async fn network_first(self, mut cache: CacheInstance, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        // Try network first
+        match self.fetch_from_network(request).await {
+            Ok(response) => {
+                cache.put(&request.url, response.clone());
+                Ok(response)
+            }
+            Err(_) => {
+                // Fall back to cache
+                if let Some(cached) = cache.get(&request.url) {
+                    Ok(cached)
+                } else {
+                    Err(FrontendError::CacheError {
+                        message: "No cached response and network unavailable".to_string()
+                    })
+                }
+            }
+        }
+    }
+
+    /// Stale-while-revalidate: serve stale, update in background
+    async fn stale_while_revalidate(self, mut cache: CacheInstance, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        let cached = cache.get(&request.url);
+
+        // Start background fetch
+        let request_clone = request.clone();
+        let cache_clone = cache.clone();
+        spawn async {
+            if let Ok(response) = self.fetch_from_network(&request_clone).await {
+                cache_clone.put(&request_clone.url, response);
+            }
+        };
+
+        // Return cached response immediately if available
+        if let Some(cached_response) = cached {
+            return Ok(cached_response);
+        }
+
+        // If no cache, wait for network
+        self.fetch_from_network(request).await
+    }
+
+    /// Network-only strategy: never use cache
+    async fn network_only(self, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        self.fetch_from_network(request).await
+    }
+
+    /// Cache-only strategy: never fetch from network
+    async fn cache_only(self, cache: CacheInstance, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        if let Some(cached) = cache.get(&request.url) {
+            Ok(cached)
+        } else {
+            Err(FrontendError::CacheError {
+                message: format!("No cached response for: {}", request.url)
+            })
+        }
+    }
+
+    /// Fetch from network
+    async fn fetch_from_network(self, request: &CacheRequest) -> Result<CacheResponse, FrontendError> {
+        let response = http::fetch(&request.url, &request.options).await.map_err(|e| {
+            FrontendError::ApiError {
+                status: 0,
+                message: format!("Network fetch failed: {}", e)
+            }
+        })?;
+
+        let ttl = self.get_ttl(&request.url);
+
+        Ok(CacheResponse {
+            url: request.url.clone(),
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+            cached_at: time::now_unix(),
+            ttl,
+            etag: response.headers.get("etag").cloned(),
+            last_modified: response.headers.get("last-modified").cloned(),
+        })
+    }
+
+    /// Get TTL for a URL based on config
+    fn get_ttl(self, url: &str) -> i64 {
+        for strategy in &self.config.strategies {
+            if self.strategy_matcher.matches_pattern(url, &strategy.pattern) {
+                return strategy.ttl;
+            }
+        }
+
+        // Default TTL based on content type
+        if url.contains("/api/") {
+            self.config.api_cache_ttl
+        } else if url.contains("/static/") {
+            self.config.static_cache_ttl
+        } else {
+            300 // 5 minute default
+        }
+    }
+
+    /// Get cache name for a URL
+    fn get_cache_name(self, url: &str) -> String {
+        if url.contains("/api/") {
+            "api-cache".to_string()
+        } else if url.contains("/static/") {
+            "static-cache".to_string()
+        } else {
+            "default-cache".to_string()
+        }
+    }
+
+    /// Clear all caches
+    pub fn clear_all(mut self) {
+        for (_, cache) in self.caches.iter_mut() {
+            cache.clear();
+        }
+    }
+
+    /// Clear cache by name
+    pub fn clear_cache(mut self, name: &str) {
+        if let Some(cache) = self.caches.get_mut(name) {
+            cache.clear();
+        }
+    }
+
+    /// Prefetch URLs into cache
+    pub async fn prefetch(mut self, urls: &[String]) {
+        for url in urls {
+            let request = CacheRequest {
+                url: url.clone(),
+                method: "GET".to_string(),
+                options: FetchOptions::default(),
+            };
+
+            // Ignore errors during prefetch
+            let _ = self.fetch_with_cache(&request).await;
+        }
+    }
+}
+
+// ============================================================================
+// Cache Instance
+// ============================================================================
+
+/// Individual cache storage instance
+pub actor CacheInstance {
+    name: String,
+    max_size: i64,
+    current_size: i64,
+    entries: Map<String, CacheResponse>,
+    access_times: Map<String, i64>,
+}
+
+impl CacheInstance {
+    pub fn new(name: &str, max_size: i64) -> Self {
+        CacheInstance {
+            name: name.to_string(),
+            max_size,
+            current_size: 0,
+            entries: Map::new(),
+            access_times: Map::new(),
+        }
+    }
+
+    /// Get entry from cache
+    pub fn get(mut self, key: &str) -> Option<CacheResponse> {
+        if let Some(entry) = self.entries.get(key) {
+            // Update access time for LRU
+            self.access_times.insert(key.to_string(), time::now_unix());
+            Some(entry.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Put entry into cache
+    pub fn put(mut self, key: &str, response: CacheResponse) {
+        let entry_size = response.body.len() as i64;
+
+        // Evict entries if necessary
+        while self.current_size + entry_size > self.max_size && !self.entries.is_empty() {
+            self.evict_lru();
+        }
+
+        // Update size tracking
+        if let Some(old_entry) = self.entries.get(key) {
+            self.current_size -= old_entry.body.len() as i64;
+        }
+
+        self.current_size += entry_size;
+        self.entries.insert(key.to_string(), response);
+        self.access_times.insert(key.to_string(), time::now_unix());
+    }
+
+    /// Delete entry from cache
+    pub fn delete(mut self, key: &str) -> bool {
+        if let Some(entry) = self.entries.remove(key) {
+            self.current_size -= entry.body.len() as i64;
+            self.access_times.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear all entries
+    pub fn clear(mut self) {
+        self.entries.clear();
+        self.access_times.clear();
+        self.current_size = 0;
+    }
+
+    /// Evict least recently used entry
+    fn evict_lru(mut self) {
+        let mut oldest_key: Option<String> = None;
+        let mut oldest_time: i64 = i64::MAX;
+
+        for (key, time) in self.access_times.iter() {
+            if *time < oldest_time {
+                oldest_time = *time;
+                oldest_key = Some(key.clone());
+            }
+        }
+
+        if let Some(key) = oldest_key {
+            self.delete(&key);
+        }
+    }
+
+    /// Get cache statistics
+    pub fn stats(self) -> CacheStats {
+        CacheStats {
+            name: self.name.clone(),
+            entry_count: self.entries.len() as i32,
+            current_size: self.current_size,
+            max_size: self.max_size,
+            utilization: (self.current_size as f64 / self.max_size as f64) * 100.0,
+        }
+    }
+}
+
+/// Cache statistics
+pub type CacheStats = type {
+    name: String,
+    entry_count: i32,
+    current_size: i64,
+    max_size: i64,
+    utilization: f64,
+}
+
+// ============================================================================
+// Strategy Matcher
+// ============================================================================
+
+/// Matches URLs to caching strategies
+pub type StrategyMatcher = type {
+    strategies: Vec<CacheStrategy>,
+}
+
+impl StrategyMatcher {
+    pub fn new(strategies: &[CacheStrategy]) -> Self {
+        StrategyMatcher {
+            strategies: strategies.to_vec(),
+        }
+    }
+
+    /// Match URL to strategy
+    pub fn match_url(self, url: &str) -> CacheStrategyType {
+        for strategy in &self.strategies {
+            if self.matches_pattern(url, &strategy.pattern) {
+                return strategy.strategy_type.clone();
+            }
+        }
+
+        // Default strategy
+        CacheStrategyType::NetworkFirst
+    }
+
+    /// Check if URL matches pattern (supports wildcards)
+    pub fn matches_pattern(self, url: &str, pattern: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+
+        // Handle simple wildcard patterns
+        if pattern.ends_with("/*") {
+            let prefix = &pattern[0..pattern.len() - 2];
+            return url.starts_with(prefix) || url.contains(prefix);
+        }
+
+        if pattern.starts_with("*/") {
+            let suffix = &pattern[1..];
+            return url.ends_with(suffix) || url.contains(suffix);
+        }
+
+        if pattern.contains("*") {
+            // Split by wildcard and check parts
+            let parts: Vec<&str> = pattern.split('*').collect();
+            let mut remaining = url;
+
+            for (i, part) in parts.iter().enumerate() {
+                if part.is_empty() {
+                    continue;
+                }
+
+                if i == 0 {
+                    if !remaining.starts_with(part) {
+                        return false;
+                    }
+                    remaining = &remaining[part.len()..];
+                } else if i == parts.len() - 1 {
+                    if !remaining.ends_with(part) {
+                        return false;
+                    }
+                } else {
+                    if let Some(pos) = remaining.find(part) {
+                        remaining = &remaining[pos + part.len()..];
+                    } else {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // Exact match
+        url == pattern || url.contains(pattern)
+    }
+}
+
+// ============================================================================
+// Cache Request/Response
+// ============================================================================
+
+/// Cache request
+pub type CacheRequest = type {
+    url: String,
+    method: String,
+    options: FetchOptions,
+}
+
+impl CacheRequest {
+    pub fn get(url: &str) -> Self {
+        CacheRequest {
+            url: url.to_string(),
+            method: "GET".to_string(),
+            options: FetchOptions::default(),
+        }
+    }
+}
+
+/// Fetch options
+pub type FetchOptions = type {
+    headers: Map<String, String>,
+    body: Option<Vec<u8>>,
+    credentials: String,
+    mode: String,
+}
+
+impl FetchOptions {
+    pub fn default() -> Self {
+        FetchOptions {
+            headers: Map::new(),
+            body: None,
+            credentials: "same-origin".to_string(),
+            mode: "cors".to_string(),
+        }
+    }
+}
+
+/// Cached response
+pub type CacheResponse = type {
+    url: String,
+    status: i32,
+    headers: Map<String, String>,
+    body: Vec<u8>,
+    cached_at: i64,
+    ttl: i64,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+impl CacheResponse {
+    /// Check if response has expired
+    pub fn is_expired(self) -> bool {
+        let now = time::now_unix();
+        now > self.cached_at + self.ttl
+    }
+
+    /// Check if response is stale (soft expiry)
+    pub fn is_stale(self) -> bool {
+        let now = time::now_unix();
+        // Stale if past 80% of TTL
+        now > self.cached_at + (self.ttl * 80 / 100)
+    }
+
+    /// Get body as string
+    pub fn text(self) -> Result<String, FrontendError> {
+        String::from_utf8(self.body.clone()).map_err(|e| {
+            FrontendError::CacheError { message: format!("Invalid UTF-8: {}", e) }
+        })
+    }
+
+    /// Get body as JSON
+    pub fn json<T>(self) -> Result<T, FrontendError> where T: Deserialize {
+        let text = self.text()?;
+        json::parse(&text).map_err(|e| {
+            FrontendError::CacheError { message: format!("Invalid JSON: {}", e) }
+        })
+    }
+}
+
+// ============================================================================
+// Service Worker Generator
+// ============================================================================
+
+/// Generates service worker code for offline caching
+pub actor ServiceWorkerGenerator {
+    config: FrontendCacheConfig,
+    precache_urls: Vec<String>,
+}
+
+impl ServiceWorkerGenerator {
+    pub fn new(config: FrontendCacheConfig) -> Self {
+        ServiceWorkerGenerator {
+            config,
+            precache_urls: vec![],
+        }
+    }
+
+    /// Add URL to precache list
+    pub fn add_precache(mut self, url: &str) {
+        self.precache_urls.push(url.to_string());
+    }
+
+    /// Generate service worker JavaScript
+    pub fn generate(self, cache_version: &str) -> String {
+        let mut sw = String::new();
+
+        // Header
+        sw.push_str(&format!(r#"// Intelligo LMS Service Worker
+// Version: {}
+// Generated: {}
+
+const CACHE_VERSION = '{}';
+const CACHE_NAME = `intelligo-cache-${CACHE_VERSION}`;
+const PRECACHE_URLS = {};
+
+"#, cache_version, time::now_unix(), cache_version, self.generate_precache_array()));
+
+        // Install event
+        sw.push_str(r#"
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(PRECACHE_URLS))
+      .then(() => self.skipWaiting())
+  );
+});
+
+"#);
+
+        // Activate event (cleanup old caches)
+        sw.push_str(r#"
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(cacheNames => {
+      return Promise.all(
+        cacheNames
+          .filter(name => name.startsWith('intelligo-cache-') && name !== CACHE_NAME)
+          .map(name => caches.delete(name))
+      );
+    }).then(() => self.clients.claim())
+  );
+});
+
+"#);
+
+        // Fetch event with routing
+        sw.push_str(&self.generate_fetch_handler());
+
+        // Helper functions
+        sw.push_str(&self.generate_helper_functions());
+
+        sw
+    }
+
+    /// Generate precache URL array
+    fn generate_precache_array(self) -> String {
+        let urls: Vec<String> = self.precache_urls.iter()
+            .map(|url| format!("'{}'", url))
+            .collect();
+        format!("[{}]", urls.join(", "))
+    }
+
+    /// Generate fetch event handler with routing
+    fn generate_fetch_handler(self) -> String {
+        let mut handler = String::from(r#"
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+
+  // Skip non-GET requests
+  if (event.request.method !== 'GET') {
+    return;
+  }
+
+  // Route based on URL pattern
+"#);
+
+        for strategy in &self.config.strategies {
+            let strategy_fn = match strategy.strategy_type {
+                CacheStrategyType::CacheFirst => "cacheFirst",
+                CacheStrategyType::NetworkFirst => "networkFirst",
+                CacheStrategyType::StaleWhileRevalidate => "staleWhileRevalidate",
+                CacheStrategyType::NetworkOnly => "networkOnly",
+                CacheStrategyType::CacheOnly => "cacheOnly",
+            };
+
+            handler.push_str(&format!(r#"
+  if (matchPattern(url.pathname, '{}')) {{
+    event.respondWith({}(event.request, {}));
+    return;
+  }}
+"#, strategy.pattern, strategy_fn, strategy.ttl));
+        }
+
+        handler.push_str(r#"
+  // Default: network first
+  event.respondWith(networkFirst(event.request, 300));
+});
+
+"#);
+
+        handler
+    }
+
+    /// Generate helper functions
+    fn generate_helper_functions(self) -> String {
+        r#"
+// Pattern matching for URL routing
+function matchPattern(pathname, pattern) {
+  if (pattern === '*') return true;
+  if (pattern.endsWith('/*')) {
+    const prefix = pattern.slice(0, -2);
+    return pathname.startsWith(prefix);
+  }
+  if (pattern.includes('*')) {
+    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+    return regex.test(pathname);
+  }
+  return pathname === pattern;
+}
+
+// Cache-first strategy
+async function cacheFirst(request, ttl) {
+  const cached = await caches.match(request);
+  if (cached && !isExpired(cached, ttl)) {
+    return cached;
+  }
+
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(CACHE_NAME);
+      cache.put(request, addTimestamp(response.clone()));
+    }
+    return response;
+  } catch (e) {
+    if (cached) return cached;
+    throw e;
+  }
+}
+
+// Network-first strategy
+async function networkFirst(request, ttl) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(CACHE_NAME);
+      cache.put(request, addTimestamp(response.clone()));
+    }
+    return response;
+  } catch (e) {
+    const cached = await caches.match(request);
+    if (cached) return cached;
+    throw e;
+  }
+}
+
+// Stale-while-revalidate strategy
+async function staleWhileRevalidate(request, ttl) {
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await caches.match(request);
+
+  // Fetch in background
+  const fetchPromise = fetch(request).then(response => {
+    if (response.ok) {
+      cache.put(request, addTimestamp(response.clone()));
+    }
+    return response;
+  });
+
+  // Return cached immediately if available
+  if (cached) {
+    return cached;
+  }
+
+  return fetchPromise;
+}
+
+// Network-only strategy
+async function networkOnly(request, ttl) {
+  return fetch(request);
+}
+
+// Cache-only strategy
+async function cacheOnly(request, ttl) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+  return new Response('Not found in cache', { status: 404 });
+}
+
+// Add timestamp header for TTL tracking
+function addTimestamp(response) {
+  const headers = new Headers(response.headers);
+  headers.set('sw-cached-at', Date.now().toString());
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+// Check if cached response is expired
+function isExpired(response, ttl) {
+  const cachedAt = response.headers.get('sw-cached-at');
+  if (!cachedAt) return false;
+  return Date.now() > parseInt(cachedAt) + (ttl * 1000);
+}
+"#.to_string()
+    }
+}
+
+// ============================================================================
+// Offline Storage
+// ============================================================================
+
+/// IndexedDB-based offline storage for large data
+pub actor OfflineStorage {
+    db_name: String,
+    version: i32,
+    stores: Vec<StoreDef>,
+}
+
+impl OfflineStorage {
+    pub fn new(db_name: &str, version: i32) -> Self {
+        OfflineStorage {
+            db_name: db_name.to_string(),
+            version,
+            stores: vec![],
+        }
+    }
+
+    /// Add object store definition
+    pub fn add_store(mut self, store: StoreDef) {
+        self.stores.push(store);
+    }
+
+    /// Generate IndexedDB initialization code
+    pub fn generate_init_code(self) -> String {
+        let mut code = String::new();
+
+        code.push_str(&format!(r#"
+// Intelligo Offline Storage
+const DB_NAME = '{}';
+const DB_VERSION = {};
+
+function openDatabase() {{
+  return new Promise((resolve, reject) => {{
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+
+    request.onupgradeneeded = (event) => {{
+      const db = event.target.result;
+"#, self.db_name, self.version));
+
+        for store in &self.stores {
+            code.push_str(&format!(r#"
+      if (!db.objectStoreNames.contains('{}')) {{
+        const store = db.createObjectStore('{}', {{ keyPath: '{}' }});
+"#, store.name, store.name, store.key_path));
+
+            for index in &store.indexes {
+                code.push_str(&format!(r#"
+        store.createIndex('{}', '{}', {{ unique: {} }});
+"#, index.name, index.key_path, index.unique));
+            }
+
+            code.push_str("      }\n");
+        }
+
+        code.push_str(r#"
+    };
+  });
+}
+
+// CRUD operations
+async function dbGet(storeName, key) {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const request = store.get(key);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function dbPut(storeName, value) {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const request = store.put(value);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function dbDelete(storeName, key) {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const request = store.delete(key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function dbGetAll(storeName) {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+"#);
+
+        code
+    }
+}
+
+/// Object store definition
+pub type StoreDef = type {
+    name: String,
+    key_path: String,
+    indexes: Vec<IndexDef>,
+}
+
+/// Index definition
+pub type IndexDef = type {
+    name: String,
+    key_path: String,
+    unique: bool,
+}
+
+impl StoreDef {
+    pub fn new(name: &str, key_path: &str) -> Self {
+        StoreDef {
+            name: name.to_string(),
+            key_path: key_path.to_string(),
+            indexes: vec![],
+        }
+    }
+
+    pub fn with_index(mut self, name: &str, key_path: &str, unique: bool) -> Self {
+        self.indexes.push(IndexDef {
+            name: name.to_string(),
+            key_path: key_path.to_string(),
+            unique,
+        });
+        self
+    }
+}

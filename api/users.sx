@@ -1,0 +1,1566 @@
+/// Intelligo LMS - Users API
+///
+/// This module provides user management endpoints:
+/// - List, get, create, update, delete users
+/// - User profiles and preferences
+/// - Role and permission management
+/// - User search and filtering
+
+module intelligo::api::users
+
+use intelligo::core::types::*
+use intelligo::core::auth::{hash_password}
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the users router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // User CRUD
+        .get("/", move |req| list_users(req, db.clone()))
+        .get("/:user_id", move |req| get_user(req, db.clone()))
+        .post("/", move |req| create_user(req, db.clone()))
+        .patch("/:user_id", move |req| update_user(req, db.clone()))
+        .delete("/:user_id", move |req| delete_user(req, db.clone()))
+
+        // User profile
+        .get("/:user_id/profile", move |req| get_user_profile(req, db.clone()))
+        .patch("/:user_id/profile", move |req| update_user_profile(req, db.clone()))
+
+        // User avatar
+        .post("/:user_id/avatar", move |req| upload_avatar(req, db.clone()))
+        .delete("/:user_id/avatar", move |req| delete_avatar(req, db.clone()))
+
+        // User preferences
+        .get("/:user_id/preferences", move |req| get_preferences(req, db.clone()))
+        .patch("/:user_id/preferences", move |req| update_preferences(req, db.clone()))
+
+        // User roles and permissions
+        .get("/:user_id/roles", move |req| get_user_roles(req, db.clone()))
+        .put("/:user_id/roles", move |req| update_user_roles(req, db.clone()))
+        .get("/:user_id/permissions", move |req| get_user_permissions(req, db.clone()))
+
+        // User enrollments
+        .get("/:user_id/enrollments", move |req| get_user_enrollments(req, db.clone()))
+
+        // User activity
+        .get("/:user_id/activity", move |req| get_user_activity(req, db.clone()))
+
+        // User notifications
+        .get("/:user_id/notifications", move |req| get_user_notifications(req, db.clone()))
+        .patch("/:user_id/notifications/:notification_id/read", move |req| mark_notification_read(req, db.clone()))
+        .post("/:user_id/notifications/read-all", move |req| mark_all_notifications_read(req, db.clone()))
+
+        // Bulk operations (admin)
+        .post("/bulk/create", move |req| bulk_create_users(req, db.clone()))
+        .post("/bulk/update", move |req| bulk_update_users(req, db.clone()))
+        .post("/bulk/delete", move |req| bulk_delete_users(req, db.clone()))
+
+        // User search
+        .get("/search", move |req| search_users(req, db.clone()))
+
+        // User impersonation (admin)
+        .post("/:user_id/impersonate", move |req| impersonate_user(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// User response type
+type UserResponse {
+    id: UserId,
+    email: String,
+    first_name: String,
+    last_name: String,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    roles: List<SystemRole>,
+    status: UserStatus,
+    email_verified: Bool,
+    mfa_enabled: Bool,
+    timezone: Option<String>,
+    locale: Option<String>,
+    created_at: DateTime,
+    updated_at: DateTime,
+    last_login_at: Option<DateTime>
+}
+
+/// User list item (abbreviated)
+type UserListItem {
+    id: UserId,
+    email: String,
+    name: String,
+    avatar_url: Option<String>,
+    roles: List<SystemRole>,
+    status: UserStatus,
+    created_at: DateTime,
+    last_login_at: Option<DateTime>
+}
+
+/// Create user request
+type CreateUserRequest {
+    email: String,
+    password: Option<String>,
+    first_name: String,
+    last_name: String,
+    display_name: Option<String>,
+    roles: Option<List<SystemRole>>,
+    tenant_id: Option<TenantId>,
+    send_welcome_email: Option<Bool>
+}
+
+/// Update user request
+type UpdateUserRequest {
+    email: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    display_name: Option<String>,
+    phone: Option<String>,
+    timezone: Option<String>,
+    locale: Option<String>,
+    bio: Option<String>,
+    status: Option<UserStatus>
+}
+
+/// User profile type
+type UserProfile {
+    user_id: UserId,
+    bio: Option<String>,
+    title: Option<String>,
+    department: Option<String>,
+    organization: Option<String>,
+    location: Option<String>,
+    website: Option<String>,
+    social_links: Map<String, String>,
+    interests: List<String>,
+    skills: List<String>,
+    education: List<EducationEntry>,
+    experience: List<ExperienceEntry>,
+    achievements: List<AchievementEntry>,
+    is_public: Bool
+}
+
+/// Education entry
+type EducationEntry {
+    institution: String,
+    degree: String,
+    field: Option<String>,
+    start_year: Option<i32>,
+    end_year: Option<i32>,
+    current: Bool
+}
+
+/// Experience entry
+type ExperienceEntry {
+    company: String,
+    title: String,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    current: Bool,
+    description: Option<String>
+}
+
+/// Achievement entry
+type AchievementEntry {
+    title: String,
+    issuer: Option<String>,
+    date: Option<DateTime>,
+    url: Option<String>,
+    description: Option<String>
+}
+
+/// User preferences
+type UserPreferences {
+    user_id: UserId,
+    email_notifications: EmailNotificationPrefs,
+    push_notifications: PushNotificationPrefs,
+    display: DisplayPrefs,
+    privacy: PrivacyPrefs,
+    accessibility: AccessibilityPrefs
+}
+
+/// Email notification preferences
+type EmailNotificationPrefs {
+    course_announcements: Bool,
+    assignment_reminders: Bool,
+    grade_notifications: Bool,
+    discussion_replies: Bool,
+    weekly_digest: Bool,
+    marketing: Bool
+}
+
+/// Push notification preferences
+type PushNotificationPrefs {
+    enabled: Bool,
+    course_announcements: Bool,
+    assignment_due: Bool,
+    grade_posted: Bool,
+    messages: Bool
+}
+
+/// Display preferences
+type DisplayPrefs {
+    theme: String,
+    language: String,
+    timezone: String,
+    date_format: String,
+    compact_mode: Bool
+}
+
+/// Privacy preferences
+type PrivacyPrefs {
+    show_profile: Bool,
+    show_email: Bool,
+    show_activity: Bool,
+    show_courses: Bool
+}
+
+/// Accessibility preferences
+type AccessibilityPrefs {
+    high_contrast: Bool,
+    large_text: Bool,
+    reduce_motion: Bool,
+    screen_reader_mode: Bool
+}
+
+/// User status enum
+enum UserStatus {
+    Active,
+    Inactive,
+    Suspended,
+    Pending
+}
+
+/// User filter for queries
+type UserFilter {
+    search: Option<String>,
+    status: Option<UserStatus>,
+    role: Option<SystemRole>,
+    tenant_id: Option<TenantId>,
+    email_verified: Option<Bool>,
+    created_after: Option<DateTime>,
+    created_before: Option<DateTime>
+}
+
+// =============================================================================
+// LIST USERS
+// =============================================================================
+
+/// List all users with pagination and filtering
+async fn list_users(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Require authentication and permission
+    ctx.require_permission(Permission::ViewUsers)?;
+
+    // Parse pagination
+    let pagination = PaginationParams::from_request(&req);
+
+    // Parse filters
+    let filter = UserFilter {
+        search: req.query_param("search"),
+        status: req.query_param("status").and_then(|s| parse_user_status(&s)),
+        role: req.query_param("role").and_then(|r| parse_system_role(&r)),
+        tenant_id: req.query_param("tenant_id"),
+        email_verified: req.query_param("email_verified").and_then(|v| v.parse::<Bool>().ok()),
+        created_after: req.query_param("created_after").and_then(|d| DateTime::parse(&d).ok()),
+        created_before: req.query_param("created_before").and_then(|d| DateTime::parse(&d).ok())
+    };
+
+    // Apply tenant scoping
+    let tenant_filter = if ctx.is_admin() {
+        filter.tenant_id.clone()
+    } else {
+        ctx.tenant_id()
+    };
+
+    // Query users
+    let (users, total) = db.users()
+        .list_with_filter(&filter, tenant_filter.as_ref(), pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Convert to list items
+    let items: List<UserListItem> = users.iter().map(user_to_list_item).collect();
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(items, meta, &ctx)))
+}
+
+// =============================================================================
+// GET USER
+// =============================================================================
+
+/// Get a specific user by ID
+async fn get_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Check if requesting own data or has permission
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::ViewUsers)?;
+    }
+
+    let user = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.clone()
+        })?;
+
+    // Check tenant access
+    if !ctx.is_admin() {
+        if let Some(tenant_id) = ctx.tenant_id() {
+            if user.primary_tenant_id.as_ref() != Some(&tenant_id) {
+                return Err(ApiError::NotFound {
+                    resource: "User".to_string(),
+                    id: user_id
+                })
+            }
+        }
+    }
+
+    Ok(Response::json(ApiResponse::success(user_to_response(&user), &ctx)))
+}
+
+// =============================================================================
+// CREATE USER
+// =============================================================================
+
+/// Create a new user
+async fn create_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Require permission
+    ctx.require_permission(Permission::CreateUsers)?;
+
+    let body: CreateUserRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate input
+    validate_create_user_input(&body)?;
+
+    // Check for existing email
+    let existing = db.users()
+        .find_by_email(&body.email)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if existing.is_some() {
+        return Err(ApiError::Conflict {
+            message: "A user with this email already exists".to_string()
+        })
+    }
+
+    // Generate password or hash provided one
+    let password_hash = if let Some(password) = body.password {
+        hash_password(&password).map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+    } else {
+        // Generate random password
+        let temp_password = generate_temp_password();
+        hash_password(&temp_password).map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+    };
+
+    // Determine tenant
+    let tenant_id = body.tenant_id.or_else(|| ctx.tenant_id());
+
+    // Create user
+    let user = db.users()
+        .create(CreateUserInput {
+            email: body.email.clone(),
+            password_hash,
+            first_name: body.first_name.clone(),
+            last_name: body.last_name.clone(),
+            tenant_id,
+            role: body.roles.as_ref()
+                .and_then(|r| r.first())
+                .cloned()
+                .unwrap_or(SystemRole::Student),
+            email_verified: false
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Set additional roles if provided
+    if let Some(roles) = body.roles {
+        if roles.len() > 1 {
+            db.users()
+                .set_roles(&user.id, &roles)
+                .await
+                .ok();
+        }
+    }
+
+    // Send welcome email if requested
+    if body.send_welcome_email.unwrap_or(true) {
+        send_welcome_email(&user.email, &user.first_name).await.ok();
+    }
+
+    Ok(Response::json(ApiResponse::success(user_to_response(&user), &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// UPDATE USER
+// =============================================================================
+
+/// Update a user
+async fn update_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Check if updating own data or has permission
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::EditUsers)?;
+    }
+
+    let body: UpdateUserRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Get existing user
+    let existing = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.clone()
+        })?;
+
+    // Check tenant access
+    if !ctx.is_admin() {
+        if let Some(tenant_id) = ctx.tenant_id() {
+            if existing.primary_tenant_id.as_ref() != Some(&tenant_id) {
+                return Err(ApiError::Forbidden {
+                    message: "Cannot update user from different tenant".to_string(),
+                    required_permission: None
+                })
+            }
+        }
+    }
+
+    // Regular users can't change their status
+    if is_self && body.status.is_some() {
+        return Err(ApiError::Forbidden {
+            message: "Cannot change own status".to_string(),
+            required_permission: None
+        })
+    }
+
+    // Check email uniqueness if changing
+    if let Some(new_email) = &body.email {
+        if new_email != &existing.email {
+            let email_exists = db.users()
+                .find_by_email(new_email)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: e.to_string(),
+                    trace_id: ctx.trace_id.clone()
+                })?
+                .is_some();
+
+            if email_exists {
+                return Err(ApiError::Conflict {
+                    message: "A user with this email already exists".to_string()
+                })
+            }
+        }
+    }
+
+    // Update user
+    let user = db.users()
+        .update(&user_id, UpdateUserInput {
+            email: body.email,
+            first_name: body.first_name,
+            last_name: body.last_name,
+            display_name: body.display_name,
+            phone: body.phone,
+            timezone: body.timezone,
+            locale: body.locale,
+            bio: body.bio,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(user_to_response(&user), &ctx)))
+}
+
+// =============================================================================
+// DELETE USER
+// =============================================================================
+
+/// Delete a user
+async fn delete_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Require permission
+    ctx.require_permission(Permission::DeleteUsers)?;
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Prevent self-deletion
+    if ctx.user_id().map(|id| id == user_id).unwrap_or(false) {
+        return Err(ApiError::Forbidden {
+            message: "Cannot delete your own account".to_string(),
+            required_permission: None
+        })
+    }
+
+    // Get user
+    let user = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.clone()
+        })?;
+
+    // Check tenant access
+    if !ctx.is_admin() {
+        if let Some(tenant_id) = ctx.tenant_id() {
+            if user.primary_tenant_id.as_ref() != Some(&tenant_id) {
+                return Err(ApiError::Forbidden {
+                    message: "Cannot delete user from different tenant".to_string(),
+                    required_permission: None
+                })
+            }
+        }
+    }
+
+    // Soft delete or hard delete based on query param
+    let hard_delete = req.query_param("hard").map(|v| v == "true").unwrap_or(false);
+
+    if hard_delete {
+        ctx.require_permission(Permission::AdminDeleteUsers)?;
+        db.users().hard_delete(&user_id).await
+    } else {
+        db.users().soft_delete(&user_id).await
+    }.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("User deleted successfully".to_string()))
+    ])).with_status(StatusCode::OK))
+}
+
+// =============================================================================
+// USER PROFILE
+// =============================================================================
+
+/// Get user profile
+async fn get_user_profile(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    let profile = db.user_profiles()
+        .find_by_user_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Profile".to_string(),
+            id: user_id.clone()
+        })?;
+
+    // Check visibility
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self && !profile.is_public && !ctx.has_permission(Permission::ViewUsers) {
+        return Err(ApiError::Forbidden {
+            message: "This profile is private".to_string(),
+            required_permission: None
+        })
+    }
+
+    Ok(Response::json(ApiResponse::success(profile, &ctx)))
+}
+
+/// Update user profile
+async fn update_user_profile(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Check if updating own profile or has permission
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::EditUsers)?;
+    }
+
+    let body: UserProfile = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let profile = db.user_profiles()
+        .update(&user_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(profile, &ctx)))
+}
+
+// =============================================================================
+// USER AVATAR
+// =============================================================================
+
+/// Upload user avatar
+async fn upload_avatar(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Check if updating own avatar or has permission
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::EditUsers)?;
+    }
+
+    // Parse multipart form
+    let file = req.file("avatar").await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid file upload: {}", e)
+    })?;
+
+    // Validate file type
+    let allowed_types = vec!["image/jpeg", "image/png", "image/gif", "image/webp"];
+    if !allowed_types.contains(&file.content_type.as_str()) {
+        return Err(ApiError::ValidationError {
+            field: "avatar".to_string(),
+            message: "Invalid file type. Allowed: JPEG, PNG, GIF, WebP".to_string(),
+            errors: vec![]
+        })
+    }
+
+    // Validate file size (max 5MB)
+    if file.size > 5 * 1024 * 1024 {
+        return Err(ApiError::PayloadTooLarge {
+            max_size: 5 * 1024 * 1024,
+            actual_size: file.size as i64
+        })
+    }
+
+    // Upload to storage
+    let avatar_url = db.storage()
+        .upload_avatar(&user_id, &file)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Update user record
+    db.users()
+        .update_avatar(&user_id, &avatar_url)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("avatar_url".to_string(), Dynamic::String(avatar_url))
+    ])))
+}
+
+/// Delete user avatar
+async fn delete_avatar(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Check if deleting own avatar or has permission
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::EditUsers)?;
+    }
+
+    // Delete from storage
+    db.storage()
+        .delete_avatar(&user_id)
+        .await
+        .ok();
+
+    // Clear avatar URL
+    db.users()
+        .update_avatar(&user_id, "")
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Avatar deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// USER PREFERENCES
+// =============================================================================
+
+/// Get user preferences
+async fn get_preferences(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self or admin can view preferences
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::AdminUsers)?;
+    }
+
+    let preferences = db.user_preferences()
+        .find_by_user_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .unwrap_or_else(|| UserPreferences::default_for(&user_id));
+
+    Ok(Response::json(ApiResponse::success(preferences, &ctx)))
+}
+
+/// Update user preferences
+async fn update_preferences(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self or admin can update preferences
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::AdminUsers)?;
+    }
+
+    let body: UserPreferences = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let preferences = db.user_preferences()
+        .upsert(&user_id, body)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(preferences, &ctx)))
+}
+
+// =============================================================================
+// USER ROLES
+// =============================================================================
+
+/// Get user roles
+async fn get_user_roles(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::ViewUsers)?;
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    let user = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(user.roles, &ctx)))
+}
+
+/// Update user roles
+async fn update_user_roles(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::ManageRoles)?;
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Prevent changing own roles
+    if ctx.user_id().map(|id| id == user_id).unwrap_or(false) {
+        return Err(ApiError::Forbidden {
+            message: "Cannot modify your own roles".to_string(),
+            required_permission: None
+        })
+    }
+
+    #[derive(Deserialize)]
+    struct UpdateRolesRequest {
+        roles: List<SystemRole>
+    }
+
+    let body: UpdateRolesRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate roles
+    if body.roles.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "roles".to_string(),
+            message: "At least one role is required".to_string(),
+            errors: vec![]
+        })
+    }
+
+    // SuperAdmin role requires super admin permission
+    if body.roles.contains(&SystemRole::SuperAdmin) {
+        if !ctx.has_role(SystemRole::SuperAdmin) {
+            return Err(ApiError::Forbidden {
+                message: "Only super admins can grant super admin role".to_string(),
+                required_permission: None
+            })
+        }
+    }
+
+    db.users()
+        .set_roles(&user_id, &body.roles)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(body.roles, &ctx)))
+}
+
+/// Get user permissions
+async fn get_user_permissions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self or admin can view permissions
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::ViewUsers)?;
+    }
+
+    let user = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.clone()
+        })?;
+
+    let permissions = user.get_permission_strings();
+
+    Ok(Response::json(ApiResponse::success(permissions, &ctx)))
+}
+
+// =============================================================================
+// USER ENROLLMENTS
+// =============================================================================
+
+/// Get user enrollments
+async fn get_user_enrollments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self or has permission
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::ViewUsers)?;
+    }
+
+    let pagination = PaginationParams::from_request(&req);
+
+    let (enrollments, total) = db.enrollments()
+        .find_by_user(&user_id, pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(enrollments, meta, &ctx)))
+}
+
+// =============================================================================
+// USER ACTIVITY
+// =============================================================================
+
+/// Get user activity log
+async fn get_user_activity(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self or admin can view activity
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        ctx.require_permission(Permission::AdminUsers)?;
+    }
+
+    let pagination = PaginationParams::from_request(&req);
+
+    let (activities, total) = db.user_activities()
+        .find_by_user(&user_id, pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(activities, meta, &ctx)))
+}
+
+// =============================================================================
+// USER NOTIFICATIONS
+// =============================================================================
+
+/// Get user notifications
+async fn get_user_notifications(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self can view notifications
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        return Err(ApiError::Forbidden {
+            message: "Cannot view another user's notifications".to_string(),
+            required_permission: None
+        })
+    }
+
+    let pagination = PaginationParams::from_request(&req);
+    let unread_only = req.query_param("unread_only").map(|v| v == "true").unwrap_or(false);
+
+    let (notifications, total) = db.notifications()
+        .find_by_user(&user_id, unread_only, pagination.limit(), pagination.offset())
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(notifications, meta, &ctx)))
+}
+
+/// Mark notification as read
+async fn mark_notification_read(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    let notification_id = req.param("notification_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Notification ID required".to_string()
+    })?;
+
+    // Only self can mark notifications
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        return Err(ApiError::Forbidden {
+            message: "Cannot modify another user's notifications".to_string(),
+            required_permission: None
+        })
+    }
+
+    db.notifications()
+        .mark_read(&notification_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Notification marked as read".to_string()))
+    ])))
+}
+
+/// Mark all notifications as read
+async fn mark_all_notifications_read(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Only self can mark notifications
+    let is_self = ctx.user_id().map(|id| id == user_id).unwrap_or(false);
+    if !is_self {
+        return Err(ApiError::Forbidden {
+            message: "Cannot modify another user's notifications".to_string(),
+            required_permission: None
+        })
+    }
+
+    let count = db.notifications()
+        .mark_all_read(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String(format!("{} notifications marked as read", count)))
+    ])))
+}
+
+// =============================================================================
+// BULK OPERATIONS
+// =============================================================================
+
+/// Bulk create users
+async fn bulk_create_users(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::AdminUsers)?;
+
+    #[derive(Deserialize)]
+    struct BulkCreateRequest {
+        users: List<CreateUserRequest>,
+        send_welcome_emails: Option<Bool>
+    }
+
+    let body: BulkCreateRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let mut created = vec![];
+    let mut errors = vec![];
+
+    for (index, user_input) in body.users.iter().enumerate() {
+        match create_single_user(&db, user_input, &ctx, body.send_welcome_emails.unwrap_or(true)).await {
+            Ok(user) => created.push(user),
+            Err(e) => errors.push(Map::from([
+                ("index".to_string(), Dynamic::Int(index as i64)),
+                ("email".to_string(), Dynamic::String(user_input.email.clone())),
+                ("error".to_string(), Dynamic::String(format!("{:?}", e)))
+            ]))
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("created".to_string(), Dynamic::Int(created.len() as i64)),
+        ("errors".to_string(), Dynamic::List(errors.into_iter().map(Dynamic::Map).collect()))
+    ])))
+}
+
+/// Bulk update users
+async fn bulk_update_users(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::AdminUsers)?;
+
+    #[derive(Deserialize)]
+    struct BulkUpdateRequest {
+        updates: List<BulkUpdateItem>
+    }
+
+    #[derive(Deserialize)]
+    struct BulkUpdateItem {
+        user_id: UserId,
+        update: UpdateUserRequest
+    }
+
+    let body: BulkUpdateRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let mut updated = 0;
+    let mut errors = vec![];
+
+    for item in body.updates {
+        match db.users().update(&item.user_id, UpdateUserInput::from(item.update)).await {
+            Ok(_) => updated += 1,
+            Err(e) => errors.push(Map::from([
+                ("user_id".to_string(), Dynamic::String(item.user_id.clone())),
+                ("error".to_string(), Dynamic::String(e.to_string()))
+            ]))
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("updated".to_string(), Dynamic::Int(updated)),
+        ("errors".to_string(), Dynamic::List(errors.into_iter().map(Dynamic::Map).collect()))
+    ])))
+}
+
+/// Bulk delete users
+async fn bulk_delete_users(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::AdminDeleteUsers)?;
+
+    #[derive(Deserialize)]
+    struct BulkDeleteRequest {
+        user_ids: List<UserId>,
+        hard_delete: Option<Bool>
+    }
+
+    let body: BulkDeleteRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Prevent self-deletion
+    if let Some(current_user_id) = ctx.user_id() {
+        if body.user_ids.contains(&current_user_id) {
+            return Err(ApiError::Forbidden {
+                message: "Cannot delete your own account".to_string(),
+                required_permission: None
+            })
+        }
+    }
+
+    let hard_delete = body.hard_delete.unwrap_or(false);
+    let mut deleted = 0;
+    let mut errors = vec![];
+
+    for user_id in body.user_ids {
+        let result = if hard_delete {
+            db.users().hard_delete(&user_id).await
+        } else {
+            db.users().soft_delete(&user_id).await
+        };
+
+        match result {
+            Ok(_) => deleted += 1,
+            Err(e) => errors.push(Map::from([
+                ("user_id".to_string(), Dynamic::String(user_id)),
+                ("error".to_string(), Dynamic::String(e.to_string()))
+            ]))
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("deleted".to_string(), Dynamic::Int(deleted)),
+        ("errors".to_string(), Dynamic::List(errors.into_iter().map(Dynamic::Map).collect()))
+    ])))
+}
+
+// =============================================================================
+// SEARCH
+// =============================================================================
+
+/// Search users
+async fn search_users(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    ctx.require_permission(Permission::ViewUsers)?;
+
+    let query = req.query_param("q").ok_or_else(|| ApiError::BadRequest {
+        message: "Search query required".to_string()
+    })?;
+
+    let limit = req.query_param("limit")
+        .and_then(|l| l.parse::<i64>().ok())
+        .unwrap_or(20)
+        .min(100);
+
+    let users = db.users()
+        .search(&query, ctx.tenant_id().as_ref(), limit)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let items: List<UserListItem> = users.iter().map(user_to_list_item).collect();
+
+    Ok(Response::json(ApiResponse::success(items, &ctx)))
+}
+
+// =============================================================================
+// IMPERSONATION
+// =============================================================================
+
+/// Impersonate a user (admin only)
+async fn impersonate_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Require super admin or impersonation permission
+    if !ctx.has_role(SystemRole::SuperAdmin) && !ctx.has_permission(Permission::ImpersonateUsers) {
+        return Err(ApiError::Forbidden {
+            message: "Impersonation requires super admin or explicit permission".to_string(),
+            required_permission: Some("ImpersonateUsers".to_string())
+        })
+    }
+
+    let user_id = req.param("user_id").ok_or_else(|| ApiError::BadRequest {
+        message: "User ID required".to_string()
+    })?;
+
+    // Cannot impersonate self
+    if ctx.user_id().map(|id| id == user_id).unwrap_or(false) {
+        return Err(ApiError::BadRequest {
+            message: "Cannot impersonate yourself".to_string()
+        })
+    }
+
+    // Get target user
+    let target_user = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.clone()
+        })?;
+
+    // Cannot impersonate super admins
+    if target_user.roles.contains(&SystemRole::SuperAdmin) {
+        return Err(ApiError::Forbidden {
+            message: "Cannot impersonate super admin users".to_string(),
+            required_permission: None
+        })
+    }
+
+    // Log impersonation
+    db.audit_logs().create(AuditLogEntry {
+        action: "user.impersonate".to_string(),
+        actor_id: ctx.user_id(),
+        target_type: "User".to_string(),
+        target_id: Some(user_id.clone()),
+        details: Map::from([
+            ("target_email".to_string(), Dynamic::String(target_user.email.clone()))
+        ]),
+        ip_address: Some(ctx.ip_address.clone()),
+        timestamp: DateTime::now()
+    }).await.ok();
+
+    // Generate impersonation token
+    let (access_token, refresh_token) = generate_impersonation_token(
+        &target_user,
+        ctx.user_id().as_ref().unwrap(),
+        Duration::hours(1)
+    ).map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })?;
+
+    Ok(Response::json(Map::from([
+        ("access_token".to_string(), Dynamic::String(access_token)),
+        ("refresh_token".to_string(), Dynamic::String(refresh_token)),
+        ("impersonating".to_string(), Dynamic::Map(Map::from([
+            ("user_id".to_string(), Dynamic::String(target_user.id)),
+            ("email".to_string(), Dynamic::String(target_user.email)),
+            ("name".to_string(), Dynamic::String(format!("{} {}", target_user.first_name, target_user.last_name)))
+        ]))),
+        ("expires_in".to_string(), Dynamic::Int(3600))
+    ])))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn user_to_response(user: &User) -> UserResponse {
+    UserResponse {
+        id: user.id.clone(),
+        email: user.email.clone(),
+        first_name: user.first_name.clone(),
+        last_name: user.last_name.clone(),
+        display_name: user.display_name.clone(),
+        avatar_url: user.avatar_url.clone(),
+        roles: user.roles.clone(),
+        status: user.status.clone(),
+        email_verified: user.email_verified,
+        mfa_enabled: user.mfa_enabled,
+        timezone: user.timezone.clone(),
+        locale: user.locale.clone(),
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+        last_login_at: user.last_login_at
+    }
+}
+
+fn user_to_list_item(user: &User) -> UserListItem {
+    UserListItem {
+        id: user.id.clone(),
+        email: user.email.clone(),
+        name: format!("{} {}", user.first_name, user.last_name),
+        avatar_url: user.avatar_url.clone(),
+        roles: user.roles.clone(),
+        status: user.status.clone(),
+        created_at: user.created_at,
+        last_login_at: user.last_login_at
+    }
+}
+
+fn validate_create_user_input(input: &CreateUserRequest) -> Result<(), ApiError> {
+    let mut errors = vec![];
+
+    if input.email.is_empty() {
+        errors.push(FieldError {
+            field: "email".to_string(),
+            code: "required".to_string(),
+            message: "Email is required".to_string()
+        });
+    }
+
+    if input.first_name.is_empty() {
+        errors.push(FieldError {
+            field: "first_name".to_string(),
+            code: "required".to_string(),
+            message: "First name is required".to_string()
+        });
+    }
+
+    if input.last_name.is_empty() {
+        errors.push(FieldError {
+            field: "last_name".to_string(),
+            code: "required".to_string(),
+            message: "Last name is required".to_string()
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "".to_string(),
+            message: "Validation failed".to_string(),
+            errors
+        })
+    }
+
+    Ok(())
+}
+
+async fn create_single_user(
+    db: &Database,
+    input: &CreateUserRequest,
+    ctx: &RequestContext,
+    send_email: Bool
+) -> Result<UserResponse, ApiError> {
+    // Similar to create_user but without the request parsing
+    validate_create_user_input(input)?;
+
+    let password_hash = if let Some(ref password) = input.password {
+        hash_password(password).map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+    } else {
+        hash_password(&generate_temp_password()).map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+    };
+
+    let tenant_id = input.tenant_id.clone().or_else(|| ctx.tenant_id());
+
+    let user = db.users()
+        .create(CreateUserInput {
+            email: input.email.clone(),
+            password_hash,
+            first_name: input.first_name.clone(),
+            last_name: input.last_name.clone(),
+            tenant_id,
+            role: input.roles.as_ref()
+                .and_then(|r| r.first())
+                .cloned()
+                .unwrap_or(SystemRole::Student),
+            email_verified: false
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if send_email {
+        send_welcome_email(&user.email, &user.first_name).await.ok();
+    }
+
+    Ok(user_to_response(&user))
+}
+
+fn generate_temp_password() -> String {
+    use std::random::random;
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%".chars().collect();
+    (0..16).map(|_| chars[(random::<u8>() as usize) % chars.len()]).collect()
+}
+
+async fn send_welcome_email(email: &str, name: &str) -> Result<(), String> {
+    // Would send welcome email
+    Ok(())
+}
+
+fn parse_user_status(s: &str) -> Option<UserStatus> {
+    match s.to_lowercase().as_str() {
+        "active" => Some(UserStatus::Active),
+        "inactive" => Some(UserStatus::Inactive),
+        "suspended" => Some(UserStatus::Suspended),
+        "pending" => Some(UserStatus::Pending),
+        _ => None
+    }
+}
+
+fn parse_system_role(s: &str) -> Option<SystemRole> {
+    match s.to_lowercase().as_str() {
+        "superadmin" | "super_admin" => Some(SystemRole::SuperAdmin),
+        "admin" => Some(SystemRole::Admin),
+        "instructor" | "teacher" => Some(SystemRole::Instructor),
+        "student" => Some(SystemRole::Student),
+        "ta" | "teaching_assistant" => Some(SystemRole::TeachingAssistant),
+        _ => None
+    }
+}
+
+fn generate_impersonation_token(
+    target: &User,
+    impersonator_id: &UserId,
+    duration: Duration
+) -> Result<(String, String), String> {
+    // Would generate JWT with impersonation claims
+    Ok(("access_token".to_string(), "refresh_token".to_string()))
+}
+
+impl UserPreferences {
+    fn default_for(user_id: &UserId) -> UserPreferences {
+        UserPreferences {
+            user_id: user_id.clone(),
+            email_notifications: EmailNotificationPrefs {
+                course_announcements: true,
+                assignment_reminders: true,
+                grade_notifications: true,
+                discussion_replies: true,
+                weekly_digest: true,
+                marketing: false
+            },
+            push_notifications: PushNotificationPrefs {
+                enabled: true,
+                course_announcements: true,
+                assignment_due: true,
+                grade_posted: true,
+                messages: true
+            },
+            display: DisplayPrefs {
+                theme: "system".to_string(),
+                language: "en".to_string(),
+                timezone: "UTC".to_string(),
+                date_format: "MM/DD/YYYY".to_string(),
+                compact_mode: false
+            },
+            privacy: PrivacyPrefs {
+                show_profile: true,
+                show_email: false,
+                show_activity: false,
+                show_courses: true
+            },
+            accessibility: AccessibilityPrefs {
+                high_contrast: false,
+                large_text: false,
+                reduce_motion: false,
+                screen_reader_mode: false
+            }
+        }
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use UserResponse;
+pub use UserListItem;
+pub use UserProfile;
+pub use UserPreferences;

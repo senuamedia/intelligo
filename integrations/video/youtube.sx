@@ -1,0 +1,781 @@
+// YouTube Integration for Intelligo LMS
+// Provides YouTube video embedding and Data API integration
+
+module intelligo::integrations::video::youtube
+
+use intelligo::integrations::video::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::http::Client as HttpClient
+use std::json::{Json, JsonValue}
+
+/// YouTube-specific configuration
+pub type YouTubeConfig {
+    api_key: String,
+    oauth_client_id: Option<String>,
+    oauth_client_secret: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    channel_id: Option<String>,
+
+    // Embed settings
+    enable_js_api: bool,
+    origin: Option<String>,
+    privacy_enhanced: bool,
+    related_videos: bool,
+    show_info: bool,
+    modest_branding: bool,
+}
+
+impl YouTubeConfig {
+    pub fn new(api_key: String) -> Self {
+        YouTubeConfig {
+            api_key: api_key,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            access_token: None,
+            refresh_token: None,
+            channel_id: None,
+            enable_js_api: true,
+            origin: None,
+            privacy_enhanced: true,
+            related_videos: false,
+            show_info: true,
+            modest_branding: true,
+        }
+    }
+}
+
+/// YouTube API response types
+pub type YouTubeVideoResponse {
+    kind: String,
+    etag: String,
+    items: Vec<YouTubeVideoItem>,
+    page_info: YouTubePageInfo,
+    next_page_token: Option<String>,
+    prev_page_token: Option<String>,
+}
+
+pub type YouTubeVideoItem {
+    kind: String,
+    etag: String,
+    id: YouTubeVideoId,
+    snippet: Option<YouTubeSnippet>,
+    content_details: Option<YouTubeContentDetails>,
+    statistics: Option<YouTubeStatistics>,
+    status: Option<YouTubeVideoStatus>,
+}
+
+pub type YouTubeVideoId {
+    video_id: Option<String>,
+    channel_id: Option<String>,
+    playlist_id: Option<String>,
+}
+
+pub type YouTubeSnippet {
+    published_at: String,
+    channel_id: String,
+    title: String,
+    description: String,
+    thumbnails: YouTubeThumbnails,
+    channel_title: String,
+    tags: Option<Vec<String>>,
+    category_id: Option<String>,
+    live_broadcast_content: Option<String>,
+    default_language: Option<String>,
+    localized: Option<YouTubeLocalized>,
+    default_audio_language: Option<String>,
+}
+
+pub type YouTubeThumbnails {
+    default_thumb: Option<YouTubeThumbnail>,
+    medium: Option<YouTubeThumbnail>,
+    high: Option<YouTubeThumbnail>,
+    standard: Option<YouTubeThumbnail>,
+    maxres: Option<YouTubeThumbnail>,
+}
+
+pub type YouTubeThumbnail {
+    url: String,
+    width: u32,
+    height: u32,
+}
+
+pub type YouTubeLocalized {
+    title: String,
+    description: String,
+}
+
+pub type YouTubeContentDetails {
+    duration: String,
+    dimension: String,
+    definition: String,
+    caption: String,
+    licensed_content: bool,
+    content_rating: Option<HashMap<String, String>>,
+    projection: String,
+}
+
+pub type YouTubeStatistics {
+    view_count: String,
+    like_count: Option<String>,
+    dislike_count: Option<String>,
+    favorite_count: String,
+    comment_count: Option<String>,
+}
+
+pub type YouTubeVideoStatus {
+    upload_status: String,
+    privacy_status: String,
+    license: String,
+    embeddable: bool,
+    public_stats_viewable: bool,
+    made_for_kids: Option<bool>,
+}
+
+pub type YouTubePageInfo {
+    total_results: u32,
+    results_per_page: u32,
+}
+
+/// YouTube Provider implementation
+pub actor YouTubeProvider {
+    config: VideoConfig,
+    youtube_config: YouTubeConfig,
+    client: BaseVideoClient,
+
+    pub fn new(config: VideoConfig) -> Self {
+        let yt_config = config.youtube_config.clone()
+            .unwrap_or_else(|| YouTubeConfig::new(
+                config.api_key.clone().unwrap_or_default()
+            ));
+
+        let mut client = BaseVideoClient::new("https://www.googleapis.com/youtube/v3".to_string());
+
+        if let Some(ref token) = yt_config.access_token {
+            client = client.with_access_token(token.clone());
+        }
+
+        YouTubeProvider {
+            config: config,
+            youtube_config: yt_config,
+            client: client,
+        }
+    }
+
+    /// Parse video ID from various YouTube URL formats
+    fn parse_video_id(self, url: &str) -> Option<String> {
+        extract_youtube_id(url)
+    }
+
+    /// Build API URL with key
+    fn build_api_url(self, endpoint: &str, params: &[(&str, &str)]) -> String {
+        let mut url = format!("{}?key={}", endpoint, self.youtube_config.api_key);
+
+        for (key, value) in params {
+            url = format!("{}&{}={}", url, key, value);
+        }
+
+        url
+    }
+
+    /// Get best available thumbnail
+    fn get_best_thumbnail(self, thumbnails: &YouTubeThumbnails) -> Option<String> {
+        thumbnails.maxres.as_ref()
+            .or(thumbnails.standard.as_ref())
+            .or(thumbnails.high.as_ref())
+            .or(thumbnails.medium.as_ref())
+            .or(thumbnails.default_thumb.as_ref())
+            .map(|t| t.url.clone())
+    }
+
+    /// Convert YouTube video to internal Video type
+    fn convert_video(self, item: YouTubeVideoItem) -> Result<Video, VideoError> {
+        let video_id = item.id.video_id.clone()
+            .ok_or(VideoError::VideoNotFound { video_id: "unknown".to_string() })?;
+
+        let snippet = item.snippet.ok_or(
+            VideoError::VideoNotFound { video_id: video_id.clone() }
+        )?;
+
+        let content_details = item.content_details;
+        let statistics = item.statistics;
+        let status = item.status;
+
+        let duration = content_details.as_ref()
+            .and_then(|cd| parse_duration(&cd.duration))
+            .unwrap_or(Duration::zero());
+
+        let thumbnail_url = self.get_best_thumbnail(&snippet.thumbnails);
+
+        let privacy = status.as_ref()
+            .map(|s| match s.privacy_status.as_str() {
+                "public" => VideoPrivacy::Public,
+                "unlisted" => VideoPrivacy::Unlisted,
+                "private" => VideoPrivacy::Private,
+                _ => VideoPrivacy::Public,
+            })
+            .unwrap_or(VideoPrivacy::Public);
+
+        let video_status = status.as_ref()
+            .map(|s| match s.upload_status.as_str() {
+                "processed" => VideoStatus::Ready,
+                "uploaded" | "processing" => VideoStatus::Processing,
+                "failed" | "rejected" => VideoStatus::Failed,
+                "deleted" => VideoStatus::Deleted,
+                _ => VideoStatus::Ready,
+            })
+            .unwrap_or(VideoStatus::Ready);
+
+        let available_qualities = content_details.as_ref()
+            .map(|cd| {
+                let mut qualities = vec![VideoQuality::Auto];
+                if cd.definition == "hd" {
+                    qualities.push(VideoQuality::HD);
+                    qualities.push(VideoQuality::High);
+                }
+                qualities.push(VideoQuality::Medium);
+                qualities.push(VideoQuality::Low);
+                qualities
+            })
+            .unwrap_or(vec![VideoQuality::Auto]);
+
+        let has_captions = content_details.as_ref()
+            .map(|cd| cd.caption == "true")
+            .unwrap_or(false);
+
+        Ok(Video {
+            id: video_id.clone(),
+            provider_type: VideoProviderType::YouTube,
+            external_id: video_id.clone(),
+            title: snippet.title,
+            description: Some(snippet.description),
+            duration: duration,
+            thumbnail_url: thumbnail_url,
+            embed_url: format!("https://www.youtube.com/embed/{}", video_id),
+            watch_url: format!("https://www.youtube.com/watch?v={}", video_id),
+            width: Some(1920),
+            height: Some(1080),
+            available_qualities: available_qualities,
+            has_captions: has_captions,
+            caption_languages: Vec::new(),
+            status: video_status,
+            privacy: privacy,
+            created_at: DateTime::parse_iso8601(&snippet.published_at)
+                .unwrap_or(DateTime::now()),
+            updated_at: DateTime::now(),
+            tags: snippet.tags.unwrap_or_default(),
+            categories: Vec::new(),
+            custom_fields: HashMap::new(),
+        })
+    }
+
+    /// Build embed URL with options
+    fn build_embed_url(self, video_id: &str, options: &VideoEmbedOptions) -> String {
+        let domain = if self.youtube_config.privacy_enhanced {
+            "www.youtube-nocookie.com"
+        } else {
+            "www.youtube.com"
+        };
+
+        let mut url = format!("https://{}/embed/{}", domain, video_id);
+        let mut params = Vec::new();
+
+        // Player options
+        if options.autoplay {
+            params.push("autoplay=1");
+        }
+        if options.muted {
+            params.push("mute=1");
+        }
+        if options.loop_video {
+            params.push(format!("loop=1&playlist={}", video_id));
+        }
+        if !options.show_controls {
+            params.push("controls=0".to_string());
+        }
+
+        // Start/end time
+        if let Some(start) = options.start_time {
+            params.push(format!("start={}", start.as_secs()));
+        }
+        if let Some(end) = options.end_time {
+            params.push(format!("end={}", end.as_secs()));
+        }
+
+        // YouTube-specific options
+        if self.youtube_config.enable_js_api {
+            params.push("enablejsapi=1".to_string());
+        }
+        if let Some(ref origin) = self.youtube_config.origin {
+            params.push(format!("origin={}", origin));
+        }
+        if !self.youtube_config.related_videos {
+            params.push("rel=0".to_string());
+        }
+        if self.youtube_config.modest_branding {
+            params.push("modestbranding=1".to_string());
+        }
+
+        // Captions
+        if options.enable_captions {
+            params.push("cc_load_policy=1".to_string());
+            if let Some(ref lang) = options.caption_language {
+                params.push(format!("cc_lang_pref={}", lang));
+            }
+        }
+
+        // Custom params
+        for (key, value) in &options.custom_params {
+            params.push(format!("{}={}", key, value));
+        }
+
+        if !params.is_empty() {
+            url = format!("{}?{}", url, params.join("&"));
+        }
+
+        url
+    }
+}
+
+impl VideoProvider for YouTubeProvider {
+    fn get_config(self) -> VideoConfig {
+        self.config.clone()
+    }
+
+    async fn test_connection(mut self) -> Result<VideoConnectionTest, VideoError> {
+        let start = DateTime::now();
+
+        // Test with a simple videos list request
+        let url = self.build_api_url("/videos", &[
+            ("part", "snippet"),
+            ("chart", "mostPopular"),
+            ("maxResults", "1"),
+        ]);
+
+        let response = self.client.get(&url).await?;
+        let latency = (DateTime::now() - start).as_millis() as u64;
+
+        Ok(VideoConnectionTest {
+            success: true,
+            message: "Connected to YouTube API".to_string(),
+            latency_ms: latency,
+            account_name: self.youtube_config.channel_id.clone(),
+            quota_remaining: None, // YouTube doesn't expose this in responses
+        })
+    }
+
+    fn can_handle_url(self, url: &str) -> bool {
+        url.contains("youtube.com") || url.contains("youtu.be")
+    }
+
+    fn extract_video_id(self, url: &str) -> Result<String, VideoError> {
+        self.parse_video_id(url).ok_or(
+            VideoError::EmbedError {
+                message: "Could not extract YouTube video ID from URL".to_string()
+            }
+        )
+    }
+
+    async fn get_video(mut self, video_id: String) -> Result<Video, VideoError> {
+        let url = self.build_api_url("/videos", &[
+            ("part", "snippet,contentDetails,statistics,status"),
+            ("id", &video_id),
+        ]);
+
+        let response = self.client.get(&url).await?;
+
+        let items = response["items"].as_array().ok_or(
+            VideoError::VideoNotFound { video_id: video_id.clone() }
+        )?;
+
+        if items.is_empty() {
+            return Err(VideoError::VideoNotFound { video_id: video_id });
+        }
+
+        let item = parse_youtube_video_item(&items[0])?;
+        self.convert_video(item)
+    }
+
+    async fn list_videos(mut self, options: VideoListOptions) -> Result<VideoList, VideoError> {
+        // For listing, we need OAuth - fallback to search if only API key
+        if self.youtube_config.access_token.is_none() {
+            return Err(VideoError::AuthenticationError {
+                message: "OAuth required for listing videos".to_string()
+            });
+        }
+
+        let channel_id = self.youtube_config.channel_id.clone()
+            .ok_or(VideoError::ConfigurationError {
+                message: "Channel ID required for listing".to_string()
+            })?;
+
+        let url = self.build_api_url("/search", &[
+            ("part", "snippet"),
+            ("channelId", &channel_id),
+            ("type", "video"),
+            ("maxResults", &options.limit.to_string()),
+        ]);
+
+        let response = self.client.get(&url).await?;
+
+        let mut videos = Vec::new();
+        if let Some(items) = response["items"].as_array() {
+            for item in items {
+                if let Ok(yt_item) = parse_youtube_search_item(item) {
+                    if let Some(video_id) = yt_item.id.video_id {
+                        // Fetch full video details
+                        if let Ok(video) = self.get_video(video_id).await {
+                            videos.push(video);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = response["pageInfo"]["totalResults"].as_u64().unwrap_or(0) as u32;
+
+        Ok(VideoList {
+            videos: videos,
+            total: total,
+            offset: options.offset,
+            limit: options.limit,
+            has_more: response["nextPageToken"].is_string(),
+        })
+    }
+
+    async fn search_videos(
+        mut self,
+        query: String,
+        options: VideoListOptions
+    ) -> Result<VideoList, VideoError> {
+        let url = self.build_api_url("/search", &[
+            ("part", "snippet"),
+            ("q", &query),
+            ("type", "video"),
+            ("maxResults", &options.limit.to_string()),
+        ]);
+
+        let response = self.client.get(&url).await?;
+
+        let mut videos = Vec::new();
+        if let Some(items) = response["items"].as_array() {
+            for item in items {
+                if let Ok(yt_item) = parse_youtube_search_item(item) {
+                    if let Some(video_id) = yt_item.id.video_id {
+                        if let Ok(video) = self.get_video(video_id).await {
+                            videos.push(video);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = response["pageInfo"]["totalResults"].as_u64().unwrap_or(0) as u32;
+
+        Ok(VideoList {
+            videos: videos,
+            total: total,
+            offset: options.offset,
+            limit: options.limit,
+            has_more: response["nextPageToken"].is_string(),
+        })
+    }
+
+    async fn get_embed(
+        self,
+        video_id: String,
+        options: VideoEmbedOptions
+    ) -> Result<VideoEmbed, VideoError> {
+        let iframe_url = self.build_embed_url(&video_id, &options);
+
+        let width = options.width.unwrap_or(640);
+        let height = options.height.unwrap_or(360);
+
+        let html = if options.responsive {
+            generate_responsive_wrapper(
+                format!(
+                    r#"<iframe src="{}" width="100%" height="100%" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>"#,
+                    iframe_url
+                ),
+                16.0 / 9.0
+            )
+        } else {
+            format!(
+                r#"<iframe src="{}" width="{}" height="{}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>"#,
+                iframe_url, width, height
+            )
+        };
+
+        Ok(VideoEmbed {
+            html: html,
+            iframe_url: iframe_url,
+            script_url: Some("https://www.youtube.com/iframe_api".to_string()),
+            width: width,
+            height: height,
+        })
+    }
+
+    fn get_player_script(self) -> Option<String> {
+        Some("https://www.youtube.com/iframe_api".to_string())
+    }
+
+    async fn get_analytics(mut self, video_id: String) -> Result<VideoAnalytics, VideoError> {
+        // YouTube Analytics API requires OAuth
+        if self.youtube_config.access_token.is_none() {
+            return Err(VideoError::AuthenticationError {
+                message: "OAuth required for analytics".to_string()
+            });
+        }
+
+        // Fetch basic statistics from Data API
+        let video = self.get_video(video_id.clone()).await?;
+
+        // For full analytics, we would use YouTube Analytics API
+        // This is a simplified version using public statistics
+
+        Ok(VideoAnalytics {
+            video_id: video_id,
+            total_views: 0,
+            unique_viewers: 0,
+            total_watch_time: Duration::zero(),
+            average_watch_time: Duration::zero(),
+            completion_rate: 0.0,
+            engagement_score: 0.0,
+            heatmap: Vec::new(),
+            top_dropoff_points: Vec::new(),
+            device_breakdown: HashMap::new(),
+            quality_breakdown: HashMap::new(),
+        })
+    }
+
+    async fn get_captions(mut self, video_id: String) -> Result<Vec<VideoCaption>, VideoError> {
+        let url = self.build_api_url("/captions", &[
+            ("part", "snippet"),
+            ("videoId", &video_id),
+        ]);
+
+        let response = self.client.get(&url).await?;
+
+        let mut captions = Vec::new();
+        if let Some(items) = response["items"].as_array() {
+            for item in items {
+                let snippet = &item["snippet"];
+
+                captions.push(VideoCaption {
+                    id: item["id"].as_str().unwrap_or_default().to_string(),
+                    language: snippet["language"].as_str().unwrap_or("en").to_string(),
+                    language_name: snippet["name"].as_str().unwrap_or("").to_string(),
+                    is_auto_generated: snippet["trackKind"].as_str() == Some("ASR"),
+                    format: CaptionFormat::Vtt,
+                    url: None, // Requires OAuth to download
+                    content: None,
+                });
+            }
+        }
+
+        Ok(captions)
+    }
+
+    async fn upload_video(self, upload: VideoUpload) -> Result<Video, VideoError> {
+        Err(VideoError::ConfigurationError {
+            message: "Video upload requires OAuth and is not yet implemented".to_string()
+        })
+    }
+
+    async fn delete_video(self, video_id: String) -> Result<(), VideoError> {
+        Err(VideoError::ConfigurationError {
+            message: "Video deletion requires OAuth and is not yet implemented".to_string()
+        })
+    }
+
+    fn get_capabilities(self) -> Vec<VideoCapability> {
+        let mut caps = vec![
+            VideoCapability::Embed,
+            VideoCapability::Captions,
+            VideoCapability::Playlists,
+        ];
+
+        if self.youtube_config.access_token.is_some() {
+            caps.push(VideoCapability::Upload);
+            caps.push(VideoCapability::Delete);
+            caps.push(VideoCapability::Analytics);
+            caps.push(VideoCapability::Privacy);
+        }
+
+        caps
+    }
+}
+
+/// Parse YouTube video item from JSON
+fn parse_youtube_video_item(json: &JsonValue) -> Result<YouTubeVideoItem, VideoError> {
+    let id_value = &json["id"];
+    let id = if id_value.is_string() {
+        YouTubeVideoId {
+            video_id: id_value.as_str().map(|s| s.to_string()),
+            channel_id: None,
+            playlist_id: None,
+        }
+    } else {
+        YouTubeVideoId {
+            video_id: json["id"]["videoId"].as_str().map(|s| s.to_string()),
+            channel_id: json["id"]["channelId"].as_str().map(|s| s.to_string()),
+            playlist_id: json["id"]["playlistId"].as_str().map(|s| s.to_string()),
+        }
+    };
+
+    let snippet = if json["snippet"].is_object() {
+        Some(parse_youtube_snippet(&json["snippet"])?)
+    } else {
+        None
+    };
+
+    let content_details = if json["contentDetails"].is_object() {
+        Some(parse_youtube_content_details(&json["contentDetails"]))
+    } else {
+        None
+    };
+
+    let statistics = if json["statistics"].is_object() {
+        Some(parse_youtube_statistics(&json["statistics"]))
+    } else {
+        None
+    };
+
+    let status = if json["status"].is_object() {
+        Some(parse_youtube_status(&json["status"]))
+    } else {
+        None
+    };
+
+    Ok(YouTubeVideoItem {
+        kind: json["kind"].as_str().unwrap_or_default().to_string(),
+        etag: json["etag"].as_str().unwrap_or_default().to_string(),
+        id: id,
+        snippet: snippet,
+        content_details: content_details,
+        statistics: statistics,
+        status: status,
+    })
+}
+
+fn parse_youtube_search_item(json: &JsonValue) -> Result<YouTubeVideoItem, VideoError> {
+    parse_youtube_video_item(json)
+}
+
+fn parse_youtube_snippet(json: &JsonValue) -> Result<YouTubeSnippet, VideoError> {
+    Ok(YouTubeSnippet {
+        published_at: json["publishedAt"].as_str().unwrap_or_default().to_string(),
+        channel_id: json["channelId"].as_str().unwrap_or_default().to_string(),
+        title: json["title"].as_str().unwrap_or_default().to_string(),
+        description: json["description"].as_str().unwrap_or_default().to_string(),
+        thumbnails: parse_youtube_thumbnails(&json["thumbnails"]),
+        channel_title: json["channelTitle"].as_str().unwrap_or_default().to_string(),
+        tags: json["tags"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+        category_id: json["categoryId"].as_str().map(|s| s.to_string()),
+        live_broadcast_content: json["liveBroadcastContent"].as_str().map(|s| s.to_string()),
+        default_language: json["defaultLanguage"].as_str().map(|s| s.to_string()),
+        localized: None,
+        default_audio_language: json["defaultAudioLanguage"].as_str().map(|s| s.to_string()),
+    })
+}
+
+fn parse_youtube_thumbnails(json: &JsonValue) -> YouTubeThumbnails {
+    YouTubeThumbnails {
+        default_thumb: parse_thumbnail(&json["default"]),
+        medium: parse_thumbnail(&json["medium"]),
+        high: parse_thumbnail(&json["high"]),
+        standard: parse_thumbnail(&json["standard"]),
+        maxres: parse_thumbnail(&json["maxres"]),
+    }
+}
+
+fn parse_thumbnail(json: &JsonValue) -> Option<YouTubeThumbnail> {
+    if !json.is_object() {
+        return None;
+    }
+
+    Some(YouTubeThumbnail {
+        url: json["url"].as_str()?.to_string(),
+        width: json["width"].as_u64()? as u32,
+        height: json["height"].as_u64()? as u32,
+    })
+}
+
+fn parse_youtube_content_details(json: &JsonValue) -> YouTubeContentDetails {
+    YouTubeContentDetails {
+        duration: json["duration"].as_str().unwrap_or_default().to_string(),
+        dimension: json["dimension"].as_str().unwrap_or("2d").to_string(),
+        definition: json["definition"].as_str().unwrap_or("sd").to_string(),
+        caption: json["caption"].as_str().unwrap_or("false").to_string(),
+        licensed_content: json["licensedContent"].as_bool().unwrap_or(false),
+        content_rating: None,
+        projection: json["projection"].as_str().unwrap_or("rectangular").to_string(),
+    }
+}
+
+fn parse_youtube_statistics(json: &JsonValue) -> YouTubeStatistics {
+    YouTubeStatistics {
+        view_count: json["viewCount"].as_str().unwrap_or("0").to_string(),
+        like_count: json["likeCount"].as_str().map(|s| s.to_string()),
+        dislike_count: json["dislikeCount"].as_str().map(|s| s.to_string()),
+        favorite_count: json["favoriteCount"].as_str().unwrap_or("0").to_string(),
+        comment_count: json["commentCount"].as_str().map(|s| s.to_string()),
+    }
+}
+
+fn parse_youtube_status(json: &JsonValue) -> YouTubeVideoStatus {
+    YouTubeVideoStatus {
+        upload_status: json["uploadStatus"].as_str().unwrap_or("processed").to_string(),
+        privacy_status: json["privacyStatus"].as_str().unwrap_or("public").to_string(),
+        license: json["license"].as_str().unwrap_or("youtube").to_string(),
+        embeddable: json["embeddable"].as_bool().unwrap_or(true),
+        public_stats_viewable: json["publicStatsViewable"].as_bool().unwrap_or(true),
+        made_for_kids: json["madeForKids"].as_bool(),
+    }
+}
+
+/// Helper to extract YouTube video ID from URL
+fn extract_youtube_id(url: &str) -> Option<String> {
+    // Handle youtube.com/watch?v=ID
+    if let Some(pos) = url.find("v=") {
+        let start = pos + 2;
+        let id: String = url[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if id.len() == 11 {
+            return Some(id);
+        }
+    }
+
+    // Handle youtu.be/ID
+    if url.contains("youtu.be/") {
+        if let Some(pos) = url.find("youtu.be/") {
+            let start = pos + 9;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if id.len() == 11 {
+                return Some(id);
+            }
+        }
+    }
+
+    // Handle youtube.com/embed/ID
+    if let Some(pos) = url.find("/embed/") {
+        let start = pos + 7;
+        let id: String = url[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if id.len() == 11 {
+            return Some(id);
+        }
+    }
+
+    None
+}

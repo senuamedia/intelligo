@@ -1,0 +1,1595 @@
+// LDAP/Active Directory Integration for Intelligo LMS
+// Supports LDAP v3 and Active Directory for enterprise authentication
+
+module intelligo::integrations::sso::ldap
+
+use intelligo::integrations::sso::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::net::{TcpStream, TlsStream}
+use std::uuid::Uuid
+
+/// LDAP Configuration
+pub type LdapConfig {
+    // Connection settings
+    host: String,
+    port: u16,
+    use_ssl: bool,
+    use_starttls: bool,
+    timeout: Duration,
+
+    // Bind credentials (for service account)
+    bind_dn: Option<String>,
+    bind_password: Option<String>,
+
+    // Search settings
+    base_dn: String,
+    user_search_base: Option<String>,
+    group_search_base: Option<String>,
+    user_filter: String,
+    group_filter: Option<String>,
+
+    // Attribute mappings
+    attribute_mappings: LdapAttributeMappings,
+
+    // Group membership
+    group_membership_attribute: Option<String>,
+    nested_groups: bool,
+
+    // Active Directory specific
+    is_active_directory: bool,
+    ad_domain: Option<String>,
+    ad_upn_suffix: Option<String>,
+
+    // Security settings
+    allow_insecure: bool,
+    verify_certificates: bool,
+    ca_certificate: Option<String>,
+
+    // User provisioning
+    auto_provision: bool,
+    default_role: Option<String>,
+    sync_groups: bool,
+}
+
+/// LDAP attribute mappings
+pub type LdapAttributeMappings {
+    username: String,
+    email: String,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    display_name: Option<String>,
+    employee_id: Option<String>,
+    department: Option<String>,
+    title: Option<String>,
+    manager: Option<String>,
+    phone: Option<String>,
+    photo: Option<String>,
+    member_of: Option<String>,
+    custom: HashMap<String, String>,
+}
+
+impl LdapAttributeMappings {
+    pub fn default_ldap() -> Self {
+        LdapAttributeMappings {
+            username: "uid".to_string(),
+            email: "mail".to_string(),
+            first_name: Some("givenName".to_string()),
+            last_name: Some("sn".to_string()),
+            display_name: Some("cn".to_string()),
+            employee_id: Some("employeeNumber".to_string()),
+            department: Some("departmentNumber".to_string()),
+            title: Some("title".to_string()),
+            manager: Some("manager".to_string()),
+            phone: Some("telephoneNumber".to_string()),
+            photo: Some("jpegPhoto".to_string()),
+            member_of: Some("memberOf".to_string()),
+            custom: HashMap::new(),
+        }
+    }
+
+    pub fn default_active_directory() -> Self {
+        LdapAttributeMappings {
+            username: "sAMAccountName".to_string(),
+            email: "mail".to_string(),
+            first_name: Some("givenName".to_string()),
+            last_name: Some("sn".to_string()),
+            display_name: Some("displayName".to_string()),
+            employee_id: Some("employeeID".to_string()),
+            department: Some("department".to_string()),
+            title: Some("title".to_string()),
+            manager: Some("manager".to_string()),
+            phone: Some("telephoneNumber".to_string()),
+            photo: Some("thumbnailPhoto".to_string()),
+            member_of: Some("memberOf".to_string()),
+            custom: HashMap::new(),
+        }
+    }
+}
+
+/// LDAP Entry (user or group)
+pub type LdapEntry {
+    dn: String,
+    attributes: HashMap<String, Vec<String>>,
+}
+
+impl LdapEntry {
+    pub fn get_first(self, attr: &str) -> Option<String> {
+        self.attributes.get(attr)
+            .and_then(|values| values.first())
+            .cloned()
+    }
+
+    pub fn get_all(self, attr: &str) -> Vec<String> {
+        self.attributes.get(attr)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// LDAP User
+pub type LdapUser {
+    dn: String,
+    username: String,
+    email: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    display_name: Option<String>,
+    employee_id: Option<String>,
+    department: Option<String>,
+    title: Option<String>,
+    manager_dn: Option<String>,
+    phone: Option<String>,
+    groups: Vec<String>,
+    raw_attributes: HashMap<String, Vec<String>>,
+    is_disabled: bool,
+}
+
+/// LDAP Group
+pub type LdapGroup {
+    dn: String,
+    name: String,
+    description: Option<String>,
+    members: Vec<String>,
+    nested_groups: Vec<String>,
+}
+
+/// LDAP authentication result
+pub type LdapAuthResult {
+    success: bool,
+    user: Option<LdapUser>,
+    error: Option<LdapError>,
+    bind_time_ms: u64,
+}
+
+/// LDAP-specific errors
+pub enum LdapError {
+    ConnectionFailed { message: String },
+    BindFailed { message: String },
+    InvalidCredentials,
+    UserNotFound { username: String },
+    AccountDisabled { username: String },
+    AccountLocked { username: String },
+    AccountExpired { username: String },
+    PasswordExpired { username: String },
+    TlsError { message: String },
+    SearchError { message: String },
+    Timeout,
+    ProtocolError { message: String },
+}
+
+impl LdapError {
+    pub fn to_sso_error(self) -> SsoError {
+        match self {
+            LdapError::ConnectionFailed { message } =>
+                SsoError::ProviderUnavailable { provider_id: format!("LDAP: {}", message) },
+            LdapError::BindFailed { message } =>
+                SsoError::AuthenticationFailed { message: message },
+            LdapError::InvalidCredentials =>
+                SsoError::AuthenticationFailed { message: "Invalid credentials".to_string() },
+            LdapError::UserNotFound { username } =>
+                SsoError::UserNotFound { identifier: username },
+            LdapError::AccountDisabled { username } =>
+                SsoError::UserDisabled { user_id: username },
+            LdapError::AccountLocked { username } =>
+                SsoError::AuthenticationFailed { message: format!("Account locked: {}", username) },
+            LdapError::AccountExpired { username } =>
+                SsoError::AuthenticationFailed { message: format!("Account expired: {}", username) },
+            LdapError::PasswordExpired { username } =>
+                SsoError::AuthenticationFailed { message: format!("Password expired: {}", username) },
+            LdapError::TlsError { message } =>
+                SsoError::NetworkError { message: format!("TLS error: {}", message) },
+            LdapError::SearchError { message } =>
+                SsoError::AuthenticationFailed { message: message },
+            LdapError::Timeout =>
+                SsoError::NetworkError { message: "Connection timeout".to_string() },
+            LdapError::ProtocolError { message } =>
+                SsoError::AuthenticationFailed { message: message },
+        }
+    }
+}
+
+/// LDAP Connection pool
+pub actor LdapConnectionPool {
+    config: LdapConfig,
+    connections: Vec<LdapConnection>,
+    max_connections: usize,
+    available: Vec<usize>,
+
+    pub fn new(config: LdapConfig, max_connections: usize) -> Self {
+        LdapConnectionPool {
+            config: config,
+            connections: Vec::new(),
+            max_connections: max_connections,
+            available: Vec::new(),
+        }
+    }
+
+    pub async fn get_connection(mut self) -> Result<LdapConnection, LdapError> {
+        // Try to get available connection
+        if let Some(idx) = self.available.pop() {
+            let conn = &self.connections[idx];
+            if conn.is_alive().await {
+                return Ok(conn.clone());
+            }
+        }
+
+        // Create new connection if under limit
+        if self.connections.len() < self.max_connections {
+            let conn = LdapConnection::connect(self.config.clone()).await?;
+            self.connections.push(conn.clone());
+            return Ok(conn);
+        }
+
+        // Wait for available connection or create new
+        Err(LdapError::ConnectionFailed {
+            message: "No available connections".to_string()
+        })
+    }
+
+    pub fn release_connection(mut self, idx: usize) {
+        if idx < self.connections.len() {
+            self.available.push(idx);
+        }
+    }
+}
+
+/// LDAP Connection
+pub actor LdapConnection {
+    config: LdapConfig,
+    stream: Option<Box<dyn LdapStream>>,
+    message_id: u32,
+    bound: bool,
+
+    pub async fn connect(config: LdapConfig) -> Result<Self, LdapError> {
+        let address = format!("{}:{}", config.host, config.port);
+
+        let stream: Box<dyn LdapStream> = if config.use_ssl {
+            let tcp = TcpStream::connect_timeout(&address, config.timeout)
+                .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+            let tls = TlsStream::new(tcp, &config.host, config.verify_certificates)
+                .map_err(|e| LdapError::TlsError { message: e.to_string() })?;
+
+            Box::new(tls)
+        } else {
+            let tcp = TcpStream::connect_timeout(&address, config.timeout)
+                .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+            Box::new(tcp)
+        };
+
+        let mut conn = LdapConnection {
+            config: config.clone(),
+            stream: Some(stream),
+            message_id: 0,
+            bound: false,
+        };
+
+        // StartTLS if configured
+        if config.use_starttls && !config.use_ssl {
+            conn.start_tls().await?;
+        }
+
+        // Bind with service account if configured
+        if let (Some(bind_dn), Some(bind_password)) = (&config.bind_dn, &config.bind_password) {
+            conn.bind(bind_dn.clone(), bind_password.clone()).await?;
+        }
+
+        Ok(conn)
+    }
+
+    pub async fn is_alive(self) -> bool {
+        self.stream.is_some() && self.bound
+    }
+
+    fn next_message_id(mut self) -> u32 {
+        self.message_id += 1;
+        self.message_id
+    }
+
+    async fn start_tls(mut self) -> Result<(), LdapError> {
+        let stream = self.stream.as_mut().ok_or(
+            LdapError::ConnectionFailed { message: "No connection".to_string() }
+        )?;
+
+        // Send extended request for StartTLS
+        let msg_id = self.next_message_id();
+        let request = encode_extended_request(msg_id, "1.3.6.1.4.1.1466.20037");
+        stream.write(&request).await
+            .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+        // Read response
+        let response = stream.read().await
+            .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+        let result = decode_extended_response(&response)?;
+        if result.result_code != 0 {
+            return Err(LdapError::TlsError {
+                message: format!("StartTLS failed: {}", result.diagnostic_message.unwrap_or_default())
+            });
+        }
+
+        // Upgrade to TLS
+        let tcp = self.stream.take().unwrap();
+        let tls = TlsStream::upgrade(tcp, &self.config.host, self.config.verify_certificates)
+            .map_err(|e| LdapError::TlsError { message: e.to_string() })?;
+
+        self.stream = Some(Box::new(tls));
+        Ok(())
+    }
+
+    pub async fn bind(mut self, dn: String, password: String) -> Result<(), LdapError> {
+        let stream = self.stream.as_mut().ok_or(
+            LdapError::ConnectionFailed { message: "No connection".to_string() }
+        )?;
+
+        let msg_id = self.next_message_id();
+        let request = encode_bind_request(msg_id, &dn, &password);
+
+        stream.write(&request).await
+            .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+        let response = stream.read().await
+            .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+        let result = decode_bind_response(&response)?;
+
+        match result.result_code {
+            0 => {
+                self.bound = true;
+                Ok(())
+            },
+            49 => Err(LdapError::InvalidCredentials),
+            _ => Err(LdapError::BindFailed {
+                message: result.diagnostic_message.unwrap_or("Bind failed".to_string())
+            }),
+        }
+    }
+
+    pub async fn search(
+        mut self,
+        base_dn: String,
+        scope: LdapSearchScope,
+        filter: String,
+        attributes: Vec<String>
+    ) -> Result<Vec<LdapEntry>, LdapError> {
+        let stream = self.stream.as_mut().ok_or(
+            LdapError::ConnectionFailed { message: "No connection".to_string() }
+        )?;
+
+        let msg_id = self.next_message_id();
+        let request = encode_search_request(msg_id, &base_dn, scope, &filter, &attributes);
+
+        stream.write(&request).await
+            .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+        let mut entries = Vec::new();
+
+        loop {
+            let response = stream.read().await
+                .map_err(|e| LdapError::ConnectionFailed { message: e.to_string() })?;
+
+            match decode_search_response(&response)? {
+                LdapSearchResponse::Entry(entry) => {
+                    entries.push(entry);
+                },
+                LdapSearchResponse::Done(result) => {
+                    if result.result_code != 0 && result.result_code != 4 {
+                        return Err(LdapError::SearchError {
+                            message: result.diagnostic_message.unwrap_or("Search failed".to_string())
+                        });
+                    }
+                    break;
+                },
+                LdapSearchResponse::Reference(_) => {
+                    // Skip referrals
+                    continue;
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    pub async fn unbind(mut self) -> Result<(), LdapError> {
+        if let Some(ref mut stream) = self.stream {
+            let msg_id = self.next_message_id();
+            let request = encode_unbind_request(msg_id);
+            let _ = stream.write(&request).await;
+        }
+        self.bound = false;
+        self.stream = None;
+        Ok(())
+    }
+}
+
+/// LDAP Search scope
+pub enum LdapSearchScope {
+    Base,
+    OneLevel,
+    Subtree,
+}
+
+/// LDAP Search response types
+enum LdapSearchResponse {
+    Entry(LdapEntry),
+    Done(LdapResult),
+    Reference(Vec<String>),
+}
+
+/// LDAP Result
+type LdapResult {
+    result_code: u8,
+    matched_dn: Option<String>,
+    diagnostic_message: Option<String>,
+}
+
+/// Trait for LDAP streams
+trait LdapStream {
+    async fn write(self, data: &[u8]) -> Result<(), std::io::Error>
+    async fn read(self) -> Result<Vec<u8>, std::io::Error>
+}
+
+/// LDAP Provider implementation
+pub actor LdapProvider {
+    provider_id: String,
+    config: LdapConfig,
+    connection_pool: LdapConnectionPool,
+
+    pub fn new(provider_id: String, config: LdapConfig) -> Self {
+        let pool = LdapConnectionPool::new(config.clone(), 10);
+
+        LdapProvider {
+            provider_id: provider_id,
+            config: config,
+            connection_pool: pool,
+        }
+    }
+
+    /// Build user search filter
+    fn build_user_filter(self, username: String) -> String {
+        let template = &self.config.user_filter;
+
+        // Replace placeholders
+        let filter = template
+            .replace("{username}", &escape_ldap_filter(&username))
+            .replace("{user}", &escape_ldap_filter(&username));
+
+        // For AD, support UPN format
+        if self.config.is_active_directory {
+            if let Some(ref upn_suffix) = self.config.ad_upn_suffix {
+                let upn = format!("{}@{}", username, upn_suffix);
+                return format!("(|{}(userPrincipalName={}))", filter, escape_ldap_filter(&upn));
+            }
+        }
+
+        filter
+    }
+
+    /// Get search base for users
+    fn get_user_search_base(self) -> String {
+        self.config.user_search_base.clone()
+            .unwrap_or_else(|| self.config.base_dn.clone())
+    }
+
+    /// Get attributes to fetch for user
+    fn get_user_attributes(self) -> Vec<String> {
+        let mappings = &self.config.attribute_mappings;
+        let mut attrs = vec![
+            "dn".to_string(),
+            mappings.username.clone(),
+            mappings.email.clone(),
+        ];
+
+        if let Some(ref attr) = mappings.first_name {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.last_name {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.display_name {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.employee_id {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.department {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.title {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.manager {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.phone {
+            attrs.push(attr.clone());
+        }
+        if let Some(ref attr) = mappings.member_of {
+            attrs.push(attr.clone());
+        }
+
+        // AD specific
+        if self.config.is_active_directory {
+            attrs.push("userAccountControl".to_string());
+        }
+
+        // Custom attributes
+        for (ldap_attr, _) in &mappings.custom {
+            attrs.push(ldap_attr.clone());
+        }
+
+        attrs
+    }
+
+    /// Parse LDAP entry into user
+    fn parse_user(self, entry: LdapEntry) -> LdapUser {
+        let mappings = &self.config.attribute_mappings;
+
+        let username = entry.get_first(&mappings.username).unwrap_or_default();
+        let email = entry.get_first(&mappings.email);
+
+        let first_name = mappings.first_name.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let last_name = mappings.last_name.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let display_name = mappings.display_name.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let employee_id = mappings.employee_id.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let department = mappings.department.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let title = mappings.title.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let manager_dn = mappings.manager.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+        let phone = mappings.phone.as_ref()
+            .and_then(|attr| entry.get_first(attr));
+
+        let groups = mappings.member_of.as_ref()
+            .map(|attr| entry.get_all(attr))
+            .unwrap_or_default();
+
+        // Check if account is disabled (AD specific)
+        let is_disabled = if self.config.is_active_directory {
+            entry.get_first("userAccountControl")
+                .and_then(|uac| uac.parse::<u32>().ok())
+                .map(|uac| (uac & 0x0002) != 0) // ACCOUNTDISABLE flag
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        LdapUser {
+            dn: entry.dn,
+            username: username,
+            email: email,
+            first_name: first_name,
+            last_name: last_name,
+            display_name: display_name,
+            employee_id: employee_id,
+            department: department,
+            title: title,
+            manager_dn: manager_dn,
+            phone: phone,
+            groups: groups,
+            raw_attributes: entry.attributes,
+            is_disabled: is_disabled,
+        }
+    }
+
+    /// Authenticate user
+    pub async fn authenticate(
+        self,
+        username: String,
+        password: String
+    ) -> Result<LdapAuthResult, LdapError> {
+        let start = DateTime::now();
+
+        // Get connection and search for user
+        let conn = self.connection_pool.get_connection().await?;
+
+        let filter = self.build_user_filter(username.clone());
+        let search_base = self.get_user_search_base();
+        let attributes = self.get_user_attributes();
+
+        let entries = conn.search(
+            search_base,
+            LdapSearchScope::Subtree,
+            filter,
+            attributes
+        ).await?;
+
+        if entries.is_empty() {
+            return Err(LdapError::UserNotFound { username: username });
+        }
+
+        let entry = entries.into_iter().next().unwrap();
+        let user_dn = entry.dn.clone();
+        let user = self.parse_user(entry);
+
+        // Check if account is disabled
+        if user.is_disabled {
+            return Err(LdapError::AccountDisabled { username: username });
+        }
+
+        // Bind as user to verify password
+        let user_conn = LdapConnection::connect(self.config.clone()).await?;
+        let bind_result = user_conn.bind(user_dn, password).await;
+
+        let bind_time_ms = (DateTime::now() - start).as_millis() as u64;
+
+        match bind_result {
+            Ok(()) => {
+                let _ = user_conn.unbind().await;
+                Ok(LdapAuthResult {
+                    success: true,
+                    user: Some(user),
+                    error: None,
+                    bind_time_ms: bind_time_ms,
+                })
+            },
+            Err(e) => {
+                Ok(LdapAuthResult {
+                    success: false,
+                    user: None,
+                    error: Some(e),
+                    bind_time_ms: bind_time_ms,
+                })
+            }
+        }
+    }
+
+    /// Fetch user by username
+    pub async fn get_user(self, username: String) -> Result<Option<LdapUser>, LdapError> {
+        let conn = self.connection_pool.get_connection().await?;
+
+        let filter = self.build_user_filter(username);
+        let search_base = self.get_user_search_base();
+        let attributes = self.get_user_attributes();
+
+        let entries = conn.search(
+            search_base,
+            LdapSearchScope::Subtree,
+            filter,
+            attributes
+        ).await?;
+
+        Ok(entries.into_iter().next().map(|e| self.parse_user(e)))
+    }
+
+    /// Fetch user groups with nested group resolution
+    pub async fn get_user_groups(
+        self,
+        user_dn: String,
+        resolve_nested: bool
+    ) -> Result<Vec<LdapGroup>, LdapError> {
+        let conn = self.connection_pool.get_connection().await?;
+
+        let group_base = self.config.group_search_base.clone()
+            .unwrap_or_else(|| self.config.base_dn.clone());
+
+        let filter = if self.config.is_active_directory {
+            if resolve_nested && self.config.nested_groups {
+                // AD nested group filter using LDAP_MATCHING_RULE_IN_CHAIN
+                format!("(member:1.2.840.113556.1.4.1941:={})", escape_ldap_filter(&user_dn))
+            } else {
+                format!("(member={})", escape_ldap_filter(&user_dn))
+            }
+        } else {
+            self.config.group_filter.clone()
+                .unwrap_or_else(|| format!("(member={})", escape_ldap_filter(&user_dn)))
+        };
+
+        let attributes = vec![
+            "dn".to_string(),
+            "cn".to_string(),
+            "description".to_string(),
+            "member".to_string(),
+        ];
+
+        let entries = conn.search(
+            group_base,
+            LdapSearchScope::Subtree,
+            filter,
+            attributes
+        ).await?;
+
+        let groups = entries.into_iter().map(|entry| {
+            LdapGroup {
+                dn: entry.dn.clone(),
+                name: entry.get_first("cn").unwrap_or_default(),
+                description: entry.get_first("description"),
+                members: entry.get_all("member"),
+                nested_groups: Vec::new(),
+            }
+        }).collect();
+
+        Ok(groups)
+    }
+
+    /// Sync all users from LDAP
+    pub async fn sync_users(self) -> Result<Vec<LdapUser>, LdapError> {
+        let conn = self.connection_pool.get_connection().await?;
+
+        let search_base = self.get_user_search_base();
+        let filter = self.config.user_filter.replace("{username}", "*").replace("{user}", "*");
+        let attributes = self.get_user_attributes();
+
+        let entries = conn.search(
+            search_base,
+            LdapSearchScope::Subtree,
+            filter,
+            attributes
+        ).await?;
+
+        Ok(entries.into_iter().map(|e| self.parse_user(e)).collect())
+    }
+
+    /// Test connection and configuration
+    pub async fn test_connection(self) -> Result<LdapTestResult, LdapError> {
+        let start = DateTime::now();
+
+        // Try to connect
+        let conn = LdapConnection::connect(self.config.clone()).await?;
+        let connect_time = (DateTime::now() - start).as_millis() as u64;
+
+        // Test search
+        let search_start = DateTime::now();
+        let entries = conn.search(
+            self.config.base_dn.clone(),
+            LdapSearchScope::Base,
+            "(objectClass=*)".to_string(),
+            vec!["dn".to_string()]
+        ).await?;
+        let search_time = (DateTime::now() - search_start).as_millis() as u64;
+
+        let _ = conn.unbind().await;
+
+        Ok(LdapTestResult {
+            success: true,
+            connect_time_ms: connect_time,
+            search_time_ms: search_time,
+            base_dn_exists: !entries.is_empty(),
+            message: None,
+        })
+    }
+}
+
+impl SsoProvider for LdapProvider {
+    fn get_config(self) -> SsoConfig {
+        let provider_type = if self.config.is_active_directory {
+            SsoProviderType::ActiveDirectory
+        } else {
+            SsoProviderType::Ldap
+        };
+
+        SsoConfig {
+            provider_id: self.provider_id.clone(),
+            provider_type: provider_type,
+            display_name: if self.config.is_active_directory {
+                "Active Directory".to_string()
+            } else {
+                "LDAP".to_string()
+            },
+            enabled: true,
+            organization_id: None,
+            saml_config: None,
+            oidc_config: None,
+            ldap_config: Some(self.config.clone()),
+            auto_provision_users: self.config.auto_provision,
+            default_role: self.config.default_role.clone(),
+            attribute_mappings: HashMap::new(),
+            allowed_domains: Vec::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    async fn initiate_auth(self, return_url: String) -> Result<SsoAuthRequest, SsoError> {
+        // LDAP doesn't redirect - authentication is done via form
+        // Return a placeholder that indicates direct auth is needed
+        Err(SsoError::ConfigurationError {
+            message: "LDAP requires direct authentication, not redirect flow".to_string()
+        })
+    }
+
+    async fn process_callback(self, request: SsoCallbackRequest) -> Result<SsoAuthResult, SsoError> {
+        // LDAP doesn't use callbacks
+        Err(SsoError::ConfigurationError {
+            message: "LDAP does not support callback authentication".to_string()
+        })
+    }
+
+    async fn validate_session(self, session_id: Uuid) -> Result<SsoSession, SsoError> {
+        Err(SsoError::SessionError {
+            message: "Session validation should be done through SsoManager".to_string()
+        })
+    }
+
+    async fn terminate_session(self, session_id: Uuid) -> Result<(), SsoError> {
+        Ok(())
+    }
+
+    fn get_logout_url(self, session_id: Uuid, return_url: String) -> Option<String> {
+        None // LDAP doesn't have logout URLs
+    }
+}
+
+/// LDAP test result
+pub type LdapTestResult {
+    success: bool,
+    connect_time_ms: u64,
+    search_time_ms: u64,
+    base_dn_exists: bool,
+    message: Option<String>,
+}
+
+/// Direct LDAP authentication (for form-based login)
+pub async fn authenticate_ldap(
+    config: LdapConfig,
+    username: String,
+    password: String
+) -> Result<SsoAuthResult, SsoError> {
+    let provider = LdapProvider::new("ldap".to_string(), config);
+
+    let result = provider.authenticate(username.clone(), password).await
+        .map_err(|e| e.to_sso_error())?;
+
+    if result.success {
+        let user = result.user.unwrap();
+
+        let mut attributes = HashMap::new();
+        if let Some(ref email) = user.email {
+            attributes.insert("email".to_string(), email.clone());
+        }
+        if let Some(ref first_name) = user.first_name {
+            attributes.insert("first_name".to_string(), first_name.clone());
+        }
+        if let Some(ref last_name) = user.last_name {
+            attributes.insert("last_name".to_string(), last_name.clone());
+        }
+        if let Some(ref display_name) = user.display_name {
+            attributes.insert("display_name".to_string(), display_name.clone());
+        }
+        if let Some(ref department) = user.department {
+            attributes.insert("department".to_string(), department.clone());
+        }
+        if let Some(ref title) = user.title {
+            attributes.insert("title".to_string(), title.clone());
+        }
+
+        Ok(SsoAuthResult {
+            success: true,
+            user_id: None,
+            email: user.email,
+            display_name: user.display_name,
+            attributes: attributes,
+            groups: user.groups,
+            session_token: None,
+            provider_id: "ldap".to_string(),
+            provider_type: SsoProviderType::Ldap,
+            is_new_user: false,
+            error: None,
+        })
+    } else {
+        Err(result.error.unwrap().to_sso_error())
+    }
+}
+
+// Helper functions for LDAP protocol encoding/decoding
+
+fn escape_ldap_filter(s: &str) -> String {
+    s.chars().map(|c| {
+        match c {
+            '\\' => "\\5c".to_string(),
+            '*' => "\\2a".to_string(),
+            '(' => "\\28".to_string(),
+            ')' => "\\29".to_string(),
+            '\0' => "\\00".to_string(),
+            _ => c.to_string(),
+        }
+    }).collect()
+}
+
+fn encode_bind_request(msg_id: u32, dn: &str, password: &str) -> Vec<u8> {
+    // BER encode LDAP bind request
+    // This is a simplified placeholder - real implementation would use proper BER encoding
+    let mut data = Vec::new();
+
+    // Message ID
+    data.extend(encode_integer(msg_id));
+
+    // Bind request
+    data.push(0x60); // Application 0 = BindRequest
+    let bind_data = [
+        &encode_integer(3)[..], // Version 3
+        &encode_string(dn)[..], // DN
+        &[0x80][..], // Simple auth context tag
+        &encode_string(password)[..], // Password
+    ].concat();
+    data.extend(encode_length(bind_data.len()));
+    data.extend(bind_data);
+
+    // Wrap in sequence
+    let mut message = vec![0x30]; // Sequence
+    message.extend(encode_length(data.len()));
+    message.extend(data);
+
+    message
+}
+
+fn encode_search_request(
+    msg_id: u32,
+    base_dn: &str,
+    scope: LdapSearchScope,
+    filter: &str,
+    attributes: &[String]
+) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    // Message ID
+    data.extend(encode_integer(msg_id));
+
+    // SearchRequest (Application 3)
+    let scope_byte = match scope {
+        LdapSearchScope::Base => 0,
+        LdapSearchScope::OneLevel => 1,
+        LdapSearchScope::Subtree => 2,
+    };
+
+    let mut search_data = Vec::new();
+
+    // Base DN
+    search_data.extend(encode_string(base_dn));
+
+    // Scope (enumerated)
+    search_data.extend(encode_enumerated(scope_byte));
+
+    // Deref aliases (enumerated - never = 0)
+    search_data.extend(encode_enumerated(0));
+
+    // Size limit (integer - 0 = unlimited)
+    search_data.extend(encode_integer(0));
+
+    // Time limit (integer - 0 = unlimited)
+    search_data.extend(encode_integer(0));
+
+    // Types only (boolean - false)
+    search_data.extend(encode_boolean(false));
+
+    // Filter
+    search_data.extend(encode_filter(filter));
+
+    // Attribute list (sequence)
+    let mut attr_data = Vec::new();
+    for attr in attributes {
+        attr_data.extend(encode_string(attr));
+    }
+    search_data.push(0x30); // Sequence
+    search_data.extend(encode_length(attr_data.len()));
+    search_data.extend(attr_data);
+
+    // Add SearchRequest tag (Application 3)
+    data.push(0x63);
+    data.extend(encode_length(search_data.len()));
+    data.extend(search_data);
+
+    // Wrap in sequence
+    let mut message = vec![0x30];
+    message.extend(encode_length(data.len()));
+    message.extend(data);
+
+    message
+}
+
+fn encode_enumerated(value: u8) -> Vec<u8> {
+    vec![0x0A, 0x01, value]
+}
+
+fn encode_boolean(value: bool) -> Vec<u8> {
+    vec![0x01, 0x01, if value { 0xFF } else { 0x00 }]
+}
+
+fn encode_filter(filter: &str) -> Vec<u8> {
+    // Parse LDAP filter string and encode to BER
+    // Supported: (attr=val), (attr=*), (!(filter)), (&(f1)(f2)), (|(f1)(f2))
+
+    let filter = filter.trim();
+
+    if !filter.starts_with('(') || !filter.ends_with(')') {
+        // Assume it's a simple equality filter
+        return encode_simple_filter("=", filter, "");
+    }
+
+    let inner = &filter[1..filter.len()-1];
+
+    // Check filter type
+    if inner.starts_with('!') {
+        // NOT filter (context 2)
+        let sub_filter = encode_filter(&inner[1..]);
+        let mut result = vec![0xA2];
+        result.extend(encode_length(sub_filter.len()));
+        result.extend(sub_filter);
+        return result;
+    }
+
+    if inner.starts_with('&') {
+        // AND filter (context 0)
+        let sub_filters = parse_compound_filter(&inner[1..]);
+        return encode_compound_filter(0xA0, &sub_filters);
+    }
+
+    if inner.starts_with('|') {
+        // OR filter (context 1)
+        let sub_filters = parse_compound_filter(&inner[1..]);
+        return encode_compound_filter(0xA1, &sub_filters);
+    }
+
+    // Simple filter - find operator
+    if let Some(pos) = inner.find(">=") {
+        encode_simple_filter(">=", &inner[..pos], &inner[pos+2..])
+    } else if let Some(pos) = inner.find("<=") {
+        encode_simple_filter("<=", &inner[..pos], &inner[pos+2..])
+    } else if let Some(pos) = inner.find("~=") {
+        encode_simple_filter("~=", &inner[..pos], &inner[pos+2..])
+    } else if let Some(pos) = inner.find('=') {
+        let attr = &inner[..pos];
+        let value = &inner[pos+1..];
+
+        if value == "*" {
+            // Present filter (context 7)
+            let mut result = vec![0x87];
+            let attr_bytes = attr.as_bytes();
+            result.extend(encode_length(attr_bytes.len()));
+            result.extend(attr_bytes);
+            result
+        } else if value.contains('*') {
+            // Substring filter (context 4)
+            encode_substring_filter(attr, value)
+        } else {
+            // Equality match (context 3)
+            encode_simple_filter("=", attr, value)
+        }
+    } else {
+        // Default: presence check
+        let mut result = vec![0x87];
+        let attr_bytes = inner.as_bytes();
+        result.extend(encode_length(attr_bytes.len()));
+        result.extend(attr_bytes);
+        result
+    }
+}
+
+fn parse_compound_filter(s: &str) -> Vec<String> {
+    let mut filters = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    filters.push(s[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    filters
+}
+
+fn encode_compound_filter(tag: u8, sub_filters: &[String]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for f in sub_filters {
+        data.extend(encode_filter(f));
+    }
+
+    let mut result = vec![tag];
+    result.extend(encode_length(data.len()));
+    result.extend(data);
+    result
+}
+
+fn encode_simple_filter(op: &str, attr: &str, value: &str) -> Vec<u8> {
+    // Tag depends on operator
+    let tag = match op {
+        "=" => 0xA3,  // equalityMatch (context 3)
+        ">=" => 0xA5, // greaterOrEqual (context 5)
+        "<=" => 0xA6, // lessOrEqual (context 6)
+        "~=" => 0xA8, // approxMatch (context 8)
+        _ => 0xA3,
+    };
+
+    let mut data = Vec::new();
+    data.extend(encode_string(attr));
+    data.extend(encode_string(value));
+
+    let mut result = vec![tag];
+    result.extend(encode_length(data.len()));
+    result.extend(data);
+    result
+}
+
+fn encode_substring_filter(attr: &str, pattern: &str) -> Vec<u8> {
+    // Substring filter (context 4)
+    let parts: Vec<&str> = pattern.split('*').collect();
+
+    let mut substrings = Vec::new();
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+
+        let tag = if i == 0 {
+            0x80 // initial (context 0)
+        } else if i == parts.len() - 1 {
+            0x82 // final (context 2)
+        } else {
+            0x81 // any (context 1)
+        };
+
+        let mut substring = vec![tag];
+        let bytes = part.as_bytes();
+        substring.extend(encode_length(bytes.len()));
+        substring.extend(bytes);
+        substrings.extend(substring);
+    }
+
+    let mut sequence = vec![0x30]; // Sequence
+    sequence.extend(encode_length(substrings.len()));
+    sequence.extend(substrings);
+
+    let mut data = Vec::new();
+    data.extend(encode_string(attr));
+    data.extend(sequence);
+
+    let mut result = vec![0xA4]; // Substrings (context 4)
+    result.extend(encode_length(data.len()));
+    result.extend(data);
+    result
+}
+
+fn encode_unbind_request(msg_id: u32) -> Vec<u8> {
+    // UnbindRequest
+    let mut data = Vec::new();
+    data.extend(encode_integer(msg_id));
+    data.push(0x42); // Application 2 = UnbindRequest
+    data.push(0x00); // Empty
+
+    let mut message = vec![0x30];
+    message.extend(encode_length(data.len()));
+    message.extend(data);
+    message
+}
+
+fn encode_extended_request(msg_id: u32, oid: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    // Message ID
+    data.extend(encode_integer(msg_id));
+
+    // ExtendedRequest (Application 23)
+    let mut ext_data = Vec::new();
+
+    // Request Name (context 0)
+    let oid_bytes = oid.as_bytes();
+    ext_data.push(0x80); // Context 0
+    ext_data.extend(encode_length(oid_bytes.len()));
+    ext_data.extend(oid_bytes);
+
+    // No request value for StartTLS
+
+    data.push(0x77); // Application 23
+    data.extend(encode_length(ext_data.len()));
+    data.extend(ext_data);
+
+    // Wrap in sequence
+    let mut message = vec![0x30];
+    message.extend(encode_length(data.len()));
+    message.extend(data);
+
+    message
+}
+
+fn decode_bind_response(data: &[u8]) -> Result<LdapResult, LdapError> {
+    // Parse BER-encoded LDAP message
+    let (_, content) = decode_sequence(data)?;
+
+    // Skip message ID
+    let (msg_id_len, rest) = decode_integer_element(&content)?;
+    let rest = &content[msg_id_len..];
+
+    // Check for BindResponse (Application 1)
+    if rest.is_empty() || rest[0] != 0x61 {
+        return Err(LdapError::ProtocolError {
+            message: "Expected BindResponse".to_string()
+        });
+    }
+
+    // Decode BindResponse content
+    let (_, bind_content) = decode_tagged_content(&rest)?;
+
+    decode_ldap_result(&bind_content)
+}
+
+fn decode_search_response(data: &[u8]) -> Result<LdapSearchResponse, LdapError> {
+    // Parse BER-encoded LDAP message
+    let (_, content) = decode_sequence(data)?;
+
+    // Skip message ID
+    let (msg_id_len, rest) = decode_integer_element(&content)?;
+    let rest = &content[msg_id_len..];
+
+    if rest.is_empty() {
+        return Err(LdapError::ProtocolError {
+            message: "Empty search response".to_string()
+        });
+    }
+
+    match rest[0] {
+        0x64 => {
+            // SearchResultEntry (Application 4)
+            let (_, entry_content) = decode_tagged_content(&rest)?;
+            let entry = decode_search_entry(&entry_content)?;
+            Ok(LdapSearchResponse::Entry(entry))
+        }
+        0x65 => {
+            // SearchResultDone (Application 5)
+            let (_, done_content) = decode_tagged_content(&rest)?;
+            let result = decode_ldap_result(&done_content)?;
+            Ok(LdapSearchResponse::Done(result))
+        }
+        0x73 => {
+            // SearchResultReference (Application 19)
+            let (_, ref_content) = decode_tagged_content(&rest)?;
+            let references = decode_references(&ref_content)?;
+            Ok(LdapSearchResponse::Reference(references))
+        }
+        tag => {
+            Err(LdapError::ProtocolError {
+                message: format!("Unknown search response tag: 0x{:02X}", tag)
+            })
+        }
+    }
+}
+
+fn decode_extended_response(data: &[u8]) -> Result<LdapResult, LdapError> {
+    // Parse BER-encoded LDAP message
+    let (_, content) = decode_sequence(data)?;
+
+    // Skip message ID
+    let (msg_id_len, rest) = decode_integer_element(&content)?;
+    let rest = &content[msg_id_len..];
+
+    // Check for ExtendedResponse (Application 24)
+    if rest.is_empty() || rest[0] != 0x78 {
+        return Err(LdapError::ProtocolError {
+            message: "Expected ExtendedResponse".to_string()
+        });
+    }
+
+    // Decode ExtendedResponse content
+    let (_, ext_content) = decode_tagged_content(&rest)?;
+
+    decode_ldap_result(&ext_content)
+}
+
+// BER decoding helper functions
+
+fn decode_sequence(data: &[u8]) -> Result<(usize, Vec<u8>), LdapError> {
+    if data.is_empty() || data[0] != 0x30 {
+        return Err(LdapError::ProtocolError {
+            message: "Expected SEQUENCE".to_string()
+        });
+    }
+
+    let (len, content_start) = decode_length(&data[1..])?;
+    let total_len = 1 + content_start + len;
+
+    if data.len() < total_len {
+        return Err(LdapError::ProtocolError {
+            message: "Truncated SEQUENCE".to_string()
+        });
+    }
+
+    Ok((total_len, data[1 + content_start..total_len].to_vec()))
+}
+
+fn decode_length(data: &[u8]) -> Result<(usize, usize), LdapError> {
+    if data.is_empty() {
+        return Err(LdapError::ProtocolError {
+            message: "Missing length".to_string()
+        });
+    }
+
+    if data[0] < 128 {
+        // Short form
+        Ok((data[0] as usize, 1))
+    } else {
+        // Long form
+        let num_bytes = (data[0] & 0x7F) as usize;
+        if data.len() < 1 + num_bytes {
+            return Err(LdapError::ProtocolError {
+                message: "Truncated length".to_string()
+            });
+        }
+
+        let mut len: usize = 0;
+        for i in 0..num_bytes {
+            len = (len << 8) | (data[1 + i] as usize);
+        }
+
+        Ok((len, 1 + num_bytes))
+    }
+}
+
+fn decode_integer_element(data: &[u8]) -> Result<(usize, i64), LdapError> {
+    if data.is_empty() || data[0] != 0x02 {
+        return Err(LdapError::ProtocolError {
+            message: "Expected INTEGER".to_string()
+        });
+    }
+
+    let (len, header_len) = decode_length(&data[1..])?;
+    let value_start = 1 + header_len;
+    let total_len = value_start + len;
+
+    if data.len() < total_len {
+        return Err(LdapError::ProtocolError {
+            message: "Truncated INTEGER".to_string()
+        });
+    }
+
+    let mut value: i64 = 0;
+    let value_bytes = &data[value_start..total_len];
+
+    // Handle sign extension
+    if !value_bytes.is_empty() && (value_bytes[0] & 0x80) != 0 {
+        value = -1; // Start with all 1s for negative
+    }
+
+    for byte in value_bytes {
+        value = (value << 8) | (*byte as i64);
+    }
+
+    Ok((total_len, value))
+}
+
+fn decode_tagged_content(data: &[u8]) -> Result<(usize, Vec<u8>), LdapError> {
+    if data.is_empty() {
+        return Err(LdapError::ProtocolError {
+            message: "Missing tagged content".to_string()
+        });
+    }
+
+    let (len, header_len) = decode_length(&data[1..])?;
+    let content_start = 1 + header_len;
+    let total_len = content_start + len;
+
+    if data.len() < total_len {
+        return Err(LdapError::ProtocolError {
+            message: "Truncated tagged content".to_string()
+        });
+    }
+
+    Ok((total_len, data[content_start..total_len].to_vec()))
+}
+
+fn decode_string_element(data: &[u8]) -> Result<(usize, String), LdapError> {
+    if data.is_empty() || data[0] != 0x04 {
+        return Err(LdapError::ProtocolError {
+            message: "Expected OCTET STRING".to_string()
+        });
+    }
+
+    let (len, header_len) = decode_length(&data[1..])?;
+    let content_start = 1 + header_len;
+    let total_len = content_start + len;
+
+    if data.len() < total_len {
+        return Err(LdapError::ProtocolError {
+            message: "Truncated OCTET STRING".to_string()
+        });
+    }
+
+    let value = String::from_utf8_lossy(&data[content_start..total_len]).to_string();
+    Ok((total_len, value))
+}
+
+fn decode_ldap_result(data: &[u8]) -> Result<LdapResult, LdapError> {
+    let mut pos = 0;
+
+    // Result code (ENUMERATED)
+    if pos >= data.len() || data[pos] != 0x0A {
+        return Err(LdapError::ProtocolError {
+            message: "Expected result code".to_string()
+        });
+    }
+
+    let (len, header_len) = decode_length(&data[pos + 1..])?;
+    let result_code = data[pos + 1 + header_len] as u8;
+    pos += 1 + header_len + len;
+
+    // Matched DN (OCTET STRING)
+    let matched_dn = if pos < data.len() && data[pos] == 0x04 {
+        let (elem_len, dn) = decode_string_element(&data[pos..])?;
+        pos += elem_len;
+        if dn.is_empty() { None } else { Some(dn) }
+    } else {
+        None
+    };
+
+    // Diagnostic message (OCTET STRING)
+    let diagnostic_message = if pos < data.len() && data[pos] == 0x04 {
+        let (_, msg) = decode_string_element(&data[pos..])?;
+        if msg.is_empty() { None } else { Some(msg) }
+    } else {
+        None
+    };
+
+    Ok(LdapResult {
+        result_code,
+        matched_dn,
+        diagnostic_message,
+    })
+}
+
+fn decode_search_entry(data: &[u8]) -> Result<LdapEntry, LdapError> {
+    let mut pos = 0;
+
+    // Object DN (OCTET STRING)
+    let (dn_len, dn) = decode_string_element(&data[pos..])?;
+    pos += dn_len;
+
+    // Attributes (SEQUENCE)
+    let mut attributes: HashMap<String, Vec<String>> = HashMap::new();
+
+    if pos < data.len() && data[pos] == 0x30 {
+        let (_, attrs_content) = decode_sequence(&data[pos..])?;
+        let mut attr_pos = 0;
+
+        while attr_pos < attrs_content.len() {
+            if attrs_content[attr_pos] != 0x30 {
+                break;
+            }
+
+            // Decode attribute sequence
+            let (attr_len, attr_content) = decode_sequence(&attrs_content[attr_pos..])?;
+            attr_pos += attr_len;
+
+            // Attribute type (OCTET STRING)
+            let (type_len, attr_type) = decode_string_element(&attr_content)?;
+
+            // Attribute values (SET)
+            let values_data = &attr_content[type_len..];
+            let mut values = Vec::new();
+
+            if !values_data.is_empty() && values_data[0] == 0x31 {
+                let (_, values_content) = decode_set(&values_data)?;
+                let mut val_pos = 0;
+
+                while val_pos < values_content.len() {
+                    if values_content[val_pos] == 0x04 {
+                        let (val_len, value) = decode_string_element(&values_content[val_pos..])?;
+                        values.push(value);
+                        val_pos += val_len;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            attributes.insert(attr_type, values);
+        }
+    }
+
+    Ok(LdapEntry {
+        dn,
+        attributes,
+    })
+}
+
+fn decode_set(data: &[u8]) -> Result<(usize, Vec<u8>), LdapError> {
+    if data.is_empty() || data[0] != 0x31 {
+        return Err(LdapError::ProtocolError {
+            message: "Expected SET".to_string()
+        });
+    }
+
+    let (len, content_start) = decode_length(&data[1..])?;
+    let total_len = 1 + content_start + len;
+
+    if data.len() < total_len {
+        return Err(LdapError::ProtocolError {
+            message: "Truncated SET".to_string()
+        });
+    }
+
+    Ok((total_len, data[1 + content_start..total_len].to_vec()))
+}
+
+fn decode_references(data: &[u8]) -> Result<Vec<String>, LdapError> {
+    let mut references = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        if data[pos] == 0x04 {
+            let (len, uri) = decode_string_element(&data[pos..])?;
+            references.push(uri);
+            pos += len;
+        } else {
+            break;
+        }
+    }
+
+    Ok(references)
+}
+
+fn encode_integer(value: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(0x02); // Integer tag
+    if value < 128 {
+        bytes.push(1);
+        bytes.push(value as u8);
+    } else if value < 32768 {
+        bytes.push(2);
+        bytes.push((value >> 8) as u8);
+        bytes.push(value as u8);
+    } else {
+        bytes.push(4);
+        bytes.push((value >> 24) as u8);
+        bytes.push((value >> 16) as u8);
+        bytes.push((value >> 8) as u8);
+        bytes.push(value as u8);
+    }
+    bytes
+}
+
+fn encode_string(s: &str) -> Vec<u8> {
+    let mut bytes = vec![0x04]; // Octet string tag
+    bytes.extend(encode_length(s.len()));
+    bytes.extend(s.as_bytes());
+    bytes
+}
+
+fn encode_length(len: usize) -> Vec<u8> {
+    if len < 128 {
+        vec![len as u8]
+    } else if len < 256 {
+        vec![0x81, len as u8]
+    } else {
+        vec![0x82, (len >> 8) as u8, len as u8]
+    }
+}

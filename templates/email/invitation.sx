@@ -1,0 +1,279 @@
+// Invitation Email Template for Intelligo LMS
+// Sent when inviting users to join the platform
+
+module intelligo::templates::email::invitation
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Invitation email template ID
+pub const TEMPLATE_ID: &str = "email.invitation";
+
+/// Create the invitation email template configuration
+pub fn get_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Platform Invitation".to_string(),
+        description: Some("Sent when inviting new users to join the learning platform".to_string()),
+        category: "administrative".to_string(),
+
+        subject: Some("{{inviter_name}} has invited you to join {{organization_name}}".to_string()),
+        body_html: INVITATION_HTML.to_string(),
+        body_text: Some(INVITATION_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "recipient_email".to_string(),
+            "organization_name".to_string(),
+            "inviter_name".to_string(),
+            "invitation_url".to_string(),
+            "expires_in".to_string(),
+        ],
+        optional_variables: vec![
+            "recipient_name".to_string(),
+            "inviter_title".to_string(),
+            "personal_message".to_string(),
+            "role".to_string(),
+            "courses".to_string(),
+            "learning_paths".to_string(),
+            "organization_description".to_string(),
+            "organization_logo_url".to_string(),
+            "support_email".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Build context for invitation email
+pub fn build_context(
+    recipient_email: String,
+    recipient_name: Option<String>,
+    organization_name: String,
+    organization_description: Option<String>,
+    organization_logo_url: Option<String>,
+    inviter_name: String,
+    inviter_title: Option<String>,
+    invitation_url: String,
+    expires_in: String,
+    personal_message: Option<String>,
+    role: Option<String>,
+    courses: Option<Vec<String>>,
+    learning_paths: Option<Vec<String>>,
+    support_email: Option<String>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("recipient_email", recipient_email)
+        .set_string("organization_name", organization_name)
+        .set_string("inviter_name", inviter_name)
+        .set_string("invitation_url", invitation_url)
+        .set_string("expires_in", expires_in)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(name) = recipient_name {
+        ctx = ctx.set_string("recipient_name", name);
+        ctx = ctx.set_bool("has_name", true);
+    }
+
+    if let Some(description) = organization_description {
+        ctx = ctx.set_string("organization_description", description);
+    }
+
+    if let Some(logo_url) = organization_logo_url {
+        ctx = ctx.set_string("organization_logo_url", logo_url);
+    }
+
+    if let Some(title) = inviter_title {
+        ctx = ctx.set_string("inviter_title", title);
+    }
+
+    if let Some(message) = personal_message {
+        ctx = ctx.set_string("personal_message", message);
+        ctx = ctx.set_bool("has_personal_message", true);
+    }
+
+    if let Some(r) = role {
+        ctx = ctx.set_string("role", r);
+        ctx = ctx.set_bool("has_role", true);
+    }
+
+    if let Some(c) = courses {
+        if !c.is_empty() {
+            let course_values: Vec<ContextValue> = c.into_iter()
+                .map(|name| ContextValue::String(name))
+                .collect();
+            ctx = ctx.set_list("courses", course_values);
+            ctx = ctx.set_bool("has_courses", true);
+        }
+    }
+
+    if let Some(lp) = learning_paths {
+        if !lp.is_empty() {
+            let path_values: Vec<ContextValue> = lp.into_iter()
+                .map(|name| ContextValue::String(name))
+                .collect();
+            ctx = ctx.set_list("learning_paths", path_values);
+            ctx = ctx.set_bool("has_learning_paths", true);
+        }
+    }
+
+    if let Some(support) = support_email {
+        ctx = ctx.set_string("support_email", support);
+    }
+
+    ctx
+}
+
+const INVITATION_HTML: &str = r#"
+<div style="text-align: center; margin-bottom: 30px;">
+    {{#if organization_logo_url}}
+    <img src="{{organization_logo_url}}" alt="{{organization_name}}" style="max-width: 200px; height: auto; margin-bottom: 20px;">
+    {{/if}}
+    <h1 style="color: #0066cc; margin: 0;">You're Invited!</h1>
+</div>
+
+<p>Hi{{#if has_name}} {{recipient_name}}{{/if}},</p>
+
+<p><strong>{{inviter_name}}</strong>{{#if inviter_title}} ({{inviter_title}}){{/if}} has invited you to join <strong>{{organization_name}}</strong>'s learning platform.</p>
+
+{{#if organization_description}}
+<p style="color: #666;">{{organization_description}}</p>
+{{/if}}
+
+{{#if has_personal_message}}
+<div style="background-color: #f8f9fa; border-left: 4px solid #0066cc; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 5px 0; font-style: italic;">"{{personal_message}}"</p>
+    <p style="margin: 0; text-align: right; color: #666;">— {{inviter_name}}</p>
+</div>
+{{/if}}
+
+{{#if has_role}}
+<p>You've been assigned the role of <strong>{{role}}</strong>.</p>
+{{/if}}
+
+{{#if has_courses}}
+<div style="background-color: #e7f3ff; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 10px 0;"><strong>You'll have access to these courses:</strong></p>
+    <ul style="margin: 0; padding-left: 20px;">
+        {{#each courses}}
+        <li>{{this}}</li>
+        {{/each}}
+    </ul>
+</div>
+{{/if}}
+
+{{#if has_learning_paths}}
+<div style="background-color: #d4edda; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 10px 0;"><strong>Learning paths assigned to you:</strong></p>
+    <ul style="margin: 0; padding-left: 20px;">
+        {{#each learning_paths}}
+        <li>{{this}}</li>
+        {{/each}}
+    </ul>
+</div>
+{{/if}}
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{invitation_url}}" class="button" style="font-size: 18px; padding: 15px 30px;">Accept Invitation</a>
+</p>
+
+<div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0;"><strong>⏰ This invitation expires in {{expires_in}}.</strong></p>
+</div>
+
+<h2>What to Expect</h2>
+<ul>
+    <li>Access to a world-class learning platform</li>
+    <li>Interactive courses and learning materials</li>
+    <li>Track your progress and earn certificates</li>
+    <li>Learn at your own pace, anytime, anywhere</li>
+</ul>
+
+{{#if support_email}}
+<p>Questions? Contact our support team at <a href="mailto:{{support_email}}">{{support_email}}</a>.</p>
+{{/if}}
+
+<p>
+    We look forward to having you!<br><br>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+
+<hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+
+<p style="font-size: 12px; color: #666;">
+    <strong>Button not working?</strong> Copy and paste this link into your browser:<br>
+    <a href="{{invitation_url}}" style="word-break: break-all;">{{invitation_url}}</a>
+</p>
+
+<p style="font-size: 12px; color: #666;">
+    If you didn't expect this invitation, you can safely ignore this email.
+</p>
+"#;
+
+const INVITATION_TEXT: &str = r#"
+YOU'RE INVITED!
+
+Hi{{#if has_name}} {{recipient_name}}{{/if}},
+
+{{inviter_name}}{{#if inviter_title}} ({{inviter_title}}){{/if}} has invited you to join {{organization_name}}'s learning platform.
+
+{{#if organization_description}}
+{{organization_description}}
+{{/if}}
+
+{{#if has_personal_message}}
+"{{personal_message}}"
+— {{inviter_name}}
+{{/if}}
+
+{{#if has_role}}
+You've been assigned the role of {{role}}.
+{{/if}}
+
+{{#if has_courses}}
+YOU'LL HAVE ACCESS TO THESE COURSES:
+{{#each courses}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+{{#if has_learning_paths}}
+LEARNING PATHS ASSIGNED TO YOU:
+{{#each learning_paths}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+ACCEPT YOUR INVITATION
+----------------------
+{{invitation_url}}
+
+⏰ This invitation expires in {{expires_in}}.
+
+WHAT TO EXPECT
+- Access to a world-class learning platform
+- Interactive courses and learning materials
+- Track your progress and earn certificates
+- Learn at your own pace, anytime, anywhere
+
+{{#if support_email}}
+Questions? Contact our support team at {{support_email}}.
+{{/if}}
+
+We look forward to having you!
+
+Best regards,
+The {{organization_name}} Team
+
+---
+If you didn't expect this invitation, you can safely ignore this email.
+"#;

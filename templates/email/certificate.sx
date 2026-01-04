@@ -1,0 +1,261 @@
+// Certificate Issued Email Template for Intelligo LMS
+// Sent when a certificate is issued to a user
+
+module intelligo::templates::email::certificate
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Certificate issued email template ID
+pub const TEMPLATE_ID: &str = "email.certificate_issued";
+
+/// Create the certificate issued email template configuration
+pub fn get_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Certificate Issued".to_string(),
+        description: Some("Sent when a certificate is issued upon course or program completion".to_string()),
+        category: "achievement".to_string(),
+
+        subject: Some("Your Certificate for {{course_name}} is Ready!".to_string()),
+        body_html: CERTIFICATE_HTML.to_string(),
+        body_text: Some(CERTIFICATE_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "course_name".to_string(),
+            "organization_name".to_string(),
+            "certificate_url".to_string(),
+            "issue_date".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "certificate_id".to_string(),
+            "certificate_type".to_string(),
+            "expiration_date".to_string(),
+            "instructor_name".to_string(),
+            "credential_hours".to_string(),
+            "verification_url".to_string(),
+            "linkedin_add_url".to_string(),
+            "download_pdf_url".to_string(),
+            "badge_image_url".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Build context for certificate issued email
+pub fn build_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    course_name: String,
+    organization_name: String,
+    certificate_url: String,
+    issue_date: String,
+    certificate_id: Option<String>,
+    certificate_type: Option<String>,
+    expiration_date: Option<String>,
+    instructor_name: Option<String>,
+    credential_hours: Option<f64>,
+    verification_url: Option<String>,
+    linkedin_add_url: Option<String>,
+    download_pdf_url: Option<String>,
+    badge_image_url: Option<String>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name)
+        .set_string("course_name", course_name)
+        .set_string("organization_name", organization_name)
+        .set_string("certificate_url", certificate_url)
+        .set_string("issue_date", issue_date)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(first_name) = user_first_name {
+        ctx = ctx.set_string("user_first_name", first_name);
+    }
+
+    if let Some(id) = certificate_id {
+        ctx = ctx.set_string("certificate_id", id);
+    }
+
+    if let Some(cert_type) = certificate_type {
+        ctx = ctx.set_string("certificate_type", cert_type);
+    }
+
+    if let Some(exp_date) = expiration_date {
+        ctx = ctx.set_string("expiration_date", exp_date);
+        ctx = ctx.set_bool("has_expiration", true);
+    }
+
+    if let Some(instructor) = instructor_name {
+        ctx = ctx.set_string("instructor_name", instructor);
+    }
+
+    if let Some(hours) = credential_hours {
+        ctx = ctx.set_number("credential_hours", hours);
+        ctx = ctx.set_bool("has_credential_hours", true);
+    }
+
+    if let Some(verify_url) = verification_url {
+        ctx = ctx.set_string("verification_url", verify_url);
+        ctx = ctx.set_bool("is_verifiable", true);
+    }
+
+    if let Some(linkedin) = linkedin_add_url {
+        ctx = ctx.set_string("linkedin_add_url", linkedin);
+    }
+
+    if let Some(pdf_url) = download_pdf_url {
+        ctx = ctx.set_string("download_pdf_url", pdf_url);
+    }
+
+    if let Some(badge_url) = badge_image_url {
+        ctx = ctx.set_string("badge_image_url", badge_url);
+        ctx = ctx.set_bool("has_badge", true);
+    }
+
+    ctx
+}
+
+const CERTIFICATE_HTML: &str = r#"
+<div style="text-align: center; margin-bottom: 30px;">
+    <div style="font-size: 64px; margin-bottom: 10px;">🏆</div>
+    <h1 style="color: #0066cc; margin: 0;">Certificate Awarded!</h1>
+</div>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+<p>Congratulations! Your certificate for <strong>{{course_name}}</strong> has been issued and is ready for download.</p>
+
+<div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 12px; padding: 30px; margin: 30px 0; text-align: center; color: white;">
+    {{#if has_badge}}
+    <img src="{{badge_image_url}}" alt="Certificate Badge" style="width: 80px; height: 80px; margin-bottom: 15px;">
+    {{/if}}
+    <h2 style="margin: 0 0 10px 0; color: white;">Certificate of Completion</h2>
+    <p style="font-size: 20px; margin: 0 0 5px 0;">{{course_name}}</p>
+    <p style="margin: 0; opacity: 0.9;">Awarded to: {{user_name}}</p>
+</div>
+
+<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Issued By:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{organization_name}}</td>
+    </tr>
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Issue Date:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{issue_date}}</td>
+    </tr>
+    {{#if certificate_id}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Certificate ID:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><code>{{certificate_id}}</code></td>
+    </tr>
+    {{/if}}
+    {{#if certificate_type}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Type:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{certificate_type}}</td>
+    </tr>
+    {{/if}}
+    {{#if instructor_name}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Instructor:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{instructor_name}}</td>
+    </tr>
+    {{/if}}
+    {{#if has_credential_hours}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Credit Hours:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{credential_hours}} hours</td>
+    </tr>
+    {{/if}}
+    {{#if has_expiration}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Valid Until:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{expiration_date}}</td>
+    </tr>
+    {{/if}}
+</table>
+
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{certificate_url}}" class="button" style="margin: 5px;">View Certificate</a>
+    {{#if download_pdf_url}}
+    <a href="{{download_pdf_url}}" class="button" style="margin: 5px; background-color: #28a745;">Download PDF</a>
+    {{/if}}
+</div>
+
+{{#if linkedin_add_url}}
+<div style="background-color: #e7f3ff; border-radius: 4px; padding: 15px; margin: 20px 0; text-align: center;">
+    <p style="margin: 0 0 10px 0;"><strong>Share Your Achievement</strong></p>
+    <a href="{{linkedin_add_url}}" style="display: inline-flex; align-items: center; padding: 10px 20px; background-color: #0077b5; color: white; text-decoration: none; border-radius: 4px;">
+        Add to LinkedIn Profile
+    </a>
+</div>
+{{/if}}
+
+{{#if is_verifiable}}
+<div style="background-color: #f8f9fa; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 5px 0;"><strong>Verification</strong></p>
+    <p style="margin: 0; font-size: 14px; color: #666;">
+        This certificate can be verified at:<br>
+        <a href="{{verification_url}}" style="word-break: break-all;">{{verification_url}}</a>
+    </p>
+</div>
+{{/if}}
+
+<p>Keep up the excellent work on your learning journey!</p>
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+"#;
+
+const CERTIFICATE_TEXT: &str = r#"
+🏆 CERTIFICATE AWARDED!
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+Congratulations! Your certificate for {{course_name}} has been issued and is ready for download.
+
+CERTIFICATE OF COMPLETION
+-------------------------
+Course: {{course_name}}
+Awarded to: {{user_name}}
+Issued by: {{organization_name}}
+Issue Date: {{issue_date}}
+{{#if certificate_id}}Certificate ID: {{certificate_id}}{{/if}}
+{{#if certificate_type}}Type: {{certificate_type}}{{/if}}
+{{#if instructor_name}}Instructor: {{instructor_name}}{{/if}}
+{{#if has_credential_hours}}Credit Hours: {{credential_hours}} hours{{/if}}
+{{#if has_expiration}}Valid Until: {{expiration_date}}{{/if}}
+
+View Certificate: {{certificate_url}}
+{{#if download_pdf_url}}Download PDF: {{download_pdf_url}}{{/if}}
+
+{{#if linkedin_add_url}}
+SHARE YOUR ACHIEVEMENT
+Add to LinkedIn: {{linkedin_add_url}}
+{{/if}}
+
+{{#if is_verifiable}}
+VERIFICATION
+This certificate can be verified at:
+{{verification_url}}
+{{/if}}
+
+Keep up the excellent work on your learning journey!
+
+Best regards,
+The {{organization_name}} Team
+"#;

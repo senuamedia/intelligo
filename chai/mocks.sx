@@ -1,0 +1,581 @@
+/// Intelligo LMS - Mocking Library
+///
+/// Provides mocking, stubbing, and spying capabilities for testing.
+
+module intelligo::chai::mocks
+
+use std::collections::{Map, List}
+use std::sync::{Arc, Mutex}
+
+// =============================================================================
+// SPY
+// =============================================================================
+
+/// A spy that records calls to a function
+pub type Spy<Args, Ret> {
+    calls: Arc<Mutex<List<SpyCall<Args>>>>,
+    return_value: Option<Ret>,
+    return_fn: Option<Box<dyn Fn(&Args) -> Ret + Send + Sync>>,
+    throw_error: Option<String>
+}
+
+/// A recorded call to a spy
+pub type SpyCall<Args> {
+    args: Args,
+    timestamp: i64
+}
+
+impl<Args: Clone, Ret: Clone + Default> Spy<Args, Ret> {
+    /// Create a new spy
+    pub fn new() -> Spy<Args, Ret> {
+        Spy {
+            calls: Arc::new(Mutex::new(vec![])),
+            return_value: None,
+            return_fn: None,
+            throw_error: None
+        }
+    }
+
+    /// Create a spy with a return value
+    pub fn returning(value: Ret) -> Spy<Args, Ret> {
+        Spy {
+            calls: Arc::new(Mutex::new(vec![])),
+            return_value: Some(value),
+            return_fn: None,
+            throw_error: None
+        }
+    }
+
+    /// Create a spy with a custom return function
+    pub fn with_fn<F>(f: F) -> Spy<Args, Ret>
+    where
+        F: Fn(&Args) -> Ret + Send + Sync + 'static
+    {
+        Spy {
+            calls: Arc::new(Mutex::new(vec![])),
+            return_value: None,
+            return_fn: Some(Box::new(f)),
+            throw_error: None
+        }
+    }
+
+    /// Call the spy
+    pub fn call(&self, args: Args) -> Ret {
+        // Record the call
+        let call = SpyCall {
+            args: args.clone(),
+            timestamp: std::time::now().as_millis() as i64
+        };
+        self.calls.lock().unwrap().push(call);
+
+        // Check if should throw
+        if let Some(ref error) = self.throw_error {
+            panic!("{}", error);
+        }
+
+        // Return value
+        if let Some(ref f) = self.return_fn {
+            f(&args)
+        } else if let Some(ref v) = self.return_value {
+            v.clone()
+        } else {
+            Ret::default()
+        }
+    }
+
+    /// Get number of times called
+    pub fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    /// Check if spy was called
+    pub fn called(&self) -> bool {
+        self.call_count() > 0
+    }
+
+    /// Check if spy was called once
+    pub fn called_once(&self) -> bool {
+        self.call_count() == 1
+    }
+
+    /// Check if spy was called twice
+    pub fn called_twice(&self) -> bool {
+        self.call_count() == 2
+    }
+
+    /// Check if spy was called n times
+    pub fn called_times(&self, n: usize) -> bool {
+        self.call_count() == n
+    }
+
+    /// Get all calls
+    pub fn get_calls(&self) -> List<SpyCall<Args>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// Get first call
+    pub fn first_call(&self) -> Option<SpyCall<Args>> {
+        self.calls.lock().unwrap().first().cloned()
+    }
+
+    /// Get last call
+    pub fn last_call(&self) -> Option<SpyCall<Args>> {
+        self.calls.lock().unwrap().last().cloned()
+    }
+
+    /// Get nth call (0-indexed)
+    pub fn get_call(&self, n: usize) -> Option<SpyCall<Args>> {
+        self.calls.lock().unwrap().get(n).cloned()
+    }
+
+    /// Reset call history
+    pub fn reset(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    /// Set return value
+    pub fn returns(&mut self, value: Ret) -> &mut Self {
+        self.return_value = Some(value);
+        self
+    }
+
+    /// Set to throw error
+    pub fn throws(&mut self, error: &str) -> &mut Self {
+        self.throw_error = Some(error.to_string());
+        self
+    }
+}
+
+// =============================================================================
+// STUB
+// =============================================================================
+
+/// A stub that replaces a function with controlled behavior
+pub type Stub<Args, Ret> {
+    behaviors: List<StubBehavior<Args, Ret>>,
+    default_return: Option<Ret>,
+    call_index: Arc<Mutex<usize>>
+}
+
+/// Behavior definition for a stub
+pub type StubBehavior<Args, Ret> {
+    matcher: Option<Box<dyn Fn(&Args) -> bool + Send + Sync>>,
+    on_call: Option<usize>,
+    return_value: Option<Ret>,
+    return_fn: Option<Box<dyn Fn(&Args) -> Ret + Send + Sync>>,
+    throw_error: Option<String>
+}
+
+impl<Args, Ret: Clone + Default> Stub<Args, Ret> {
+    /// Create a new stub
+    pub fn new() -> Stub<Args, Ret> {
+        Stub {
+            behaviors: vec![],
+            default_return: None,
+            call_index: Arc::new(Mutex::new(0))
+        }
+    }
+
+    /// Call the stub
+    pub fn call(&self, args: Args) -> Ret {
+        let mut index = self.call_index.lock().unwrap();
+        let current_call = *index;
+        *index += 1;
+
+        // Find matching behavior
+        for behavior in &self.behaviors {
+            // Check on_call match
+            if let Some(on_call) = behavior.on_call {
+                if on_call != current_call {
+                    continue;
+                }
+            }
+
+            // Check matcher
+            if let Some(ref matcher) = behavior.matcher {
+                if !matcher(&args) {
+                    continue;
+                }
+            }
+
+            // Execute behavior
+            if let Some(ref error) = behavior.throw_error {
+                panic!("{}", error);
+            }
+
+            if let Some(ref f) = behavior.return_fn {
+                return f(&args);
+            }
+
+            if let Some(ref v) = behavior.return_value {
+                return v.clone();
+            }
+        }
+
+        // Return default
+        self.default_return.clone().unwrap_or_default()
+    }
+
+    /// Add behavior for specific call number
+    pub fn on_call(&mut self, n: usize) -> StubBehaviorBuilder<Args, Ret> {
+        StubBehaviorBuilder {
+            stub: self,
+            behavior: StubBehavior {
+                matcher: None,
+                on_call: Some(n),
+                return_value: None,
+                return_fn: None,
+                throw_error: None
+            }
+        }
+    }
+
+    /// Add behavior with matcher
+    pub fn when<F>(&mut self, matcher: F) -> StubBehaviorBuilder<Args, Ret>
+    where
+        F: Fn(&Args) -> bool + Send + Sync + 'static
+    {
+        StubBehaviorBuilder {
+            stub: self,
+            behavior: StubBehavior {
+                matcher: Some(Box::new(matcher)),
+                on_call: None,
+                return_value: None,
+                return_fn: None,
+                throw_error: None
+            }
+        }
+    }
+
+    /// Set default return value
+    pub fn returns(&mut self, value: Ret) -> &mut Self {
+        self.default_return = Some(value);
+        self
+    }
+
+    /// Reset the stub
+    pub fn reset(&self) {
+        *self.call_index.lock().unwrap() = 0;
+    }
+}
+
+/// Builder for stub behaviors
+pub struct StubBehaviorBuilder<'a, Args, Ret> {
+    stub: &'a mut Stub<Args, Ret>,
+    behavior: StubBehavior<Args, Ret>
+}
+
+impl<'a, Args, Ret: Clone> StubBehaviorBuilder<'a, Args, Ret> {
+    /// Set return value for this behavior
+    pub fn returns(mut self, value: Ret) -> &'a mut Stub<Args, Ret> {
+        self.behavior.return_value = Some(value);
+        self.stub.behaviors.push(self.behavior);
+        self.stub
+    }
+
+    /// Set to throw error for this behavior
+    pub fn throws(mut self, error: &str) -> &'a mut Stub<Args, Ret> {
+        self.behavior.throw_error = Some(error.to_string());
+        self.stub.behaviors.push(self.behavior);
+        self.stub
+    }
+
+    /// Set custom return function for this behavior
+    pub fn returns_fn<F>(mut self, f: F) -> &'a mut Stub<Args, Ret>
+    where
+        F: Fn(&Args) -> Ret + Send + Sync + 'static
+    {
+        self.behavior.return_fn = Some(Box::new(f));
+        self.stub.behaviors.push(self.behavior);
+        self.stub
+    }
+}
+
+// =============================================================================
+// MOCK
+// =============================================================================
+
+/// A mock object that can verify expectations
+pub type Mock {
+    expectations: Arc<Mutex<List<Expectation>>>,
+    name: String
+}
+
+/// An expectation on a mock
+pub type Expectation {
+    method_name: String,
+    call_count: Option<ExpectedCallCount>,
+    args_matcher: Option<Box<dyn Fn(&[Dynamic]) -> bool + Send + Sync>>,
+    actual_calls: i32,
+    verified: bool
+}
+
+/// Expected call count
+pub enum ExpectedCallCount {
+    Exactly(i32),
+    AtLeast(i32),
+    AtMost(i32),
+    Between(i32, i32),
+    Never
+}
+
+impl Mock {
+    /// Create a new mock
+    pub fn new(name: &str) -> Mock {
+        Mock {
+            expectations: Arc::new(Mutex::new(vec![])),
+            name: name.to_string()
+        }
+    }
+
+    /// Expect a method to be called
+    pub fn expects(&self, method_name: &str) -> ExpectationBuilder {
+        ExpectationBuilder {
+            mock: self,
+            expectation: Expectation {
+                method_name: method_name.to_string(),
+                call_count: None,
+                args_matcher: None,
+                actual_calls: 0,
+                verified: false
+            }
+        }
+    }
+
+    /// Record a call to a method
+    pub fn record_call(&self, method_name: &str, args: &[Dynamic]) {
+        let mut expectations = self.expectations.lock().unwrap();
+        for exp in expectations.iter_mut() {
+            if exp.method_name == method_name {
+                // Check args matcher if present
+                if let Some(ref matcher) = exp.args_matcher {
+                    if matcher(args) {
+                        exp.actual_calls += 1;
+                    }
+                } else {
+                    exp.actual_calls += 1;
+                }
+            }
+        }
+    }
+
+    /// Verify all expectations were met
+    pub fn verify(&self) -> Result<(), String> {
+        let expectations = self.expectations.lock().unwrap();
+
+        for exp in expectations.iter() {
+            let satisfied = match exp.call_count {
+                Some(ExpectedCallCount::Exactly(n)) => exp.actual_calls == n,
+                Some(ExpectedCallCount::AtLeast(n)) => exp.actual_calls >= n,
+                Some(ExpectedCallCount::AtMost(n)) => exp.actual_calls <= n,
+                Some(ExpectedCallCount::Between(min, max)) =>
+                    exp.actual_calls >= min && exp.actual_calls <= max,
+                Some(ExpectedCallCount::Never) => exp.actual_calls == 0,
+                None => exp.actual_calls > 0
+            };
+
+            if !satisfied {
+                return Err(format!(
+                    "Mock '{}': Expected method '{}' call count not satisfied. Actual: {}",
+                    self.name,
+                    exp.method_name,
+                    exp.actual_calls
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reset the mock
+    pub fn reset(&self) {
+        self.expectations.lock().unwrap().clear();
+    }
+}
+
+/// Builder for mock expectations
+pub struct ExpectationBuilder<'a> {
+    mock: &'a Mock,
+    expectation: Expectation
+}
+
+impl<'a> ExpectationBuilder<'a> {
+    /// Expect method to be called exactly n times
+    pub fn times(mut self, n: i32) -> Self {
+        self.expectation.call_count = Some(ExpectedCallCount::Exactly(n));
+        self
+    }
+
+    /// Expect method to be called once
+    pub fn once(mut self) -> Self {
+        self.expectation.call_count = Some(ExpectedCallCount::Exactly(1));
+        self
+    }
+
+    /// Expect method to be called twice
+    pub fn twice(mut self) -> Self {
+        self.expectation.call_count = Some(ExpectedCallCount::Exactly(2));
+        self
+    }
+
+    /// Expect method to never be called
+    pub fn never(mut self) -> Self {
+        self.expectation.call_count = Some(ExpectedCallCount::Never);
+        self
+    }
+
+    /// Expect method to be called at least n times
+    pub fn at_least(mut self, n: i32) -> Self {
+        self.expectation.call_count = Some(ExpectedCallCount::AtLeast(n));
+        self
+    }
+
+    /// Expect method to be called at most n times
+    pub fn at_most(mut self, n: i32) -> Self {
+        self.expectation.call_count = Some(ExpectedCallCount::AtMost(n));
+        self
+    }
+
+    /// Add argument matcher
+    pub fn with_args<F>(mut self, matcher: F) -> Self
+    where
+        F: Fn(&[Dynamic]) -> bool + Send + Sync + 'static
+    {
+        self.expectation.args_matcher = Some(Box::new(matcher));
+        self
+    }
+
+    /// Finalize the expectation
+    pub fn build(self) {
+        self.mock.expectations.lock().unwrap().push(self.expectation);
+    }
+}
+
+// =============================================================================
+// FAKE SERVICES
+// =============================================================================
+
+/// Fake HTTP client for testing
+pub type FakeHttpClient {
+    responses: Map<String, FakeResponse>,
+    requests: Arc<Mutex<List<FakeRequest>>>
+}
+
+/// A fake HTTP response
+pub type FakeResponse {
+    status: i32,
+    body: String,
+    headers: Map<String, String>
+}
+
+/// A recorded fake request
+pub type FakeRequest {
+    method: String,
+    url: String,
+    body: Option<String>,
+    headers: Map<String, String>
+}
+
+impl FakeHttpClient {
+    pub fn new() -> FakeHttpClient {
+        FakeHttpClient {
+            responses: Map::new(),
+            requests: Arc::new(Mutex::new(vec![]))
+        }
+    }
+
+    /// Add a response for a URL pattern
+    pub fn when_url(&mut self, pattern: &str) -> &mut FakeResponse {
+        self.responses.entry(pattern.to_string()).or_insert(FakeResponse {
+            status: 200,
+            body: "{}".to_string(),
+            headers: Map::new()
+        })
+    }
+
+    /// Perform a fake request
+    pub fn request(&self, method: &str, url: &str, body: Option<String>) -> Result<FakeResponse, String> {
+        // Record request
+        self.requests.lock().unwrap().push(FakeRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            body,
+            headers: Map::new()
+        });
+
+        // Find matching response
+        for (pattern, response) in &self.responses {
+            if url.contains(pattern) {
+                return Ok(response.clone());
+            }
+        }
+
+        Err(format!("No fake response configured for URL: {}", url))
+    }
+
+    /// Get recorded requests
+    pub fn get_requests(&self) -> List<FakeRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl FakeResponse {
+    pub fn status(&mut self, status: i32) -> &mut Self {
+        self.status = status;
+        self
+    }
+
+    pub fn body(&mut self, body: &str) -> &mut Self {
+        self.body = body.to_string();
+        self
+    }
+
+    pub fn json(&mut self, json: &str) -> &mut Self {
+        self.body = json.to_string();
+        self.headers.insert("Content-Type".to_string(), "application/json".to_string());
+        self
+    }
+
+    pub fn header(&mut self, key: &str, value: &str) -> &mut Self {
+        self.headers.insert(key.to_string(), value.to_string());
+        self
+    }
+}
+
+/// Fake database for testing
+pub type FakeDatabase {
+    tables: Map<String, List<Map<String, Dynamic>>>,
+    queries: Arc<Mutex<List<String>>>
+}
+
+impl FakeDatabase {
+    pub fn new() -> FakeDatabase {
+        FakeDatabase {
+            tables: Map::new(),
+            queries: Arc::new(Mutex::new(vec![]))
+        }
+    }
+
+    /// Add a table with data
+    pub fn with_table(&mut self, name: &str, rows: List<Map<String, Dynamic>>) -> &mut Self {
+        self.tables.insert(name.to_string(), rows);
+        self
+    }
+
+    /// Query the fake database
+    pub fn query(&self, sql: &str) -> List<Map<String, Dynamic>> {
+        self.queries.lock().unwrap().push(sql.to_string());
+        // Simple implementation - return first matching table
+        for (table_name, rows) in &self.tables {
+            if sql.to_lowercase().contains(&table_name.to_lowercase()) {
+                return rows.clone();
+            }
+        }
+        vec![]
+    }
+
+    /// Get recorded queries
+    pub fn get_queries(&self) -> List<String> {
+        self.queries.lock().unwrap().clone()
+    }
+}

@@ -1,0 +1,1043 @@
+/// Intelligo LMS - Tenant Branding
+///
+/// Per-tenant branding configuration including logos, colors, typography,
+/// custom CSS, and white-label domain settings.
+
+module intelligo::tenant::branding
+
+use intelligo::tenant::core::*
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// BRANDING CONFIGURATION
+// =============================================================================
+
+/// Complete branding configuration for a tenant
+type TenantBranding {
+    /// Unique identifier
+    id: String,
+
+    /// Tenant ID this branding belongs to
+    tenant_id: TenantId,
+
+    /// Branding name (for multiple brand variants)
+    name: String,
+
+    /// Whether this is the active branding
+    is_active: Bool,
+
+    /// Logo configuration
+    logo: LogoConfig,
+
+    /// Favicon configuration
+    favicon: FaviconConfig,
+
+    /// Color palette
+    colors: ColorPalette,
+
+    /// Typography settings
+    typography: TypographyConfig,
+
+    /// Layout settings
+    layout: LayoutConfig,
+
+    /// Login page customization
+    login_page: LoginPageConfig,
+
+    /// Email branding
+    email_branding: EmailBrandingConfig,
+
+    /// Custom CSS
+    custom_css: Option<String>,
+
+    /// Custom JavaScript
+    custom_js: Option<String>,
+
+    /// Custom HTML for head section
+    custom_head_html: Option<String>,
+
+    /// Custom HTML for body start
+    custom_body_start_html: Option<String>,
+
+    /// Custom HTML for body end
+    custom_body_end_html: Option<String>,
+
+    /// Social media links
+    social_links: SocialLinks,
+
+    /// Footer configuration
+    footer: FooterConfig,
+
+    /// SEO metadata
+    seo: SeoConfig,
+
+    /// Created timestamp
+    created_at: DateTime,
+
+    /// Updated timestamp
+    updated_at: DateTime,
+
+    /// Last published timestamp
+    published_at: Option<DateTime>
+}
+
+impl TenantBranding {
+    /// Create default branding for tenant
+    fn default_for_tenant(tenant_id: TenantId) -> TenantBranding {
+        let now = DateTime::now();
+        TenantBranding {
+            id: generate_uuid(),
+            tenant_id,
+            name: "Default".to_string(),
+            is_active: true,
+            logo: LogoConfig::default(),
+            favicon: FaviconConfig::default(),
+            colors: ColorPalette::default(),
+            typography: TypographyConfig::default(),
+            layout: LayoutConfig::default(),
+            login_page: LoginPageConfig::default(),
+            email_branding: EmailBrandingConfig::default(),
+            custom_css: None,
+            custom_js: None,
+            custom_head_html: None,
+            custom_body_start_html: None,
+            custom_body_end_html: None,
+            social_links: SocialLinks::default(),
+            footer: FooterConfig::default(),
+            seo: SeoConfig::default(),
+            created_at: now,
+            updated_at: now,
+            published_at: None
+        }
+    }
+
+    /// Generate CSS variables from branding
+    fn generate_css_variables(&self) -> String {
+        let mut css = ":root {\n".to_string();
+
+        // Colors
+        css.push_str(&format!("  --color-primary: {};\n", self.colors.primary));
+        css.push_str(&format!("  --color-primary-light: {};\n", self.colors.primary_light));
+        css.push_str(&format!("  --color-primary-dark: {};\n", self.colors.primary_dark));
+        css.push_str(&format!("  --color-secondary: {};\n", self.colors.secondary));
+        css.push_str(&format!("  --color-secondary-light: {};\n", self.colors.secondary_light));
+        css.push_str(&format!("  --color-secondary-dark: {};\n", self.colors.secondary_dark));
+        css.push_str(&format!("  --color-accent: {};\n", self.colors.accent));
+        css.push_str(&format!("  --color-success: {};\n", self.colors.success));
+        css.push_str(&format!("  --color-warning: {};\n", self.colors.warning));
+        css.push_str(&format!("  --color-error: {};\n", self.colors.error));
+        css.push_str(&format!("  --color-info: {};\n", self.colors.info));
+        css.push_str(&format!("  --color-text-primary: {};\n", self.colors.text_primary));
+        css.push_str(&format!("  --color-text-secondary: {};\n", self.colors.text_secondary));
+        css.push_str(&format!("  --color-text-disabled: {};\n", self.colors.text_disabled));
+        css.push_str(&format!("  --color-background: {};\n", self.colors.background));
+        css.push_str(&format!("  --color-surface: {};\n", self.colors.surface));
+        css.push_str(&format!("  --color-border: {};\n", self.colors.border));
+
+        // Typography
+        css.push_str(&format!("  --font-family-primary: {};\n", self.typography.font_family_primary));
+        css.push_str(&format!("  --font-family-secondary: {};\n", self.typography.font_family_secondary));
+        css.push_str(&format!("  --font-family-mono: {};\n", self.typography.font_family_mono));
+        css.push_str(&format!("  --font-size-base: {};\n", self.typography.font_size_base));
+        css.push_str(&format!("  --line-height-base: {};\n", self.typography.line_height_base));
+
+        // Layout
+        css.push_str(&format!("  --border-radius: {};\n", self.layout.border_radius));
+        css.push_str(&format!("  --spacing-unit: {};\n", self.layout.spacing_unit));
+        css.push_str(&format!("  --container-max-width: {};\n", self.layout.container_max_width));
+
+        css.push_str("}\n");
+
+        // Dark mode overrides
+        if let Some(ref dark) = self.colors.dark_mode {
+            css.push_str("\n@media (prefers-color-scheme: dark) {\n");
+            css.push_str("  :root {\n");
+            css.push_str(&format!("    --color-text-primary: {};\n", dark.text_primary));
+            css.push_str(&format!("    --color-text-secondary: {};\n", dark.text_secondary));
+            css.push_str(&format!("    --color-background: {};\n", dark.background));
+            css.push_str(&format!("    --color-surface: {};\n", dark.surface));
+            css.push_str(&format!("    --color-border: {};\n", dark.border));
+            css.push_str("  }\n");
+            css.push_str("}\n");
+        }
+
+        // Custom CSS
+        if let Some(ref custom) = self.custom_css {
+            css.push_str("\n/* Custom CSS */\n");
+            css.push_str(custom);
+        }
+
+        css
+    }
+}
+
+// =============================================================================
+// LOGO CONFIGURATION
+// =============================================================================
+
+/// Logo configuration
+type LogoConfig {
+    /// Primary logo URL
+    primary: Option<String>,
+
+    /// Light version (for dark backgrounds)
+    light: Option<String>,
+
+    /// Dark version (for light backgrounds)
+    dark: Option<String>,
+
+    /// Icon/square version
+    icon: Option<String>,
+
+    /// Logo alt text
+    alt_text: String,
+
+    /// Logo width (CSS value)
+    width: String,
+
+    /// Logo height (CSS value)
+    height: String,
+
+    /// Logo padding
+    padding: String
+}
+
+impl Default for LogoConfig {
+    fn default() -> Self {
+        LogoConfig {
+            primary: None,
+            light: None,
+            dark: None,
+            icon: None,
+            alt_text: "Logo".to_string(),
+            width: "auto".to_string(),
+            height: "40px".to_string(),
+            padding: "0".to_string()
+        }
+    }
+}
+
+/// Favicon configuration
+type FaviconConfig {
+    /// ICO favicon
+    ico: Option<String>,
+
+    /// 16x16 PNG
+    png_16: Option<String>,
+
+    /// 32x32 PNG
+    png_32: Option<String>,
+
+    /// 180x180 Apple touch icon
+    apple_touch: Option<String>,
+
+    /// 192x192 Android icon
+    android_192: Option<String>,
+
+    /// 512x512 Android icon
+    android_512: Option<String>,
+
+    /// Safari pinned tab SVG
+    safari_pinned: Option<String>,
+
+    /// Safari pinned tab color
+    safari_pinned_color: String,
+
+    /// MS tile color
+    ms_tile_color: String
+}
+
+impl Default for FaviconConfig {
+    fn default() -> Self {
+        FaviconConfig {
+            ico: None,
+            png_16: None,
+            png_32: None,
+            apple_touch: None,
+            android_192: None,
+            android_512: None,
+            safari_pinned: None,
+            safari_pinned_color: "#000000".to_string(),
+            ms_tile_color: "#ffffff".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// COLOR CONFIGURATION
+// =============================================================================
+
+/// Complete color palette
+type ColorPalette {
+    /// Primary brand color
+    primary: String,
+    primary_light: String,
+    primary_dark: String,
+
+    /// Secondary brand color
+    secondary: String,
+    secondary_light: String,
+    secondary_dark: String,
+
+    /// Accent color
+    accent: String,
+
+    /// Semantic colors
+    success: String,
+    warning: String,
+    error: String,
+    info: String,
+
+    /// Text colors
+    text_primary: String,
+    text_secondary: String,
+    text_disabled: String,
+
+    /// Background colors
+    background: String,
+    surface: String,
+    border: String,
+
+    /// Dark mode overrides
+    dark_mode: Option<DarkModeColors>,
+
+    /// Custom color tokens
+    custom: Map<String, String>
+}
+
+impl Default for ColorPalette {
+    fn default() -> Self {
+        ColorPalette {
+            primary: "#2563eb".to_string(),
+            primary_light: "#60a5fa".to_string(),
+            primary_dark: "#1d4ed8".to_string(),
+            secondary: "#7c3aed".to_string(),
+            secondary_light: "#a78bfa".to_string(),
+            secondary_dark: "#5b21b6".to_string(),
+            accent: "#f59e0b".to_string(),
+            success: "#10b981".to_string(),
+            warning: "#f59e0b".to_string(),
+            error: "#ef4444".to_string(),
+            info: "#3b82f6".to_string(),
+            text_primary: "#111827".to_string(),
+            text_secondary: "#6b7280".to_string(),
+            text_disabled: "#9ca3af".to_string(),
+            background: "#f9fafb".to_string(),
+            surface: "#ffffff".to_string(),
+            border: "#e5e7eb".to_string(),
+            dark_mode: Some(DarkModeColors::default()),
+            custom: Map::new()
+        }
+    }
+}
+
+/// Dark mode color overrides
+type DarkModeColors {
+    text_primary: String,
+    text_secondary: String,
+    background: String,
+    surface: String,
+    border: String
+}
+
+impl Default for DarkModeColors {
+    fn default() -> Self {
+        DarkModeColors {
+            text_primary: "#f9fafb".to_string(),
+            text_secondary: "#9ca3af".to_string(),
+            background: "#111827".to_string(),
+            surface: "#1f2937".to_string(),
+            border: "#374151".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// TYPOGRAPHY CONFIGURATION
+// =============================================================================
+
+/// Typography settings
+type TypographyConfig {
+    /// Primary font family
+    font_family_primary: String,
+
+    /// Secondary font family (headings)
+    font_family_secondary: String,
+
+    /// Monospace font family
+    font_family_mono: String,
+
+    /// Base font size
+    font_size_base: String,
+
+    /// Base line height
+    line_height_base: String,
+
+    /// Font weights
+    font_weight_light: i32,
+    font_weight_normal: i32,
+    font_weight_medium: i32,
+    font_weight_semibold: i32,
+    font_weight_bold: i32,
+
+    /// Heading sizes
+    heading_sizes: HeadingSizes,
+
+    /// Custom font imports (Google Fonts URLs, etc.)
+    font_imports: List<String>
+}
+
+impl Default for TypographyConfig {
+    fn default() -> Self {
+        TypographyConfig {
+            font_family_primary: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif".to_string(),
+            font_family_secondary: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif".to_string(),
+            font_family_mono: "'JetBrains Mono', 'Fira Code', monospace".to_string(),
+            font_size_base: "16px".to_string(),
+            line_height_base: "1.5".to_string(),
+            font_weight_light: 300,
+            font_weight_normal: 400,
+            font_weight_medium: 500,
+            font_weight_semibold: 600,
+            font_weight_bold: 700,
+            heading_sizes: HeadingSizes::default(),
+            font_imports: vec![
+                "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap".to_string()
+            ]
+        }
+    }
+}
+
+/// Heading size configuration
+type HeadingSizes {
+    h1: String,
+    h2: String,
+    h3: String,
+    h4: String,
+    h5: String,
+    h6: String
+}
+
+impl Default for HeadingSizes {
+    fn default() -> Self {
+        HeadingSizes {
+            h1: "2.25rem".to_string(),
+            h2: "1.875rem".to_string(),
+            h3: "1.5rem".to_string(),
+            h4: "1.25rem".to_string(),
+            h5: "1.125rem".to_string(),
+            h6: "1rem".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// LAYOUT CONFIGURATION
+// =============================================================================
+
+/// Layout settings
+type LayoutConfig {
+    /// Border radius
+    border_radius: String,
+
+    /// Spacing unit
+    spacing_unit: String,
+
+    /// Container max width
+    container_max_width: String,
+
+    /// Sidebar width
+    sidebar_width: String,
+
+    /// Header height
+    header_height: String,
+
+    /// Footer height
+    footer_height: String,
+
+    /// Card styles
+    card_shadow: String,
+    card_border: Bool,
+
+    /// Button styles
+    button_border_radius: String,
+
+    /// Input styles
+    input_border_radius: String
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        LayoutConfig {
+            border_radius: "0.5rem".to_string(),
+            spacing_unit: "1rem".to_string(),
+            container_max_width: "1280px".to_string(),
+            sidebar_width: "256px".to_string(),
+            header_height: "64px".to_string(),
+            footer_height: "auto".to_string(),
+            card_shadow: "0 1px 3px 0 rgb(0 0 0 / 0.1)".to_string(),
+            card_border: true,
+            button_border_radius: "0.375rem".to_string(),
+            input_border_radius: "0.375rem".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// LOGIN PAGE CONFIGURATION
+// =============================================================================
+
+/// Login page customization
+type LoginPageConfig {
+    /// Background image
+    background_image: Option<String>,
+
+    /// Background color
+    background_color: String,
+
+    /// Background gradient
+    background_gradient: Option<String>,
+
+    /// Welcome message
+    welcome_title: String,
+
+    /// Welcome subtitle
+    welcome_subtitle: Option<String>,
+
+    /// Show social login buttons
+    show_social_login: Bool,
+
+    /// Show "Remember me" checkbox
+    show_remember_me: Bool,
+
+    /// Show "Forgot password" link
+    show_forgot_password: Bool,
+
+    /// Show registration link
+    show_registration: Bool,
+
+    /// Custom HTML below form
+    custom_footer_html: Option<String>,
+
+    /// Login form position
+    form_position: FormPosition,
+
+    /// Form container style
+    form_style: FormStyle
+}
+
+impl Default for LoginPageConfig {
+    fn default() -> Self {
+        LoginPageConfig {
+            background_image: None,
+            background_color: "#f9fafb".to_string(),
+            background_gradient: None,
+            welcome_title: "Welcome Back".to_string(),
+            welcome_subtitle: Some("Sign in to continue your learning journey".to_string()),
+            show_social_login: true,
+            show_remember_me: true,
+            show_forgot_password: true,
+            show_registration: true,
+            custom_footer_html: None,
+            form_position: FormPosition::Center,
+            form_style: FormStyle::Card
+        }
+    }
+}
+
+/// Login form position
+enum FormPosition {
+    Center,
+    Left,
+    Right
+}
+
+/// Login form style
+enum FormStyle {
+    Card,
+    Floating,
+    FullWidth,
+    Split
+}
+
+// =============================================================================
+// EMAIL BRANDING
+// =============================================================================
+
+/// Email branding configuration
+type EmailBrandingConfig {
+    /// Header logo
+    header_logo: Option<String>,
+
+    /// Header background color
+    header_background: String,
+
+    /// Body background color
+    body_background: String,
+
+    /// Content background color
+    content_background: String,
+
+    /// Primary button color
+    button_color: String,
+
+    /// Button text color
+    button_text_color: String,
+
+    /// Footer text
+    footer_text: Option<String>,
+
+    /// Social links in footer
+    show_social_links: Bool,
+
+    /// Unsubscribe link text
+    unsubscribe_text: String
+}
+
+impl Default for EmailBrandingConfig {
+    fn default() -> Self {
+        EmailBrandingConfig {
+            header_logo: None,
+            header_background: "#2563eb".to_string(),
+            body_background: "#f9fafb".to_string(),
+            content_background: "#ffffff".to_string(),
+            button_color: "#2563eb".to_string(),
+            button_text_color: "#ffffff".to_string(),
+            footer_text: None,
+            show_social_links: true,
+            unsubscribe_text: "Unsubscribe from these emails".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// SOCIAL LINKS & FOOTER
+// =============================================================================
+
+/// Social media links
+type SocialLinks {
+    facebook: Option<String>,
+    twitter: Option<String>,
+    linkedin: Option<String>,
+    instagram: Option<String>,
+    youtube: Option<String>,
+    github: Option<String>,
+    custom: List<CustomSocialLink>
+}
+
+impl Default for SocialLinks {
+    fn default() -> Self {
+        SocialLinks {
+            facebook: None,
+            twitter: None,
+            linkedin: None,
+            instagram: None,
+            youtube: None,
+            github: None,
+            custom: vec![]
+        }
+    }
+}
+
+/// Custom social link
+type CustomSocialLink {
+    name: String,
+    url: String,
+    icon: String
+}
+
+/// Footer configuration
+type FooterConfig {
+    /// Footer text
+    copyright_text: Option<String>,
+
+    /// Show powered by
+    show_powered_by: Bool,
+
+    /// Footer links
+    links: List<FooterLink>,
+
+    /// Legal links
+    legal_links: LegalLinks
+}
+
+impl Default for FooterConfig {
+    fn default() -> Self {
+        FooterConfig {
+            copyright_text: None,
+            show_powered_by: true,
+            links: vec![],
+            legal_links: LegalLinks::default()
+        }
+    }
+}
+
+/// Footer link
+type FooterLink {
+    label: String,
+    url: String,
+    open_in_new_tab: Bool
+}
+
+/// Legal links
+type LegalLinks {
+    privacy_policy: Option<String>,
+    terms_of_service: Option<String>,
+    cookie_policy: Option<String>
+}
+
+impl Default for LegalLinks {
+    fn default() -> Self {
+        LegalLinks {
+            privacy_policy: None,
+            terms_of_service: None,
+            cookie_policy: None
+        }
+    }
+}
+
+// =============================================================================
+// SEO CONFIGURATION
+// =============================================================================
+
+/// SEO metadata configuration
+type SeoConfig {
+    /// Default page title
+    default_title: String,
+
+    /// Title template
+    title_template: String,
+
+    /// Default description
+    default_description: Option<String>,
+
+    /// Default keywords
+    keywords: List<String>,
+
+    /// OG image
+    og_image: Option<String>,
+
+    /// Twitter card type
+    twitter_card: String,
+
+    /// Twitter handle
+    twitter_handle: Option<String>,
+
+    /// Robots meta
+    robots: String,
+
+    /// Canonical URL base
+    canonical_base: Option<String>,
+
+    /// Custom meta tags
+    custom_meta: List<MetaTag>
+}
+
+impl Default for SeoConfig {
+    fn default() -> Self {
+        SeoConfig {
+            default_title: "Learning Management System".to_string(),
+            title_template: "%s | LMS".to_string(),
+            default_description: None,
+            keywords: vec![],
+            og_image: None,
+            twitter_card: "summary_large_image".to_string(),
+            twitter_handle: None,
+            robots: "index, follow".to_string(),
+            canonical_base: None,
+            custom_meta: vec![]
+        }
+    }
+}
+
+/// Custom meta tag
+type MetaTag {
+    name: Option<String>,
+    property: Option<String>,
+    content: String
+}
+
+// =============================================================================
+// BRANDING MANAGER
+// =============================================================================
+
+/// Branding management actor
+actor BrandingManager {
+    var brandings: Map<String, TenantBranding> = Map::new()
+    var tenant_active_branding: Map<TenantId, String> = Map::new()
+    var css_cache: Map<String, String> = Map::new()
+
+    fn new() -> Self {
+        BrandingManager::default()
+    }
+
+    /// Create branding for tenant
+    receive CreateBranding(tenant_id: TenantId, name: String) -> TenantBranding {
+        let mut branding = TenantBranding::default_for_tenant(tenant_id.clone());
+        branding.name = name;
+
+        // Set as active if first branding
+        if !self.tenant_active_branding.contains_key(&tenant_id) {
+            branding.is_active = true;
+            self.tenant_active_branding.insert(tenant_id, branding.id.clone());
+        } else {
+            branding.is_active = false;
+        }
+
+        self.brandings.insert(branding.id.clone(), branding.clone());
+        checkpoint();
+
+        branding
+    }
+
+    /// Get branding by ID
+    receive GetBranding(id: String) -> Option<TenantBranding> {
+        self.brandings.get(&id).cloned()
+    }
+
+    /// Get active branding for tenant
+    receive GetActiveBranding(tenant_id: TenantId) -> Option<TenantBranding> {
+        self.tenant_active_branding.get(&tenant_id)
+            .and_then(|id| self.brandings.get(id))
+            .cloned()
+    }
+
+    /// List brandings for tenant
+    receive ListBrandings(tenant_id: TenantId) -> List<TenantBranding> {
+        self.brandings.values()
+            .filter(|b| b.tenant_id == tenant_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Update branding
+    receive UpdateBranding(id: String, update: BrandingUpdate) -> Result<TenantBranding, TenantError> {
+        let branding = self.brandings.get_mut(&id)
+            .ok_or(TenantError::ConfigurationError {
+                message: "Branding not found".to_string()
+            })?;
+
+        if let Some(name) = update.name {
+            branding.name = name;
+        }
+
+        if let Some(logo) = update.logo {
+            branding.logo = logo;
+        }
+
+        if let Some(favicon) = update.favicon {
+            branding.favicon = favicon;
+        }
+
+        if let Some(colors) = update.colors {
+            branding.colors = colors;
+        }
+
+        if let Some(typography) = update.typography {
+            branding.typography = typography;
+        }
+
+        if let Some(layout) = update.layout {
+            branding.layout = layout;
+        }
+
+        if let Some(login_page) = update.login_page {
+            branding.login_page = login_page;
+        }
+
+        if let Some(email_branding) = update.email_branding {
+            branding.email_branding = email_branding;
+        }
+
+        if let Some(css) = update.custom_css {
+            branding.custom_css = Some(css);
+        }
+
+        if let Some(js) = update.custom_js {
+            branding.custom_js = Some(js);
+        }
+
+        if let Some(social) = update.social_links {
+            branding.social_links = social;
+        }
+
+        if let Some(footer) = update.footer {
+            branding.footer = footer;
+        }
+
+        if let Some(seo) = update.seo {
+            branding.seo = seo;
+        }
+
+        branding.updated_at = DateTime::now();
+
+        // Invalidate CSS cache
+        self.css_cache.remove(&id);
+
+        let updated = branding.clone();
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Set active branding for tenant
+    receive SetActiveBranding(tenant_id: TenantId, branding_id: String) -> Result<(), TenantError> {
+        // Verify branding exists and belongs to tenant
+        let branding = self.brandings.get(&branding_id)
+            .ok_or(TenantError::ConfigurationError {
+                message: "Branding not found".to_string()
+            })?;
+
+        if branding.tenant_id != tenant_id {
+            return Err(TenantError::ConfigurationError {
+                message: "Branding does not belong to tenant".to_string()
+            });
+        }
+
+        // Deactivate current active branding
+        if let Some(current_id) = self.tenant_active_branding.get(&tenant_id) {
+            if let Some(current) = self.brandings.get_mut(current_id) {
+                current.is_active = false;
+            }
+        }
+
+        // Activate new branding
+        if let Some(new_branding) = self.brandings.get_mut(&branding_id) {
+            new_branding.is_active = true;
+            new_branding.published_at = Some(DateTime::now());
+        }
+
+        self.tenant_active_branding.insert(tenant_id, branding_id);
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Get compiled CSS for branding
+    receive GetCompiledCss(branding_id: String) -> Option<String> {
+        // Check cache
+        if let Some(css) = self.css_cache.get(&branding_id) {
+            return Some(css.clone());
+        }
+
+        // Generate CSS
+        if let Some(branding) = self.brandings.get(&branding_id) {
+            let css = branding.generate_css_variables();
+            self.css_cache.insert(branding_id, css.clone());
+            return Some(css);
+        }
+
+        None
+    }
+
+    /// Delete branding
+    receive DeleteBranding(id: String) -> Result<(), TenantError> {
+        let branding = self.brandings.get(&id)
+            .ok_or(TenantError::ConfigurationError {
+                message: "Branding not found".to_string()
+            })?;
+
+        if branding.is_active {
+            return Err(TenantError::ConfigurationError {
+                message: "Cannot delete active branding".to_string()
+            });
+        }
+
+        self.brandings.remove(&id);
+        self.css_cache.remove(&id);
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Duplicate branding
+    receive DuplicateBranding(id: String, new_name: String) -> Result<TenantBranding, TenantError> {
+        let original = self.brandings.get(&id)
+            .ok_or(TenantError::ConfigurationError {
+                message: "Branding not found".to_string()
+            })?
+            .clone();
+
+        let mut new_branding = original;
+        new_branding.id = generate_uuid();
+        new_branding.name = new_name;
+        new_branding.is_active = false;
+        new_branding.created_at = DateTime::now();
+        new_branding.updated_at = DateTime::now();
+        new_branding.published_at = None;
+
+        self.brandings.insert(new_branding.id.clone(), new_branding.clone());
+        checkpoint();
+
+        Ok(new_branding)
+    }
+
+    /// Clear CSS cache
+    receive ClearCache() {
+        self.css_cache.clear();
+    }
+}
+
+// =============================================================================
+// SUPPORTING TYPES
+// =============================================================================
+
+/// Branding update request
+type BrandingUpdate {
+    name: Option<String>,
+    logo: Option<LogoConfig>,
+    favicon: Option<FaviconConfig>,
+    colors: Option<ColorPalette>,
+    typography: Option<TypographyConfig>,
+    layout: Option<LayoutConfig>,
+    login_page: Option<LoginPageConfig>,
+    email_branding: Option<EmailBrandingConfig>,
+    custom_css: Option<String>,
+    custom_js: Option<String>,
+    social_links: Option<SocialLinks>,
+    footer: Option<FooterConfig>,
+    seo: Option<SeoConfig>
+}
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_default_branding() {
+        let tenant = TenantId("test".to_string());
+        let branding = TenantBranding::default_for_tenant(tenant);
+
+        assert_eq!(branding.name, "Default");
+        assert!(branding.is_active);
+        assert_eq!(branding.colors.primary, "#2563eb");
+    }
+
+    #[test]
+    fn test_css_generation() {
+        let tenant = TenantId("test".to_string());
+        let branding = TenantBranding::default_for_tenant(tenant);
+        let css = branding.generate_css_variables();
+
+        assert!(css.contains("--color-primary: #2563eb"));
+        assert!(css.contains("--font-family-primary:"));
+    }
+
+    #[test]
+    fn test_color_palette() {
+        let palette = ColorPalette::default();
+        assert!(palette.dark_mode.is_some());
+        assert_eq!(palette.success, "#10b981");
+    }
+}

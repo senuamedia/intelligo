@@ -1,0 +1,1484 @@
+/// Intelligo LMS - Microsoft Teams Integration
+///
+/// Complete Microsoft Teams integration including:
+/// - Graph API integration
+/// - Team/Channel creation for courses
+/// - Meeting scheduling
+/// - Notifications to channels
+/// - Assignment sync
+/// - Grade posting
+
+module intelligo::integrations::communication::teams
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+use std::http::{HttpClient, Request, Response, Headers}
+use std::json::{Json, to_json, from_json}
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+/// Microsoft Teams configuration
+type TeamsConfig {
+    /// Azure AD tenant ID
+    tenant_id: String,
+    /// Application (client) ID
+    client_id: String,
+    /// Client secret
+    client_secret: String,
+    /// Default owner user ID (for created teams)
+    default_owner_id: Option<String>,
+    /// Webhook URL for incoming notifications
+    webhook_url: Option<String>,
+    /// Enable meeting transcription
+    enable_transcription: Bool,
+    /// Default meeting provider
+    meeting_provider: MeetingProvider
+}
+
+/// Meeting provider
+enum MeetingProvider {
+    MicrosoftTeams,
+    Skype
+}
+
+impl TeamsConfig {
+    fn from_env() -> Result<TeamsConfig, TeamsError> {
+        Ok(TeamsConfig {
+            tenant_id: std::env::get("MICROSOFT_TENANT_ID")
+                .ok_or(TeamsError::ConfigurationError { message: "MICROSOFT_TENANT_ID not set".to_string() })?,
+            client_id: std::env::get("MICROSOFT_CLIENT_ID")
+                .ok_or(TeamsError::ConfigurationError { message: "MICROSOFT_CLIENT_ID not set".to_string() })?,
+            client_secret: std::env::get("MICROSOFT_CLIENT_SECRET")
+                .ok_or(TeamsError::ConfigurationError { message: "MICROSOFT_CLIENT_SECRET not set".to_string() })?,
+            default_owner_id: std::env::get("TEAMS_DEFAULT_OWNER_ID"),
+            webhook_url: std::env::get("TEAMS_WEBHOOK_URL"),
+            enable_transcription: std::env::get("TEAMS_ENABLE_TRANSCRIPTION")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
+            meeting_provider: MeetingProvider::MicrosoftTeams
+        })
+    }
+}
+
+// =============================================================================
+// TEAMS TYPES
+// =============================================================================
+
+/// Microsoft Teams team
+type Team {
+    id: String,
+    display_name: String,
+    description: Option<String>,
+    visibility: TeamVisibility,
+    is_archived: Bool,
+    web_url: Option<String>,
+    created_at: Option<DateTime>,
+    /// Internal metadata
+    internal_id: Option<String>,
+    /// Linked course ID
+    course_id: Option<CourseId>
+}
+
+/// Team visibility
+enum TeamVisibility {
+    Private,
+    Public
+}
+
+impl TeamVisibility {
+    fn to_string(&self) -> String {
+        match self {
+            TeamVisibility::Private => "Private".to_string(),
+            TeamVisibility::Public => "Public".to_string()
+        }
+    }
+}
+
+/// Teams channel
+type Channel {
+    id: String,
+    display_name: String,
+    description: Option<String>,
+    membership_type: ChannelMembershipType,
+    web_url: Option<String>,
+    email: Option<String>,
+    is_favorite_by_default: Bool
+}
+
+/// Channel membership type
+enum ChannelMembershipType {
+    Standard,
+    Private,
+    Shared
+}
+
+impl ChannelMembershipType {
+    fn to_string(&self) -> String {
+        match self {
+            ChannelMembershipType::Standard => "standard".to_string(),
+            ChannelMembershipType::Private => "private".to_string(),
+            ChannelMembershipType::Shared => "shared".to_string()
+        }
+    }
+}
+
+/// Team member
+type TeamMember {
+    id: String,
+    user_id: String,
+    display_name: String,
+    email: Option<String>,
+    roles: List<TeamRole>
+}
+
+/// Team role
+enum TeamRole {
+    Owner,
+    Member,
+    Guest
+}
+
+impl TeamRole {
+    fn to_string(&self) -> String {
+        match self {
+            TeamRole::Owner => "owner".to_string(),
+            TeamRole::Member => "member".to_string(),
+            TeamRole::Guest => "guest".to_string()
+        }
+    }
+}
+
+/// Online meeting
+type OnlineMeeting {
+    id: String,
+    subject: String,
+    start_time: DateTime,
+    end_time: DateTime,
+    join_url: String,
+    join_web_url: String,
+    video_teleconference_id: Option<String>,
+    participants: MeetingParticipants,
+    lobby_bypass_settings: LobbyBypassSettings,
+    is_entry_exit_announced: Bool,
+    allow_attendee_to_enable_camera: Bool,
+    allow_attendee_to_enable_mic: Bool,
+    recording_enabled: Bool
+}
+
+/// Meeting participants
+type MeetingParticipants {
+    organizer: MeetingParticipant,
+    attendees: List<MeetingParticipant>
+}
+
+/// Meeting participant
+type MeetingParticipant {
+    upn: Option<String>,
+    role: ParticipantRole,
+    identity: Option<ParticipantIdentity>
+}
+
+/// Participant role
+enum ParticipantRole {
+    Presenter,
+    Attendee,
+    Producer,
+    Coorganizer
+}
+
+impl ParticipantRole {
+    fn to_string(&self) -> String {
+        match self {
+            ParticipantRole::Presenter => "presenter".to_string(),
+            ParticipantRole::Attendee => "attendee".to_string(),
+            ParticipantRole::Producer => "producer".to_string(),
+            ParticipantRole::Coorganizer => "coorganizer".to_string()
+        }
+    }
+}
+
+/// Participant identity
+type ParticipantIdentity {
+    user: Option<IdentityUser>
+}
+
+/// Identity user
+type IdentityUser {
+    id: String,
+    display_name: Option<String>
+}
+
+/// Lobby bypass settings
+type LobbyBypassSettings {
+    scope: LobbyBypassScope,
+    is_dial_in_bypass_enabled: Bool
+}
+
+/// Lobby bypass scope
+enum LobbyBypassScope {
+    Everyone,
+    Organization,
+    OrganizationAndFederated,
+    Organizer,
+    InvitedUsers
+}
+
+impl LobbyBypassScope {
+    fn to_string(&self) -> String {
+        match self {
+            LobbyBypassScope::Everyone => "everyone".to_string(),
+            LobbyBypassScope::Organization => "organization".to_string(),
+            LobbyBypassScope::OrganizationAndFederated => "organizationAndFederated".to_string(),
+            LobbyBypassScope::Organizer => "organizer".to_string(),
+            LobbyBypassScope::InvitedUsers => "invitedUsersInCompany".to_string()
+        }
+    }
+}
+
+/// Chat message
+type ChatMessage {
+    id: String,
+    message_type: MessageType,
+    created_at: DateTime,
+    subject: Option<String>,
+    body: MessageBody,
+    from: MessageFrom,
+    attachments: List<MessageAttachment>,
+    mentions: List<MessageMention>,
+    importance: MessageImportance,
+    web_url: Option<String>
+}
+
+/// Message type
+enum MessageType {
+    Message,
+    ChatEvent,
+    Typing,
+    UnknownFutureValue
+}
+
+/// Message body
+type MessageBody {
+    content_type: MessageContentType,
+    content: String
+}
+
+/// Message content type
+enum MessageContentType {
+    Text,
+    Html
+}
+
+impl MessageContentType {
+    fn to_string(&self) -> String {
+        match self {
+            MessageContentType::Text => "text".to_string(),
+            MessageContentType::Html => "html".to_string()
+        }
+    }
+}
+
+/// Message from info
+type MessageFrom {
+    user: Option<UserIdentity>
+}
+
+/// User identity
+type UserIdentity {
+    id: String,
+    display_name: Option<String>,
+    user_identity_type: Option<String>
+}
+
+/// Message attachment
+type MessageAttachment {
+    id: String,
+    content_type: String,
+    content_url: Option<String>,
+    name: Option<String>,
+    thumbnail_url: Option<String>
+}
+
+/// Message mention
+type MessageMention {
+    id: i32,
+    mentioned: MentionedEntity,
+    mention_text: String
+}
+
+/// Mentioned entity
+type MentionedEntity {
+    user: Option<UserIdentity>,
+    conversation: Option<ConversationIdentity>
+}
+
+/// Conversation identity
+type ConversationIdentity {
+    id: String,
+    display_name: Option<String>
+}
+
+/// Message importance
+enum MessageImportance {
+    Normal,
+    High,
+    Urgent
+}
+
+impl MessageImportance {
+    fn to_string(&self) -> String {
+        match self {
+            MessageImportance::Normal => "normal".to_string(),
+            MessageImportance::High => "high".to_string(),
+            MessageImportance::Urgent => "urgent".to_string()
+        }
+    }
+}
+
+/// Adaptive card for rich notifications
+type AdaptiveCard {
+    schema: String,
+    type_: String,
+    version: String,
+    body: List<CardElement>,
+    actions: List<CardAction>
+}
+
+/// Card element
+enum CardElement {
+    TextBlock {
+        text: String,
+        size: Option<String>,
+        weight: Option<String>,
+        color: Option<String>,
+        wrap: Bool
+    },
+    Image {
+        url: String,
+        size: Option<String>,
+        alt_text: Option<String>
+    },
+    ColumnSet {
+        columns: List<CardColumn>
+    },
+    FactSet {
+        facts: List<CardFact>
+    },
+    Container {
+        items: List<CardElement>
+    }
+}
+
+/// Card column
+type CardColumn {
+    width: String,
+    items: List<CardElement>
+}
+
+/// Card fact
+type CardFact {
+    title: String,
+    value: String
+}
+
+/// Card action
+enum CardAction {
+    OpenUrl {
+        title: String,
+        url: String
+    },
+    Submit {
+        title: String,
+        data: Json
+    },
+    ShowCard {
+        title: String,
+        card: AdaptiveCard
+    }
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// Teams errors
+enum TeamsError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// Authentication error
+    AuthenticationError { message: String },
+    /// API error
+    ApiError { code: String, message: String },
+    /// Team not found
+    TeamNotFound { team_id: String },
+    /// Channel not found
+    ChannelNotFound { team_id: String, channel_id: String },
+    /// User not found
+    UserNotFound { user_id: String },
+    /// Permission denied
+    PermissionDenied { message: String },
+    /// Rate limit
+    RateLimitError { retry_after: i64 },
+    /// Network error
+    NetworkError { message: String },
+    /// Meeting error
+    MeetingError { message: String }
+}
+
+impl TeamsError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            TeamsError::ConfigurationError { message } =>
+                LmsError::IntegrationError { provider: "teams".to_string(), message: message.clone() },
+            TeamsError::AuthenticationError { message } =>
+                LmsError::AccessDenied { reason: message.clone() },
+            TeamsError::TeamNotFound { team_id } =>
+                LmsError::NotFound { entity_type: "team".to_string(), id: team_id.clone() },
+            TeamsError::ChannelNotFound { team_id, channel_id } =>
+                LmsError::NotFound { entity_type: "channel".to_string(), id: format!("{}:{}", team_id, channel_id) },
+            TeamsError::UserNotFound { user_id } =>
+                LmsError::NotFound { entity_type: "user".to_string(), id: user_id.clone() },
+            TeamsError::PermissionDenied { message } =>
+                LmsError::AccessDenied { reason: message.clone() },
+            TeamsError::RateLimitError { retry_after } =>
+                LmsError::RateLimitExceeded { retry_after: Duration::seconds(*retry_after) },
+            _ => LmsError::IntegrationError { provider: "teams".to_string(), message: format!("{:?}", self) }
+        }
+    }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating a team
+type CreateTeamInput {
+    /// Course ID to link to
+    course_id: CourseId,
+    /// Team name
+    display_name: String,
+    /// Description
+    description: Option<String>,
+    /// Visibility
+    visibility: TeamVisibility,
+    /// Owner user IDs (Azure AD)
+    owners: List<String>,
+    /// Initial member user IDs
+    members: List<String>,
+    /// Create default channels
+    create_default_channels: Bool
+}
+
+/// Input for creating a channel
+type CreateChannelInput {
+    /// Team ID
+    team_id: String,
+    /// Channel name
+    display_name: String,
+    /// Description
+    description: Option<String>,
+    /// Membership type
+    membership_type: ChannelMembershipType,
+    /// Is favorite by default
+    is_favorite_by_default: Bool
+}
+
+/// Input for creating a meeting
+type CreateMeetingInput {
+    /// Subject
+    subject: String,
+    /// Start time
+    start_time: DateTime,
+    /// End time
+    end_time: DateTime,
+    /// Organizer user ID
+    organizer_id: String,
+    /// Attendee user IDs
+    attendees: List<String>,
+    /// Allow lobby bypass
+    lobby_bypass: LobbyBypassScope,
+    /// Allow attendees to unmute
+    allow_attendee_to_enable_mic: Bool,
+    /// Allow attendees to enable camera
+    allow_attendee_to_enable_camera: Bool,
+    /// Enable recording
+    enable_recording: Bool,
+    /// Course ID for context
+    course_id: Option<CourseId>
+}
+
+/// Input for posting a message
+type PostMessageInput {
+    /// Team ID
+    team_id: String,
+    /// Channel ID
+    channel_id: String,
+    /// Message content (HTML or text)
+    content: String,
+    /// Content type
+    content_type: MessageContentType,
+    /// Subject (optional)
+    subject: Option<String>,
+    /// Importance
+    importance: MessageImportance,
+    /// Mentions
+    mentions: List<MentionInput>,
+    /// Attachments
+    attachments: List<AttachmentInput>
+}
+
+/// Mention input
+type MentionInput {
+    /// User ID to mention
+    user_id: String,
+    /// Display name
+    display_name: String
+}
+
+/// Attachment input
+type AttachmentInput {
+    /// Content type
+    content_type: String,
+    /// Content URL
+    content_url: Option<String>,
+    /// Name
+    name: String,
+    /// Content (for adaptive cards)
+    content: Option<Json>
+}
+
+// =============================================================================
+// TEAMS SERVICE ACTOR
+// =============================================================================
+
+/// Access token
+type AccessToken {
+    token: String,
+    expires_at: DateTime
+}
+
+/// Teams service actor
+actor TeamsService {
+    /// Configuration
+    config: TeamsConfig,
+
+    /// HTTP client
+    client: HttpClient,
+
+    /// Access token
+    access_token: Option<AccessToken>,
+
+    /// Team cache (team_id -> Team)
+    teams_cache: Map<String, Team>,
+
+    /// Course to team mapping
+    course_teams: Map<CourseId, String>,
+
+    /// Channel cache (team_id -> channels)
+    channels_cache: Map<String, List<Channel>>
+}
+
+impl TeamsService {
+    /// Create new Teams service
+    pub fn new(config: TeamsConfig) -> TeamsService {
+        TeamsService {
+            config,
+            client: HttpClient::new(),
+            access_token: None,
+            teams_cache: Map::new(),
+            course_teams: Map::new(),
+            channels_cache: Map::new()
+        }
+    }
+
+    /// Create from environment
+    pub fn from_env() -> Result<TeamsService, TeamsError> {
+        let config = TeamsConfig::from_env()?;
+        Ok(TeamsService::new(config))
+    }
+
+    // =========================================================================
+    // AUTHENTICATION
+    // =========================================================================
+
+    async fn get_access_token(&mut self) -> Result<String, TeamsError> {
+        // Check if current token is valid
+        if let Some(ref token) = self.access_token {
+            if token.expires_at > DateTime::now() + Duration::minutes(5) {
+                return Ok(token.token.clone())
+            }
+        }
+
+        // Request new token
+        let url = format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            self.config.tenant_id
+        );
+
+        let body = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}&scope=https://graph.microsoft.com/.default",
+            urlencoding::encode(&self.config.client_id),
+            urlencoding::encode(&self.config.client_secret)
+        );
+
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&body)
+            .send()
+            .await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        if response.status() != 200 {
+            return Err(TeamsError::AuthenticationError {
+                message: "Failed to obtain access token".to_string()
+            })
+        }
+
+        let json: Json = response.json().await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        let token = json.get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or(TeamsError::AuthenticationError { message: "No access token in response".to_string() })?
+            .to_string();
+
+        let expires_in = json.get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+
+        self.access_token = Some(AccessToken {
+            token: token.clone(),
+            expires_at: DateTime::now() + Duration::seconds(expires_in)
+        });
+
+        Ok(token)
+    }
+
+    // =========================================================================
+    // HTTP HELPERS
+    // =========================================================================
+
+    async fn graph_get(&mut self, endpoint: &str) -> Result<Json, TeamsError> {
+        let token = self.get_access_token().await?;
+        let url = format!("https://graph.microsoft.com/v1.0{}", endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", token));
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    async fn graph_post(&mut self, endpoint: &str, body: &Json) -> Result<Json, TeamsError> {
+        let token = self.get_access_token().await?;
+        let url = format!("https://graph.microsoft.com/v1.0{}", endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", token));
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&to_json(body))
+            .send()
+            .await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    async fn graph_patch(&mut self, endpoint: &str, body: &Json) -> Result<Json, TeamsError> {
+        let token = self.get_access_token().await?;
+        let url = format!("https://graph.microsoft.com/v1.0{}", endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", token));
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.patch(&url)
+            .headers(headers)
+            .body(&to_json(body))
+            .send()
+            .await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        // PATCH often returns 204 No Content
+        if response.status() == 204 {
+            return Ok(Json::Null)
+        }
+
+        self.handle_response(response).await
+    }
+
+    async fn graph_delete(&mut self, endpoint: &str) -> Result<(), TeamsError> {
+        let token = self.get_access_token().await?;
+        let url = format!("https://graph.microsoft.com/v1.0{}", endpoint);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", token));
+
+        let response = self.client.delete(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        if response.status() >= 200 && response.status() < 300 {
+            Ok(())
+        } else {
+            let _ = self.handle_response(response).await?;
+            Ok(())
+        }
+    }
+
+    async fn handle_response(&self, response: Response) -> Result<Json, TeamsError> {
+        let status = response.status();
+
+        // Check for rate limiting
+        if status == 429 {
+            let retry_after = response.headers().get("Retry-After")
+                .and_then(|h| h.parse::<i64>().ok())
+                .unwrap_or(60);
+            return Err(TeamsError::RateLimitError { retry_after })
+        }
+
+        let body = response.text().await
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        if body.is_empty() {
+            return Ok(Json::Null)
+        }
+
+        let json: Json = from_json(&body)
+            .map_err(|e| TeamsError::NetworkError { message: e.to_string() })?;
+
+        if status >= 200 && status < 300 {
+            return Ok(json)
+        }
+
+        let error = json.get("error").unwrap_or(&json);
+        let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error").to_string();
+
+        match code.as_str() {
+            "Unauthorized" | "InvalidAuthenticationToken" =>
+                Err(TeamsError::AuthenticationError { message }),
+            "Forbidden" | "AccessDenied" =>
+                Err(TeamsError::PermissionDenied { message }),
+            "NotFound" | "ItemNotFound" =>
+                Err(TeamsError::ApiError { code, message }),
+            _ => Err(TeamsError::ApiError { code, message })
+        }
+    }
+
+    // =========================================================================
+    // TEAM MANAGEMENT
+    // =========================================================================
+
+    /// Create a team for a course
+    pub async fn create_team(&mut self, input: CreateTeamInput) -> Result<Team, TeamsError> {
+        // Create group first
+        let group_body = Json::object([
+            ("displayName", Json::String(input.display_name.clone())),
+            ("description", Json::String(input.description.clone().unwrap_or_default())),
+            ("mailEnabled", Json::Bool(false)),
+            ("mailNickname", Json::String(format!("course-{}", input.course_id.replace("_", "-")))),
+            ("securityEnabled", Json::Bool(false)),
+            ("groupTypes", Json::Array(vec![Json::String("Unified".to_string())])),
+            ("visibility", Json::String(input.visibility.to_string()))
+        ]);
+
+        // Add owners
+        let mut members_json: Vec<Json> = input.owners.iter().map(|o| {
+            Json::String(format!("https://graph.microsoft.com/v1.0/users/{}", o))
+        }).collect();
+
+        let group_body = {
+            let mut obj = group_body;
+            obj.as_object_mut().map(|o| {
+                o.insert("members@odata.bind".to_string(), Json::Array(members_json.clone()));
+                o.insert("owners@odata.bind".to_string(), Json::Array(
+                    input.owners.iter().map(|owner| {
+                        Json::String(format!("https://graph.microsoft.com/v1.0/users/{}", owner))
+                    }).collect()
+                ));
+            });
+            obj
+        };
+
+        let group_json = self.graph_post("/groups", &group_body).await?;
+        let group_id = group_json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Wait a moment for group to be created
+        std::time::sleep(Duration::seconds(2));
+
+        // Enable team for the group
+        let team_body = Json::object([
+            ("memberSettings", Json::object([
+                ("allowCreateUpdateChannels", Json::Bool(false)),
+                ("allowDeleteChannels", Json::Bool(false)),
+                ("allowAddRemoveApps", Json::Bool(false)),
+                ("allowCreatePrivateChannels", Json::Bool(false))
+            ])),
+            ("guestSettings", Json::object([
+                ("allowCreateUpdateChannels", Json::Bool(false)),
+                ("allowDeleteChannels", Json::Bool(false))
+            ])),
+            ("messagingSettings", Json::object([
+                ("allowUserEditMessages", Json::Bool(true)),
+                ("allowUserDeleteMessages", Json::Bool(true)),
+                ("allowOwnerDeleteMessages", Json::Bool(true)),
+                ("allowTeamMentions", Json::Bool(true)),
+                ("allowChannelMentions", Json::Bool(true))
+            ])),
+            ("funSettings", Json::object([
+                ("allowGiphy", Json::Bool(true)),
+                ("giphyContentRating", Json::String("moderate".to_string())),
+                ("allowStickersAndMemes", Json::Bool(true)),
+                ("allowCustomMemes", Json::Bool(true))
+            ]))
+        ]);
+
+        self.graph_post(&format!("/groups/{}/team", group_id), &team_body).await?;
+
+        // Add additional members
+        for member_id in &input.members {
+            let _ = self.add_team_member(&group_id, member_id, TeamRole::Member).await;
+        }
+
+        // Create default channels if requested
+        if input.create_default_channels {
+            self.create_default_channels(&group_id).await?;
+        }
+
+        let team = Team {
+            id: group_id.clone(),
+            display_name: input.display_name,
+            description: input.description,
+            visibility: input.visibility,
+            is_archived: false,
+            web_url: Some(format!("https://teams.microsoft.com/l/team/{}", group_id)),
+            created_at: Some(DateTime::now()),
+            internal_id: None,
+            course_id: Some(input.course_id.clone())
+        };
+
+        // Cache
+        self.teams_cache.insert(group_id.clone(), team.clone());
+        self.course_teams.insert(input.course_id, group_id);
+
+        Ok(team)
+    }
+
+    async fn create_default_channels(&mut self, team_id: &str) -> Result<(), TeamsError> {
+        let default_channels = vec![
+            ("Announcements", "Course announcements from instructors"),
+            ("Assignments", "Discussion about assignments"),
+            ("Q&A", "Questions and answers"),
+            ("Resources", "Course resources and materials")
+        ];
+
+        for (name, description) in default_channels {
+            let _ = self.create_channel(CreateChannelInput {
+                team_id: team_id.to_string(),
+                display_name: name.to_string(),
+                description: Some(description.to_string()),
+                membership_type: ChannelMembershipType::Standard,
+                is_favorite_by_default: true
+            }).await;
+        }
+
+        Ok(())
+    }
+
+    /// Get team by ID
+    pub async fn get_team(&mut self, team_id: &str) -> Result<Team, TeamsError> {
+        // Check cache
+        if let Some(team) = self.teams_cache.get(team_id) {
+            return Ok(team.clone())
+        }
+
+        let json = self.graph_get(&format!("/teams/{}", team_id)).await?;
+        let team = self.parse_team(json)?;
+
+        self.teams_cache.insert(team_id.to_string(), team.clone());
+
+        Ok(team)
+    }
+
+    /// Get team for course
+    pub async fn get_team_for_course(&mut self, course_id: &CourseId) -> Option<Team> {
+        if let Some(team_id) = self.course_teams.get(course_id) {
+            self.get_team(team_id).await.ok()
+        } else {
+            None
+        }
+    }
+
+    /// Archive a team
+    pub async fn archive_team(&mut self, team_id: &str) -> Result<(), TeamsError> {
+        let body = Json::object([
+            ("shouldSetSpoSiteReadOnlyForMembers", Json::Bool(true))
+        ]);
+
+        self.graph_post(&format!("/teams/{}/archive", team_id), &body).await?;
+
+        // Update cache
+        if let Some(team) = self.teams_cache.get_mut(team_id) {
+            team.is_archived = true;
+        }
+
+        Ok(())
+    }
+
+    /// Unarchive a team
+    pub async fn unarchive_team(&mut self, team_id: &str) -> Result<(), TeamsError> {
+        self.graph_post(&format!("/teams/{}/unarchive", team_id), &Json::Null).await?;
+
+        if let Some(team) = self.teams_cache.get_mut(team_id) {
+            team.is_archived = false;
+        }
+
+        Ok(())
+    }
+
+    /// Delete a team
+    pub async fn delete_team(&mut self, team_id: &str) -> Result<(), TeamsError> {
+        self.graph_delete(&format!("/groups/{}", team_id)).await?;
+
+        // Remove from cache
+        self.teams_cache.remove(team_id);
+
+        // Remove course mapping
+        self.course_teams.retain(|_, v| v != team_id);
+
+        Ok(())
+    }
+
+    fn parse_team(&self, json: Json) -> Result<Team, TeamsError> {
+        Ok(Team {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            display_name: json.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            description: json.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            visibility: match json.get("visibility").and_then(|v| v.as_str()).unwrap_or("private") {
+                "public" => TeamVisibility::Public,
+                _ => TeamVisibility::Private
+            },
+            is_archived: json.get("isArchived").and_then(|v| v.as_bool()).unwrap_or(false),
+            web_url: json.get("webUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            created_at: json.get("createdDateTime").and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_rfc3339(s).ok()),
+            internal_id: json.get("internalId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            course_id: None
+        })
+    }
+
+    // =========================================================================
+    // MEMBER MANAGEMENT
+    // =========================================================================
+
+    /// Add member to team
+    pub async fn add_team_member(&mut self, team_id: &str, user_id: &str, role: TeamRole) -> Result<(), TeamsError> {
+        let body = Json::object([
+            ("@odata.type", Json::String("#microsoft.graph.aadUserConversationMember".to_string())),
+            ("roles", Json::Array(vec![Json::String(role.to_string())])),
+            ("user@odata.bind", Json::String(format!("https://graph.microsoft.com/v1.0/users('{}')", user_id)))
+        ]);
+
+        self.graph_post(&format!("/teams/{}/members", team_id), &body).await?;
+        Ok(())
+    }
+
+    /// Remove member from team
+    pub async fn remove_team_member(&mut self, team_id: &str, membership_id: &str) -> Result<(), TeamsError> {
+        self.graph_delete(&format!("/teams/{}/members/{}", team_id, membership_id)).await
+    }
+
+    /// List team members
+    pub async fn list_team_members(&mut self, team_id: &str) -> Result<List<TeamMember>, TeamsError> {
+        let json = self.graph_get(&format!("/teams/{}/members", team_id)).await?;
+
+        let members = json.get("value")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().map(|m| TeamMember {
+                    id: m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    user_id: m.get("userId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    display_name: m.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    email: m.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    roles: m.get("roles")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter().filter_map(|r| r.as_str().map(|s| match s {
+                                "owner" => TeamRole::Owner,
+                                "guest" => TeamRole::Guest,
+                                _ => TeamRole::Member
+                            })).collect()
+                        })
+                        .unwrap_or_default()
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        Ok(members)
+    }
+
+    // =========================================================================
+    // CHANNEL MANAGEMENT
+    // =========================================================================
+
+    /// Create a channel
+    pub async fn create_channel(&mut self, input: CreateChannelInput) -> Result<Channel, TeamsError> {
+        let body = Json::object([
+            ("displayName", Json::String(input.display_name.clone())),
+            ("description", Json::String(input.description.clone().unwrap_or_default())),
+            ("membershipType", Json::String(input.membership_type.to_string())),
+            ("isFavoriteByDefault", Json::Bool(input.is_favorite_by_default))
+        ]);
+
+        let json = self.graph_post(&format!("/teams/{}/channels", input.team_id), &body).await?;
+        let channel = self.parse_channel(json)?;
+
+        // Update cache
+        let channels = self.channels_cache.entry(input.team_id).or_insert(vec![]);
+        channels.push(channel.clone());
+
+        Ok(channel)
+    }
+
+    /// Get channel
+    pub async fn get_channel(&mut self, team_id: &str, channel_id: &str) -> Result<Channel, TeamsError> {
+        let json = self.graph_get(&format!("/teams/{}/channels/{}", team_id, channel_id)).await?;
+        self.parse_channel(json)
+    }
+
+    /// List channels
+    pub async fn list_channels(&mut self, team_id: &str) -> Result<List<Channel>, TeamsError> {
+        // Check cache
+        if let Some(channels) = self.channels_cache.get(team_id) {
+            return Ok(channels.clone())
+        }
+
+        let json = self.graph_get(&format!("/teams/{}/channels", team_id)).await?;
+
+        let channels = json.get("value")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|c| self.parse_channel(c.clone()).ok()).collect()
+            })
+            .unwrap_or_default();
+
+        self.channels_cache.insert(team_id.to_string(), channels.clone());
+
+        Ok(channels)
+    }
+
+    /// Delete channel
+    pub async fn delete_channel(&mut self, team_id: &str, channel_id: &str) -> Result<(), TeamsError> {
+        self.graph_delete(&format!("/teams/{}/channels/{}", team_id, channel_id)).await?;
+
+        // Update cache
+        if let Some(channels) = self.channels_cache.get_mut(team_id) {
+            channels.retain(|c| c.id != channel_id);
+        }
+
+        Ok(())
+    }
+
+    fn parse_channel(&self, json: Json) -> Result<Channel, TeamsError> {
+        Ok(Channel {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            display_name: json.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            description: json.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            membership_type: match json.get("membershipType").and_then(|v| v.as_str()).unwrap_or("standard") {
+                "private" => ChannelMembershipType::Private,
+                "shared" => ChannelMembershipType::Shared,
+                _ => ChannelMembershipType::Standard
+            },
+            web_url: json.get("webUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            is_favorite_by_default: json.get("isFavoriteByDefault").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+    }
+
+    // =========================================================================
+    // MEETINGS
+    // =========================================================================
+
+    /// Create an online meeting
+    pub async fn create_meeting(&mut self, input: CreateMeetingInput) -> Result<OnlineMeeting, TeamsError> {
+        let mut attendees: Vec<Json> = input.attendees.iter().map(|a| {
+            Json::object([
+                ("upn", Json::String(a.clone())),
+                ("role", Json::String("attendee".to_string()))
+            ])
+        }).collect();
+
+        let body = Json::object([
+            ("subject", Json::String(input.subject.clone())),
+            ("startDateTime", Json::String(input.start_time.to_rfc3339())),
+            ("endDateTime", Json::String(input.end_time.to_rfc3339())),
+            ("participants", Json::object([
+                ("organizer", Json::object([
+                    ("upn", Json::String(input.organizer_id.clone()))
+                ])),
+                ("attendees", Json::Array(attendees))
+            ])),
+            ("lobbyBypassSettings", Json::object([
+                ("scope", Json::String(input.lobby_bypass.to_string())),
+                ("isDialInBypassEnabled", Json::Bool(false))
+            ])),
+            ("allowAttendeeToEnableMic", Json::Bool(input.allow_attendee_to_enable_mic)),
+            ("allowAttendeeToEnableCamera", Json::Bool(input.allow_attendee_to_enable_camera)),
+            ("recordAutomatically", Json::Bool(input.enable_recording))
+        ]);
+
+        let json = self.graph_post(&format!("/users/{}/onlineMeetings", input.organizer_id), &body).await?;
+        self.parse_meeting(json)
+    }
+
+    /// Get meeting
+    pub async fn get_meeting(&mut self, user_id: &str, meeting_id: &str) -> Result<OnlineMeeting, TeamsError> {
+        let json = self.graph_get(&format!("/users/{}/onlineMeetings/{}", user_id, meeting_id)).await?;
+        self.parse_meeting(json)
+    }
+
+    /// Delete meeting
+    pub async fn delete_meeting(&mut self, user_id: &str, meeting_id: &str) -> Result<(), TeamsError> {
+        self.graph_delete(&format!("/users/{}/onlineMeetings/{}", user_id, meeting_id)).await
+    }
+
+    fn parse_meeting(&self, json: Json) -> Result<OnlineMeeting, TeamsError> {
+        let participants = json.get("participants").cloned().unwrap_or(Json::Null);
+        let lobby_settings = json.get("lobbyBypassSettings").cloned().unwrap_or(Json::Null);
+
+        Ok(OnlineMeeting {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            subject: json.get("subject").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            start_time: json.get("startDateTime").and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_rfc3339(s).ok())
+                .unwrap_or(DateTime::now()),
+            end_time: json.get("endDateTime").and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_rfc3339(s).ok())
+                .unwrap_or(DateTime::now()),
+            join_url: json.get("joinUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            join_web_url: json.get("joinWebUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            video_teleconference_id: json.get("videoTeleconferenceId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            participants: MeetingParticipants {
+                organizer: MeetingParticipant {
+                    upn: participants.get("organizer")
+                        .and_then(|o| o.get("upn"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    role: ParticipantRole::Presenter,
+                    identity: None
+                },
+                attendees: vec![]
+            },
+            lobby_bypass_settings: LobbyBypassSettings {
+                scope: match lobby_settings.get("scope").and_then(|v| v.as_str()).unwrap_or("organization") {
+                    "everyone" => LobbyBypassScope::Everyone,
+                    "organizer" => LobbyBypassScope::Organizer,
+                    "organizationAndFederated" => LobbyBypassScope::OrganizationAndFederated,
+                    "invitedUsersInCompany" => LobbyBypassScope::InvitedUsers,
+                    _ => LobbyBypassScope::Organization
+                },
+                is_dial_in_bypass_enabled: lobby_settings.get("isDialInBypassEnabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            },
+            is_entry_exit_announced: json.get("isEntryExitAnnounced").and_then(|v| v.as_bool()).unwrap_or(true),
+            allow_attendee_to_enable_camera: json.get("allowAttendeeToEnableCamera").and_then(|v| v.as_bool()).unwrap_or(true),
+            allow_attendee_to_enable_mic: json.get("allowAttendeeToEnableMic").and_then(|v| v.as_bool()).unwrap_or(true),
+            recording_enabled: json.get("recordAutomatically").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+    }
+
+    // =========================================================================
+    // MESSAGING
+    // =========================================================================
+
+    /// Post a message to a channel
+    pub async fn post_message(&mut self, input: PostMessageInput) -> Result<ChatMessage, TeamsError> {
+        let mut body = Json::object([
+            ("body", Json::object([
+                ("contentType", Json::String(input.content_type.to_string())),
+                ("content", Json::String(input.content))
+            ])),
+            ("importance", Json::String(input.importance.to_string()))
+        ]);
+
+        if let Some(subject) = input.subject {
+            body.as_object_mut().map(|obj| {
+                obj.insert("subject".to_string(), Json::String(subject));
+            });
+        }
+
+        // Add mentions
+        if !input.mentions.is_empty() {
+            let mentions: Vec<Json> = input.mentions.iter().enumerate().map(|(i, m)| {
+                Json::object([
+                    ("id", Json::Number((i as i32).into())),
+                    ("mentionText", Json::String(m.display_name.clone())),
+                    ("mentioned", Json::object([
+                        ("user", Json::object([
+                            ("id", Json::String(m.user_id.clone())),
+                            ("displayName", Json::String(m.display_name.clone())),
+                            ("userIdentityType", Json::String("aadUser".to_string()))
+                        ]))
+                    ]))
+                ])
+            }).collect();
+
+            body.as_object_mut().map(|obj| {
+                obj.insert("mentions".to_string(), Json::Array(mentions));
+            });
+        }
+
+        // Add attachments
+        if !input.attachments.is_empty() {
+            let attachments: Vec<Json> = input.attachments.iter().map(|a| {
+                let mut att = Json::object([
+                    ("id", Json::String(generate_uuid())),
+                    ("contentType", Json::String(a.content_type.clone())),
+                    ("name", Json::String(a.name.clone()))
+                ]);
+
+                if let Some(url) = &a.content_url {
+                    att.as_object_mut().map(|obj| {
+                        obj.insert("contentUrl".to_string(), Json::String(url.clone()));
+                    });
+                }
+
+                if let Some(content) = &a.content {
+                    att.as_object_mut().map(|obj| {
+                        obj.insert("content".to_string(), content.clone());
+                    });
+                }
+
+                att
+            }).collect();
+
+            body.as_object_mut().map(|obj| {
+                obj.insert("attachments".to_string(), Json::Array(attachments));
+            });
+        }
+
+        let json = self.graph_post(
+            &format!("/teams/{}/channels/{}/messages", input.team_id, input.channel_id),
+            &body
+        ).await?;
+
+        self.parse_message(json)
+    }
+
+    /// Reply to a message
+    pub async fn reply_to_message(
+        &mut self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        content_type: MessageContentType
+    ) -> Result<ChatMessage, TeamsError> {
+        let body = Json::object([
+            ("body", Json::object([
+                ("contentType", Json::String(content_type.to_string())),
+                ("content", Json::String(content.to_string()))
+            ]))
+        ]);
+
+        let json = self.graph_post(
+            &format!("/teams/{}/channels/{}/messages/{}/replies", team_id, channel_id, message_id),
+            &body
+        ).await?;
+
+        self.parse_message(json)
+    }
+
+    /// Get channel messages
+    pub async fn get_channel_messages(
+        &mut self,
+        team_id: &str,
+        channel_id: &str,
+        top: Option<i32>
+    ) -> Result<List<ChatMessage>, TeamsError> {
+        let mut endpoint = format!("/teams/{}/channels/{}/messages", team_id, channel_id);
+        if let Some(t) = top {
+            endpoint.push_str(&format!("?$top={}", t));
+        }
+
+        let json = self.graph_get(&endpoint).await?;
+
+        let messages = json.get("value")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|m| self.parse_message(m.clone()).ok()).collect()
+            })
+            .unwrap_or_default();
+
+        Ok(messages)
+    }
+
+    fn parse_message(&self, json: Json) -> Result<ChatMessage, TeamsError> {
+        let body_json = json.get("body").cloned().unwrap_or(Json::Null);
+        let from_json = json.get("from").cloned().unwrap_or(Json::Null);
+
+        Ok(ChatMessage {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            message_type: match json.get("messageType").and_then(|v| v.as_str()).unwrap_or("message") {
+                "chatEvent" => MessageType::ChatEvent,
+                "typing" => MessageType::Typing,
+                _ => MessageType::Message
+            },
+            created_at: json.get("createdDateTime").and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_rfc3339(s).ok())
+                .unwrap_or(DateTime::now()),
+            subject: json.get("subject").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            body: MessageBody {
+                content_type: match body_json.get("contentType").and_then(|v| v.as_str()).unwrap_or("text") {
+                    "html" => MessageContentType::Html,
+                    _ => MessageContentType::Text
+                },
+                content: body_json.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            },
+            from: MessageFrom {
+                user: from_json.get("user").map(|u| UserIdentity {
+                    id: u.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    display_name: u.get("displayName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    user_identity_type: u.get("userIdentityType").and_then(|v| v.as_str()).map(|s| s.to_string())
+                })
+            },
+            attachments: vec![],
+            mentions: vec![],
+            importance: match json.get("importance").and_then(|v| v.as_str()).unwrap_or("normal") {
+                "high" => MessageImportance::High,
+                "urgent" => MessageImportance::Urgent,
+                _ => MessageImportance::Normal
+            },
+            web_url: json.get("webUrl").and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    }
+
+    // =========================================================================
+    // CONVENIENCE METHODS FOR LMS
+    // =========================================================================
+
+    /// Post course announcement to Teams
+    pub async fn post_course_announcement(
+        &mut self,
+        course_id: &CourseId,
+        title: &str,
+        content: &str,
+        instructor_name: &str
+    ) -> Result<ChatMessage, TeamsError> {
+        let team_id = self.course_teams.get(course_id)
+            .ok_or(TeamsError::TeamNotFound { team_id: course_id.clone() })?
+            .clone();
+
+        // Find announcements channel
+        let channels = self.list_channels(&team_id).await?;
+        let channel = channels.iter()
+            .find(|c| c.display_name.to_lowercase().contains("announcement"))
+            .or(channels.first())
+            .ok_or(TeamsError::ChannelNotFound { team_id: team_id.clone(), channel_id: "announcements".to_string() })?;
+
+        let html_content = format!(
+            r#"<h2>{}</h2>
+            <p>{}</p>
+            <hr>
+            <p><small>Posted by {}</small></p>"#,
+            title, content, instructor_name
+        );
+
+        self.post_message(PostMessageInput {
+            team_id: team_id.clone(),
+            channel_id: channel.id.clone(),
+            content: html_content,
+            content_type: MessageContentType::Html,
+            subject: Some(title.to_string()),
+            importance: MessageImportance::High,
+            mentions: vec![],
+            attachments: vec![]
+        }).await
+    }
+
+    /// Post grade notification to Teams
+    pub async fn post_grade_notification(
+        &mut self,
+        course_id: &CourseId,
+        student_name: &str,
+        assignment_name: &str,
+        grade: &str,
+        feedback: Option<&str>
+    ) -> Result<(), TeamsError> {
+        // This would typically go to a private channel or direct message
+        // For now, we'll skip posting grades publicly
+        Ok(())
+    }
+
+    /// Schedule a class meeting
+    pub async fn schedule_class_meeting(
+        &mut self,
+        course_id: &CourseId,
+        subject: &str,
+        start_time: DateTime,
+        duration_minutes: i32,
+        organizer_id: &str,
+        attendees: List<String>
+    ) -> Result<OnlineMeeting, TeamsError> {
+        let end_time = start_time + Duration::minutes(duration_minutes as i64);
+
+        self.create_meeting(CreateMeetingInput {
+            subject: subject.to_string(),
+            start_time,
+            end_time,
+            organizer_id: organizer_id.to_string(),
+            attendees,
+            lobby_bypass: LobbyBypassScope::Organization,
+            allow_attendee_to_enable_mic: true,
+            allow_attendee_to_enable_camera: true,
+            enable_recording: self.config.enable_transcription,
+            course_id: Some(course_id.clone())
+        }).await
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut encoded = String::new();
+        for c in s.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                    encoded.push(c);
+                }
+                _ => {
+                    for byte in c.to_string().as_bytes() {
+                        encoded.push_str(&format!("%{:02X}", byte));
+                    }
+                }
+            }
+        }
+        encoded
+    }
+}

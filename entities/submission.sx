@@ -1,0 +1,1270 @@
+/// Intelligo LMS - Submission Entity
+///
+/// Submissions represent student work submitted for assessments.
+/// They include content (text, files, quiz responses), attempt tracking,
+/// plagiarism detection results, and proctoring flags.
+
+module intelligo::entities::submission
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// SUBMISSION ENTITY
+// =============================================================================
+
+/// A student submission for an assessment
+type Submission {
+    /// Unique identifier
+    id: SubmissionId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Bundle type (quiz_submission, assignment_submission, discussion_post, etc.)
+    bundle: String,
+
+    /// Assessment this is submitted for
+    assessment_id: AssessmentId,
+
+    /// Course context
+    course_id: CourseId,
+
+    /// Enrollment context
+    enrollment_id: EnrollmentId,
+
+    /// Student who submitted
+    student_id: StudentId,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    // =========================================================================
+    // Attempt Tracking
+    // =========================================================================
+
+    /// Attempt number (1-indexed)
+    attempt_number: i32,
+
+    /// Attempt ID for detailed tracking
+    attempt_id: AttemptId,
+
+    /// All attempts for this student/assessment
+    attempt_history: List<AttemptSummary>,
+
+    // =========================================================================
+    // Content
+    // =========================================================================
+
+    /// Type of submission
+    submission_type: SubmissionType,
+
+    /// Submitted content
+    content: SubmissionContent,
+
+    /// Question responses (for quizzes/exams)
+    question_responses: List<QuestionResponse>,
+
+    // =========================================================================
+    // Status
+    // =========================================================================
+
+    /// Submission status
+    status: SubmissionStatus,
+
+    /// Whether this is a late submission
+    is_late: Bool,
+
+    /// Time past due (if late)
+    late_duration: Option<Duration>,
+
+    /// Whether this is a resubmission
+    is_resubmission: Bool,
+
+    /// Previous submission ID (if resubmission)
+    previous_submission_id: Option<SubmissionId>,
+
+    // =========================================================================
+    // Timing
+    // =========================================================================
+
+    /// When the attempt was started
+    started_at: DateTime,
+
+    /// When submitted
+    submitted_at: Option<DateTime>,
+
+    /// Time spent on submission (seconds)
+    time_spent_seconds: i64,
+
+    /// Time limit for this attempt (copied from assessment at start)
+    time_limit: Option<Duration>,
+
+    /// Whether auto-submitted due to timeout
+    auto_submitted: Bool,
+
+    // =========================================================================
+    // Plagiarism Detection
+    // =========================================================================
+
+    /// Plagiarism detection results
+    plagiarism: Option<PlagiarismResult>,
+
+    // =========================================================================
+    // Proctoring
+    // =========================================================================
+
+    /// Proctoring session data
+    proctoring_session: Option<ProctoringSession>,
+
+    /// Proctoring flags/violations
+    proctoring_flags: List<ProctoringFlag>,
+
+    /// Overall proctoring status
+    proctoring_status: Option<ProctoringStatus>,
+
+    // =========================================================================
+    // Grading
+    // =========================================================================
+
+    /// Whether grading is complete
+    is_graded: Bool,
+
+    /// Grade ID (if graded)
+    grade_id: Option<GradeId>,
+
+    /// Quick reference to score (denormalized)
+    score: Option<f32>,
+
+    /// Quick reference to max points
+    max_points: f32,
+
+    // =========================================================================
+    // Metadata
+    // =========================================================================
+
+    /// IP address of submission
+    ip_address: Option<String>,
+
+    /// User agent string
+    user_agent: Option<String>,
+
+    /// Submission source
+    submission_source: SubmissionSource,
+
+    /// Additional metadata
+    metadata: Map<String, Dynamic>,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+// =============================================================================
+// SUBMISSION CONTENT
+// =============================================================================
+
+/// The actual content of a submission
+enum SubmissionContent {
+    /// Text submission
+    Text {
+        body: String,
+        format: TextFormat,
+        word_count: i32
+    },
+
+    /// File upload submission
+    Files {
+        files: List<SubmittedFile>
+    },
+
+    /// URL submission
+    Url {
+        url: String,
+        title: Option<String>,
+        preview: Option<String>
+    },
+
+    /// Media recording submission
+    Media {
+        media_id: MediaId,
+        media_type: MediaType,
+        duration_seconds: Option<i32>,
+        transcript: Option<String>
+    },
+
+    /// Quiz/exam responses (questions answered inline)
+    QuizResponses {
+        /// Included for backward compatibility, main data in question_responses
+        response_count: i32
+    },
+
+    /// Discussion post
+    DiscussionPost {
+        body: String,
+        format: TextFormat,
+        word_count: i32,
+        parent_post_id: Option<String>,
+        attachments: List<SubmittedFile>,
+        replies: List<DiscussionReply>
+    },
+
+    /// Google Docs submission
+    GoogleDocs {
+        doc_id: String,
+        doc_url: String,
+        doc_title: String,
+        snapshot_file_id: Option<MediaId>
+    },
+
+    /// Office Online submission
+    OfficeOnline {
+        doc_id: String,
+        doc_url: String,
+        doc_title: String,
+        doc_type: String,
+        snapshot_file_id: Option<MediaId>
+    },
+
+    /// Mixed content submission
+    Mixed {
+        items: List<SubmissionContentItem>
+    }
+}
+
+/// Text format
+enum TextFormat {
+    PlainText,
+    Markdown,
+    Html,
+    RichText
+}
+
+/// Media type
+enum MediaType {
+    Video,
+    Audio,
+    Image
+}
+
+/// A file included in a submission
+type SubmittedFile {
+    /// Unique identifier
+    id: String,
+
+    /// File reference in media system
+    media_id: MediaId,
+
+    /// Original filename
+    filename: String,
+
+    /// File size in bytes
+    file_size: i64,
+
+    /// MIME type
+    mime_type: String,
+
+    /// When uploaded
+    uploaded_at: DateTime,
+
+    /// File hash for integrity
+    file_hash: Option<String>,
+
+    /// Preview URL (for images, PDFs)
+    preview_url: Option<String>
+}
+
+/// An item in mixed content submission
+type SubmissionContentItem {
+    id: String,
+    content_type: String,
+    content: SubmissionContent,
+    position: i32
+}
+
+/// A reply in a discussion
+type DiscussionReply {
+    id: String,
+    author_id: UserId,
+    body: String,
+    format: TextFormat,
+    created_at: DateTime,
+    updated_at: DateTime,
+    is_edited: Bool
+}
+
+// =============================================================================
+// QUESTION RESPONSE
+// =============================================================================
+
+/// A response to a question in a quiz/exam
+type QuestionResponse {
+    /// Unique identifier
+    id: String,
+
+    /// Question ID
+    question_id: String,
+
+    /// Response content
+    response: ResponseContent,
+
+    /// Whether the response is correct (auto-graded)
+    is_correct: Option<Bool>,
+
+    /// Partial correctness (0.0-1.0)
+    correctness: Option<f32>,
+
+    /// Points earned
+    points_earned: Option<f32>,
+
+    /// Maximum points possible
+    max_points: f32,
+
+    /// Feedback provided
+    feedback: Option<String>,
+
+    /// Time spent on this question (seconds)
+    time_spent_seconds: i64,
+
+    /// When answered
+    answered_at: DateTime,
+
+    /// Number of times answer was changed
+    change_count: i32,
+
+    /// Hints used
+    hints_used: List<String>,
+
+    /// Points deducted for hints
+    hint_penalty: f32,
+
+    /// Whether flagged for review (by student)
+    flagged_for_review: Bool
+}
+
+/// The content of a question response
+enum ResponseContent {
+    /// Single choice selected
+    SingleChoice {
+        selected_option_id: String
+    },
+
+    /// Multiple choices selected
+    MultipleChoice {
+        selected_option_ids: List<String>
+    },
+
+    /// True/False answer
+    TrueFalse {
+        value: Bool
+    },
+
+    /// Short text answer
+    ShortAnswer {
+        text: String
+    },
+
+    /// Essay response
+    Essay {
+        text: String,
+        format: TextFormat,
+        word_count: i32
+    },
+
+    /// Fill in the blank answers
+    FillInBlank {
+        blanks: Map<String, String>
+    },
+
+    /// Matching responses
+    Matching {
+        matches: Map<String, String>  // premise_id -> response_id
+    },
+
+    /// Ordering response
+    Ordering {
+        ordered_ids: List<String>
+    },
+
+    /// Numeric answer
+    Numeric {
+        value: f64,
+        units: Option<String>
+    },
+
+    /// Hotspot selection
+    Hotspot {
+        x: f32,
+        y: f32,
+        region_id: Option<String>
+    },
+
+    /// File upload response
+    FileUpload {
+        files: List<SubmittedFile>
+    },
+
+    /// Likert scale response
+    Likert {
+        value: i32,
+        label: Option<String>
+    },
+
+    /// No response provided
+    Unanswered
+}
+
+// =============================================================================
+// ATTEMPT TRACKING
+// =============================================================================
+
+/// Summary of a previous attempt
+type AttemptSummary {
+    /// Attempt ID
+    attempt_id: AttemptId,
+
+    /// Attempt number
+    attempt_number: i32,
+
+    /// Submission ID
+    submission_id: SubmissionId,
+
+    /// Score achieved
+    score: Option<f32>,
+
+    /// Max points
+    max_points: f32,
+
+    /// Percentage
+    percentage: Option<f32>,
+
+    /// Time spent (seconds)
+    time_spent_seconds: i64,
+
+    /// When submitted
+    submitted_at: Option<DateTime>,
+
+    /// Status
+    status: SubmissionStatus
+}
+
+/// Detailed attempt record
+type Attempt {
+    /// Unique identifier
+    id: AttemptId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Submission ID
+    submission_id: SubmissionId,
+
+    /// Assessment ID
+    assessment_id: AssessmentId,
+
+    /// Student ID
+    student_id: StudentId,
+
+    /// Attempt number
+    attempt_number: i32,
+
+    /// When started
+    started_at: DateTime,
+
+    /// When ended
+    ended_at: Option<DateTime>,
+
+    /// Time spent (seconds)
+    time_spent_seconds: i64,
+
+    /// Time limit for this attempt
+    time_limit: Option<Duration>,
+
+    /// Time remaining when submitted
+    time_remaining: Option<Duration>,
+
+    /// Question order (if randomized)
+    question_order: List<String>,
+
+    /// Option order per question (if randomized)
+    option_orders: Map<String, List<String>>,
+
+    /// Event log
+    events: List<AttemptEvent>,
+
+    /// Whether auto-submitted
+    auto_submitted: Bool,
+
+    /// IP address
+    ip_address: Option<String>,
+
+    /// User agent
+    user_agent: Option<String>
+}
+
+/// An event during an attempt
+type AttemptEvent {
+    /// Event type
+    event_type: AttemptEventType,
+
+    /// When it occurred
+    timestamp: DateTime,
+
+    /// Event data
+    data: Map<String, Dynamic>
+}
+
+/// Types of attempt events
+enum AttemptEventType {
+    /// Attempt started
+    Started,
+    /// Question viewed
+    QuestionViewed,
+    /// Answer saved
+    AnswerSaved,
+    /// Answer changed
+    AnswerChanged,
+    /// Hint requested
+    HintRequested,
+    /// Question flagged
+    QuestionFlagged,
+    /// Question unflagged
+    QuestionUnflagged,
+    /// Timer warning shown
+    TimerWarning,
+    /// Navigation (next/prev)
+    Navigation,
+    /// Focus lost (tab switch)
+    FocusLost,
+    /// Focus regained
+    FocusRegained,
+    /// Submitted
+    Submitted,
+    /// Auto-submitted (timeout)
+    AutoSubmitted,
+    /// Custom event
+    Custom { name: String }
+}
+
+// =============================================================================
+// PLAGIARISM DETECTION
+// =============================================================================
+
+/// Results of plagiarism detection
+type PlagiarismResult {
+    /// Detection provider
+    provider: PlagiarismProvider,
+
+    /// Overall similarity score (0-100)
+    similarity_score: f32,
+
+    /// AI content probability (0-100)
+    ai_probability: Option<f32>,
+
+    /// Detailed matches
+    matches: List<PlagiarismMatch>,
+
+    /// Sources found
+    sources: List<PlagiarismSource>,
+
+    /// Report URL
+    report_url: Option<String>,
+
+    /// Detection status
+    status: PlagiarismStatus,
+
+    /// When detection was run
+    checked_at: DateTime,
+
+    /// Error message (if failed)
+    error_message: Option<String>
+}
+
+/// Plagiarism detection provider
+enum PlagiarismProvider {
+    /// Built-in detection
+    Builtin,
+    /// Turnitin
+    Turnitin,
+    /// Copyleaks
+    Copyleaks,
+    /// Unicheck
+    Unicheck,
+    /// Custom provider
+    Custom { name: String }
+}
+
+/// A plagiarism match in the submission
+type PlagiarismMatch {
+    /// Start position in text
+    start_pos: i32,
+
+    /// End position in text
+    end_pos: i32,
+
+    /// Matched text
+    matched_text: String,
+
+    /// Source URL or reference
+    source: String,
+
+    /// Match percentage
+    match_percentage: f32
+}
+
+/// A source found in plagiarism check
+type PlagiarismSource {
+    /// Source type
+    source_type: SourceType,
+
+    /// Source title/name
+    title: String,
+
+    /// Source URL
+    url: Option<String>,
+
+    /// Match percentage from this source
+    match_percentage: f32,
+
+    /// Whether this is a student submission match
+    is_student_submission: Bool
+}
+
+/// Type of plagiarism source
+enum SourceType {
+    Website,
+    Journal,
+    Book,
+    StudentSubmission,
+    Database,
+    Other
+}
+
+/// Status of plagiarism check
+enum PlagiarismStatus {
+    /// Pending check
+    Pending,
+    /// Currently checking
+    InProgress,
+    /// Check complete
+    Complete,
+    /// Check failed
+    Failed,
+    /// Not applicable
+    NotApplicable
+}
+
+// =============================================================================
+// PROCTORING SESSION
+// =============================================================================
+
+/// Proctoring session data
+type ProctoringSession {
+    /// Session ID
+    session_id: String,
+
+    /// Provider session reference
+    provider_session_id: Option<String>,
+
+    /// Provider used
+    provider: ProctoringProvider,
+
+    /// When session started
+    started_at: DateTime,
+
+    /// When session ended
+    ended_at: Option<DateTime>,
+
+    /// Recording URLs
+    recordings: ProctoringRecordings,
+
+    /// Identity verification result
+    identity_verification: Option<IdentityVerification>,
+
+    /// Room scan result
+    room_scan: Option<RoomScanResult>,
+
+    /// Session events
+    events: List<ProctoringEvent>
+}
+
+/// Proctoring service provider
+enum ProctoringProvider {
+    Builtin,
+    Proctorio,
+    Respondus,
+    ExamSoft,
+    Honorlock,
+    ProctorU,
+    Custom { name: String }
+}
+
+/// Proctoring recordings
+type ProctoringRecordings {
+    webcam_url: Option<String>,
+    screen_url: Option<String>,
+    audio_url: Option<String>,
+    combined_url: Option<String>
+}
+
+/// Identity verification result
+type IdentityVerification {
+    verified: Bool,
+    method: VerificationMethod,
+    confidence: f32,
+    verified_at: DateTime,
+    photo_id_url: Option<String>,
+    face_match_score: Option<f32>
+}
+
+/// Verification method
+enum VerificationMethod {
+    PhotoId,
+    Biometric,
+    Challenge,
+    Manual
+}
+
+/// Room scan result
+type RoomScanResult {
+    completed: Bool,
+    completed_at: Option<DateTime>,
+    recording_url: Option<String>,
+    flags: List<String>
+}
+
+/// A proctoring event
+type ProctoringEvent {
+    event_type: ProctoringEventType,
+    timestamp: DateTime,
+    severity: RiskLevel,
+    data: Map<String, Dynamic>,
+    screenshot_url: Option<String>
+}
+
+/// Types of proctoring events
+enum ProctoringEventType {
+    SessionStart,
+    SessionEnd,
+    FaceDetected,
+    FaceLost,
+    MultipleFaces,
+    PhoneDetected,
+    TabSwitch,
+    WindowSwitch,
+    CopyPaste,
+    RightClick,
+    PrintScreen,
+    Keyboard,
+    AudioAnomaly,
+    MovementAnomaly,
+    BrowserWarning,
+    FullscreenExit,
+    Custom { name: String }
+}
+
+/// A proctoring flag/violation
+type ProctoringFlag {
+    /// Unique identifier
+    id: String,
+
+    /// Flag type
+    flag_type: ProctoringEventType,
+
+    /// Severity
+    severity: RiskLevel,
+
+    /// When detected
+    detected_at: DateTime,
+
+    /// Description
+    description: String,
+
+    /// Evidence (screenshot, recording timestamp)
+    evidence: Option<ProctoringEvidence>,
+
+    /// Whether reviewed by instructor
+    reviewed: Bool,
+
+    /// Reviewer's decision
+    decision: Option<FlagDecision>,
+
+    /// Reviewer notes
+    reviewer_notes: Option<String>,
+
+    /// Reviewed by
+    reviewed_by: Option<UserId>,
+
+    /// Reviewed at
+    reviewed_at: Option<DateTime>
+}
+
+/// Evidence for a proctoring flag
+type ProctoringEvidence {
+    screenshot_url: Option<String>,
+    recording_url: Option<String>,
+    recording_timestamp: Option<i32>,
+    additional_data: Map<String, Dynamic>
+}
+
+/// Decision on a proctoring flag
+enum FlagDecision {
+    /// Dismissed as false positive
+    Dismissed,
+    /// Noted but no action
+    Noted,
+    /// Warning issued
+    Warning,
+    /// Points deducted
+    PointsDeducted { points: f32 },
+    /// Attempt invalidated
+    AttemptInvalidated,
+    /// Referred for further review
+    Referred
+}
+
+/// Overall proctoring status
+enum ProctoringStatus {
+    /// Proctoring not required
+    NotRequired,
+    /// Pending review
+    PendingReview,
+    /// Passed proctoring review
+    Passed,
+    /// Failed proctoring review
+    Failed,
+    /// Flagged for instructor review
+    Flagged,
+    /// Review in progress
+    UnderReview
+}
+
+// =============================================================================
+// LATE SUBMISSION
+// =============================================================================
+
+/// Late submission information
+type LateSubmissionInfo {
+    /// Original due date
+    due_date: DateTime,
+
+    /// Actual submission time
+    submitted_at: DateTime,
+
+    /// Duration past due
+    late_duration: Duration,
+
+    /// Whether within grace period
+    within_grace_period: Bool,
+
+    /// Penalty applied
+    penalty_applied: Option<LatePenalty>,
+
+    /// Exception granted
+    exception: Option<LateException>
+}
+
+/// Late penalty applied
+type LatePenalty {
+    /// Penalty type
+    penalty_type: PenaltyType,
+
+    /// Percentage deducted
+    percentage_deducted: f32,
+
+    /// Points deducted
+    points_deducted: f32
+}
+
+/// Penalty type
+enum PenaltyType {
+    None,
+    PercentPerDay,
+    FlatPercent,
+    ZeroAfterDeadline
+}
+
+/// Late exception granted
+type LateException {
+    /// Reason for exception
+    reason: String,
+
+    /// Extended due date
+    extended_due_date: Option<DateTime>,
+
+    /// Penalty waived
+    penalty_waived: Bool,
+
+    /// Granted by
+    granted_by: UserId,
+
+    /// Granted at
+    granted_at: DateTime
+}
+
+// =============================================================================
+// SUBMISSION SOURCE
+// =============================================================================
+
+/// Source of the submission
+enum SubmissionSource {
+    /// Web interface
+    Web,
+    /// Mobile app
+    MobileApp,
+    /// LTI launch
+    Lti,
+    /// API submission
+    Api,
+    /// Auto-submit (timeout)
+    AutoSubmit,
+    /// Imported
+    Import
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for starting a submission attempt
+type StartAttemptInput {
+    assessment_id: AssessmentId,
+    access_code: Option<String>,
+    ip_address: Option<String>,
+    user_agent: Option<String>
+}
+
+/// Input for submitting content
+type SubmitContentInput {
+    submission_id: SubmissionId,
+    content: SubmissionContent,
+    question_responses: Option<List<QuestionResponse>>,
+    submit_final: Bool
+}
+
+/// Input for saving progress (auto-save)
+type SaveProgressInput {
+    submission_id: SubmissionId,
+    question_responses: List<QuestionResponse>,
+    time_spent_seconds: i64
+}
+
+/// Input for submitting a discussion post
+type SubmitDiscussionInput {
+    assessment_id: AssessmentId,
+    body: String,
+    format: TextFormat,
+    parent_post_id: Option<String>,
+    attachments: List<MediaId>
+}
+
+// =============================================================================
+// FILTER TYPES
+// =============================================================================
+
+/// Filter options for submission queries
+type SubmissionFilter {
+    tenant_id: Option<TenantId>,
+    course_id: Option<CourseId>,
+    assessment_id: Option<AssessmentId>,
+    student_id: Option<StudentId>,
+    enrollment_id: Option<EnrollmentId>,
+    status: Option<SubmissionStatus>,
+    is_late: Option<Bool>,
+    is_graded: Option<Bool>,
+    submitted_date_range: Option<DateRange>,
+    needs_grading: Option<Bool>,
+    has_proctoring_flags: Option<Bool>
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Submission {
+    /// Create a new submission
+    fn new(
+        bundle: String,
+        assessment_id: AssessmentId,
+        course_id: CourseId,
+        enrollment_id: EnrollmentId,
+        student_id: StudentId,
+        tenant_id: TenantId,
+        attempt_number: i32,
+        max_points: f32
+    ) -> Submission {
+        let now = DateTime::now();
+        Submission {
+            id: generate_submission_id(),
+            uuid: generate_uuid(),
+            bundle,
+            assessment_id,
+            course_id,
+            enrollment_id,
+            student_id,
+            tenant_id,
+            attempt_number,
+            attempt_id: generate_uuid(),
+            attempt_history: vec![],
+            submission_type: SubmissionType::Text,
+            content: SubmissionContent::Text {
+                body: "".to_string(),
+                format: TextFormat::PlainText,
+                word_count: 0
+            },
+            question_responses: vec![],
+            status: SubmissionStatus::InProgress,
+            is_late: false,
+            late_duration: None,
+            is_resubmission: attempt_number > 1,
+            previous_submission_id: None,
+            started_at: now,
+            submitted_at: None,
+            time_spent_seconds: 0,
+            time_limit: None,
+            auto_submitted: false,
+            plagiarism: None,
+            proctoring_session: None,
+            proctoring_flags: vec![],
+            proctoring_status: None,
+            is_graded: false,
+            grade_id: None,
+            score: None,
+            max_points,
+            ip_address: None,
+            user_agent: None,
+            submission_source: SubmissionSource::Web,
+            metadata: Map::new(),
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Submit the submission
+    fn submit(&mut self, due_date: Option<DateTime>) {
+        let now = DateTime::now();
+        self.submitted_at = Some(now);
+        self.status = SubmissionStatus::Submitted;
+
+        if let Some(due) = due_date {
+            if now > due {
+                self.is_late = true;
+                self.late_duration = Some(now - due);
+            }
+        }
+    }
+
+    /// Calculate percentage score
+    fn percentage(&self) -> Option<f32> {
+        self.score.map(|s| (s / self.max_points) * 100.0)
+    }
+
+    /// Get correct response count
+    fn correct_count(&self) -> i32 {
+        self.question_responses
+            .iter()
+            .filter(|r| r.is_correct == Some(true))
+            .count() as i32
+    }
+
+    /// Get total response count
+    fn response_count(&self) -> i32 {
+        self.question_responses.len() as i32
+    }
+
+    /// Check if has proctoring violations
+    fn has_violations(&self) -> Bool {
+        !self.proctoring_flags.is_empty()
+    }
+
+    /// Get high severity violation count
+    fn high_severity_violations(&self) -> i32 {
+        self.proctoring_flags
+            .iter()
+            .filter(|f| matches!(f.severity, RiskLevel::High | RiskLevel::Critical))
+            .count() as i32
+    }
+
+    /// Check if needs grading
+    fn needs_grading(&self) -> Bool {
+        self.status == SubmissionStatus::Submitted && !self.is_graded
+    }
+
+    /// Check if plagiarism check is pending
+    fn plagiarism_pending(&self) -> Bool {
+        self.plagiarism.as_ref()
+            .map(|p| matches!(p.status, PlagiarismStatus::Pending | PlagiarismStatus::InProgress))
+            .unwrap_or(false)
+    }
+}
+
+impl QuestionResponse {
+    /// Create a new question response
+    fn new(question_id: String, max_points: f32) -> QuestionResponse {
+        QuestionResponse {
+            id: generate_uuid(),
+            question_id,
+            response: ResponseContent::Unanswered,
+            is_correct: None,
+            correctness: None,
+            points_earned: None,
+            max_points,
+            feedback: None,
+            time_spent_seconds: 0,
+            answered_at: DateTime::now(),
+            change_count: 0,
+            hints_used: vec![],
+            hint_penalty: 0.0,
+            flagged_for_review: false
+        }
+    }
+
+    /// Update the response
+    fn update_response(&mut self, response: ResponseContent) {
+        self.response = response;
+        self.change_count += 1;
+        self.answered_at = DateTime::now();
+    }
+
+    /// Calculate points after hint penalty
+    fn adjusted_points(&self) -> Option<f32> {
+        self.points_earned.map(|p| (p - self.hint_penalty).max(0.0))
+    }
+}
+
+impl Attempt {
+    /// Create a new attempt
+    fn new(
+        submission_id: SubmissionId,
+        assessment_id: AssessmentId,
+        student_id: StudentId,
+        attempt_number: i32,
+        time_limit: Option<Duration>
+    ) -> Attempt {
+        let now = DateTime::now();
+        Attempt {
+            id: generate_uuid(),
+            uuid: generate_uuid(),
+            submission_id,
+            assessment_id,
+            student_id,
+            attempt_number,
+            started_at: now,
+            ended_at: None,
+            time_spent_seconds: 0,
+            time_limit,
+            time_remaining: time_limit,
+            question_order: vec![],
+            option_orders: Map::new(),
+            events: vec![AttemptEvent {
+                event_type: AttemptEventType::Started,
+                timestamp: now,
+                data: Map::new()
+            }],
+            auto_submitted: false,
+            ip_address: None,
+            user_agent: None
+        }
+    }
+
+    /// End the attempt
+    fn end(&mut self, auto_submitted: Bool) {
+        let now = DateTime::now();
+        self.ended_at = Some(now);
+        self.auto_submitted = auto_submitted;
+        self.time_spent_seconds = (now - self.started_at).as_seconds();
+
+        let event_type = if auto_submitted {
+            AttemptEventType::AutoSubmitted
+        } else {
+            AttemptEventType::Submitted
+        };
+
+        self.events.push(AttemptEvent {
+            event_type,
+            timestamp: now,
+            data: Map::new()
+        });
+    }
+
+    /// Record an event
+    fn record_event(&mut self, event_type: AttemptEventType, data: Map<String, Dynamic>) {
+        self.events.push(AttemptEvent {
+            event_type,
+            timestamp: DateTime::now(),
+            data
+        });
+    }
+
+    /// Check if time has expired
+    fn is_time_expired(&self) -> Bool {
+        if let Some(limit) = self.time_limit {
+            let elapsed = DateTime::now() - self.started_at;
+            return elapsed >= limit
+        }
+        false
+    }
+
+    /// Get remaining time
+    fn remaining_time(&self) -> Option<Duration> {
+        self.time_limit.map(|limit| {
+            let elapsed = DateTime::now() - self.started_at;
+            if elapsed >= limit {
+                Duration::seconds(0)
+            } else {
+                limit - elapsed
+            }
+        })
+    }
+}
+
+impl PlagiarismResult {
+    /// Check if similarity is high
+    fn is_high_similarity(&self, threshold: f32) -> Bool {
+        self.similarity_score >= threshold
+    }
+
+    /// Check if likely AI-generated
+    fn is_likely_ai(&self, threshold: f32) -> Bool {
+        self.ai_probability.map(|p| p >= threshold).unwrap_or(false)
+    }
+}
+
+impl ProctoringSession {
+    /// Create a new proctoring session
+    fn new(provider: ProctoringProvider) -> ProctoringSession {
+        ProctoringSession {
+            session_id: generate_uuid(),
+            provider_session_id: None,
+            provider,
+            started_at: DateTime::now(),
+            ended_at: None,
+            recordings: ProctoringRecordings {
+                webcam_url: None,
+                screen_url: None,
+                audio_url: None,
+                combined_url: None
+            },
+            identity_verification: None,
+            room_scan: None,
+            events: vec![]
+        }
+    }
+
+    /// End the session
+    fn end(&mut self) {
+        self.ended_at = Some(DateTime::now());
+    }
+
+    /// Get flag count by severity
+    fn flag_count_by_severity(&self, flags: &List<ProctoringFlag>, severity: RiskLevel) -> i32 {
+        flags.iter().filter(|f| f.severity == severity).count() as i32
+    }
+}

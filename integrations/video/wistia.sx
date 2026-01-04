@@ -1,0 +1,720 @@
+// Wistia Integration for Intelligo LMS
+// Analytics-rich video hosting with detailed engagement tracking
+
+module intelligo::integrations::video::wistia
+
+use intelligo::integrations::video::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::json::{Json, JsonValue}
+
+/// Wistia-specific configuration
+pub type WistiaConfig {
+    api_token: String,
+    project_id: Option<String>,
+
+    // Embed settings
+    player_color: Option<String>,
+    autoplay: bool,
+    muted: bool,
+    end_video_behavior: WistiaEndBehavior,
+    playbar: bool,
+    play_button: bool,
+    volume_control: bool,
+    settings_control: bool,
+    fullscreen_button: bool,
+    control_visibility: WistiaControlVisibility,
+    quality_control: bool,
+    playback_rate_control: bool,
+
+    // Tracking settings
+    google_analytics_id: Option<String>,
+    track_email: bool,
+    anonymize_ip: bool,
+
+    // Turnstile (email gate) settings
+    turnstile_enabled: bool,
+    turnstile_timing: Option<WistiaTurnstileTime>,
+    turnstile_skip_for_known: bool,
+}
+
+impl WistiaConfig {
+    pub fn new(api_token: String) -> Self {
+        WistiaConfig {
+            api_token: api_token,
+            project_id: None,
+            player_color: None,
+            autoplay: false,
+            muted: false,
+            end_video_behavior: WistiaEndBehavior::Default,
+            playbar: true,
+            play_button: true,
+            volume_control: true,
+            settings_control: true,
+            fullscreen_button: true,
+            control_visibility: WistiaControlVisibility::OnHover,
+            quality_control: true,
+            playback_rate_control: true,
+            google_analytics_id: None,
+            track_email: false,
+            anonymize_ip: true,
+            turnstile_enabled: false,
+            turnstile_timing: None,
+            turnstile_skip_for_known: true,
+        }
+    }
+}
+
+/// Wistia end video behavior
+pub enum WistiaEndBehavior {
+    Default,
+    Reset,
+    Loop,
+}
+
+impl WistiaEndBehavior {
+    pub fn to_string(self) -> String {
+        match self {
+            WistiaEndBehavior::Default => "default".to_string(),
+            WistiaEndBehavior::Reset => "reset".to_string(),
+            WistiaEndBehavior::Loop => "loop".to_string(),
+        }
+    }
+}
+
+/// Wistia control visibility
+pub enum WistiaControlVisibility {
+    Always,
+    OnHover,
+    Never,
+}
+
+impl WistiaControlVisibility {
+    pub fn to_string(self) -> String {
+        match self {
+            WistiaControlVisibility::Always => "always".to_string(),
+            WistiaControlVisibility::OnHover => "onhover".to_string(),
+            WistiaControlVisibility::Never => "never".to_string(),
+        }
+    }
+}
+
+/// Wistia turnstile timing
+pub enum WistiaTurnstileTime {
+    Before,
+    End,
+    AtTime { seconds: u32 },
+    AtPercent { percent: u32 },
+}
+
+/// Wistia media (video) response
+pub type WistiaMedia {
+    id: u64,
+    hashed_id: String,
+    name: String,
+    media_type: String,
+    status: String,
+    progress: Option<f64>,
+    section: Option<String>,
+    thumbnail: WistiaThumbnail,
+    duration: f64,
+    created: String,
+    updated: String,
+    assets: Vec<WistiaAsset>,
+    description: Option<String>,
+    embed_code: Option<String>,
+}
+
+pub type WistiaThumbnail {
+    url: String,
+    width: u32,
+    height: u32,
+}
+
+pub type WistiaAsset {
+    url: String,
+    width: u32,
+    height: u32,
+    file_size: u64,
+    content_type: String,
+    asset_type: String,
+}
+
+/// Wistia project response
+pub type WistiaProject {
+    id: u64,
+    hashed_id: String,
+    name: String,
+    description: Option<String>,
+    media_count: u32,
+    created: String,
+    updated: String,
+    anonymous_can_upload: bool,
+    anonymous_can_download: bool,
+    public: bool,
+    public_id: Option<String>,
+}
+
+/// Wistia stats response
+pub type WistiaStats {
+    load_count: u64,
+    play_count: u64,
+    play_rate: f64,
+    hours_watched: f64,
+    engagement: f64,
+    visitors: u64,
+}
+
+/// Wistia engagement data
+pub type WistiaEngagementData {
+    received_at: String,
+    visitor_key: String,
+    account_id: u64,
+    media_id: String,
+    event_key: String,
+    percent_viewed: f64,
+    seconds_viewed: f64,
+}
+
+/// Wistia Provider implementation
+pub actor WistiaProvider {
+    config: VideoConfig,
+    wistia_config: WistiaConfig,
+    client: BaseVideoClient,
+
+    pub fn new(config: VideoConfig) -> Self {
+        let wistia_cfg = config.wistia_config.clone()
+            .unwrap_or_else(|| WistiaConfig::new(
+                config.api_key.clone().unwrap_or_default()
+            ));
+
+        let client = BaseVideoClient::new("https://api.wistia.com/v1".to_string())
+            .with_access_token(wistia_cfg.api_token.clone());
+
+        WistiaProvider {
+            config: config,
+            wistia_config: wistia_cfg,
+            client: client,
+        }
+    }
+
+    /// Extract video ID (hashed_id) from Wistia URL
+    fn parse_video_id(self, url: &str) -> Option<String> {
+        // Handle wistia.com/medias/ID or wi.st/medias/ID
+        if let Some(pos) = url.find("/medias/") {
+            let start = pos + 8;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric())
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+
+        // Handle embed URLs like fast.wistia.net/embed/iframe/ID
+        if let Some(pos) = url.find("/embed/iframe/") {
+            let start = pos + 14;
+            let id: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric())
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    /// Convert Wistia media to internal Video type
+    fn convert_video(self, media: WistiaMedia) -> Video {
+        let thumbnail_url = Some(media.thumbnail.url.clone());
+
+        let status = match media.status.as_str() {
+            "ready" => VideoStatus::Ready,
+            "processing" | "queued" => VideoStatus::Processing,
+            "failed" => VideoStatus::Failed,
+            _ => VideoStatus::Ready,
+        };
+
+        // Determine available qualities from assets
+        let available_qualities = media.assets.iter()
+            .filter_map(|a| {
+                match a.height {
+                    h if h >= 2160 => Some(VideoQuality::UHD),
+                    h if h >= 1080 => Some(VideoQuality::HD),
+                    h if h >= 720 => Some(VideoQuality::High),
+                    h if h >= 480 => Some(VideoQuality::Medium),
+                    h if h >= 360 => Some(VideoQuality::Low),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        Video {
+            id: media.hashed_id.clone(),
+            provider_type: VideoProviderType::Wistia,
+            external_id: media.hashed_id.clone(),
+            title: media.name,
+            description: media.description,
+            duration: Duration::seconds(media.duration as i64),
+            thumbnail_url: thumbnail_url,
+            embed_url: format!("https://fast.wistia.net/embed/iframe/{}", media.hashed_id),
+            watch_url: format!("https://wistia.com/medias/{}", media.hashed_id),
+            width: Some(media.thumbnail.width),
+            height: Some(media.thumbnail.height),
+            available_qualities: available_qualities,
+            has_captions: false, // Would need to check separately
+            caption_languages: Vec::new(),
+            status: status,
+            privacy: VideoPrivacy::Unlisted, // Wistia doesn't have public videos
+            created_at: DateTime::parse_iso8601(&media.created)
+                .unwrap_or(DateTime::now()),
+            updated_at: DateTime::parse_iso8601(&media.updated)
+                .unwrap_or(DateTime::now()),
+            tags: Vec::new(),
+            categories: Vec::new(),
+            custom_fields: HashMap::new(),
+        }
+    }
+
+    /// Build embed URL with options
+    fn build_embed_url(self, video_id: &str, options: &VideoEmbedOptions) -> String {
+        let mut url = format!("https://fast.wistia.net/embed/iframe/{}", video_id);
+        let mut params = Vec::new();
+
+        // Player options
+        if options.autoplay || self.wistia_config.autoplay {
+            params.push("autoPlay=true");
+        }
+        if options.muted || self.wistia_config.muted {
+            params.push("muted=true");
+        }
+        if !options.show_controls {
+            params.push("controlsVisibleOnLoad=false");
+        }
+
+        // Start time
+        if let Some(start) = options.start_time {
+            params.push(format!("time={}", start.as_secs()));
+        }
+
+        // Wistia-specific options
+        if let Some(ref color) = self.wistia_config.player_color {
+            params.push(format!("playerColor={}", color));
+        }
+
+        if !self.wistia_config.playbar {
+            params.push("playbar=false".to_string());
+        }
+        if !self.wistia_config.play_button {
+            params.push("playButton=false".to_string());
+        }
+        if !self.wistia_config.volume_control {
+            params.push("volumeControl=false".to_string());
+        }
+        if !self.wistia_config.fullscreen_button {
+            params.push("fullscreenButton=false".to_string());
+        }
+        if self.wistia_config.playback_rate_control {
+            params.push("playbackRateControl=true".to_string());
+        }
+
+        let end_behavior = self.wistia_config.end_video_behavior.to_string();
+        if end_behavior != "default" {
+            params.push(format!("endVideoBehavior={}", end_behavior));
+        }
+
+        // Captions
+        if options.enable_captions {
+            params.push("captions=true".to_string());
+            if let Some(ref lang) = options.caption_language {
+                params.push(format!("captionsLanguage={}", lang));
+            }
+        }
+
+        // Custom params
+        for (key, value) in &options.custom_params {
+            params.push(format!("{}={}", key, value));
+        }
+
+        if !params.is_empty() {
+            url = format!("{}?{}", url, params.join("&"));
+        }
+
+        url
+    }
+
+    /// Build async embed code (recommended by Wistia)
+    fn build_async_embed(self, video_id: &str, options: &VideoEmbedOptions) -> String {
+        let mut embed_options = Vec::new();
+
+        if options.autoplay || self.wistia_config.autoplay {
+            embed_options.push(r#""autoPlay": true"#.to_string());
+        }
+        if options.muted || self.wistia_config.muted {
+            embed_options.push(r#""muted": true"#.to_string());
+        }
+        if let Some(ref color) = self.wistia_config.player_color {
+            embed_options.push(format!(r#""playerColor": "{}""#, color));
+        }
+        if !self.wistia_config.playbar {
+            embed_options.push(r#""playbar": false"#.to_string());
+        }
+
+        let options_json = if embed_options.is_empty() {
+            "{}".to_string()
+        } else {
+            format!("{{{}}}", embed_options.join(", "))
+        };
+
+        format!(r#"
+<script src="https://fast.wistia.com/embed/medias/{}.jsonp" async></script>
+<script src="https://fast.wistia.com/assets/external/E-v1.js" async></script>
+<div class="wistia_responsive_padding" style="padding:56.25% 0 0 0;position:relative;">
+    <div class="wistia_responsive_wrapper" style="height:100%;left:0;position:absolute;top:0;width:100%;">
+        <div class="wistia_embed wistia_async_{} seo=false videoFoam=true" style="height:100%;position:relative;width:100%">
+            <div class="wistia_swatch" style="height:100%;left:0;opacity:0;overflow:hidden;position:absolute;top:0;transition:opacity 200ms;width:100%;">
+                <img src="https://fast.wistia.com/embed/medias/{}/swatch" style="filter:blur(5px);height:100%;object-fit:contain;width:100%;" alt="" aria-hidden="true" onload="this.parentNode.style.opacity=1;" />
+            </div>
+        </div>
+    </div>
+</div>
+"#, video_id, video_id, video_id)
+    }
+}
+
+impl VideoProvider for WistiaProvider {
+    fn get_config(self) -> VideoConfig {
+        self.config.clone()
+    }
+
+    async fn test_connection(mut self) -> Result<VideoConnectionTest, VideoError> {
+        let start = DateTime::now();
+
+        let response = self.client.get("/account.json").await?;
+        let latency = (DateTime::now() - start).as_millis() as u64;
+
+        let account_name = response["name"].as_str().map(|s| s.to_string());
+
+        Ok(VideoConnectionTest {
+            success: true,
+            message: "Connected to Wistia API".to_string(),
+            latency_ms: latency,
+            account_name: account_name,
+            quota_remaining: None,
+        })
+    }
+
+    fn can_handle_url(self, url: &str) -> bool {
+        url.contains("wistia.com") ||
+        url.contains("wi.st") ||
+        url.contains("wistia.net")
+    }
+
+    fn extract_video_id(self, url: &str) -> Result<String, VideoError> {
+        self.parse_video_id(url).ok_or(
+            VideoError::EmbedError {
+                message: "Could not extract Wistia video ID from URL".to_string()
+            }
+        )
+    }
+
+    async fn get_video(mut self, video_id: String) -> Result<Video, VideoError> {
+        let response = self.client.get(&format!("/medias/{}.json", video_id)).await?;
+
+        let media = parse_wistia_media(&response)?;
+        Ok(self.convert_video(media))
+    }
+
+    async fn list_videos(mut self, options: VideoListOptions) -> Result<VideoList, VideoError> {
+        let path = match self.wistia_config.project_id {
+            Some(ref project_id) => format!("/projects/{}/medias.json", project_id),
+            None => "/medias.json".to_string(),
+        };
+
+        let sort = match options.sort_by {
+            VideoSortField::Title => "name",
+            VideoSortField::CreatedAt => "created",
+            VideoSortField::Duration => "duration",
+            VideoSortField::Views => "play_count",
+        };
+
+        let url = format!(
+            "{}?page={}&per_page={}&sort_by={}&sort_direction={}",
+            path,
+            (options.offset / options.limit) + 1,
+            options.limit,
+            sort,
+            match options.sort_order {
+                SortOrder::Ascending => "0",
+                SortOrder::Descending => "1",
+            }
+        );
+
+        let response = self.client.get(&url).await?;
+
+        let mut videos = Vec::new();
+        if let Some(items) = response.as_array() {
+            for item in items {
+                if let Ok(media) = parse_wistia_media(item) {
+                    videos.push(self.convert_video(media));
+                }
+            }
+        }
+
+        Ok(VideoList {
+            videos: videos.clone(),
+            total: videos.len() as u32, // Wistia doesn't provide total in list response
+            offset: options.offset,
+            limit: options.limit,
+            has_more: videos.len() == options.limit as usize,
+        })
+    }
+
+    async fn search_videos(
+        mut self,
+        query: String,
+        options: VideoListOptions
+    ) -> Result<VideoList, VideoError> {
+        // Wistia doesn't have a dedicated search endpoint
+        // We'll list and filter client-side
+        let all_videos = self.list_videos(VideoListOptions {
+            limit: 100,
+            offset: 0,
+            ..options.clone()
+        }).await?;
+
+        let query_lower = query.to_lowercase();
+        let filtered: Vec<Video> = all_videos.videos.into_iter()
+            .filter(|v| {
+                v.title.to_lowercase().contains(&query_lower) ||
+                v.description.as_ref()
+                    .map(|d| d.to_lowercase().contains(&query_lower))
+                    .unwrap_or(false)
+            })
+            .skip(options.offset as usize)
+            .take(options.limit as usize)
+            .collect();
+
+        Ok(VideoList {
+            videos: filtered.clone(),
+            total: filtered.len() as u32,
+            offset: options.offset,
+            limit: options.limit,
+            has_more: false,
+        })
+    }
+
+    async fn get_embed(
+        self,
+        video_id: String,
+        options: VideoEmbedOptions
+    ) -> Result<VideoEmbed, VideoError> {
+        let iframe_url = self.build_embed_url(&video_id, &options);
+
+        let width = options.width.unwrap_or(640);
+        let height = options.height.unwrap_or(360);
+
+        // Wistia recommends async embed for best performance
+        let html = if options.responsive {
+            self.build_async_embed(&video_id, &options)
+        } else {
+            format!(
+                r#"<iframe src="{}" width="{}" height="{}" frameborder="0" allowfullscreen></iframe>"#,
+                iframe_url, width, height
+            )
+        };
+
+        Ok(VideoEmbed {
+            html: html,
+            iframe_url: iframe_url,
+            script_url: Some("https://fast.wistia.com/assets/external/E-v1.js".to_string()),
+            width: width,
+            height: height,
+        })
+    }
+
+    fn get_player_script(self) -> Option<String> {
+        Some("https://fast.wistia.com/assets/external/E-v1.js".to_string())
+    }
+
+    async fn get_analytics(mut self, video_id: String) -> Result<VideoAnalytics, VideoError> {
+        let url = format!("/medias/{}/stats.json", video_id);
+        let response = self.client.get(&url).await?;
+
+        let stats = parse_wistia_stats(&response)?;
+
+        // Convert hours to Duration
+        let total_watch_time = Duration::seconds((stats.hours_watched * 3600.0) as i64);
+
+        // Calculate average watch time
+        let average_watch_time = if stats.play_count > 0 {
+            Duration::seconds((stats.hours_watched * 3600.0 / stats.play_count as f64) as i64)
+        } else {
+            Duration::zero()
+        };
+
+        Ok(VideoAnalytics {
+            video_id: video_id,
+            total_views: stats.play_count,
+            unique_viewers: stats.visitors,
+            total_watch_time: total_watch_time,
+            average_watch_time: average_watch_time,
+            completion_rate: stats.engagement,
+            engagement_score: stats.engagement,
+            heatmap: Vec::new(), // Would need engagement graph endpoint
+            top_dropoff_points: Vec::new(),
+            device_breakdown: HashMap::new(),
+            quality_breakdown: HashMap::new(),
+        })
+    }
+
+    async fn get_captions(mut self, video_id: String) -> Result<Vec<VideoCaption>, VideoError> {
+        let url = format!("/medias/{}/captions.json", video_id);
+        let response = self.client.get(&url).await?;
+
+        let mut captions = Vec::new();
+        if let Some(items) = response.as_array() {
+            for item in items {
+                captions.push(VideoCaption {
+                    id: item["hashed_id"].as_str().unwrap_or_default().to_string(),
+                    language: item["language"].as_str().unwrap_or("en").to_string(),
+                    language_name: item["english_name"].as_str().unwrap_or("").to_string(),
+                    is_auto_generated: false,
+                    format: CaptionFormat::Srt,
+                    url: item["url"].as_str().map(|s| s.to_string()),
+                    content: None,
+                });
+            }
+        }
+
+        Ok(captions)
+    }
+
+    async fn upload_video(mut self, upload: VideoUpload) -> Result<Video, VideoError> {
+        // Wistia supports both URL-based and direct upload
+        if let Some(ref file_url) = upload.file_url {
+            let body = Json::object([
+                ("url", Json::string(file_url)),
+                ("name", Json::string(&upload.title)),
+                ("description", Json::string(upload.description.as_ref().unwrap_or(&"".to_string()))),
+            ]);
+
+            let response = self.client.post("/medias.json", body).await?;
+            let media = parse_wistia_media(&response)?;
+            return Ok(self.convert_video(media));
+        }
+
+        // Direct file upload would require multipart form
+        Err(VideoError::UploadError {
+            message: "Direct file upload not yet implemented".to_string()
+        })
+    }
+
+    async fn delete_video(mut self, video_id: String) -> Result<(), VideoError> {
+        self.client.delete(&format!("/medias/{}.json", video_id)).await
+    }
+
+    fn get_capabilities(self) -> Vec<VideoCapability> {
+        vec![
+            VideoCapability::Embed,
+            VideoCapability::Upload,
+            VideoCapability::Delete,
+            VideoCapability::Analytics,
+            VideoCapability::Captions,
+            VideoCapability::Chapters,
+            VideoCapability::CustomThumbnail,
+            VideoCapability::DomainRestriction,
+        ]
+    }
+}
+
+/// Parse Wistia media from JSON
+fn parse_wistia_media(json: &JsonValue) -> Result<WistiaMedia, VideoError> {
+    Ok(WistiaMedia {
+        id: json["id"].as_u64().unwrap_or(0),
+        hashed_id: json["hashed_id"].as_str()
+            .ok_or(VideoError::VideoNotFound { video_id: "unknown".to_string() })?
+            .to_string(),
+        name: json["name"].as_str().unwrap_or_default().to_string(),
+        media_type: json["type"].as_str().unwrap_or("Video").to_string(),
+        status: json["status"].as_str().unwrap_or("ready").to_string(),
+        progress: json["progress"].as_f64(),
+        section: json["section"].as_str().map(|s| s.to_string()),
+        thumbnail: WistiaThumbnail {
+            url: json["thumbnail"]["url"].as_str().unwrap_or_default().to_string(),
+            width: json["thumbnail"]["width"].as_u64().unwrap_or(1920) as u32,
+            height: json["thumbnail"]["height"].as_u64().unwrap_or(1080) as u32,
+        },
+        duration: json["duration"].as_f64().unwrap_or(0.0),
+        created: json["created"].as_str().unwrap_or_default().to_string(),
+        updated: json["updated"].as_str().unwrap_or_default().to_string(),
+        assets: json["assets"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| parse_wistia_asset(v)).collect())
+            .unwrap_or_default(),
+        description: json["description"].as_str().map(|s| s.to_string()),
+        embed_code: json["embedCode"].as_str().map(|s| s.to_string()),
+    })
+}
+
+fn parse_wistia_asset(json: &JsonValue) -> Option<WistiaAsset> {
+    Some(WistiaAsset {
+        url: json["url"].as_str()?.to_string(),
+        width: json["width"].as_u64()? as u32,
+        height: json["height"].as_u64()? as u32,
+        file_size: json["fileSize"].as_u64().unwrap_or(0),
+        content_type: json["contentType"].as_str()?.to_string(),
+        asset_type: json["type"].as_str()?.to_string(),
+    })
+}
+
+fn parse_wistia_stats(json: &JsonValue) -> Result<WistiaStats, VideoError> {
+    Ok(WistiaStats {
+        load_count: json["load_count"].as_u64().unwrap_or(0),
+        play_count: json["play_count"].as_u64().unwrap_or(0),
+        play_rate: json["play_rate"].as_f64().unwrap_or(0.0),
+        hours_watched: json["hours_watched"].as_f64().unwrap_or(0.0),
+        engagement: json["engagement"].as_f64().unwrap_or(0.0),
+        visitors: json["visitors"].as_u64().unwrap_or(0),
+    })
+}
+
+/// Wistia player integration helper
+pub fn generate_wistia_player_init(
+    video_id: String,
+    container_id: String,
+    options: HashMap<String, String>
+) -> String {
+    let options_json: Vec<String> = options.iter()
+        .map(|(k, v)| format!(r#""{}": {}"#, k, v))
+        .collect();
+
+    format!(r#"
+window._wq = window._wq || [];
+_wq.push({{
+    id: "{}",
+    options: {{{}}},
+    onReady: function(video) {{
+        window.intelligo_wistia_players = window.intelligo_wistia_players || {{}};
+        window.intelligo_wistia_players["{}"] = video;
+
+        video.bind("play", function() {{
+            console.log("Wistia video playing:", video.name());
+        }});
+
+        video.bind("percentwatchedchanged", function(percent, lastPercent) {{
+            if (Math.floor(percent * 100) % 10 === 0 && percent > lastPercent) {{
+                console.log("Wistia progress:", Math.floor(percent * 100) + "%");
+            }}
+        }});
+
+        video.bind("end", function() {{
+            console.log("Wistia video ended");
+        }});
+    }}
+}});
+"#, video_id, options_json.join(", "), video_id)
+}

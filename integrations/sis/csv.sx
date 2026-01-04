@@ -1,0 +1,1035 @@
+// CSV Import/Export for SIS Integration in Intelligo LMS
+// Supports roster sync via CSV file uploads
+
+module intelligo::integrations::sis::csv
+
+use intelligo::integrations::sis::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::io::{Read, Write, BufReader, BufWriter}
+use std::fs::File
+
+/// CSV Import configuration
+pub type CsvImportConfig {
+    // File settings
+    delimiter: char,
+    quote_char: char,
+    escape_char: Option<char>,
+    has_header: bool,
+    skip_lines: u32,
+
+    // Encoding
+    encoding: CsvEncoding,
+
+    // Column mappings (column index or header name)
+    column_mappings: CsvColumnMappings,
+
+    // Behavior
+    trim_whitespace: bool,
+    skip_empty_rows: bool,
+    stop_on_error: bool,
+    max_errors: u32,
+
+    // Date format
+    date_format: String,
+}
+
+impl CsvImportConfig {
+    pub fn default() -> Self {
+        CsvImportConfig {
+            delimiter: ',',
+            quote_char: '"',
+            escape_char: Some('\\'),
+            has_header: true,
+            skip_lines: 0,
+            encoding: CsvEncoding::Utf8,
+            column_mappings: CsvColumnMappings::default(),
+            trim_whitespace: true,
+            skip_empty_rows: true,
+            stop_on_error: false,
+            max_errors: 100,
+            date_format: "%Y-%m-%d".to_string(),
+        }
+    }
+}
+
+/// CSV Encoding types
+pub enum CsvEncoding {
+    Utf8,
+    Utf16,
+    Latin1,
+    Windows1252,
+}
+
+/// CSV Column mappings
+pub type CsvColumnMappings {
+    // User columns
+    user_id: CsvColumn,
+    user_email: CsvColumn,
+    user_first_name: CsvColumn,
+    user_last_name: CsvColumn,
+    user_role: Option<CsvColumn>,
+    user_grade_level: Option<CsvColumn>,
+    user_status: Option<CsvColumn>,
+    user_password: Option<CsvColumn>,
+
+    // Course columns
+    course_id: Option<CsvColumn>,
+    course_code: Option<CsvColumn>,
+    course_name: Option<CsvColumn>,
+    course_description: Option<CsvColumn>,
+    course_term: Option<CsvColumn>,
+
+    // Enrollment columns (for combined files)
+    enrollment_user_id: Option<CsvColumn>,
+    enrollment_course_id: Option<CsvColumn>,
+    enrollment_role: Option<CsvColumn>,
+    enrollment_section: Option<CsvColumn>,
+
+    // Custom columns
+    custom: HashMap<String, CsvColumn>,
+}
+
+impl CsvColumnMappings {
+    pub fn default() -> Self {
+        CsvColumnMappings {
+            user_id: CsvColumn::Header("user_id".to_string()),
+            user_email: CsvColumn::Header("email".to_string()),
+            user_first_name: CsvColumn::Header("first_name".to_string()),
+            user_last_name: CsvColumn::Header("last_name".to_string()),
+            user_role: Some(CsvColumn::Header("role".to_string())),
+            user_grade_level: Some(CsvColumn::Header("grade".to_string())),
+            user_status: Some(CsvColumn::Header("status".to_string())),
+            user_password: None,
+
+            course_id: Some(CsvColumn::Header("course_id".to_string())),
+            course_code: Some(CsvColumn::Header("course_code".to_string())),
+            course_name: Some(CsvColumn::Header("course_name".to_string())),
+            course_description: None,
+            course_term: Some(CsvColumn::Header("term".to_string())),
+
+            enrollment_user_id: Some(CsvColumn::Header("user_id".to_string())),
+            enrollment_course_id: Some(CsvColumn::Header("course_id".to_string())),
+            enrollment_role: Some(CsvColumn::Header("role".to_string())),
+            enrollment_section: Some(CsvColumn::Header("section".to_string())),
+
+            custom: HashMap::new(),
+        }
+    }
+
+    /// Create mappings for user import
+    pub fn for_users() -> Self {
+        let mut mappings = Self::default();
+        mappings.course_id = None;
+        mappings.course_code = None;
+        mappings.course_name = None;
+        mappings.enrollment_user_id = None;
+        mappings.enrollment_course_id = None;
+        mappings
+    }
+
+    /// Create mappings for course import
+    pub fn for_courses() -> Self {
+        let mut mappings = Self::default();
+        mappings.user_id = CsvColumn::Index(0); // Placeholder
+        mappings.user_email = CsvColumn::Index(0);
+        mappings.user_first_name = CsvColumn::Index(0);
+        mappings.user_last_name = CsvColumn::Index(0);
+        mappings.user_role = None;
+        mappings.enrollment_user_id = None;
+        mappings.enrollment_course_id = None;
+        mappings
+    }
+
+    /// Create mappings for enrollment import
+    pub fn for_enrollments() -> Self {
+        let mut mappings = Self::default();
+        mappings.user_id = CsvColumn::Index(0);
+        mappings.user_email = CsvColumn::Index(0);
+        mappings.user_first_name = CsvColumn::Index(0);
+        mappings.user_last_name = CsvColumn::Index(0);
+        mappings.course_id = None;
+        mappings.course_code = None;
+        mappings.course_name = None;
+        mappings
+    }
+}
+
+/// CSV Column reference (by index or header name)
+pub enum CsvColumn {
+    Index(u32),
+    Header(String),
+}
+
+impl CsvColumn {
+    pub fn get_value(self, row: &CsvRow, headers: &Option<Vec<String>>) -> Option<String> {
+        match self {
+            CsvColumn::Index(idx) => row.get(idx as usize).cloned(),
+            CsvColumn::Header(name) => {
+                headers.as_ref().and_then(|h| {
+                    h.iter()
+                        .position(|n| n.eq_ignore_ascii_case(&name))
+                        .and_then(|idx| row.get(idx).cloned())
+                })
+            }
+        }
+    }
+}
+
+/// CSV Row type
+pub type CsvRow = Vec<String>;
+
+/// CSV Import result
+pub type CsvImportResult {
+    success: bool,
+    file_name: String,
+    import_type: CsvImportType,
+    started_at: DateTime,
+    completed_at: DateTime,
+
+    total_rows: u32,
+    processed_rows: u32,
+    skipped_rows: u32,
+    created: u32,
+    updated: u32,
+    errors: u32,
+
+    error_details: Vec<CsvImportError>,
+    warnings: Vec<String>,
+}
+
+impl CsvImportResult {
+    pub fn new(file_name: String, import_type: CsvImportType) -> Self {
+        CsvImportResult {
+            success: true,
+            file_name: file_name,
+            import_type: import_type,
+            started_at: DateTime::now(),
+            completed_at: DateTime::now(),
+            total_rows: 0,
+            processed_rows: 0,
+            skipped_rows: 0,
+            created: 0,
+            updated: 0,
+            errors: 0,
+            error_details: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// CSV Import type
+pub enum CsvImportType {
+    Users,
+    Courses,
+    Enrollments,
+    Combined,
+}
+
+/// CSV Import error
+pub type CsvImportError {
+    row_number: u32,
+    column: Option<String>,
+    value: Option<String>,
+    error_type: CsvErrorType,
+    message: String,
+}
+
+/// CSV Error types
+pub enum CsvErrorType {
+    ParseError,
+    MissingRequired,
+    InvalidFormat,
+    DuplicateEntry,
+    ValidationFailed,
+    RelationNotFound,
+}
+
+/// CSV Parser
+pub actor CsvParser {
+    config: CsvImportConfig,
+    headers: Option<Vec<String>>,
+    current_line: u32,
+
+    pub fn new(config: CsvImportConfig) -> Self {
+        CsvParser {
+            config: config,
+            headers: None,
+            current_line: 0,
+        }
+    }
+
+    /// Parse CSV file
+    pub fn parse_file(mut self, path: String) -> Result<Vec<CsvRow>, SisError> {
+        let file = File::open(&path)
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        let reader = BufReader::new(file);
+        self.parse_reader(reader)
+    }
+
+    /// Parse CSV from string
+    pub fn parse_string(mut self, content: String) -> Result<Vec<CsvRow>, SisError> {
+        self.parse_reader(content.as_bytes())
+    }
+
+    /// Parse CSV from reader
+    fn parse_reader<R: Read>(mut self, reader: R) -> Result<Vec<CsvRow>, SisError> {
+        let mut rows = Vec::new();
+        let buf_reader = BufReader::new(reader);
+        let mut lines = buf_reader.lines();
+
+        // Skip initial lines if configured
+        for _ in 0..self.config.skip_lines {
+            lines.next();
+            self.current_line += 1;
+        }
+
+        // Parse header if present
+        if self.config.has_header {
+            if let Some(line_result) = lines.next() {
+                let line = line_result.map_err(|e| SisError::ParseError {
+                    entity: "header".to_string(),
+                    details: e.to_string()
+                })?;
+
+                self.headers = Some(self.parse_row(&line)?);
+                self.current_line += 1;
+            }
+        }
+
+        // Parse data rows
+        for line_result in lines {
+            self.current_line += 1;
+
+            let line = line_result.map_err(|e| SisError::ParseError {
+                entity: format!("line {}", self.current_line),
+                details: e.to_string()
+            })?;
+
+            // Skip empty rows
+            if self.config.skip_empty_rows && line.trim().is_empty() {
+                continue;
+            }
+
+            let row = self.parse_row(&line)?;
+            rows.push(row);
+        }
+
+        Ok(rows)
+    }
+
+    /// Parse a single row
+    fn parse_row(self, line: &str) -> Result<CsvRow, SisError> {
+        let mut fields = Vec::new();
+        let mut current_field = String::new();
+        let mut in_quotes = false;
+        let mut chars = line.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if in_quotes {
+                if c == self.config.quote_char {
+                    // Check for escaped quote
+                    if chars.peek() == Some(&self.config.quote_char) {
+                        current_field.push(c);
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else if self.config.escape_char == Some(c) {
+                    // Escape character
+                    if let Some(next) = chars.next() {
+                        current_field.push(next);
+                    }
+                } else {
+                    current_field.push(c);
+                }
+            } else {
+                if c == self.config.quote_char {
+                    in_quotes = true;
+                } else if c == self.config.delimiter {
+                    let field = if self.config.trim_whitespace {
+                        current_field.trim().to_string()
+                    } else {
+                        current_field.clone()
+                    };
+                    fields.push(field);
+                    current_field = String::new();
+                } else {
+                    current_field.push(c);
+                }
+            }
+        }
+
+        // Add last field
+        let field = if self.config.trim_whitespace {
+            current_field.trim().to_string()
+        } else {
+            current_field
+        };
+        fields.push(field);
+
+        Ok(fields)
+    }
+
+    /// Get headers
+    pub fn get_headers(self) -> Option<Vec<String>> {
+        self.headers.clone()
+    }
+
+    /// Get current line number
+    pub fn get_line_number(self) -> u32 {
+        self.current_line
+    }
+}
+
+/// CSV SIS Provider implementation
+pub actor CsvSisProvider {
+    config: SisConfig,
+    import_config: CsvImportConfig,
+    users_file: Option<String>,
+    courses_file: Option<String>,
+    enrollments_file: Option<String>,
+
+    // Cached data
+    cached_users: Vec<SisUser>,
+    cached_courses: Vec<SisCourse>,
+    cached_enrollments: Vec<SisEnrollment>,
+    cache_valid: bool,
+
+    pub fn new(config: SisConfig) -> Self {
+        CsvSisProvider {
+            config: config,
+            import_config: CsvImportConfig::default(),
+            users_file: None,
+            courses_file: None,
+            enrollments_file: None,
+            cached_users: Vec::new(),
+            cached_courses: Vec::new(),
+            cached_enrollments: Vec::new(),
+            cache_valid: false,
+        }
+    }
+
+    pub fn with_import_config(mut self, import_config: CsvImportConfig) -> Self {
+        self.import_config = import_config;
+        self
+    }
+
+    /// Set file paths for import
+    pub fn set_files(
+        mut self,
+        users_file: Option<String>,
+        courses_file: Option<String>,
+        enrollments_file: Option<String>
+    ) {
+        self.users_file = users_file;
+        self.courses_file = courses_file;
+        self.enrollments_file = enrollments_file;
+        self.cache_valid = false;
+    }
+
+    /// Load and cache all data from CSV files
+    async fn load_data(mut self) -> Result<(), SisError> {
+        if self.cache_valid {
+            return Ok(());
+        }
+
+        // Load users
+        if let Some(ref path) = self.users_file {
+            self.cached_users = self.load_users(path.clone()).await?;
+        }
+
+        // Load courses
+        if let Some(ref path) = self.courses_file {
+            self.cached_courses = self.load_courses(path.clone()).await?;
+        }
+
+        // Load enrollments
+        if let Some(ref path) = self.enrollments_file {
+            self.cached_enrollments = self.load_enrollments(path.clone()).await?;
+        }
+
+        self.cache_valid = true;
+        Ok(())
+    }
+
+    /// Load users from CSV file
+    async fn load_users(self, path: String) -> Result<Vec<SisUser>, SisError> {
+        let parser = CsvParser::new(self.import_config.clone());
+        let rows = parser.parse_file(path)?;
+        let headers = parser.get_headers();
+
+        let mappings = &self.import_config.column_mappings;
+        let mut users = Vec::new();
+
+        for (idx, row) in rows.iter().enumerate() {
+            match self.parse_user_row(row, &headers, mappings) {
+                Ok(user) => users.push(user),
+                Err(e) => {
+                    if self.import_config.stop_on_error {
+                        return Err(e);
+                    }
+                    // Log error but continue
+                }
+            }
+        }
+
+        Ok(users)
+    }
+
+    /// Parse a user from CSV row
+    fn parse_user_row(
+        self,
+        row: &CsvRow,
+        headers: &Option<Vec<String>>,
+        mappings: &CsvColumnMappings
+    ) -> Result<SisUser, SisError> {
+        let source_id = mappings.user_id.get_value(row, headers)
+            .ok_or(SisError::ValidationError {
+                entity: "user".to_string(),
+                field: "user_id".to_string(),
+                message: "Missing user ID".to_string()
+            })?;
+
+        let email = mappings.user_email.get_value(row, headers)
+            .ok_or(SisError::ValidationError {
+                entity: "user".to_string(),
+                field: "email".to_string(),
+                message: "Missing email".to_string()
+            })?;
+
+        let first_name = mappings.user_first_name.get_value(row, headers)
+            .unwrap_or_default();
+
+        let last_name = mappings.user_last_name.get_value(row, headers)
+            .unwrap_or_default();
+
+        let role = mappings.user_role.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .map(|r| SisRole::from_string(&r))
+            .unwrap_or(SisRole::Student);
+
+        let status = mappings.user_status.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .map(|s| SisUserStatus::from_string(&s))
+            .unwrap_or(SisUserStatus::Active);
+
+        let grade_levels = mappings.user_grade_level.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .map(|g| vec![g])
+            .unwrap_or_default();
+
+        Ok(SisUser {
+            source_id: source_id,
+            email: email,
+            first_name: first_name,
+            last_name: last_name,
+            username: None,
+            role: role,
+            grade_levels: grade_levels,
+            status: status,
+            phone: None,
+            metadata: HashMap::new(),
+        })
+    }
+
+    /// Load courses from CSV file
+    async fn load_courses(self, path: String) -> Result<Vec<SisCourse>, SisError> {
+        let parser = CsvParser::new(self.import_config.clone());
+        let rows = parser.parse_file(path)?;
+        let headers = parser.get_headers();
+
+        let mappings = &self.import_config.column_mappings;
+        let mut courses = Vec::new();
+
+        for row in rows.iter() {
+            match self.parse_course_row(row, &headers, mappings) {
+                Ok(course) => courses.push(course),
+                Err(e) => {
+                    if self.import_config.stop_on_error {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(courses)
+    }
+
+    /// Parse a course from CSV row
+    fn parse_course_row(
+        self,
+        row: &CsvRow,
+        headers: &Option<Vec<String>>,
+        mappings: &CsvColumnMappings
+    ) -> Result<SisCourse, SisError> {
+        let source_id = mappings.course_id.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .ok_or(SisError::ValidationError {
+                entity: "course".to_string(),
+                field: "course_id".to_string(),
+                message: "Missing course ID".to_string()
+            })?;
+
+        let code = mappings.course_code.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .unwrap_or(source_id.clone());
+
+        let name = mappings.course_name.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .ok_or(SisError::ValidationError {
+                entity: "course".to_string(),
+                field: "course_name".to_string(),
+                message: "Missing course name".to_string()
+            })?;
+
+        let description = mappings.course_description.as_ref()
+            .and_then(|col| col.get_value(row, headers));
+
+        let term_ids = mappings.course_term.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .map(|t| vec![t])
+            .unwrap_or_default();
+
+        Ok(SisCourse {
+            source_id: source_id,
+            code: code,
+            name: name,
+            description: description,
+            term_ids: term_ids,
+            status: SisCourseStatus::Active,
+            subject_codes: Vec::new(),
+            grade_levels: Vec::new(),
+            metadata: HashMap::new(),
+        })
+    }
+
+    /// Load enrollments from CSV file
+    async fn load_enrollments(self, path: String) -> Result<Vec<SisEnrollment>, SisError> {
+        let parser = CsvParser::new(self.import_config.clone());
+        let rows = parser.parse_file(path)?;
+        let headers = parser.get_headers();
+
+        let mappings = &self.import_config.column_mappings;
+        let mut enrollments = Vec::new();
+
+        for row in rows.iter() {
+            match self.parse_enrollment_row(row, &headers, mappings) {
+                Ok(enrollment) => enrollments.push(enrollment),
+                Err(e) => {
+                    if self.import_config.stop_on_error {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(enrollments)
+    }
+
+    /// Parse an enrollment from CSV row
+    fn parse_enrollment_row(
+        self,
+        row: &CsvRow,
+        headers: &Option<Vec<String>>,
+        mappings: &CsvColumnMappings
+    ) -> Result<SisEnrollment, SisError> {
+        let user_id = mappings.enrollment_user_id.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .ok_or(SisError::ValidationError {
+                entity: "enrollment".to_string(),
+                field: "user_id".to_string(),
+                message: "Missing user ID".to_string()
+            })?;
+
+        let class_id = mappings.enrollment_course_id.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .ok_or(SisError::ValidationError {
+                entity: "enrollment".to_string(),
+                field: "course_id".to_string(),
+                message: "Missing course ID".to_string()
+            })?;
+
+        let role = mappings.enrollment_role.as_ref()
+            .and_then(|col| col.get_value(row, headers))
+            .map(|r| SisRole::from_string(&r))
+            .unwrap_or(SisRole::Student);
+
+        let source_id = format!("{}_{}", user_id, class_id);
+
+        Ok(SisEnrollment {
+            source_id: source_id,
+            user_id: user_id,
+            class_id: class_id,
+            role: role,
+            status: SisEnrollmentStatus::Active,
+            begin_date: None,
+            end_date: None,
+            primary: true,
+        })
+    }
+}
+
+impl SisProvider for CsvSisProvider {
+    fn get_config(self) -> SisConfig {
+        self.config.clone()
+    }
+
+    async fn test_connection(self) -> Result<ConnectionTestResult, SisError> {
+        // For CSV, test that files exist and are readable
+        let mut capabilities = Vec::new();
+
+        if self.users_file.is_some() {
+            capabilities.push("users".to_string());
+        }
+        if self.courses_file.is_some() {
+            capabilities.push("courses".to_string());
+        }
+        if self.enrollments_file.is_some() {
+            capabilities.push("enrollments".to_string());
+        }
+
+        Ok(ConnectionTestResult {
+            success: true,
+            message: "CSV files configured".to_string(),
+            latency_ms: 0,
+            version: Some("CSV 1.0".to_string()),
+            capabilities: capabilities,
+        })
+    }
+
+    async fn fetch_users(mut self, options: FetchOptions) -> Result<Vec<SisUser>, SisError> {
+        self.load_data().await?;
+
+        let mut users = self.cached_users.clone();
+
+        // Apply filters
+        if !options.include_inactive {
+            users.retain(|u| matches!(u.status, SisUserStatus::Active));
+        }
+
+        // Apply pagination
+        if let Some(offset) = options.offset {
+            users = users.into_iter().skip(offset as usize).collect();
+        }
+        if let Some(limit) = options.limit {
+            users = users.into_iter().take(limit as usize).collect();
+        }
+
+        Ok(users)
+    }
+
+    async fn fetch_user(mut self, source_id: String) -> Result<Option<SisUser>, SisError> {
+        self.load_data().await?;
+
+        Ok(self.cached_users.iter()
+            .find(|u| u.source_id == source_id)
+            .cloned())
+    }
+
+    async fn fetch_courses(mut self, options: FetchOptions) -> Result<Vec<SisCourse>, SisError> {
+        self.load_data().await?;
+
+        let mut courses = self.cached_courses.clone();
+
+        if !options.include_inactive {
+            courses.retain(|c| matches!(c.status, SisCourseStatus::Active));
+        }
+
+        if let Some(offset) = options.offset {
+            courses = courses.into_iter().skip(offset as usize).collect();
+        }
+        if let Some(limit) = options.limit {
+            courses = courses.into_iter().take(limit as usize).collect();
+        }
+
+        Ok(courses)
+    }
+
+    async fn fetch_course(mut self, source_id: String) -> Result<Option<SisCourse>, SisError> {
+        self.load_data().await?;
+
+        Ok(self.cached_courses.iter()
+            .find(|c| c.source_id == source_id)
+            .cloned())
+    }
+
+    async fn fetch_classes(self, options: FetchOptions) -> Result<Vec<SisClass>, SisError> {
+        // CSV doesn't distinguish between courses and classes
+        Ok(Vec::new())
+    }
+
+    async fn fetch_class(self, source_id: String) -> Result<Option<SisClass>, SisError> {
+        Ok(None)
+    }
+
+    async fn fetch_enrollments(mut self, options: FetchOptions) -> Result<Vec<SisEnrollment>, SisError> {
+        self.load_data().await?;
+
+        let mut enrollments = self.cached_enrollments.clone();
+
+        if !options.include_inactive {
+            enrollments.retain(|e| matches!(e.status, SisEnrollmentStatus::Active));
+        }
+
+        if let Some(offset) = options.offset {
+            enrollments = enrollments.into_iter().skip(offset as usize).collect();
+        }
+        if let Some(limit) = options.limit {
+            enrollments = enrollments.into_iter().take(limit as usize).collect();
+        }
+
+        Ok(enrollments)
+    }
+
+    async fn fetch_class_enrollments(
+        mut self,
+        class_id: String,
+        options: FetchOptions
+    ) -> Result<Vec<SisEnrollment>, SisError> {
+        self.load_data().await?;
+
+        let enrollments: Vec<SisEnrollment> = self.cached_enrollments.iter()
+            .filter(|e| e.class_id == class_id)
+            .cloned()
+            .collect();
+
+        Ok(enrollments)
+    }
+
+    async fn fetch_terms(self, options: FetchOptions) -> Result<Vec<SisTerm>, SisError> {
+        // CSV doesn't typically include terms
+        Ok(Vec::new())
+    }
+
+    async fn push_grades(self, grades: Vec<SisGrade>) -> Result<GradePushResult, SisError> {
+        // CSV doesn't support grade passback
+        Err(SisError::ConfigurationError {
+            message: "CSV provider does not support grade passback".to_string()
+        })
+    }
+
+    fn supports_grade_passback(self) -> bool {
+        false
+    }
+
+    fn get_capabilities(self) -> Vec<SisCapability> {
+        vec![
+            SisCapability::Users,
+            SisCapability::Courses,
+            SisCapability::Enrollments,
+        ]
+    }
+
+    async fn fetch_deltas(
+        self,
+        since: DateTime,
+        entity_types: Vec<SisEntityType>
+    ) -> Result<SisDelta, SisError> {
+        // CSV doesn't support delta sync
+        Err(SisError::ConfigurationError {
+            message: "CSV provider does not support delta sync".to_string()
+        })
+    }
+
+    fn supports_delta_sync(self) -> bool {
+        false
+    }
+}
+
+/// CSV Export functionality
+pub actor CsvExporter {
+    config: CsvImportConfig,
+
+    pub fn new() -> Self {
+        CsvExporter {
+            config: CsvImportConfig::default(),
+        }
+    }
+
+    pub fn with_config(mut self, config: CsvImportConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Export users to CSV
+    pub fn export_users(self, users: Vec<SisUser>, path: String) -> Result<(), SisError> {
+        let file = File::create(&path)
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        let mut writer = BufWriter::new(file);
+
+        // Write header
+        self.write_row(&mut writer, &[
+            "user_id", "email", "first_name", "last_name", "role", "grade", "status"
+        ])?;
+
+        // Write data
+        for user in users {
+            let role = match user.role {
+                SisRole::Student => "student",
+                SisRole::Teacher => "teacher",
+                SisRole::Administrator => "admin",
+                SisRole::Parent => "parent",
+                SisRole::Guardian => "guardian",
+                SisRole::Aide => "aide",
+                SisRole::Counselor => "counselor",
+                SisRole::Other { ref name } => name.as_str(),
+            };
+
+            let status = match user.status {
+                SisUserStatus::Active => "active",
+                SisUserStatus::Inactive => "inactive",
+                SisUserStatus::ToBeDeleted => "deleted",
+            };
+
+            let grade = user.grade_levels.first().cloned().unwrap_or_default();
+
+            self.write_row(&mut writer, &[
+                &user.source_id,
+                &user.email,
+                &user.first_name,
+                &user.last_name,
+                role,
+                &grade,
+                status,
+            ])?;
+        }
+
+        writer.flush()
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        Ok(())
+    }
+
+    /// Export courses to CSV
+    pub fn export_courses(self, courses: Vec<SisCourse>, path: String) -> Result<(), SisError> {
+        let file = File::create(&path)
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        let mut writer = BufWriter::new(file);
+
+        // Write header
+        self.write_row(&mut writer, &[
+            "course_id", "course_code", "course_name", "description", "term"
+        ])?;
+
+        // Write data
+        for course in courses {
+            let term = course.term_ids.first().cloned().unwrap_or_default();
+            let description = course.description.clone().unwrap_or_default();
+
+            self.write_row(&mut writer, &[
+                &course.source_id,
+                &course.code,
+                &course.name,
+                &description,
+                &term,
+            ])?;
+        }
+
+        writer.flush()
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        Ok(())
+    }
+
+    /// Export enrollments to CSV
+    pub fn export_enrollments(
+        self,
+        enrollments: Vec<SisEnrollment>,
+        path: String
+    ) -> Result<(), SisError> {
+        let file = File::create(&path)
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        let mut writer = BufWriter::new(file);
+
+        // Write header
+        self.write_row(&mut writer, &[
+            "user_id", "course_id", "role", "status"
+        ])?;
+
+        // Write data
+        for enrollment in enrollments {
+            let role = match enrollment.role {
+                SisRole::Student => "student",
+                SisRole::Teacher => "teacher",
+                _ => "student",
+            };
+
+            let status = match enrollment.status {
+                SisEnrollmentStatus::Active => "active",
+                SisEnrollmentStatus::Inactive => "inactive",
+                SisEnrollmentStatus::ToBeDeleted => "deleted",
+            };
+
+            self.write_row(&mut writer, &[
+                &enrollment.user_id,
+                &enrollment.class_id,
+                role,
+                status,
+            ])?;
+        }
+
+        writer.flush()
+            .map_err(|e| SisError::ParseError {
+                entity: "file".to_string(),
+                details: e.to_string()
+            })?;
+
+        Ok(())
+    }
+
+    /// Write a row to CSV
+    fn write_row<W: Write>(self, writer: &mut W, fields: &[&str]) -> Result<(), SisError> {
+        let row = fields.iter()
+            .map(|f| self.escape_field(f))
+            .collect::<Vec<String>>()
+            .join(&self.config.delimiter.to_string());
+
+        writeln!(writer, "{}", row)
+            .map_err(|e| SisError::ParseError {
+                entity: "row".to_string(),
+                details: e.to_string()
+            })
+    }
+
+    /// Escape a field for CSV
+    fn escape_field(self, field: &str) -> String {
+        let needs_quotes = field.contains(self.config.delimiter)
+            || field.contains(self.config.quote_char)
+            || field.contains('\n')
+            || field.contains('\r');
+
+        if needs_quotes {
+            let escaped = field.replace(
+                self.config.quote_char,
+                &format!("{}{}", self.config.quote_char, self.config.quote_char)
+            );
+            format!("{}{}{}", self.config.quote_char, escaped, self.config.quote_char)
+        } else {
+            field.to_string()
+        }
+    }
+}

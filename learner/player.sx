@@ -1,0 +1,1316 @@
+// =============================================================================
+// INTELLIGO LMS - Content Player
+// =============================================================================
+// Unified content player for all content types including SCORM packages,
+// videos, documents, interactive content, and assessments. Provides seamless
+// navigation, progress tracking, and xAPI/SCORM data communication.
+// =============================================================================
+
+module intelligo::learner::player
+
+use intelligo::core::types::*
+use intelligo::entities::lesson::{Lesson, LessonBundle, ContentType}
+use intelligo::entities::progress::{Progress, CompletionStatus}
+use intelligo::entities::course::{Course}
+use intelligo::entities::module::{Module}
+use intelligo::compliance::scorm12::{Scorm12Runtime, Scorm12Api}
+use intelligo::compliance::scorm2004::{Scorm2004Runtime, Scorm2004Api}
+use intelligo::compliance::xapi::{XApiClient, Statement}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// Player Configuration
+// =============================================================================
+
+/// Content player configuration
+pub struct PlayerConfig {
+    /// Enable SCORM communication
+    scorm_enabled: bool,
+    /// Enable xAPI tracking
+    xapi_enabled: bool,
+    /// Auto-save progress interval (seconds)
+    auto_save_interval: i32,
+    /// Session timeout (minutes)
+    session_timeout: i32,
+    /// Enable bookmarking
+    bookmarking_enabled: bool,
+    /// Enable notes
+    notes_enabled: bool,
+    /// Enable transcript (for videos)
+    transcript_enabled: bool,
+    /// Enable playback speed control
+    speed_control_enabled: bool,
+    /// Enable picture-in-picture
+    pip_enabled: bool,
+    /// Enable fullscreen
+    fullscreen_enabled: bool,
+    /// Show navigation controls
+    show_navigation: bool,
+    /// Enable keyboard shortcuts
+    keyboard_shortcuts: bool,
+    /// Auto-advance to next content
+    auto_advance: bool,
+    /// Completion threshold (percent)
+    completion_threshold: f32,
+    /// Require assessment pass to complete
+    require_assessment_pass: bool,
+}
+
+impl Default for PlayerConfig {
+    fn default() -> Self {
+        PlayerConfig {
+            scorm_enabled: true,
+            xapi_enabled: true,
+            auto_save_interval: 30,
+            session_timeout: 30,
+            bookmarking_enabled: true,
+            notes_enabled: true,
+            transcript_enabled: true,
+            speed_control_enabled: true,
+            pip_enabled: true,
+            fullscreen_enabled: true,
+            show_navigation: true,
+            keyboard_shortcuts: true,
+            auto_advance: false,
+            completion_threshold: 80.0,
+            require_assessment_pass: false,
+        }
+    }
+}
+
+// =============================================================================
+// Player Session Types
+// =============================================================================
+
+/// Active player session
+pub struct PlayerSession {
+    /// Session ID
+    id: SessionId,
+    /// Student ID
+    student_id: StudentId,
+    /// Course being viewed
+    course_id: CourseId,
+    /// Current module
+    module_id: ModuleId,
+    /// Current lesson
+    lesson_id: LessonId,
+    /// Enrollment ID
+    enrollment_id: EnrollmentId,
+    /// Session state
+    state: SessionState,
+    /// Session start time
+    started_at: DateTime,
+    /// Last activity time
+    last_activity: DateTime,
+    /// Total session time (seconds)
+    session_time: i32,
+    /// Current position/bookmark
+    position: ContentPosition,
+    /// SCORM runtime (if applicable)
+    scorm_runtime: Option<ScormRuntimeWrapper>,
+    /// xAPI tracking data
+    xapi_data: XApiTrackingData,
+    /// Player settings for this session
+    settings: PlayerSettings,
+    /// Session metadata
+    metadata: Map<String, String>,
+}
+
+type SessionId = String
+
+/// Session state
+pub enum SessionState {
+    Initializing,
+    Active,
+    Paused,
+    Completed,
+    TimedOut,
+    Error { message: String },
+}
+
+/// Content position (bookmark)
+pub struct ContentPosition {
+    /// Position type depends on content
+    position_type: PositionType,
+    /// Position value
+    value: String,
+    /// Additional context
+    context: Map<String, String>,
+    /// Saved at
+    saved_at: DateTime,
+}
+
+/// Position type
+pub enum PositionType {
+    /// Video/audio time position (seconds)
+    Time { seconds: f32 },
+    /// Document page
+    Page { page_number: i32 },
+    /// SCORM bookmark
+    ScormBookmark { location: String },
+    /// Scroll position (percentage)
+    Scroll { percent: f32 },
+    /// Slide number (presentations)
+    Slide { slide_number: i32 },
+    /// Custom position
+    Custom { key: String, value: String },
+}
+
+/// SCORM runtime wrapper (abstracts 1.2 vs 2004)
+pub enum ScormRuntimeWrapper {
+    Scorm12(Scorm12Runtime),
+    Scorm2004(Scorm2004Runtime),
+}
+
+/// xAPI tracking data
+pub struct XApiTrackingData {
+    /// Statements to send
+    pending_statements: List<Statement>,
+    /// Last statement sent
+    last_statement_at: Option<DateTime>,
+    /// Total statements sent
+    statements_sent: i32,
+    /// Activity ID
+    activity_id: String,
+}
+
+/// Player settings (user preferences)
+pub struct PlayerSettings {
+    /// Video playback speed
+    playback_speed: f32,
+    /// Video quality preference
+    video_quality: VideoQuality,
+    /// Closed captions enabled
+    captions_enabled: bool,
+    /// Caption language
+    caption_language: String,
+    /// Volume level
+    volume: f32,
+    /// Muted
+    muted: bool,
+    /// Autoplay
+    autoplay: bool,
+    /// Theme
+    theme: PlayerTheme,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        PlayerSettings {
+            playback_speed: 1.0,
+            video_quality: VideoQuality::Auto,
+            captions_enabled: false,
+            caption_language: "en".to_string(),
+            volume: 1.0,
+            muted: false,
+            autoplay: true,
+            theme: PlayerTheme::Auto,
+        }
+    }
+}
+
+/// Video quality
+pub enum VideoQuality {
+    Auto,
+    Low,     // 360p
+    Medium,  // 480p
+    High,    // 720p
+    Full,    // 1080p
+    Ultra,   // 4K
+}
+
+/// Player theme
+pub enum PlayerTheme {
+    Auto,
+    Light,
+    Dark,
+}
+
+// =============================================================================
+// Content Data Types
+// =============================================================================
+
+/// Complete content data for player
+pub struct ContentData {
+    /// Lesson details
+    lesson: LessonDetails,
+    /// Course context
+    course: CourseContext,
+    /// Module context
+    module: ModuleContext,
+    /// Navigation
+    navigation: NavigationData,
+    /// Progress data
+    progress: ProgressData,
+    /// Content sources
+    sources: List<ContentSource>,
+    /// Transcript (if available)
+    transcript: Option<Transcript>,
+    /// Attachments
+    attachments: List<Attachment>,
+    /// Related content
+    related: List<RelatedContent>,
+}
+
+/// Lesson details
+pub struct LessonDetails {
+    id: LessonId,
+    title: String,
+    description: Option<String>,
+    content_type: ContentType,
+    bundle_type: LessonBundle,
+    duration_minutes: Option<i32>,
+    thumbnail_url: Option<String>,
+    objectives: List<String>,
+    keywords: List<String>,
+}
+
+/// Course context
+pub struct CourseContext {
+    id: CourseId,
+    title: String,
+    instructor: Option<String>,
+}
+
+/// Module context
+pub struct ModuleContext {
+    id: ModuleId,
+    title: String,
+    position: i32,
+}
+
+/// Navigation data
+pub struct NavigationData {
+    /// Previous lesson
+    previous: Option<NavigationItem>,
+    /// Next lesson
+    next: Option<NavigationItem>,
+    /// Course outline
+    outline: List<OutlineSection>,
+    /// Current position in course
+    current_position: CoursePosition,
+    /// Can navigate forward (linear courses)
+    can_navigate_forward: bool,
+    /// Can navigate backward
+    can_navigate_backward: bool,
+}
+
+/// Navigation item
+pub struct NavigationItem {
+    lesson_id: LessonId,
+    module_id: ModuleId,
+    title: String,
+    content_type: ContentType,
+    duration_minutes: Option<i32>,
+    completed: bool,
+    locked: bool,
+}
+
+/// Outline section (module)
+pub struct OutlineSection {
+    module_id: ModuleId,
+    title: String,
+    position: i32,
+    lessons: List<OutlineLesson>,
+    expanded: bool,
+}
+
+/// Outline lesson
+pub struct OutlineLesson {
+    lesson_id: LessonId,
+    title: String,
+    content_type: ContentType,
+    duration_minutes: Option<i32>,
+    status: LessonStatus,
+    is_current: bool,
+    locked: bool,
+}
+
+/// Lesson status
+pub enum LessonStatus {
+    NotStarted,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+/// Course position
+pub struct CoursePosition {
+    module_index: i32,
+    lesson_index: i32,
+    total_modules: i32,
+    total_lessons: i32,
+    lessons_completed: i32,
+}
+
+/// Progress data
+pub struct ProgressData {
+    /// Lesson progress percent
+    lesson_progress: f32,
+    /// Completion status
+    completion_status: CompletionStatus,
+    /// Score (if applicable)
+    score: Option<ScoreData>,
+    /// Time spent on this lesson
+    time_spent_seconds: i32,
+    /// Last position
+    last_position: Option<ContentPosition>,
+    /// Attempts (for assessments)
+    attempts: i32,
+    /// Max attempts
+    max_attempts: Option<i32>,
+}
+
+/// Score data
+pub struct ScoreData {
+    raw: f32,
+    min: f32,
+    max: f32,
+    scaled: f32,
+}
+
+/// Content source
+pub struct ContentSource {
+    source_type: SourceType,
+    url: String,
+    mime_type: String,
+    quality: Option<VideoQuality>,
+    bitrate: Option<i32>,
+    width: Option<i32>,
+    height: Option<i32>,
+    duration_seconds: Option<f32>,
+}
+
+/// Source type
+pub enum SourceType {
+    Primary,
+    Fallback,
+    Alternative,
+}
+
+/// Transcript
+pub struct Transcript {
+    language: String,
+    format: TranscriptFormat,
+    content: String,
+    cues: Option<List<TranscriptCue>>,
+}
+
+/// Transcript format
+pub enum TranscriptFormat {
+    Text,
+    Vtt,
+    Srt,
+    Json,
+}
+
+/// Transcript cue (for timed transcripts)
+pub struct TranscriptCue {
+    id: String,
+    start_time: f32,
+    end_time: f32,
+    text: String,
+}
+
+/// Attachment
+pub struct Attachment {
+    id: String,
+    name: String,
+    description: Option<String>,
+    url: String,
+    mime_type: String,
+    size_bytes: i64,
+}
+
+/// Related content
+pub struct RelatedContent {
+    lesson_id: LessonId,
+    title: String,
+    content_type: ContentType,
+    thumbnail_url: Option<String>,
+    relevance: f32,
+}
+
+// =============================================================================
+// Player Events
+// =============================================================================
+
+/// Player event
+pub struct PlayerEvent {
+    event_type: PlayerEventType,
+    timestamp: DateTime,
+    session_id: SessionId,
+    data: Map<String, String>,
+}
+
+/// Player event type
+pub enum PlayerEventType {
+    /// Session started
+    SessionStarted,
+    /// Session ended
+    SessionEnded,
+    /// Content loaded
+    ContentLoaded,
+    /// Playback started
+    PlaybackStarted,
+    /// Playback paused
+    PlaybackPaused,
+    /// Playback resumed
+    PlaybackResumed,
+    /// Playback completed
+    PlaybackCompleted,
+    /// Position changed (seek)
+    PositionChanged { from: f32, to: f32 },
+    /// Speed changed
+    SpeedChanged { speed: f32 },
+    /// Volume changed
+    VolumeChanged { volume: f32 },
+    /// Fullscreen toggled
+    FullscreenToggled { enabled: bool },
+    /// Captions toggled
+    CaptionsToggled { enabled: bool },
+    /// Note added
+    NoteAdded { note_id: String },
+    /// Bookmark saved
+    BookmarkSaved,
+    /// Navigation clicked
+    NavigationClicked { target: String },
+    /// Interaction (for interactive content)
+    Interaction { interaction_type: String, correct: Option<bool> },
+    /// Error occurred
+    Error { code: String, message: String },
+    /// SCORM commit
+    ScormCommit,
+    /// xAPI statement sent
+    XApiStatement { verb: String },
+}
+
+// =============================================================================
+// Player Notes
+// =============================================================================
+
+/// Player note
+pub struct PlayerNote {
+    id: String,
+    student_id: StudentId,
+    lesson_id: LessonId,
+    content: String,
+    position: Option<ContentPosition>,
+    color: NoteColor,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// Note color
+pub enum NoteColor {
+    Yellow,
+    Green,
+    Blue,
+    Pink,
+    Purple,
+}
+
+// =============================================================================
+// Player Actor
+// =============================================================================
+
+/// Content player actor
+pub actor ContentPlayerActor {
+    var config: PlayerConfig = PlayerConfig::default()
+
+    /// Active sessions
+    var sessions: Map<SessionId, PlayerSession> = Map::new()
+
+    /// User settings (student_id -> settings)
+    var user_settings: Map<StudentId, PlayerSettings> = Map::new()
+
+    /// Notes (lesson_id -> student_id -> notes)
+    var notes: Map<LessonId, Map<StudentId, List<PlayerNote>>> = Map::new()
+
+    /// Bookmarks (lesson_id -> student_id -> position)
+    var bookmarks: Map<LessonId, Map<StudentId, ContentPosition>> = Map::new()
+
+    /// xAPI client
+    var xapi_client: Option<XApiClient> = None
+
+    /// Event log (recent events for debugging)
+    var event_log: List<PlayerEvent> = vec![]
+    var max_event_log_size: i32 = 1000
+
+    pub fn new() -> Self {
+        ContentPlayerActor {
+            config: PlayerConfig::default(),
+            sessions: Map::new(),
+            user_settings: Map::new(),
+            notes: Map::new(),
+            bookmarks: Map::new(),
+            xapi_client: None,
+            event_log: vec![],
+            max_event_log_size: 1000,
+        }
+    }
+
+    /// Initialize player with xAPI client
+    pub receive Initialize(xapi_client: Option<XApiClient>) {
+        self.xapi_client = xapi_client;
+        checkpoint();
+    }
+
+    // =========================================================================
+    // Session Management
+    // =========================================================================
+
+    /// Start a player session
+    pub receive StartSession(
+        student_id: StudentId,
+        enrollment_id: EnrollmentId,
+        course_id: CourseId,
+        module_id: ModuleId,
+        lesson_id: LessonId
+    ) -> Result<PlayerSession, LmsError> {
+        let session_id = generate_uuid();
+
+        // Get user settings or defaults
+        let settings = self.user_settings.get(&student_id)
+            .cloned()
+            .unwrap_or_default();
+
+        // Get saved bookmark
+        let position = self.bookmarks.get(&lesson_id)
+            .and_then(|m| m.get(&student_id))
+            .cloned()
+            .unwrap_or(ContentPosition {
+                position_type: PositionType::Time { seconds: 0.0 },
+                value: "0".to_string(),
+                context: Map::new(),
+                saved_at: DateTime::now(),
+            });
+
+        let session = PlayerSession {
+            id: session_id.clone(),
+            student_id: student_id.clone(),
+            course_id,
+            module_id,
+            lesson_id: lesson_id.clone(),
+            enrollment_id,
+            state: SessionState::Initializing,
+            started_at: DateTime::now(),
+            last_activity: DateTime::now(),
+            session_time: 0,
+            position,
+            scorm_runtime: None,
+            xapi_data: XApiTrackingData {
+                pending_statements: vec![],
+                last_statement_at: None,
+                statements_sent: 0,
+                activity_id: format!("lesson/{}", lesson_id),
+            },
+            settings,
+            metadata: Map::new(),
+        };
+
+        self.sessions.insert(session_id.clone(), session.clone());
+
+        // Log event
+        self.log_event(PlayerEvent {
+            event_type: PlayerEventType::SessionStarted,
+            timestamp: DateTime::now(),
+            session_id: session_id.clone(),
+            data: Map::new(),
+        });
+
+        // Send xAPI initialized statement
+        if self.config.xapi_enabled {
+            self.send_xapi_statement(&session, "initialized").await;
+        }
+
+        checkpoint();
+        Ok(session)
+    }
+
+    /// Update session activity (heartbeat)
+    pub receive UpdateSession(
+        session_id: SessionId,
+        time_delta: i32,
+        position: Option<ContentPosition>
+    ) -> Result<(), LmsError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        session.last_activity = DateTime::now();
+        session.session_time += time_delta;
+
+        if let Some(pos) = position {
+            session.position = pos;
+        }
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// End player session
+    pub receive EndSession(
+        session_id: SessionId,
+        completion_status: Option<CompletionStatus>,
+        score: Option<ScoreData>
+    ) -> Result<SessionSummary, LmsError> {
+        let mut session = self.sessions.remove(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        session.state = SessionState::Completed;
+
+        // Save bookmark
+        self.save_bookmark_internal(&session);
+
+        // Log event
+        self.log_event(PlayerEvent {
+            event_type: PlayerEventType::SessionEnded,
+            timestamp: DateTime::now(),
+            session_id: session_id.clone(),
+            data: Map::new(),
+        });
+
+        // Send xAPI terminated statement
+        if self.config.xapi_enabled {
+            self.send_xapi_statement(&session, "terminated").await;
+        }
+
+        // Commit SCORM data
+        if let Some(runtime) = &session.scorm_runtime {
+            self.commit_scorm_data(runtime).await;
+        }
+
+        let summary = SessionSummary {
+            session_id,
+            duration_seconds: session.session_time,
+            completion_status,
+            score,
+            position: session.position,
+        };
+
+        checkpoint();
+        Ok(summary)
+    }
+
+    // =========================================================================
+    // SCORM Integration
+    // =========================================================================
+
+    /// Initialize SCORM runtime for session
+    pub receive InitializeScorm(
+        session_id: SessionId,
+        scorm_version: ScormVersion,
+        sco_id: String
+    ) -> Result<ScormInitResult, LmsError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        // Create appropriate runtime
+        let runtime = match scorm_version {
+            ScormVersion::Scorm12 => {
+                let rt = Scorm12Runtime::new(
+                    session.student_id.clone(),
+                    session.lesson_id.clone(),
+                    sco_id
+                );
+                ScormRuntimeWrapper::Scorm12(rt)
+            },
+            ScormVersion::Scorm2004 => {
+                let rt = Scorm2004Runtime::new(
+                    session.student_id.clone(),
+                    session.lesson_id.clone(),
+                    sco_id
+                );
+                ScormRuntimeWrapper::Scorm2004(rt)
+            },
+        };
+
+        session.scorm_runtime = Some(runtime);
+
+        checkpoint();
+        Ok(ScormInitResult {
+            success: true,
+            learner_id: session.student_id.clone(),
+            learner_name: "Student".to_string(), // Would fetch actual name
+            launch_data: "".to_string(),
+            location: session.position.value.clone(),
+        })
+    }
+
+    /// Get SCORM value
+    pub receive ScormGetValue(
+        session_id: SessionId,
+        element: String
+    ) -> Result<String, LmsError> {
+        let session = self.sessions.get(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        let runtime = session.scorm_runtime.as_ref()
+            .ok_or(LmsError::NotFound {
+                entity_type: "ScormRuntime".to_string(),
+                id: session_id.clone()
+            })?;
+
+        match runtime {
+            ScormRuntimeWrapper::Scorm12(rt) => rt.get_value(&element),
+            ScormRuntimeWrapper::Scorm2004(rt) => rt.get_value(&element),
+        }
+    }
+
+    /// Set SCORM value
+    pub receive ScormSetValue(
+        session_id: SessionId,
+        element: String,
+        value: String
+    ) -> Result<(), LmsError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        let runtime = session.scorm_runtime.as_mut()
+            .ok_or(LmsError::NotFound {
+                entity_type: "ScormRuntime".to_string(),
+                id: session_id.clone()
+            })?;
+
+        match runtime {
+            ScormRuntimeWrapper::Scorm12(rt) => rt.set_value(&element, &value)?,
+            ScormRuntimeWrapper::Scorm2004(rt) => rt.set_value(&element, &value)?,
+        };
+
+        // Handle special elements
+        if element == "cmi.core.lesson_location" || element == "cmi.location" {
+            session.position = ContentPosition {
+                position_type: PositionType::ScormBookmark { location: value.clone() },
+                value,
+                context: Map::new(),
+                saved_at: DateTime::now(),
+            };
+        }
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Commit SCORM data
+    pub receive ScormCommit(session_id: SessionId) -> Result<(), LmsError> {
+        let session = self.sessions.get(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        if let Some(runtime) = &session.scorm_runtime {
+            self.commit_scorm_data(runtime).await;
+        }
+
+        self.log_event(PlayerEvent {
+            event_type: PlayerEventType::ScormCommit,
+            timestamp: DateTime::now(),
+            session_id,
+            data: Map::new(),
+        });
+
+        checkpoint();
+        Ok(())
+    }
+
+    async fn commit_scorm_data(&self, runtime: &ScormRuntimeWrapper) {
+        // In production, persist SCORM data to storage
+        match runtime {
+            ScormRuntimeWrapper::Scorm12(rt) => {
+                let data = rt.get_all_data();
+                // Persist data...
+            },
+            ScormRuntimeWrapper::Scorm2004(rt) => {
+                let data = rt.get_all_data();
+                // Persist data...
+            },
+        }
+    }
+
+    // =========================================================================
+    // xAPI Integration
+    // =========================================================================
+
+    async fn send_xapi_statement(&self, session: &PlayerSession, verb: &str) {
+        if let Some(client) = &self.xapi_client {
+            let statement = self.build_xapi_statement(session, verb);
+            // In production, send to LRS
+            // client.send_statement(statement).await;
+        }
+    }
+
+    fn build_xapi_statement(&self, session: &PlayerSession, verb: &str) -> Statement {
+        // Build xAPI statement - simplified
+        Statement {
+            id: generate_uuid(),
+            actor_id: session.student_id.clone(),
+            verb: verb.to_string(),
+            object_id: session.xapi_data.activity_id.clone(),
+            timestamp: DateTime::now().to_rfc3339(),
+            result: None,
+            context: None,
+        }
+    }
+
+    // =========================================================================
+    // Content Loading
+    // =========================================================================
+
+    /// Get content data for player
+    pub receive GetContentData(
+        session_id: SessionId
+    ) -> Result<ContentData, LmsError> {
+        let session = self.sessions.get(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        // In production, fetch lesson, course, module data from storage
+        let content_data = self.build_content_data(session).await?;
+
+        self.log_event(PlayerEvent {
+            event_type: PlayerEventType::ContentLoaded,
+            timestamp: DateTime::now(),
+            session_id,
+            data: Map::new(),
+        });
+
+        Ok(content_data)
+    }
+
+    async fn build_content_data(&self, session: &PlayerSession) -> Result<ContentData, LmsError> {
+        // In production, this would fetch from various services
+        Ok(ContentData {
+            lesson: LessonDetails {
+                id: session.lesson_id.clone(),
+                title: "Lesson Title".to_string(),
+                description: None,
+                content_type: ContentType::Video,
+                bundle_type: LessonBundle::Video,
+                duration_minutes: Some(10),
+                thumbnail_url: None,
+                objectives: vec![],
+                keywords: vec![],
+            },
+            course: CourseContext {
+                id: session.course_id.clone(),
+                title: "Course Title".to_string(),
+                instructor: None,
+            },
+            module: ModuleContext {
+                id: session.module_id.clone(),
+                title: "Module Title".to_string(),
+                position: 1,
+            },
+            navigation: NavigationData {
+                previous: None,
+                next: None,
+                outline: vec![],
+                current_position: CoursePosition {
+                    module_index: 0,
+                    lesson_index: 0,
+                    total_modules: 1,
+                    total_lessons: 1,
+                    lessons_completed: 0,
+                },
+                can_navigate_forward: true,
+                can_navigate_backward: true,
+            },
+            progress: ProgressData {
+                lesson_progress: 0.0,
+                completion_status: CompletionStatus::NotAttempted,
+                score: None,
+                time_spent_seconds: session.session_time,
+                last_position: Some(session.position.clone()),
+                attempts: 0,
+                max_attempts: None,
+            },
+            sources: vec![],
+            transcript: None,
+            attachments: vec![],
+            related: vec![],
+        })
+    }
+
+    // =========================================================================
+    // Playback Events
+    // =========================================================================
+
+    /// Record playback event
+    pub receive RecordPlaybackEvent(
+        session_id: SessionId,
+        event_type: PlayerEventType
+    ) -> Result<(), LmsError> {
+        self.log_event(PlayerEvent {
+            event_type,
+            timestamp: DateTime::now(),
+            session_id,
+            data: Map::new(),
+        });
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Update playback position
+    pub receive UpdatePosition(
+        session_id: SessionId,
+        position: ContentPosition
+    ) -> Result<(), LmsError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        let old_position = session.position.clone();
+        session.position = position.clone();
+        session.last_activity = DateTime::now();
+
+        // Check if this is a significant seek
+        if let (PositionType::Time { seconds: old_sec }, PositionType::Time { seconds: new_sec }) =
+            (&old_position.position_type, &position.position_type)
+        {
+            if (new_sec - old_sec).abs() > 5.0 {
+                self.log_event(PlayerEvent {
+                    event_type: PlayerEventType::PositionChanged { from: *old_sec, to: *new_sec },
+                    timestamp: DateTime::now(),
+                    session_id,
+                    data: Map::new(),
+                });
+            }
+        }
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Mark content as completed
+    pub receive MarkCompleted(
+        session_id: SessionId,
+        score: Option<ScoreData>
+    ) -> Result<(), LmsError> {
+        let session = self.sessions.get_mut(&session_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "PlayerSession".to_string(),
+                id: session_id.clone()
+            })?;
+
+        session.state = SessionState::Completed;
+
+        self.log_event(PlayerEvent {
+            event_type: PlayerEventType::PlaybackCompleted,
+            timestamp: DateTime::now(),
+            session_id: session_id.clone(),
+            data: Map::new(),
+        });
+
+        // Send xAPI completed statement
+        if self.config.xapi_enabled {
+            self.send_xapi_statement(session, "completed").await;
+        }
+
+        checkpoint();
+        Ok(())
+    }
+
+    // =========================================================================
+    // Bookmarks & Notes
+    // =========================================================================
+
+    /// Save bookmark
+    pub receive SaveBookmark(
+        student_id: StudentId,
+        lesson_id: LessonId,
+        position: ContentPosition
+    ) -> Result<(), LmsError> {
+        let student_bookmarks = self.bookmarks
+            .entry(lesson_id.clone())
+            .or_insert(Map::new());
+
+        student_bookmarks.insert(student_id, position);
+
+        checkpoint();
+        Ok(())
+    }
+
+    fn save_bookmark_internal(&mut self, session: &PlayerSession) {
+        let student_bookmarks = self.bookmarks
+            .entry(session.lesson_id.clone())
+            .or_insert(Map::new());
+
+        student_bookmarks.insert(session.student_id.clone(), session.position.clone());
+    }
+
+    /// Get bookmark
+    pub receive GetBookmark(
+        student_id: StudentId,
+        lesson_id: LessonId
+    ) -> Option<ContentPosition> {
+        self.bookmarks.get(&lesson_id)
+            .and_then(|m| m.get(&student_id))
+            .cloned()
+    }
+
+    /// Add note
+    pub receive AddNote(
+        student_id: StudentId,
+        lesson_id: LessonId,
+        content: String,
+        position: Option<ContentPosition>,
+        color: NoteColor
+    ) -> Result<PlayerNote, LmsError> {
+        let note = PlayerNote {
+            id: generate_uuid(),
+            student_id: student_id.clone(),
+            lesson_id: lesson_id.clone(),
+            content,
+            position,
+            color,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+
+        let lesson_notes = self.notes
+            .entry(lesson_id)
+            .or_insert(Map::new());
+
+        let student_notes = lesson_notes
+            .entry(student_id)
+            .or_insert(vec![]);
+
+        student_notes.push(note.clone());
+
+        checkpoint();
+        Ok(note)
+    }
+
+    /// Get notes for lesson
+    pub receive GetNotes(
+        student_id: StudentId,
+        lesson_id: LessonId
+    ) -> List<PlayerNote> {
+        self.notes.get(&lesson_id)
+            .and_then(|m| m.get(&student_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Update note
+    pub receive UpdateNote(
+        note_id: String,
+        content: String
+    ) -> Result<PlayerNote, LmsError> {
+        for (_, lesson_notes) in self.notes.iter_mut() {
+            for (_, student_notes) in lesson_notes.iter_mut() {
+                for note in student_notes.iter_mut() {
+                    if note.id == note_id {
+                        note.content = content;
+                        note.updated_at = DateTime::now();
+
+                        checkpoint();
+                        return Ok(note.clone());
+                    }
+                }
+            }
+        }
+
+        Err(LmsError::NotFound {
+            entity_type: "PlayerNote".to_string(),
+            id: note_id
+        })
+    }
+
+    /// Delete note
+    pub receive DeleteNote(note_id: String) -> Result<(), LmsError> {
+        for (_, lesson_notes) in self.notes.iter_mut() {
+            for (_, student_notes) in lesson_notes.iter_mut() {
+                if let Some(pos) = student_notes.iter().position(|n| n.id == note_id) {
+                    student_notes.remove(pos);
+                    checkpoint();
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(LmsError::NotFound {
+            entity_type: "PlayerNote".to_string(),
+            id: note_id
+        })
+    }
+
+    // =========================================================================
+    // Settings
+    // =========================================================================
+
+    /// Get player settings
+    pub receive GetSettings(student_id: StudentId) -> PlayerSettings {
+        self.user_settings.get(&student_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Save player settings
+    pub receive SaveSettings(
+        student_id: StudentId,
+        settings: PlayerSettings
+    ) -> Result<(), LmsError> {
+        self.user_settings.insert(student_id, settings);
+        checkpoint();
+        Ok(())
+    }
+
+    // =========================================================================
+    // Event Logging
+    // =========================================================================
+
+    fn log_event(&mut self, event: PlayerEvent) {
+        self.event_log.push(event);
+
+        // Trim log if too large
+        if self.event_log.len() > self.max_event_log_size as usize {
+            self.event_log.remove(0);
+        }
+    }
+
+    /// Get recent events
+    pub receive GetEvents(
+        session_id: Option<SessionId>,
+        limit: i32
+    ) -> List<PlayerEvent> {
+        let mut events: List<PlayerEvent> = if let Some(sid) = session_id {
+            self.event_log.iter()
+                .filter(|e| e.session_id == sid)
+                .cloned()
+                .collect()
+        } else {
+            self.event_log.clone()
+        };
+
+        events.reverse();
+        events.into_iter().take(limit as usize).collect()
+    }
+
+    // =========================================================================
+    // Cleanup
+    // =========================================================================
+
+    /// Clean up expired sessions
+    pub receive CleanupExpiredSessions() {
+        let timeout = Duration::minutes(self.config.session_timeout as i64);
+        let now = DateTime::now();
+
+        let expired: List<SessionId> = self.sessions.iter()
+            .filter(|(_, s)| now - s.last_activity > timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for session_id in expired {
+            if let Some(session) = self.sessions.remove(&session_id) {
+                // Save bookmark before removing
+                self.save_bookmark_internal(&session);
+            }
+        }
+
+        checkpoint();
+    }
+}
+
+// =============================================================================
+// Supporting Types
+// =============================================================================
+
+/// SCORM version
+pub enum ScormVersion {
+    Scorm12,
+    Scorm2004,
+}
+
+/// SCORM initialization result
+pub struct ScormInitResult {
+    success: bool,
+    learner_id: String,
+    learner_name: String,
+    launch_data: String,
+    location: String,
+}
+
+/// Session summary
+pub struct SessionSummary {
+    session_id: SessionId,
+    duration_seconds: i32,
+    completion_status: Option<CompletionStatus>,
+    score: Option<ScoreData>,
+    position: ContentPosition,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_player_creation() {
+        let player = ContentPlayerActor::new();
+        assert!(player.sessions.is_empty());
+    }
+
+    #[test]
+    fn test_position_types() {
+        let time_pos = PositionType::Time { seconds: 120.5 };
+        let page_pos = PositionType::Page { page_number: 5 };
+        let scorm_pos = PositionType::ScormBookmark { location: "1.2.3".to_string() };
+
+        assert!(matches!(time_pos, PositionType::Time { .. }));
+        assert!(matches!(page_pos, PositionType::Page { .. }));
+        assert!(matches!(scorm_pos, PositionType::ScormBookmark { .. }));
+    }
+
+    #[test]
+    fn test_player_settings_default() {
+        let settings = PlayerSettings::default();
+        assert_eq!(settings.playback_speed, 1.0);
+        assert_eq!(settings.volume, 1.0);
+        assert!(!settings.captions_enabled);
+    }
+
+    #[test]
+    fn test_session_state() {
+        let active = SessionState::Active;
+        let completed = SessionState::Completed;
+        let error = SessionState::Error { message: "Test error".to_string() };
+
+        assert!(matches!(active, SessionState::Active));
+        assert!(matches!(completed, SessionState::Completed));
+        assert!(matches!(error, SessionState::Error { .. }));
+    }
+}

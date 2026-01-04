@@ -1,0 +1,1097 @@
+/// Intelligo LMS - User Management Admin Module
+///
+/// Comprehensive user management interface for administrators.
+
+module intelligo::admin::users
+
+use intelligo::core::*
+use intelligo::entities::*
+use intelligo::runtime::*
+
+// ============================================================================
+// User Management Service
+// ============================================================================
+
+/// Central user management service
+pub actor UserManagementService {
+    tenant_id: String,
+    auth_service: AuthService,
+    notification_service: NotificationService,
+    audit_log: AuditLog,
+
+    pub fn new(tenant_id: &str) -> Self {
+        UserManagementService {
+            tenant_id: tenant_id.to_string(),
+            auth_service: AuthService::new(),
+            notification_service: NotificationService::new(),
+            audit_log: AuditLog::new()
+        }
+    }
+
+    // ========================================================================
+    // User CRUD Operations
+    // ========================================================================
+
+    /// Create a new user
+    pub fn create_user(mut self, request: CreateUserRequest) -> Result<User, UserError> {
+        // Validate request
+        self.validate_create_request(&request)?;
+
+        // Check for duplicate email
+        if self.email_exists(&request.email) {
+            return Err(UserError::DuplicateEmail(request.email.clone()));
+        }
+
+        // Generate user ID
+        let user_id = Uuid::new_v4().to_string();
+
+        // Hash password if provided
+        let password_hash = match &request.password {
+            Some(pwd) => Some(self.auth_service.hash_password(pwd)?),
+            None => None
+        };
+
+        // Create user entity
+        let user = User {
+            id: user_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            email: request.email.clone(),
+            username: request.username.unwrap_or_else(|| request.email.clone()),
+            password_hash,
+            first_name: request.first_name,
+            last_name: request.last_name,
+            display_name: request.display_name,
+            avatar_url: request.avatar_url,
+            role: request.role.unwrap_or(UserRole::Learner),
+            status: UserStatus::Pending,
+            email_verified: false,
+            phone: request.phone,
+            phone_verified: false,
+            timezone: request.timezone.unwrap_or_else(|| "UTC".to_string()),
+            locale: request.locale.unwrap_or_else(|| "en".to_string()),
+            metadata: request.metadata.unwrap_or_default(),
+            groups: vec![],
+            permissions: vec![],
+            last_login_at: None,
+            login_count: 0,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            created_by: request.created_by.clone(),
+            deleted_at: None
+        };
+
+        // Save user
+        self.save_user(&user)?;
+
+        // Assign to groups if specified
+        if let Some(group_ids) = request.group_ids {
+            for group_id in group_ids {
+                self.add_user_to_group(&user_id, &group_id)?;
+            }
+        }
+
+        // Send welcome email if requested
+        if request.send_welcome_email.unwrap_or(true) {
+            self.send_welcome_email(&user)?;
+        }
+
+        // Audit log
+        self.audit_log.log(AuditEntry {
+            action: "user.created".to_string(),
+            actor_id: request.created_by,
+            target_type: "user".to_string(),
+            target_id: user_id.clone(),
+            details: Map::new(),
+            timestamp: DateTime::now()
+        });
+
+        Ok(user)
+    }
+
+    /// Update an existing user
+    pub fn update_user(mut self, user_id: &str, request: UpdateUserRequest) -> Result<User, UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        // Update fields
+        if let Some(email) = request.email {
+            if email != user.email && self.email_exists(&email) {
+                return Err(UserError::DuplicateEmail(email));
+            }
+            user.email = email;
+            user.email_verified = false;
+        }
+
+        if let Some(first_name) = request.first_name {
+            user.first_name = first_name;
+        }
+
+        if let Some(last_name) = request.last_name {
+            user.last_name = last_name;
+        }
+
+        if let Some(display_name) = request.display_name {
+            user.display_name = Some(display_name);
+        }
+
+        if let Some(role) = request.role {
+            user.role = role;
+        }
+
+        if let Some(status) = request.status {
+            user.status = status;
+        }
+
+        if let Some(timezone) = request.timezone {
+            user.timezone = timezone;
+        }
+
+        if let Some(locale) = request.locale {
+            user.locale = locale;
+        }
+
+        if let Some(metadata) = request.metadata {
+            user.metadata.extend(metadata);
+        }
+
+        user.updated_at = DateTime::now();
+
+        self.save_user(&user)?;
+
+        // Audit log
+        self.audit_log.log(AuditEntry {
+            action: "user.updated".to_string(),
+            actor_id: request.updated_by,
+            target_type: "user".to_string(),
+            target_id: user_id.to_string(),
+            details: Map::new(),
+            timestamp: DateTime::now()
+        });
+
+        Ok(user)
+    }
+
+    /// Delete a user (soft delete)
+    pub fn delete_user(mut self, user_id: &str, deleted_by: Option<String>) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.status = UserStatus::Deleted;
+        user.deleted_at = Some(DateTime::now());
+        user.updated_at = DateTime::now();
+
+        self.save_user(&user)?;
+
+        self.audit_log.log(AuditEntry {
+            action: "user.deleted".to_string(),
+            actor_id: deleted_by,
+            target_type: "user".to_string(),
+            target_id: user_id.to_string(),
+            details: Map::new(),
+            timestamp: DateTime::now()
+        });
+
+        Ok(())
+    }
+
+    /// Permanently delete a user (hard delete)
+    pub fn purge_user(mut self, user_id: &str, purged_by: Option<String>) -> Result<(), UserError> {
+        // Remove from all groups
+        self.remove_user_from_all_groups(user_id)?;
+
+        // Delete user record
+        self.hard_delete_user(user_id)?;
+
+        self.audit_log.log(AuditEntry {
+            action: "user.purged".to_string(),
+            actor_id: purged_by,
+            target_type: "user".to_string(),
+            target_id: user_id.to_string(),
+            details: Map::new(),
+            timestamp: DateTime::now()
+        });
+
+        Ok(())
+    }
+
+    /// Get a user by ID
+    pub fn get_user(self, user_id: &str) -> Result<User, UserError> {
+        // Would query from database/repository
+        Err(UserError::NotFound(user_id.to_string()))
+    }
+
+    /// Get a user by email
+    pub fn get_user_by_email(self, email: &str) -> Result<User, UserError> {
+        // Would query from database/repository
+        Err(UserError::NotFound(format!("User with email {} not found", email)))
+    }
+
+    /// List users with pagination and filtering
+    pub fn list_users(self, query: UserListQuery) -> Result<PagedResult<User>, UserError> {
+        // Would query from database with pagination
+        Ok(PagedResult {
+            items: vec![],
+            total: 0,
+            page: query.page.unwrap_or(1),
+            page_size: query.page_size.unwrap_or(20),
+            has_more: false,
+        })
+    }
+
+    /// Search users
+    pub fn search_users(self, search: UserSearchQuery) -> Result<Vec<UserSearchResult>, UserError> {
+        // Would use search index
+        Ok(vec![])
+    }
+
+    // ========================================================================
+    // User Status Management
+    // ========================================================================
+
+    /// Activate a user account
+    pub fn activate_user(mut self, user_id: &str, activated_by: Option<String>) -> Result<User, UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.status = UserStatus::Active;
+        user.updated_at = DateTime::now();
+
+        self.save_user(&user)?;
+
+        // Send activation notification
+        self.notification_service.send(Notification {
+            user_id: user_id.to_string(),
+            notification_type: NotificationType::AccountActivated,
+            data: Map::new()
+        });
+
+        self.audit_log.log(AuditEntry {
+            action: "user.activated".to_string(),
+            actor_id: activated_by,
+            target_type: "user".to_string(),
+            target_id: user_id.to_string(),
+            details: Map::new(),
+            timestamp: DateTime::now()
+        });
+
+        Ok(user)
+    }
+
+    /// Suspend a user account
+    pub fn suspend_user(mut self, user_id: &str, reason: &str, suspended_by: Option<String>) -> Result<User, UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.status = UserStatus::Suspended;
+        user.metadata.insert("suspension_reason".to_string(), reason.to_string());
+        user.metadata.insert("suspended_at".to_string(), DateTime::now().to_string());
+        user.updated_at = DateTime::now();
+
+        self.save_user(&user)?;
+
+        // Invalidate all sessions
+        self.auth_service.invalidate_all_sessions(user_id)?;
+
+        self.audit_log.log(AuditEntry {
+            action: "user.suspended".to_string(),
+            actor_id: suspended_by,
+            target_type: "user".to_string(),
+            target_id: user_id.to_string(),
+            details: {
+                let mut d = Map::new();
+                d.insert("reason".to_string(), reason.to_string());
+                d
+            },
+            timestamp: DateTime::now()
+        });
+
+        Ok(user)
+    }
+
+    /// Lock a user account (temporary security measure)
+    pub fn lock_user(mut self, user_id: &str, reason: &str, duration: Option<Duration>) -> Result<User, UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.status = UserStatus::Locked;
+        user.metadata.insert("lock_reason".to_string(), reason.to_string());
+        user.metadata.insert("locked_at".to_string(), DateTime::now().to_string());
+
+        if let Some(dur) = duration {
+            let unlock_at = DateTime::now() + dur;
+            user.metadata.insert("unlock_at".to_string(), unlock_at.to_string());
+        }
+
+        user.updated_at = DateTime::now();
+        self.save_user(&user)?;
+
+        // Invalidate all sessions
+        self.auth_service.invalidate_all_sessions(user_id)?;
+
+        Ok(user)
+    }
+
+    /// Unlock a user account
+    pub fn unlock_user(mut self, user_id: &str) -> Result<User, UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.status = UserStatus::Active;
+        user.metadata.remove("lock_reason");
+        user.metadata.remove("locked_at");
+        user.metadata.remove("unlock_at");
+        user.updated_at = DateTime::now();
+
+        self.save_user(&user)?;
+
+        Ok(user)
+    }
+
+    // ========================================================================
+    // Password Management
+    // ========================================================================
+
+    /// Set user password
+    pub fn set_password(mut self, user_id: &str, password: &str) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        // Validate password strength
+        self.validate_password(password)?;
+
+        user.password_hash = Some(self.auth_service.hash_password(password)?);
+        user.updated_at = DateTime::now();
+
+        self.save_user(&user)?;
+
+        self.audit_log.log(AuditEntry {
+            action: "user.password_changed".to_string(),
+            actor_id: Some(user_id.to_string()),
+            target_type: "user".to_string(),
+            target_id: user_id.to_string(),
+            details: Map::new(),
+            timestamp: DateTime::now()
+        });
+
+        Ok(())
+    }
+
+    /// Initiate password reset
+    pub fn initiate_password_reset(mut self, email: &str) -> Result<PasswordResetToken, UserError> {
+        let user = self.get_user_by_email(email)?;
+
+        let token = PasswordResetToken {
+            token: Uuid::new_v4().to_string(),
+            user_id: user.id.clone(),
+            expires_at: DateTime::now() + Duration::from_secs(3600), // 1 hour
+            used: false
+        };
+
+        self.save_password_reset_token(&token)?;
+
+        // Send reset email
+        self.notification_service.send(Notification {
+            user_id: user.id.clone(),
+            notification_type: NotificationType::PasswordReset,
+            data: {
+                let mut d = Map::new();
+                d.insert("reset_token".to_string(), token.token.clone());
+                d
+            }
+        });
+
+        Ok(token)
+    }
+
+    /// Complete password reset
+    pub fn complete_password_reset(mut self, token: &str, new_password: &str) -> Result<(), UserError> {
+        let reset_token = self.get_password_reset_token(token)?;
+
+        if reset_token.used {
+            return Err(UserError::TokenAlreadyUsed);
+        }
+
+        if reset_token.expires_at < DateTime::now() {
+            return Err(UserError::TokenExpired);
+        }
+
+        self.set_password(&reset_token.user_id, new_password)?;
+        self.mark_token_used(token)?;
+
+        Ok(())
+    }
+
+    /// Force password change on next login
+    pub fn require_password_change(mut self, user_id: &str) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+        user.metadata.insert("require_password_change".to_string(), "true".to_string());
+        user.updated_at = DateTime::now();
+        self.save_user(&user)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Group Management
+    // ========================================================================
+
+    /// Add user to a group
+    pub fn add_user_to_group(mut self, user_id: &str, group_id: &str) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        if !user.groups.contains(&group_id.to_string()) {
+            user.groups.push(group_id.to_string());
+            user.updated_at = DateTime::now();
+            self.save_user(&user)?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove user from a group
+    pub fn remove_user_from_group(mut self, user_id: &str, group_id: &str) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.groups.retain(|g| g != group_id);
+        user.updated_at = DateTime::now();
+        self.save_user(&user)?;
+
+        Ok(())
+    }
+
+    /// Set user groups (replaces all existing)
+    pub fn set_user_groups(mut self, user_id: &str, group_ids: Vec<String>) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.groups = group_ids;
+        user.updated_at = DateTime::now();
+        self.save_user(&user)?;
+
+        Ok(())
+    }
+
+    /// Get user's groups
+    pub fn get_user_groups(self, user_id: &str) -> Result<Vec<Group>, UserError> {
+        // Would query groups from database
+        let user = self.get_user(user_id)?;
+        // Return empty list - actual implementation would fetch Group objects
+        Ok(vec![])
+    }
+
+    // ========================================================================
+    // Permission Management
+    // ========================================================================
+
+    /// Grant permission to user
+    pub fn grant_permission(mut self, user_id: &str, permission: Permission) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        if !user.permissions.contains(&permission) {
+            user.permissions.push(permission);
+            user.updated_at = DateTime::now();
+            self.save_user(&user)?;
+        }
+
+        Ok(())
+    }
+
+    /// Revoke permission from user
+    pub fn revoke_permission(mut self, user_id: &str, permission: &Permission) -> Result<(), UserError> {
+        let mut user = self.get_user(user_id)?;
+
+        user.permissions.retain(|p| p != permission);
+        user.updated_at = DateTime::now();
+        self.save_user(&user)?;
+
+        Ok(())
+    }
+
+    /// Check if user has permission
+    pub fn has_permission(self, user_id: &str, permission: &Permission) -> Result<bool, UserError> {
+        let user = self.get_user(user_id)?;
+
+        // Check direct permissions
+        if user.permissions.contains(permission) {
+            return Ok(true);
+        }
+
+        // Check role-based permissions
+        let role_permissions = self.get_role_permissions(&user.role)?;
+        if role_permissions.contains(permission) {
+            return Ok(true);
+        }
+
+        // Check group-based permissions
+        for group_id in &user.groups {
+            let group_permissions = self.get_group_permissions(group_id)?;
+            if group_permissions.contains(permission) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Get all effective permissions for a user
+    pub fn get_effective_permissions(self, user_id: &str) -> Result<Vec<Permission>, UserError> {
+        let user = self.get_user(user_id)?;
+        let mut permissions = user.permissions.clone();
+
+        // Add role permissions
+        let role_permissions = self.get_role_permissions(&user.role)?;
+        for p in role_permissions {
+            if !permissions.contains(&p) {
+                permissions.push(p);
+            }
+        }
+
+        // Add group permissions
+        for group_id in &user.groups {
+            let group_permissions = self.get_group_permissions(group_id)?;
+            for p in group_permissions {
+                if !permissions.contains(&p) {
+                    permissions.push(p);
+                }
+            }
+        }
+
+        Ok(permissions)
+    }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Bulk create users
+    pub fn bulk_create_users(mut self, requests: Vec<CreateUserRequest>) -> Result<BulkOperationResult<User>, UserError> {
+        let mut results = BulkOperationResult::new();
+
+        for request in requests {
+            match self.create_user(request.clone()) {
+                Ok(user) => results.add_success(user),
+                Err(e) => results.add_failure(request.email, e.to_string())
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Bulk update users
+    pub fn bulk_update_users(mut self, updates: Vec<(String, UpdateUserRequest)>) -> Result<BulkOperationResult<User>, UserError> {
+        let mut results = BulkOperationResult::new();
+
+        for (user_id, request) in updates {
+            match self.update_user(&user_id, request) {
+                Ok(user) => results.add_success(user),
+                Err(e) => results.add_failure(user_id, e.to_string())
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Bulk delete users
+    pub fn bulk_delete_users(mut self, user_ids: Vec<String>, deleted_by: Option<String>) -> Result<BulkOperationResult<String>, UserError> {
+        let mut results = BulkOperationResult::new();
+
+        for user_id in user_ids {
+            match self.delete_user(&user_id, deleted_by.clone()) {
+                Ok(_) => results.add_success(user_id),
+                Err(e) => results.add_failure(user_id.clone(), e.to_string())
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Bulk assign to group
+    pub fn bulk_assign_to_group(mut self, user_ids: Vec<String>, group_id: &str) -> Result<BulkOperationResult<String>, UserError> {
+        let mut results = BulkOperationResult::new();
+
+        for user_id in user_ids {
+            match self.add_user_to_group(&user_id, group_id) {
+                Ok(_) => results.add_success(user_id),
+                Err(e) => results.add_failure(user_id.clone(), e.to_string())
+            }
+        }
+
+        Ok(results)
+    }
+
+    // ========================================================================
+    // Import/Export
+    // ========================================================================
+
+    /// Import users from CSV
+    pub fn import_users_csv(mut self, csv_data: &str, options: ImportOptions) -> Result<ImportResult, UserError> {
+        let mut result = ImportResult::new();
+
+        // Parse CSV
+        let records = self.parse_csv(csv_data)?;
+
+        for (line_num, record) in records.iter().enumerate() {
+            let request = match self.csv_record_to_create_request(record, &options) {
+                Ok(req) => req,
+                Err(e) => {
+                    result.add_error(line_num + 1, e.to_string());
+                    continue;
+                }
+            };
+
+            // Check for duplicates
+            if options.skip_duplicates && self.email_exists(&request.email) {
+                result.add_skipped(line_num + 1, "Duplicate email");
+                continue;
+            }
+
+            // Update existing or create new
+            if options.update_existing {
+                if let Ok(existing) = self.get_user_by_email(&request.email) {
+                    let update = self.create_request_to_update_request(&request);
+                    match self.update_user(&existing.id, update) {
+                        Ok(_) => result.add_updated(),
+                        Err(e) => result.add_error(line_num + 1, e.to_string())
+                    }
+                    continue;
+                }
+            }
+
+            match self.create_user(request) {
+                Ok(_) => result.add_created(),
+                Err(e) => result.add_error(line_num + 1, e.to_string())
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Export users to CSV
+    pub fn export_users_csv(self, query: UserListQuery) -> Result<String, UserError> {
+        let users = self.list_users(query)?;
+
+        let mut csv = String::new();
+        csv.push_str("id,email,first_name,last_name,role,status,created_at\n");
+
+        for user in users.items {
+            csv.push_str(&format!(
+                "{},{},{},{},{:?},{:?},{}\n",
+                user.id,
+                user.email,
+                user.first_name,
+                user.last_name,
+                user.role,
+                user.status,
+                user.created_at
+            ));
+        }
+
+        Ok(csv)
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn validate_create_request(self, request: &CreateUserRequest) -> Result<(), UserError> {
+        if request.email.is_empty() {
+            return Err(UserError::ValidationError("Email is required".to_string()));
+        }
+
+        if !self.is_valid_email(&request.email) {
+            return Err(UserError::ValidationError("Invalid email format".to_string()));
+        }
+
+        if request.first_name.is_empty() {
+            return Err(UserError::ValidationError("First name is required".to_string()));
+        }
+
+        if request.last_name.is_empty() {
+            return Err(UserError::ValidationError("Last name is required".to_string()));
+        }
+
+        Ok(())
+    }
+
+    fn validate_password(self, password: &str) -> Result<(), UserError> {
+        if password.len() < 8 {
+            return Err(UserError::WeakPassword("Password must be at least 8 characters".to_string()));
+        }
+
+        let has_uppercase = password.chars().any(|c| c.is_uppercase());
+        let has_lowercase = password.chars().any(|c| c.is_lowercase());
+        let has_digit = password.chars().any(|c| c.is_ascii_digit());
+
+        if !has_uppercase || !has_lowercase || !has_digit {
+            return Err(UserError::WeakPassword(
+                "Password must contain uppercase, lowercase, and digit".to_string()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn is_valid_email(self, email: &str) -> bool {
+        email.contains('@') && email.contains('.')
+    }
+
+    fn email_exists(self, email: &str) -> bool {
+        self.get_user_by_email(email).is_ok()
+    }
+
+    fn save_user(self, user: &User) -> Result<(), UserError> {
+        // Would persist to database
+        Ok(())
+    }
+
+    fn hard_delete_user(self, user_id: &str) -> Result<(), UserError> {
+        // Would permanently delete from database
+        Ok(())
+    }
+
+    fn remove_user_from_all_groups(self, user_id: &str) -> Result<(), UserError> {
+        // Would remove user from all group memberships
+        Ok(())
+    }
+
+    fn send_welcome_email(self, user: &User) -> Result<(), UserError> {
+        // Would send welcome email via notification service
+        self.notification_service.send_email(&user.email, "welcome", HashMap::new());
+        Ok(())
+    }
+
+    fn save_password_reset_token(self, token: &PasswordResetToken) -> Result<(), UserError> {
+        // Would persist token to database
+        Ok(())
+    }
+
+    fn get_password_reset_token(self, token: &str) -> Result<PasswordResetToken, UserError> {
+        // Would query token from database
+        Err(UserError::InvalidToken("Token not found".to_string()))
+    }
+
+    fn mark_token_used(self, token: &str) -> Result<(), UserError> {
+        // Would update token status in database
+        Ok(())
+    }
+
+    fn get_role_permissions(self, role: &UserRole) -> Result<Vec<Permission>, UserError> {
+        // Return default permissions based on role
+        let permissions = match role {
+            UserRole::Admin => vec![
+                Permission::ManageUsers,
+                Permission::ManageCourses,
+                Permission::ManageEnrollments,
+                Permission::ViewReports,
+            ],
+            UserRole::Instructor => vec![
+                Permission::CreateCourses,
+                Permission::ManageOwnCourses,
+                Permission::GradeAssessments,
+            ],
+            UserRole::Learner => vec![
+                Permission::ViewCourses,
+                Permission::SubmitAssessments,
+            ],
+            _ => vec![],
+        };
+        Ok(permissions)
+    }
+
+    fn get_group_permissions(self, group_id: &str) -> Result<Vec<Permission>, UserError> {
+        // Would query group permissions from database
+        Ok(vec![])
+    }
+
+    fn parse_csv(self, csv_data: &str) -> Result<Vec<Map<String, String>>, UserError> {
+        let mut records = vec![];
+        let lines: Vec<&str> = csv_data.lines().collect();
+
+        if lines.is_empty() {
+            return Ok(records);
+        }
+
+        let headers: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
+
+        for line in &lines[1..] {
+            let values: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            let mut record = Map::new();
+
+            for (i, header) in headers.iter().enumerate() {
+                if i < values.len() {
+                    record.insert(header.to_string(), values[i].to_string());
+                }
+            }
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+
+    fn csv_record_to_create_request(self, record: &Map<String, String>, options: &ImportOptions) -> Result<CreateUserRequest, UserError> {
+        let email = record.get("email").ok_or(
+            UserError::ValidationError("Email is required".to_string())
+        )?;
+
+        Ok(CreateUserRequest {
+            email: email.clone(),
+            username: record.get("username").cloned(),
+            password: None,
+            first_name: record.get("first_name").cloned(),
+            last_name: record.get("last_name").cloned(),
+            display_name: record.get("display_name").cloned(),
+            role: options.default_role.clone(),
+            groups: options.default_groups.clone(),
+            send_welcome_email: options.send_welcome_email,
+            metadata: None,
+        })
+    }
+
+    fn create_request_to_update_request(self, request: &CreateUserRequest) -> UpdateUserRequest {
+        UpdateUserRequest {
+            username: request.username.clone(),
+            first_name: request.first_name.clone(),
+            last_name: request.last_name.clone(),
+            display_name: request.display_name.clone(),
+            role: request.role.clone(),
+            metadata: request.metadata.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// User entity
+pub type User = type {
+    id: String,
+    tenant_id: String,
+    email: String,
+    username: String,
+    password_hash: Option<String>,
+    first_name: String,
+    last_name: String,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    role: UserRole,
+    status: UserStatus,
+    email_verified: bool,
+    phone: Option<String>,
+    phone_verified: bool,
+    timezone: String,
+    locale: String,
+    metadata: Map<String, String>,
+    groups: Vec<String>,
+    permissions: Vec<Permission>,
+    last_login_at: Option<DateTime>,
+    login_count: i32,
+    created_at: DateTime,
+    updated_at: DateTime,
+    created_by: Option<String>,
+    deleted_at: Option<DateTime>
+}
+
+/// User role
+pub enum UserRole {
+    SuperAdmin,
+    TenantAdmin,
+    Instructor,
+    TeachingAssistant,
+    Learner,
+    Observer,
+    Guest,
+    Custom(String)
+}
+
+/// User account status
+pub enum UserStatus {
+    Pending,
+    Active,
+    Inactive,
+    Suspended,
+    Locked,
+    Deleted
+}
+
+/// Permission definition
+pub type Permission = type {
+    resource: String,
+    action: String,
+    conditions: Option<Map<String, String>>
+}
+
+/// User group
+pub type Group = type {
+    id: String,
+    tenant_id: String,
+    name: String,
+    description: Option<String>,
+    parent_id: Option<String>,
+    permissions: Vec<Permission>,
+    metadata: Map<String, String>,
+    member_count: i32,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Create user request
+pub type CreateUserRequest = type {
+    email: String,
+    username: Option<String>,
+    password: Option<String>,
+    first_name: String,
+    last_name: String,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    role: Option<UserRole>,
+    phone: Option<String>,
+    timezone: Option<String>,
+    locale: Option<String>,
+    metadata: Option<Map<String, String>>,
+    group_ids: Option<Vec<String>>,
+    send_welcome_email: Option<bool>,
+    created_by: Option<String>
+}
+
+/// Update user request
+pub type UpdateUserRequest = type {
+    email: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    role: Option<UserRole>,
+    status: Option<UserStatus>,
+    phone: Option<String>,
+    timezone: Option<String>,
+    locale: Option<String>,
+    metadata: Option<Map<String, String>>,
+    updated_by: Option<String>
+}
+
+/// User list query
+pub type UserListQuery = type {
+    page: Option<i32>,
+    page_size: Option<i32>,
+    sort_by: Option<String>,
+    sort_order: Option<SortOrder>,
+    status: Option<UserStatus>,
+    role: Option<UserRole>,
+    group_id: Option<String>,
+    created_after: Option<DateTime>,
+    created_before: Option<DateTime>
+}
+
+/// User search query
+pub type UserSearchQuery = type {
+    query: String,
+    fields: Option<Vec<String>>,
+    limit: Option<i32>
+}
+
+/// User search result
+pub type UserSearchResult = type {
+    user: User,
+    score: f64,
+    highlights: Map<String, String>
+}
+
+/// Password reset token
+pub type PasswordResetToken = type {
+    token: String,
+    user_id: String,
+    expires_at: DateTime,
+    used: bool
+}
+
+/// Import options
+pub type ImportOptions = type {
+    skip_duplicates: bool,
+    update_existing: bool,
+    default_role: Option<UserRole>,
+    default_groups: Option<Vec<String>>,
+    send_welcome_email: bool,
+    require_password_change: bool
+}
+
+/// Import result
+pub type ImportResult = type {
+    created: i32,
+    updated: i32,
+    skipped: i32,
+    errors: Vec<ImportError>
+}
+
+impl ImportResult {
+    pub fn new() -> Self {
+        ImportResult { created: 0, updated: 0, skipped: 0, errors: vec![] }
+    }
+
+    pub fn add_created(mut self) { self.created += 1; }
+    pub fn add_updated(mut self) { self.updated += 1; }
+    pub fn add_skipped(mut self, line: usize, reason: &str) { self.skipped += 1; }
+    pub fn add_error(mut self, line: usize, message: String) {
+        self.errors.push(ImportError { line, message });
+    }
+}
+
+pub type ImportError = type { line: usize, message: String }
+
+/// Bulk operation result
+pub type BulkOperationResult<T> = type {
+    successes: Vec<T>,
+    failures: Vec<BulkFailure>
+}
+
+impl<T> BulkOperationResult<T> {
+    pub fn new() -> Self {
+        BulkOperationResult { successes: vec![], failures: vec![] }
+    }
+
+    pub fn add_success(mut self, item: T) {
+        self.successes.push(item);
+    }
+
+    pub fn add_failure(mut self, id: String, error: String) {
+        self.failures.push(BulkFailure { id, error });
+    }
+
+    pub fn success_count(self) -> usize { self.successes.len() }
+    pub fn failure_count(self) -> usize { self.failures.len() }
+}
+
+pub type BulkFailure = type { id: String, error: String }
+
+/// Paged result
+pub type PagedResult<T> = type {
+    items: Vec<T>,
+    total: i64,
+    page: i32,
+    page_size: i32,
+    total_pages: i32
+}
+
+/// Sort order
+pub enum SortOrder {
+    Ascending,
+    Descending
+}
+
+/// User errors
+pub enum UserError {
+    NotFound(String),
+    DuplicateEmail(String),
+    ValidationError(String),
+    WeakPassword(String),
+    TokenExpired,
+    TokenAlreadyUsed,
+    Unauthorized,
+    InternalError(String)
+}
+
+impl UserError {
+    pub fn to_string(self) -> String {
+        match self {
+            UserError::NotFound(id) => format!("User not found: {}", id),
+            UserError::DuplicateEmail(email) => format!("Email already exists: {}", email),
+            UserError::ValidationError(msg) => msg,
+            UserError::WeakPassword(msg) => msg,
+            UserError::TokenExpired => "Token has expired".to_string(),
+            UserError::TokenAlreadyUsed => "Token has already been used".to_string(),
+            UserError::Unauthorized => "Unauthorized".to_string(),
+            UserError::InternalError(msg) => msg
+        }
+    }
+}

@@ -1,0 +1,22 @@
+/// Intelligo LMS - Configuration Module
+///
+/// Centralized configuration management system providing environment-based config,
+/// feature flags, application settings, and secret management.
+
+module intelligo::config
+
+// Re-export all configuration submodules
+pub use intelligo::config::core::*
+pub use intelligo::config::feature_flags::*
+pub use intelligo::config::settings::*
+pub use intelligo::config::secrets::*
+
+/// Initialize configuration system
+pub fn init() {
+    println!("[Config] Initializing configuration system")
+}
+
+/// Get the configuration module version
+pub fn version() -> String {
+    "1.0.0".to_string()
+}

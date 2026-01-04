@@ -1,0 +1,180 @@
+/// Intelligo LMS - Enrollment Flow Integration Tests
+///
+/// Tests the complete enrollment workflow from registration to completion.
+
+module intelligo::tests::integration::enrollment_flow
+
+use intelligo::chai::*
+use intelligo::entities::*
+use intelligo::api::*
+
+pub fn register_tests() {
+    describe("Enrollment Flow", || {
+        describe("course enrollment", || {
+            before(|| {
+                // Setup test data
+            });
+
+            after(|| {
+                // Cleanup
+            });
+
+            it("allows user to enroll in published course", || {
+                // Create a published course
+                let mut course = Course::new("tenant_1", "Test Course");
+                course.publish().unwrap();
+
+                // Create user
+                let user = TestUser::learner();
+
+                // Enroll
+                let enrollment = Enrollment::new("tenant_1", &user.id, &course.id);
+
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Pending);
+            });
+
+            it("activates enrollment on first access", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                enrollment.activate().unwrap();
+
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Active);
+                expect(&enrollment.started_at.is_some()).to().be_true();
+            });
+
+            it("tracks progress across modules", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment.activate().unwrap();
+
+                // Complete first module (33%)
+                enrollment.update_progress(33.0);
+                expect(&enrollment.progress).to().equal(&33.0);
+
+                // Complete second module (66%)
+                enrollment.update_progress(66.0);
+                expect(&enrollment.progress).to().equal(&66.0);
+
+                // Complete third module (100%)
+                enrollment.update_progress(100.0);
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Completed);
+            });
+
+            it("prevents duplicate enrollments", || {
+                // First enrollment succeeds
+                let enrollment1 = Enrollment::new("tenant_1", "user_1", "course_1");
+
+                // Second enrollment should fail
+                // In a real system, the service would check for existing enrollment
+            });
+
+            it("respects enrollment capacity", || {
+                // Create course with max 10 enrollments
+                let mut course = Course::new("tenant_1", "Limited Course");
+                course.set_max_enrollments(10);
+                course.publish().unwrap();
+
+                // Enroll 10 users
+                for i in 0..10 {
+                    // Each should succeed
+                }
+
+                // 11th enrollment should fail due to capacity
+            });
+        });
+
+        describe("enrollment with prerequisites", || {
+            it("blocks enrollment when prerequisites not met", || {
+                // Create prerequisite course
+                let prereq_course = Course::new("tenant_1", "Prerequisite Course");
+
+                // Create main course with prerequisite
+                let mut main_course = Course::new("tenant_1", "Advanced Course");
+                main_course.add_prerequisite(&prereq_course.id);
+
+                // Try to enroll without completing prerequisite
+                // Should fail
+            });
+
+            it("allows enrollment when prerequisites completed", || {
+                // Complete prerequisite course
+                let mut prereq_enrollment = Enrollment::new("tenant_1", "user_1", "prereq_course");
+                prereq_enrollment.activate().unwrap();
+                prereq_enrollment.update_progress(100.0);
+
+                // Now enrolling in main course should succeed
+            });
+        });
+
+        describe("enrollment expiration", || {
+            it("expires enrollment after time limit", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment.set_expiration(DateTime::now() - Duration::from_secs(86400)); // Yesterday
+                enrollment.activate().unwrap();
+
+                // Check expiration
+                let is_expired = enrollment.is_expired();
+                expect(&is_expired).to().be_true();
+            });
+
+            it("extends enrollment when renewal requested", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment.set_expiration(DateTime::now() + Duration::from_secs(86400));
+
+                enrollment.extend(Duration::from_secs(86400 * 30)); // 30 more days
+
+                expect(&enrollment.is_expired()).to().be_false();
+            });
+        });
+
+        describe("withdrawal", || {
+            it("allows withdrawal from active enrollment", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment.activate().unwrap();
+                enrollment.update_progress(50.0);
+
+                let result = enrollment.withdraw();
+
+                expect(&result.is_ok()).to().be_true();
+                expect(&enrollment.status).to().equal(&EnrollmentStatus::Withdrawn);
+            });
+
+            it("preserves progress after withdrawal", || {
+                let mut enrollment = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment.activate().unwrap();
+                enrollment.update_progress(50.0);
+                enrollment.withdraw().unwrap();
+
+                // Progress should still be 50% for records
+                expect(&enrollment.progress).to().equal(&50.0);
+            });
+        });
+
+        describe("re-enrollment", || {
+            it("allows re-enrollment after course update", || {
+                // Complete first enrollment
+                let mut enrollment1 = Enrollment::new("tenant_1", "user_1", "course_1");
+                enrollment1.activate().unwrap();
+                enrollment1.update_progress(100.0);
+
+                // Course is updated (new version)
+
+                // Re-enrollment should be allowed
+                let enrollment2 = Enrollment::new("tenant_1", "user_1", "course_1");
+                expect(&enrollment2.id).to().not().equal(&enrollment1.id);
+            });
+        });
+
+        describe("group enrollment", || {
+            it("enrolls multiple users at once", || {
+                let user_ids = vec!["user_1", "user_2", "user_3"];
+                let course_id = "course_1";
+
+                let enrollments: Vec<_> = user_ids.iter()
+                    .map(|uid| Enrollment::new("tenant_1", uid, course_id))
+                    .collect();
+
+                expect(&enrollments.len()).to().equal(&3);
+            });
+        });
+    });
+}

@@ -1,0 +1,1682 @@
+/// Intelligo LMS - Email Integration
+///
+/// Complete email integration including:
+/// - SMTP provider support
+/// - SendGrid integration
+/// - AWS SES integration
+/// - Microsoft Graph API (Outlook)
+/// - Gmail API
+/// - Email templates (welcome, enrollment, grade, certificate)
+/// - Bulk email for announcements
+/// - Email preferences and unsubscribe
+
+module intelligo::integrations::communication::email
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::http::{HttpClient, Request, Response, Headers}
+use std::json::{Json, to_json, from_json}
+use std::base64
+
+// =============================================================================
+// EMAIL PROVIDER TYPES
+// =============================================================================
+
+/// Email provider identifier
+enum EmailProvider {
+    Smtp,
+    SendGrid,
+    AwsSes,
+    MicrosoftGraph,
+    Gmail,
+    Custom { provider_id: String }
+}
+
+impl EmailProvider {
+    fn to_string(&self) -> String {
+        match self {
+            EmailProvider::Smtp => "smtp".to_string(),
+            EmailProvider::SendGrid => "sendgrid".to_string(),
+            EmailProvider::AwsSes => "aws_ses".to_string(),
+            EmailProvider::MicrosoftGraph => "microsoft_graph".to_string(),
+            EmailProvider::Gmail => "gmail".to_string(),
+            EmailProvider::Custom { provider_id } => provider_id.clone()
+        }
+    }
+}
+
+// =============================================================================
+// PROVIDER CONFIGURATIONS
+// =============================================================================
+
+/// SMTP configuration
+type SmtpConfig {
+    host: String,
+    port: i32,
+    username: String,
+    password: String,
+    use_tls: Bool,
+    use_starttls: Bool,
+    from_email: String,
+    from_name: String,
+    reply_to: Option<String>
+}
+
+impl SmtpConfig {
+    fn default() -> SmtpConfig {
+        SmtpConfig {
+            host: "localhost",
+            port: 587,
+            username: "",
+            password: "",
+            use_tls: false,
+            use_starttls: true,
+            from_email: "noreply@intelligo.edu",
+            from_name: "Intelligo LMS",
+            reply_to: None
+        }
+    }
+}
+
+/// SendGrid configuration
+type SendGridConfig {
+    api_key: String,
+    from_email: String,
+    from_name: String,
+    reply_to: Option<String>,
+    /// Sandbox mode for testing
+    sandbox_mode: Bool,
+    /// IP pool name
+    ip_pool_name: Option<String>
+}
+
+impl SendGridConfig {
+    fn from_env() -> Result<SendGridConfig, EmailError> {
+        let api_key = std::env::get("SENDGRID_API_KEY")
+            .ok_or(EmailError::ConfigurationError { message: "SENDGRID_API_KEY not set".to_string() })?;
+
+        Ok(SendGridConfig {
+            api_key,
+            from_email: std::env::get("SENDGRID_FROM_EMAIL").unwrap_or("noreply@intelligo.edu".to_string()),
+            from_name: std::env::get("SENDGRID_FROM_NAME").unwrap_or("Intelligo LMS".to_string()),
+            reply_to: std::env::get("SENDGRID_REPLY_TO"),
+            sandbox_mode: std::env::get("SENDGRID_SANDBOX").map(|v| v == "true").unwrap_or(false),
+            ip_pool_name: std::env::get("SENDGRID_IP_POOL")
+        })
+    }
+}
+
+/// AWS SES configuration
+type AwsSesConfig {
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    from_email: String,
+    from_name: String,
+    reply_to: Option<String>,
+    /// Configuration set name
+    configuration_set: Option<String>
+}
+
+impl AwsSesConfig {
+    fn from_env() -> Result<AwsSesConfig, EmailError> {
+        Ok(AwsSesConfig {
+            region: std::env::get("AWS_REGION").unwrap_or("us-east-1".to_string()),
+            access_key_id: std::env::get("AWS_ACCESS_KEY_ID")
+                .ok_or(EmailError::ConfigurationError { message: "AWS_ACCESS_KEY_ID not set".to_string() })?,
+            secret_access_key: std::env::get("AWS_SECRET_ACCESS_KEY")
+                .ok_or(EmailError::ConfigurationError { message: "AWS_SECRET_ACCESS_KEY not set".to_string() })?,
+            from_email: std::env::get("AWS_SES_FROM_EMAIL").unwrap_or("noreply@intelligo.edu".to_string()),
+            from_name: std::env::get("AWS_SES_FROM_NAME").unwrap_or("Intelligo LMS".to_string()),
+            reply_to: std::env::get("AWS_SES_REPLY_TO"),
+            configuration_set: std::env::get("AWS_SES_CONFIG_SET")
+        })
+    }
+}
+
+/// Microsoft Graph configuration (for Outlook/365)
+type MicrosoftGraphConfig {
+    tenant_id: String,
+    client_id: String,
+    client_secret: String,
+    /// Send as this user (requires Mail.Send permission)
+    sender_email: String,
+    /// Use application permissions (vs delegated)
+    use_app_permissions: Bool
+}
+
+impl MicrosoftGraphConfig {
+    fn from_env() -> Result<MicrosoftGraphConfig, EmailError> {
+        Ok(MicrosoftGraphConfig {
+            tenant_id: std::env::get("MICROSOFT_TENANT_ID")
+                .ok_or(EmailError::ConfigurationError { message: "MICROSOFT_TENANT_ID not set".to_string() })?,
+            client_id: std::env::get("MICROSOFT_CLIENT_ID")
+                .ok_or(EmailError::ConfigurationError { message: "MICROSOFT_CLIENT_ID not set".to_string() })?,
+            client_secret: std::env::get("MICROSOFT_CLIENT_SECRET")
+                .ok_or(EmailError::ConfigurationError { message: "MICROSOFT_CLIENT_SECRET not set".to_string() })?,
+            sender_email: std::env::get("MICROSOFT_SENDER_EMAIL").unwrap_or("noreply@intelligo.edu".to_string()),
+            use_app_permissions: true
+        })
+    }
+}
+
+/// Gmail API configuration
+type GmailConfig {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+    sender_email: String
+}
+
+impl GmailConfig {
+    fn from_env() -> Result<GmailConfig, EmailError> {
+        Ok(GmailConfig {
+            client_id: std::env::get("GMAIL_CLIENT_ID")
+                .ok_or(EmailError::ConfigurationError { message: "GMAIL_CLIENT_ID not set".to_string() })?,
+            client_secret: std::env::get("GMAIL_CLIENT_SECRET")
+                .ok_or(EmailError::ConfigurationError { message: "GMAIL_CLIENT_SECRET not set".to_string() })?,
+            refresh_token: std::env::get("GMAIL_REFRESH_TOKEN")
+                .ok_or(EmailError::ConfigurationError { message: "GMAIL_REFRESH_TOKEN not set".to_string() })?,
+            sender_email: std::env::get("GMAIL_SENDER_EMAIL").unwrap_or("noreply@intelligo.edu".to_string())
+        })
+    }
+}
+
+// =============================================================================
+// EMAIL TYPES
+// =============================================================================
+
+/// Email address with optional name
+type EmailAddress {
+    email: String,
+    name: Option<String>
+}
+
+impl EmailAddress {
+    fn new(email: &str) -> EmailAddress {
+        EmailAddress { email: email.to_string(), name: None }
+    }
+
+    fn with_name(email: &str, name: &str) -> EmailAddress {
+        EmailAddress { email: email.to_string(), name: Some(name.to_string()) }
+    }
+
+    fn to_string(&self) -> String {
+        match &self.name {
+            Some(name) => format!("{} <{}>", name, self.email),
+            None => self.email.clone()
+        }
+    }
+}
+
+/// Email attachment
+type EmailAttachment {
+    filename: String,
+    content_type: String,
+    content: Vec<u8>,
+    content_id: Option<String>,
+    disposition: AttachmentDisposition
+}
+
+/// Attachment disposition
+enum AttachmentDisposition {
+    Attachment,
+    Inline
+}
+
+/// Email message
+type EmailMessage {
+    /// Unique message ID
+    id: String,
+    /// From address
+    from: EmailAddress,
+    /// To addresses
+    to: List<EmailAddress>,
+    /// CC addresses
+    cc: List<EmailAddress>,
+    /// BCC addresses
+    bcc: List<EmailAddress>,
+    /// Reply-to address
+    reply_to: Option<EmailAddress>,
+    /// Subject
+    subject: String,
+    /// Plain text body
+    text_body: Option<String>,
+    /// HTML body
+    html_body: Option<String>,
+    /// Attachments
+    attachments: List<EmailAttachment>,
+    /// Headers
+    headers: Map<String, String>,
+    /// Tags for tracking
+    tags: List<String>,
+    /// Template ID (for provider templates)
+    template_id: Option<String>,
+    /// Template data
+    template_data: Map<String, Dynamic>,
+    /// Metadata
+    metadata: Map<String, String>,
+    /// Send at (scheduled send)
+    send_at: Option<DateTime>,
+    /// Priority
+    priority: EmailPriority
+}
+
+/// Email priority
+enum EmailPriority {
+    Low,
+    Normal,
+    High
+}
+
+impl EmailMessage {
+    fn new(to: EmailAddress, subject: &str) -> EmailMessage {
+        EmailMessage {
+            id: generate_uuid(),
+            from: EmailAddress::new("noreply@intelligo.edu"),
+            to: vec![to],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: None,
+            subject: subject.to_string(),
+            text_body: None,
+            html_body: None,
+            attachments: vec![],
+            headers: Map::new(),
+            tags: vec![],
+            template_id: None,
+            template_data: Map::new(),
+            metadata: Map::new(),
+            send_at: None,
+            priority: EmailPriority::Normal
+        }
+    }
+
+    fn with_body(mut self, text: &str, html: Option<&str>) -> Self {
+        self.text_body = Some(text.to_string());
+        self.html_body = html.map(|h| h.to_string());
+        self
+    }
+
+    fn with_template(mut self, template_id: &str, data: Map<String, Dynamic>) -> Self {
+        self.template_id = Some(template_id.to_string());
+        self.template_data = data;
+        self
+    }
+
+    fn add_attachment(mut self, attachment: EmailAttachment) -> Self {
+        self.attachments.push(attachment);
+        self
+    }
+
+    fn add_tag(mut self, tag: &str) -> Self {
+        self.tags.push(tag.to_string());
+        self
+    }
+}
+
+/// Send result
+type SendResult {
+    message_id: String,
+    provider_message_id: Option<String>,
+    status: SendStatus,
+    provider: EmailProvider,
+    timestamp: DateTime
+}
+
+/// Send status
+enum SendStatus {
+    Queued,
+    Sent,
+    Delivered,
+    Failed { error: String },
+    Bounced { bounce_type: BounceType },
+    Complained
+}
+
+/// Bounce type
+enum BounceType {
+    Hard,
+    Soft,
+    Transient
+}
+
+// =============================================================================
+// EMAIL TEMPLATES
+// =============================================================================
+
+/// Email template type
+enum EmailTemplateType {
+    Welcome,
+    Enrollment,
+    EnrollmentConfirmation,
+    CourseInvitation,
+    AssignmentDue,
+    AssignmentGraded,
+    GradePosted,
+    CourseAnnouncement,
+    Certificate,
+    PasswordReset,
+    EmailVerification,
+    AccountDeactivation,
+    Custom { name: String }
+}
+
+impl EmailTemplateType {
+    fn to_string(&self) -> String {
+        match self {
+            EmailTemplateType::Welcome => "welcome".to_string(),
+            EmailTemplateType::Enrollment => "enrollment".to_string(),
+            EmailTemplateType::EnrollmentConfirmation => "enrollment_confirmation".to_string(),
+            EmailTemplateType::CourseInvitation => "course_invitation".to_string(),
+            EmailTemplateType::AssignmentDue => "assignment_due".to_string(),
+            EmailTemplateType::AssignmentGraded => "assignment_graded".to_string(),
+            EmailTemplateType::GradePosted => "grade_posted".to_string(),
+            EmailTemplateType::CourseAnnouncement => "course_announcement".to_string(),
+            EmailTemplateType::Certificate => "certificate".to_string(),
+            EmailTemplateType::PasswordReset => "password_reset".to_string(),
+            EmailTemplateType::EmailVerification => "email_verification".to_string(),
+            EmailTemplateType::AccountDeactivation => "account_deactivation".to_string(),
+            EmailTemplateType::Custom { name } => name.clone()
+        }
+    }
+}
+
+/// Email template
+type EmailTemplate {
+    id: String,
+    template_type: EmailTemplateType,
+    name: String,
+    subject: String,
+    text_body: String,
+    html_body: String,
+    /// Variables available in template
+    variables: List<String>,
+    /// Tenant-specific (None = global)
+    tenant_id: Option<TenantId>,
+    /// Active
+    active: Bool,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+impl EmailTemplate {
+    /// Render template with data
+    fn render(&self, data: &Map<String, Dynamic>) -> (String, String, String) {
+        let subject = self.render_string(&self.subject, data);
+        let text_body = self.render_string(&self.text_body, data);
+        let html_body = self.render_string(&self.html_body, data);
+        (subject, text_body, html_body)
+    }
+
+    fn render_string(&self, template: &str, data: &Map<String, Dynamic>) -> String {
+        let mut result = template.to_string();
+        for (key, value) in data {
+            let placeholder = format!("{{{{{}}}}}", key);
+            let replacement = match value {
+                Dynamic::String(s) => s.clone(),
+                Dynamic::Int(i) => i.to_string(),
+                Dynamic::Float(f) => f.to_string(),
+                Dynamic::Bool(b) => b.to_string(),
+                _ => "".to_string()
+            };
+            result = result.replace(&placeholder, &replacement);
+        }
+        result
+    }
+}
+
+// =============================================================================
+// EMAIL PREFERENCES
+// =============================================================================
+
+/// User email preferences
+type EmailPreferences {
+    user_id: UserId,
+    /// Global email enabled
+    emails_enabled: Bool,
+    /// Preference by type
+    type_preferences: Map<String, Bool>,
+    /// Unsubscribed from all
+    unsubscribed: Bool,
+    /// Unsubscribe token
+    unsubscribe_token: String,
+    /// Preferred frequency
+    digest_frequency: DigestFrequency,
+    /// Quiet hours
+    quiet_hours: Option<QuietHours>,
+    updated_at: DateTime
+}
+
+/// Digest frequency
+enum DigestFrequency {
+    Immediate,
+    Daily,
+    Weekly,
+    Never
+}
+
+/// Quiet hours (no emails during this time)
+type QuietHours {
+    start_hour: i32,
+    end_hour: i32,
+    timezone: String
+}
+
+impl EmailPreferences {
+    fn default(user_id: UserId) -> EmailPreferences {
+        EmailPreferences {
+            user_id,
+            emails_enabled: true,
+            type_preferences: Map::new(),
+            unsubscribed: false,
+            unsubscribe_token: generate_token(),
+            digest_frequency: DigestFrequency::Immediate,
+            quiet_hours: None,
+            updated_at: DateTime::now()
+        }
+    }
+
+    /// Check if user should receive this email type
+    fn should_receive(&self, email_type: &EmailTemplateType) -> Bool {
+        if self.unsubscribed || !self.emails_enabled {
+            return false
+        }
+
+        let type_key = email_type.to_string();
+        self.type_preferences.get(&type_key).copied().unwrap_or(true)
+    }
+
+    /// Update preference for email type
+    fn set_preference(&mut self, email_type: &EmailTemplateType, enabled: Bool) {
+        let type_key = email_type.to_string();
+        self.type_preferences.insert(type_key, enabled);
+        self.updated_at = DateTime::now();
+    }
+
+    /// Unsubscribe from all
+    fn unsubscribe_all(&mut self) {
+        self.unsubscribed = true;
+        self.updated_at = DateTime::now();
+    }
+
+    /// Resubscribe
+    fn resubscribe(&mut self) {
+        self.unsubscribed = false;
+        self.updated_at = DateTime::now();
+    }
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// Email errors
+enum EmailError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// Provider error
+    ProviderError { provider: String, message: String },
+    /// Template not found
+    TemplateNotFound { template_type: String },
+    /// Template render error
+    TemplateRenderError { message: String },
+    /// Invalid email address
+    InvalidEmailAddress { email: String },
+    /// Rate limit exceeded
+    RateLimitError { retry_after: Option<i64> },
+    /// User unsubscribed
+    UserUnsubscribed { user_id: UserId },
+    /// Network error
+    NetworkError { message: String },
+    /// Send failed
+    SendFailed { message: String }
+}
+
+impl EmailError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            EmailError::ConfigurationError { message } =>
+                LmsError::IntegrationError { provider: "email".to_string(), message: message.clone() },
+            EmailError::TemplateNotFound { template_type } =>
+                LmsError::NotFound { entity_type: "email_template".to_string(), id: template_type.clone() },
+            EmailError::RateLimitError { retry_after } =>
+                LmsError::RateLimitExceeded { retry_after: Duration::seconds(retry_after.unwrap_or(60)) },
+            _ => LmsError::IntegrationError { provider: "email".to_string(), message: format!("{:?}", self) }
+        }
+    }
+}
+
+// =============================================================================
+// EMAIL SERVICE CONFIGURATION
+// =============================================================================
+
+/// Email service configuration
+type EmailServiceConfig {
+    /// Default provider
+    default_provider: EmailProvider,
+    /// SMTP config
+    smtp: Option<SmtpConfig>,
+    /// SendGrid config
+    sendgrid: Option<SendGridConfig>,
+    /// AWS SES config
+    aws_ses: Option<AwsSesConfig>,
+    /// Microsoft Graph config
+    microsoft_graph: Option<MicrosoftGraphConfig>,
+    /// Gmail config
+    gmail: Option<GmailConfig>,
+    /// Base URL for links in emails
+    base_url: String,
+    /// Default from email
+    default_from_email: String,
+    /// Default from name
+    default_from_name: String,
+    /// Rate limit (emails per minute)
+    rate_limit: i32,
+    /// Batch size for bulk emails
+    batch_size: i32,
+    /// Enable tracking
+    enable_tracking: Bool
+}
+
+impl EmailServiceConfig {
+    fn default() -> EmailServiceConfig {
+        EmailServiceConfig {
+            default_provider: EmailProvider::Smtp,
+            smtp: None,
+            sendgrid: None,
+            aws_ses: None,
+            microsoft_graph: None,
+            gmail: None,
+            base_url: "https://intelligo.edu".to_string(),
+            default_from_email: "noreply@intelligo.edu".to_string(),
+            default_from_name: "Intelligo LMS".to_string(),
+            rate_limit: 100,
+            batch_size: 500,
+            enable_tracking: true
+        }
+    }
+}
+
+// =============================================================================
+// EMAIL SERVICE ACTOR
+// =============================================================================
+
+/// Email service actor
+actor EmailService {
+    /// Configuration
+    config: EmailServiceConfig,
+
+    /// HTTP client
+    client: HttpClient,
+
+    /// Templates (template_type -> template)
+    templates: Map<String, EmailTemplate>,
+
+    /// User preferences
+    preferences: Map<UserId, EmailPreferences>,
+
+    /// Send queue
+    queue: List<QueuedEmail>,
+
+    /// Send history (message_id -> result)
+    history: Map<String, SendResult>,
+
+    /// Rate limiter (minute -> count)
+    rate_counter: Map<i64, i32>,
+
+    /// Microsoft Graph access token
+    ms_graph_token: Option<AccessToken>,
+
+    /// Gmail access token
+    gmail_token: Option<AccessToken>
+}
+
+/// Queued email for bulk sending
+type QueuedEmail {
+    message: EmailMessage,
+    created_at: DateTime,
+    attempts: i32,
+    last_attempt: Option<DateTime>
+}
+
+/// Access token for OAuth-based providers
+type AccessToken {
+    token: String,
+    expires_at: DateTime
+}
+
+impl EmailService {
+    /// Create new email service
+    pub fn new(config: EmailServiceConfig) -> EmailService {
+        let mut service = EmailService {
+            config,
+            client: HttpClient::new(),
+            templates: Map::new(),
+            preferences: Map::new(),
+            queue: vec![],
+            history: Map::new(),
+            rate_counter: Map::new(),
+            ms_graph_token: None,
+            gmail_token: None
+        };
+
+        // Initialize default templates
+        service.init_default_templates();
+        service
+    }
+
+    fn init_default_templates(&mut self) {
+        // Welcome email
+        self.templates.insert("welcome".to_string(), EmailTemplate {
+            id: "tpl_welcome".to_string(),
+            template_type: EmailTemplateType::Welcome,
+            name: "Welcome Email".to_string(),
+            subject: "Welcome to {{platform_name}}!".to_string(),
+            text_body: r#"Hi {{user_name}},
+
+Welcome to {{platform_name}}! We're excited to have you.
+
+Get started by exploring your courses at {{base_url}}/courses
+
+Best regards,
+The {{platform_name}} Team"#.to_string(),
+            html_body: r#"<h1>Welcome to {{platform_name}}!</h1>
+<p>Hi {{user_name}},</p>
+<p>We're excited to have you on board. Get started by exploring your courses.</p>
+<a href="{{base_url}}/courses" style="background:#4CAF50;color:white;padding:10px 20px;text-decoration:none;border-radius:5px;">View Courses</a>
+<p>Best regards,<br>The {{platform_name}} Team</p>"#.to_string(),
+            variables: vec!["user_name".to_string(), "platform_name".to_string(), "base_url".to_string()],
+            tenant_id: None,
+            active: true,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        });
+
+        // Enrollment confirmation
+        self.templates.insert("enrollment_confirmation".to_string(), EmailTemplate {
+            id: "tpl_enrollment".to_string(),
+            template_type: EmailTemplateType::EnrollmentConfirmation,
+            name: "Enrollment Confirmation".to_string(),
+            subject: "You're enrolled in {{course_name}}".to_string(),
+            text_body: r#"Hi {{user_name}},
+
+Congratulations! You've been enrolled in {{course_name}}.
+
+Course Details:
+- Start Date: {{start_date}}
+- Instructor: {{instructor_name}}
+
+Access your course: {{course_url}}
+
+Best regards,
+The {{platform_name}} Team"#.to_string(),
+            html_body: r#"<h1>Enrollment Confirmed!</h1>
+<p>Hi {{user_name}},</p>
+<p>Congratulations! You've been enrolled in <strong>{{course_name}}</strong>.</p>
+<table>
+<tr><td>Start Date:</td><td>{{start_date}}</td></tr>
+<tr><td>Instructor:</td><td>{{instructor_name}}</td></tr>
+</table>
+<a href="{{course_url}}" style="background:#2196F3;color:white;padding:10px 20px;text-decoration:none;border-radius:5px;">Go to Course</a>"#.to_string(),
+            variables: vec!["user_name".to_string(), "course_name".to_string(), "start_date".to_string(), "instructor_name".to_string(), "course_url".to_string()],
+            tenant_id: None,
+            active: true,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        });
+
+        // Grade posted
+        self.templates.insert("grade_posted".to_string(), EmailTemplate {
+            id: "tpl_grade".to_string(),
+            template_type: EmailTemplateType::GradePosted,
+            name: "Grade Posted".to_string(),
+            subject: "Grade posted for {{assignment_name}}".to_string(),
+            text_body: r#"Hi {{user_name}},
+
+Your grade for "{{assignment_name}}" in {{course_name}} has been posted.
+
+Grade: {{grade}}
+Feedback: {{feedback}}
+
+View your grade: {{grade_url}}
+
+Best regards,
+The {{platform_name}} Team"#.to_string(),
+            html_body: r#"<h1>Grade Posted</h1>
+<p>Hi {{user_name}},</p>
+<p>Your grade for <strong>{{assignment_name}}</strong> in {{course_name}} has been posted.</p>
+<div style="background:#f5f5f5;padding:15px;border-radius:5px;margin:15px 0;">
+<p><strong>Grade:</strong> {{grade}}</p>
+<p><strong>Feedback:</strong> {{feedback}}</p>
+</div>
+<a href="{{grade_url}}" style="background:#2196F3;color:white;padding:10px 20px;text-decoration:none;border-radius:5px;">View Grade</a>"#.to_string(),
+            variables: vec!["user_name".to_string(), "assignment_name".to_string(), "course_name".to_string(), "grade".to_string(), "feedback".to_string(), "grade_url".to_string()],
+            tenant_id: None,
+            active: true,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        });
+
+        // Certificate
+        self.templates.insert("certificate".to_string(), EmailTemplate {
+            id: "tpl_certificate".to_string(),
+            template_type: EmailTemplateType::Certificate,
+            name: "Certificate Issued".to_string(),
+            subject: "Congratulations! Your certificate for {{course_name}}".to_string(),
+            text_body: r#"Congratulations {{user_name}}!
+
+You have successfully completed {{course_name}} and earned your certificate.
+
+Certificate Details:
+- Completion Date: {{completion_date}}
+- Final Grade: {{final_grade}}
+- Certificate ID: {{certificate_id}}
+
+Download your certificate: {{certificate_url}}
+Verify: {{verification_url}}
+
+Best regards,
+The {{platform_name}} Team"#.to_string(),
+            html_body: r#"<h1>Congratulations!</h1>
+<p>{{user_name}}, you have successfully completed <strong>{{course_name}}</strong>!</p>
+<div style="background:#4CAF50;color:white;padding:20px;border-radius:5px;text-align:center;margin:20px 0;">
+<h2>Certificate Earned!</h2>
+<p>Completion Date: {{completion_date}}</p>
+<p>Final Grade: {{final_grade}}</p>
+</div>
+<a href="{{certificate_url}}" style="background:#2196F3;color:white;padding:15px 30px;text-decoration:none;border-radius:5px;display:inline-block;">Download Certificate</a>
+<p><small>Certificate ID: {{certificate_id}} | <a href="{{verification_url}}">Verify</a></small></p>"#.to_string(),
+            variables: vec!["user_name".to_string(), "course_name".to_string(), "completion_date".to_string(), "final_grade".to_string(), "certificate_id".to_string(), "certificate_url".to_string(), "verification_url".to_string()],
+            tenant_id: None,
+            active: true,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        });
+
+        // Course announcement
+        self.templates.insert("course_announcement".to_string(), EmailTemplate {
+            id: "tpl_announcement".to_string(),
+            template_type: EmailTemplateType::CourseAnnouncement,
+            name: "Course Announcement".to_string(),
+            subject: "[{{course_name}}] {{announcement_title}}".to_string(),
+            text_body: r#"{{announcement_title}}
+
+{{announcement_body}}
+
+---
+This announcement was posted in {{course_name}} by {{instructor_name}}.
+
+View in course: {{announcement_url}}"#.to_string(),
+            html_body: r#"<h1>{{announcement_title}}</h1>
+<div style="border-left:4px solid #2196F3;padding-left:15px;margin:15px 0;">
+{{announcement_body}}
+</div>
+<p><small>Posted in {{course_name}} by {{instructor_name}}</small></p>
+<a href="{{announcement_url}}">View in course</a>"#.to_string(),
+            variables: vec!["announcement_title".to_string(), "announcement_body".to_string(), "course_name".to_string(), "instructor_name".to_string(), "announcement_url".to_string()],
+            tenant_id: None,
+            active: true,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        });
+    }
+
+    // =========================================================================
+    // SENDING EMAILS
+    // =========================================================================
+
+    /// Send a single email
+    pub async fn send(&mut self, message: EmailMessage) -> Result<SendResult, EmailError> {
+        // Check rate limit
+        self.check_rate_limit()?;
+
+        // Set default from if not specified
+        let mut msg = message;
+        if msg.from.email.is_empty() {
+            msg.from = EmailAddress::with_name(&self.config.default_from_email, &self.config.default_from_name);
+        }
+
+        // Send via configured provider
+        let result = match self.config.default_provider {
+            EmailProvider::Smtp => self.send_smtp(&msg).await,
+            EmailProvider::SendGrid => self.send_sendgrid(&msg).await,
+            EmailProvider::AwsSes => self.send_ses(&msg).await,
+            EmailProvider::MicrosoftGraph => self.send_microsoft_graph(&msg).await,
+            EmailProvider::Gmail => self.send_gmail(&msg).await,
+            EmailProvider::Custom { .. } => Err(EmailError::ConfigurationError {
+                message: "Custom provider not implemented".to_string()
+            })
+        }?;
+
+        // Store in history
+        self.history.insert(result.message_id.clone(), result.clone());
+
+        // Increment rate counter
+        self.increment_rate_counter();
+
+        Ok(result)
+    }
+
+    /// Send templated email
+    pub async fn send_templated(
+        &mut self,
+        template_type: EmailTemplateType,
+        to: EmailAddress,
+        data: Map<String, Dynamic>
+    ) -> Result<SendResult, EmailError> {
+        let template = self.templates.get(&template_type.to_string())
+            .ok_or(EmailError::TemplateNotFound { template_type: template_type.to_string() })?
+            .clone();
+
+        let (subject, text_body, html_body) = template.render(&data);
+
+        let message = EmailMessage {
+            id: generate_uuid(),
+            from: EmailAddress::with_name(&self.config.default_from_email, &self.config.default_from_name),
+            to: vec![to],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: None,
+            subject,
+            text_body: Some(text_body),
+            html_body: Some(html_body),
+            attachments: vec![],
+            headers: Map::new(),
+            tags: vec![template_type.to_string()],
+            template_id: Some(template.id),
+            template_data: data,
+            metadata: Map::new(),
+            send_at: None,
+            priority: EmailPriority::Normal
+        };
+
+        self.send(message).await
+    }
+
+    /// Send bulk emails (for announcements)
+    pub async fn send_bulk(
+        &mut self,
+        template_type: EmailTemplateType,
+        recipients: List<BulkRecipient>,
+        common_data: Map<String, Dynamic>
+    ) -> Result<BulkSendResult, EmailError> {
+        let mut results = BulkSendResult {
+            total: recipients.len() as i32,
+            sent: 0,
+            failed: 0,
+            failures: vec![]
+        };
+
+        // Process in batches
+        for batch in recipients.chunks(self.config.batch_size as usize) {
+            for recipient in batch {
+                // Check user preferences
+                if let Some(user_id) = &recipient.user_id {
+                    if let Some(prefs) = self.preferences.get(user_id) {
+                        if !prefs.should_receive(&template_type) {
+                            continue
+                        }
+                    }
+                }
+
+                // Merge common data with recipient-specific data
+                let mut data = common_data.clone();
+                for (k, v) in &recipient.data {
+                    data.insert(k.clone(), v.clone());
+                }
+                data.insert("user_name".to_string(), Dynamic::String(recipient.name.clone().unwrap_or_default()));
+                data.insert("user_email".to_string(), Dynamic::String(recipient.email.clone()));
+
+                // Add unsubscribe link
+                if let Some(user_id) = &recipient.user_id {
+                    if let Some(prefs) = self.preferences.get(user_id) {
+                        let unsubscribe_url = format!("{}/unsubscribe?token={}", self.config.base_url, prefs.unsubscribe_token);
+                        data.insert("unsubscribe_url".to_string(), Dynamic::String(unsubscribe_url));
+                    }
+                }
+
+                let to = match &recipient.name {
+                    Some(name) => EmailAddress::with_name(&recipient.email, name),
+                    None => EmailAddress::new(&recipient.email)
+                };
+
+                match self.send_templated(template_type.clone(), to, data).await {
+                    Ok(_) => results.sent += 1,
+                    Err(e) => {
+                        results.failed += 1;
+                        results.failures.push(BulkSendFailure {
+                            email: recipient.email.clone(),
+                            error: format!("{:?}", e)
+                        });
+                    }
+                }
+
+                // Small delay to avoid rate limits
+                std::time::sleep(Duration::milliseconds(10));
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn check_rate_limit(&self) -> Result<(), EmailError> {
+        let minute = DateTime::now().timestamp() / 60;
+        let count = self.rate_counter.get(&minute).copied().unwrap_or(0);
+
+        if count >= self.config.rate_limit {
+            return Err(EmailError::RateLimitError { retry_after: Some(60) })
+        }
+
+        Ok(())
+    }
+
+    fn increment_rate_counter(&mut self) {
+        let minute = DateTime::now().timestamp() / 60;
+        let count = self.rate_counter.entry(minute).or_insert(0);
+        *count += 1;
+
+        // Clean old entries
+        let old_minute = minute - 5;
+        self.rate_counter.retain(|&m, _| m > old_minute);
+    }
+
+    // =========================================================================
+    // PROVIDER IMPLEMENTATIONS
+    // =========================================================================
+
+    async fn send_smtp(&self, message: &EmailMessage) -> Result<SendResult, EmailError> {
+        let config = self.config.smtp.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "SMTP not configured".to_string() })?;
+
+        // Build MIME message
+        // In production, would use a proper SMTP library
+        // This is a simplified implementation
+
+        Ok(SendResult {
+            message_id: message.id.clone(),
+            provider_message_id: Some(format!("<{}@{}>", message.id, config.host)),
+            status: SendStatus::Sent,
+            provider: EmailProvider::Smtp,
+            timestamp: DateTime::now()
+        })
+    }
+
+    async fn send_sendgrid(&self, message: &EmailMessage) -> Result<SendResult, EmailError> {
+        let config = self.config.sendgrid.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "SendGrid not configured".to_string() })?;
+
+        let url = "https://api.sendgrid.com/v3/mail/send";
+
+        // Build request body
+        let mut personalizations = vec![Json::object([
+            ("to", Json::Array(message.to.iter().map(|t| {
+                let mut obj = vec![("email", Json::String(t.email.clone()))];
+                if let Some(name) = &t.name {
+                    obj.push(("name", Json::String(name.clone())));
+                }
+                Json::object(obj)
+            }).collect()))
+        ])];
+
+        if !message.cc.is_empty() {
+            personalizations[0].as_object_mut().map(|obj| {
+                obj.insert("cc".to_string(), Json::Array(message.cc.iter().map(|c| {
+                    Json::object([("email", Json::String(c.email.clone()))])
+                }).collect()));
+            });
+        }
+
+        let mut body = Json::object([
+            ("personalizations", Json::Array(personalizations)),
+            ("from", Json::object([
+                ("email", Json::String(config.from_email.clone())),
+                ("name", Json::String(config.from_name.clone()))
+            ])),
+            ("subject", Json::String(message.subject.clone()))
+        ]);
+
+        // Add content
+        let mut content = vec![];
+        if let Some(text) = &message.text_body {
+            content.push(Json::object([
+                ("type", Json::String("text/plain".to_string())),
+                ("value", Json::String(text.clone()))
+            ]));
+        }
+        if let Some(html) = &message.html_body {
+            content.push(Json::object([
+                ("type", Json::String("text/html".to_string())),
+                ("value", Json::String(html.clone()))
+            ]));
+        }
+
+        body.as_object_mut().map(|obj| {
+            obj.insert("content".to_string(), Json::Array(content));
+        });
+
+        // Add tracking settings
+        if self.config.enable_tracking {
+            body.as_object_mut().map(|obj| {
+                obj.insert("tracking_settings".to_string(), Json::object([
+                    ("click_tracking", Json::object([("enable", Json::Bool(true))])),
+                    ("open_tracking", Json::object([("enable", Json::Bool(true))]))
+                ]));
+            });
+        }
+
+        // Add sandbox mode
+        if config.sandbox_mode {
+            body.as_object_mut().map(|obj| {
+                obj.insert("mail_settings".to_string(), Json::object([
+                    ("sandbox_mode", Json::object([("enable", Json::Bool(true))]))
+                ]));
+            });
+        }
+
+        // Add categories/tags
+        if !message.tags.is_empty() {
+            body.as_object_mut().map(|obj| {
+                obj.insert("categories".to_string(), Json::Array(
+                    message.tags.iter().map(|t| Json::String(t.clone())).collect()
+                ));
+            });
+        }
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", config.api_key));
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.post(url)
+            .headers(headers)
+            .body(&to_json(&body))
+            .send()
+            .await
+            .map_err(|e| EmailError::NetworkError { message: e.to_string() })?;
+
+        let status = response.status();
+        if status >= 200 && status < 300 {
+            let msg_id = response.headers().get("X-Message-Id")
+                .map(|h| h.to_string());
+
+            Ok(SendResult {
+                message_id: message.id.clone(),
+                provider_message_id: msg_id,
+                status: SendStatus::Queued,
+                provider: EmailProvider::SendGrid,
+                timestamp: DateTime::now()
+            })
+        } else {
+            let error_body = response.text().await.unwrap_or_default();
+            Err(EmailError::SendFailed { message: format!("SendGrid error: {}", error_body) })
+        }
+    }
+
+    async fn send_ses(&self, message: &EmailMessage) -> Result<SendResult, EmailError> {
+        let config = self.config.aws_ses.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "AWS SES not configured".to_string() })?;
+
+        // Build SES request
+        // In production, would use AWS SDK or proper signing
+        let url = format!("https://email.{}.amazonaws.com/", config.region);
+
+        // Build simple email body
+        let mut params = vec![
+            format!("Action=SendEmail"),
+            format!("Source={}", urlencoding::encode(&format!("{} <{}>", config.from_name, config.from_email))),
+            format!("Destination.ToAddresses.member.1={}", urlencoding::encode(&message.to[0].email)),
+            format!("Message.Subject.Data={}", urlencoding::encode(&message.subject))
+        ];
+
+        if let Some(text) = &message.text_body {
+            params.push(format!("Message.Body.Text.Data={}", urlencoding::encode(text)));
+        }
+        if let Some(html) = &message.html_body {
+            params.push(format!("Message.Body.Html.Data={}", urlencoding::encode(html)));
+        }
+
+        if let Some(config_set) = &config.configuration_set {
+            params.push(format!("ConfigurationSetName={}", urlencoding::encode(config_set)));
+        }
+
+        let body = params.join("&");
+
+        // Sign request with AWS Signature V4
+        // This is simplified - production would use proper AWS signing
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&body)
+            .send()
+            .await
+            .map_err(|e| EmailError::NetworkError { message: e.to_string() })?;
+
+        if response.status() == 200 {
+            Ok(SendResult {
+                message_id: message.id.clone(),
+                provider_message_id: None, // Would parse from XML response
+                status: SendStatus::Sent,
+                provider: EmailProvider::AwsSes,
+                timestamp: DateTime::now()
+            })
+        } else {
+            let error_body = response.text().await.unwrap_or_default();
+            Err(EmailError::SendFailed { message: format!("SES error: {}", error_body) })
+        }
+    }
+
+    async fn send_microsoft_graph(&mut self, message: &EmailMessage) -> Result<SendResult, EmailError> {
+        let config = self.config.microsoft_graph.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "Microsoft Graph not configured".to_string() })?;
+
+        // Get access token
+        let token = self.get_ms_graph_token().await?;
+
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/users/{}/sendMail",
+            config.sender_email
+        );
+
+        // Build message
+        let mut to_recipients: Vec<Json> = message.to.iter().map(|t| {
+            Json::object([
+                ("emailAddress", Json::object([
+                    ("address", Json::String(t.email.clone())),
+                    ("name", Json::String(t.name.clone().unwrap_or_default()))
+                ]))
+            ])
+        }).collect();
+
+        let mut mail_message = Json::object([
+            ("subject", Json::String(message.subject.clone())),
+            ("toRecipients", Json::Array(to_recipients))
+        ]);
+
+        // Add body
+        let body_content = message.html_body.as_ref()
+            .or(message.text_body.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        let content_type = if message.html_body.is_some() { "HTML" } else { "Text" };
+
+        mail_message.as_object_mut().map(|obj| {
+            obj.insert("body".to_string(), Json::object([
+                ("contentType", Json::String(content_type.to_string())),
+                ("content", Json::String(body_content))
+            ]));
+        });
+
+        let body = Json::object([
+            ("message", mail_message),
+            ("saveToSentItems", Json::Bool(false))
+        ]);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", token));
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&to_json(&body))
+            .send()
+            .await
+            .map_err(|e| EmailError::NetworkError { message: e.to_string() })?;
+
+        if response.status() == 202 {
+            Ok(SendResult {
+                message_id: message.id.clone(),
+                provider_message_id: None,
+                status: SendStatus::Sent,
+                provider: EmailProvider::MicrosoftGraph,
+                timestamp: DateTime::now()
+            })
+        } else {
+            let error_body = response.text().await.unwrap_or_default();
+            Err(EmailError::SendFailed { message: format!("Graph API error: {}", error_body) })
+        }
+    }
+
+    async fn get_ms_graph_token(&mut self) -> Result<String, EmailError> {
+        // Check if current token is valid
+        if let Some(ref token) = self.ms_graph_token {
+            if token.expires_at > DateTime::now() + Duration::minutes(5) {
+                return Ok(token.token.clone())
+            }
+        }
+
+        let config = self.config.microsoft_graph.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "Microsoft Graph not configured".to_string() })?;
+
+        let url = format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            config.tenant_id
+        );
+
+        let body = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}&scope=https://graph.microsoft.com/.default",
+            urlencoding::encode(&config.client_id),
+            urlencoding::encode(&config.client_secret)
+        );
+
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&body)
+            .send()
+            .await
+            .map_err(|e| EmailError::NetworkError { message: e.to_string() })?;
+
+        let json: Json = response.json().await
+            .map_err(|e| EmailError::ProviderError { provider: "microsoft_graph".to_string(), message: e.to_string() })?;
+
+        let token = json.get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or(EmailError::ProviderError { provider: "microsoft_graph".to_string(), message: "No access token".to_string() })?
+            .to_string();
+
+        let expires_in = json.get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+
+        self.ms_graph_token = Some(AccessToken {
+            token: token.clone(),
+            expires_at: DateTime::now() + Duration::seconds(expires_in)
+        });
+
+        Ok(token)
+    }
+
+    async fn send_gmail(&mut self, message: &EmailMessage) -> Result<SendResult, EmailError> {
+        let config = self.config.gmail.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "Gmail not configured".to_string() })?;
+
+        // Get access token
+        let token = self.get_gmail_token().await?;
+
+        let url = format!(
+            "https://gmail.googleapis.com/gmail/v1/users/{}/messages/send",
+            config.sender_email
+        );
+
+        // Build MIME message
+        let mime_message = self.build_mime_message(message);
+        let encoded = base64::encode_url_safe(mime_message.as_bytes());
+
+        let body = Json::object([
+            ("raw", Json::String(encoded))
+        ]);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", token));
+        headers.set("Content-Type", "application/json");
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .body(&to_json(&body))
+            .send()
+            .await
+            .map_err(|e| EmailError::NetworkError { message: e.to_string() })?;
+
+        if response.status() == 200 {
+            let result: Json = response.json().await.unwrap_or(Json::Null);
+            let provider_id = result.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            Ok(SendResult {
+                message_id: message.id.clone(),
+                provider_message_id: provider_id,
+                status: SendStatus::Sent,
+                provider: EmailProvider::Gmail,
+                timestamp: DateTime::now()
+            })
+        } else {
+            let error_body = response.text().await.unwrap_or_default();
+            Err(EmailError::SendFailed { message: format!("Gmail API error: {}", error_body) })
+        }
+    }
+
+    async fn get_gmail_token(&mut self) -> Result<String, EmailError> {
+        if let Some(ref token) = self.gmail_token {
+            if token.expires_at > DateTime::now() + Duration::minutes(5) {
+                return Ok(token.token.clone())
+            }
+        }
+
+        let config = self.config.gmail.as_ref()
+            .ok_or(EmailError::ConfigurationError { message: "Gmail not configured".to_string() })?;
+
+        let url = "https://oauth2.googleapis.com/token";
+
+        let body = format!(
+            "grant_type=refresh_token&client_id={}&client_secret={}&refresh_token={}",
+            urlencoding::encode(&config.client_id),
+            urlencoding::encode(&config.client_secret),
+            urlencoding::encode(&config.refresh_token)
+        );
+
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+
+        let response = self.client.post(url)
+            .headers(headers)
+            .body(&body)
+            .send()
+            .await
+            .map_err(|e| EmailError::NetworkError { message: e.to_string() })?;
+
+        let json: Json = response.json().await
+            .map_err(|e| EmailError::ProviderError { provider: "gmail".to_string(), message: e.to_string() })?;
+
+        let token = json.get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or(EmailError::ProviderError { provider: "gmail".to_string(), message: "No access token".to_string() })?
+            .to_string();
+
+        let expires_in = json.get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+
+        self.gmail_token = Some(AccessToken {
+            token: token.clone(),
+            expires_at: DateTime::now() + Duration::seconds(expires_in)
+        });
+
+        Ok(token)
+    }
+
+    fn build_mime_message(&self, message: &EmailMessage) -> String {
+        let mut mime = String::new();
+
+        // Headers
+        mime.push_str(&format!("From: {}\r\n", message.from.to_string()));
+        mime.push_str(&format!("To: {}\r\n", message.to.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")));
+        mime.push_str(&format!("Subject: {}\r\n", message.subject));
+        mime.push_str("MIME-Version: 1.0\r\n");
+
+        if message.html_body.is_some() && message.text_body.is_some() {
+            // Multipart
+            let boundary = format!("boundary_{}", generate_uuid());
+            mime.push_str(&format!("Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n", boundary));
+
+            if let Some(text) = &message.text_body {
+                mime.push_str(&format!("--{}\r\n", boundary));
+                mime.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+                mime.push_str(text);
+                mime.push_str("\r\n");
+            }
+
+            if let Some(html) = &message.html_body {
+                mime.push_str(&format!("--{}\r\n", boundary));
+                mime.push_str("Content-Type: text/html; charset=utf-8\r\n\r\n");
+                mime.push_str(html);
+                mime.push_str("\r\n");
+            }
+
+            mime.push_str(&format!("--{}--\r\n", boundary));
+        } else if let Some(html) = &message.html_body {
+            mime.push_str("Content-Type: text/html; charset=utf-8\r\n\r\n");
+            mime.push_str(html);
+        } else if let Some(text) = &message.text_body {
+            mime.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+            mime.push_str(text);
+        }
+
+        mime
+    }
+
+    // =========================================================================
+    // PREFERENCES
+    // =========================================================================
+
+    /// Get user email preferences
+    pub fn get_preferences(&self, user_id: &UserId) -> EmailPreferences {
+        self.preferences.get(user_id)
+            .cloned()
+            .unwrap_or_else(|| EmailPreferences::default(user_id.clone()))
+    }
+
+    /// Update user preferences
+    pub fn update_preferences(&mut self, user_id: UserId, preferences: EmailPreferences) {
+        self.preferences.insert(user_id, preferences);
+    }
+
+    /// Unsubscribe user via token
+    pub fn unsubscribe_by_token(&mut self, token: &str) -> Result<UserId, EmailError> {
+        for (user_id, prefs) in self.preferences.iter_mut() {
+            if prefs.unsubscribe_token == token {
+                prefs.unsubscribe_all();
+                return Ok(user_id.clone())
+            }
+        }
+
+        Err(EmailError::ConfigurationError { message: "Invalid unsubscribe token".to_string() })
+    }
+
+    // =========================================================================
+    // TEMPLATES
+    // =========================================================================
+
+    /// Add or update a template
+    pub fn set_template(&mut self, template: EmailTemplate) {
+        let key = template.template_type.to_string();
+        self.templates.insert(key, template);
+    }
+
+    /// Get template
+    pub fn get_template(&self, template_type: &EmailTemplateType) -> Option<&EmailTemplate> {
+        self.templates.get(&template_type.to_string())
+    }
+
+    /// List all templates
+    pub fn list_templates(&self) -> List<&EmailTemplate> {
+        self.templates.values().collect()
+    }
+
+    // =========================================================================
+    // CONVENIENCE METHODS
+    // =========================================================================
+
+    /// Send welcome email
+    pub async fn send_welcome(&mut self, user_id: UserId, email: &str, name: &str) -> Result<SendResult, EmailError> {
+        let mut data = Map::new();
+        data.insert("user_name".to_string(), Dynamic::String(name.to_string()));
+        data.insert("platform_name".to_string(), Dynamic::String("Intelligo".to_string()));
+        data.insert("base_url".to_string(), Dynamic::String(self.config.base_url.clone()));
+
+        self.send_templated(
+            EmailTemplateType::Welcome,
+            EmailAddress::with_name(email, name),
+            data
+        ).await
+    }
+
+    /// Send enrollment confirmation
+    pub async fn send_enrollment_confirmation(
+        &mut self,
+        user_email: &str,
+        user_name: &str,
+        course_name: &str,
+        instructor_name: &str,
+        course_id: &CourseId
+    ) -> Result<SendResult, EmailError> {
+        let mut data = Map::new();
+        data.insert("user_name".to_string(), Dynamic::String(user_name.to_string()));
+        data.insert("course_name".to_string(), Dynamic::String(course_name.to_string()));
+        data.insert("instructor_name".to_string(), Dynamic::String(instructor_name.to_string()));
+        data.insert("start_date".to_string(), Dynamic::String(DateTime::now().format("%B %d, %Y")));
+        data.insert("course_url".to_string(), Dynamic::String(format!("{}/courses/{}", self.config.base_url, course_id)));
+        data.insert("platform_name".to_string(), Dynamic::String("Intelligo".to_string()));
+
+        self.send_templated(
+            EmailTemplateType::EnrollmentConfirmation,
+            EmailAddress::with_name(user_email, user_name),
+            data
+        ).await
+    }
+
+    /// Send grade notification
+    pub async fn send_grade_notification(
+        &mut self,
+        user_email: &str,
+        user_name: &str,
+        course_name: &str,
+        assignment_name: &str,
+        grade: &str,
+        feedback: &str,
+        grade_id: &GradeId
+    ) -> Result<SendResult, EmailError> {
+        let mut data = Map::new();
+        data.insert("user_name".to_string(), Dynamic::String(user_name.to_string()));
+        data.insert("course_name".to_string(), Dynamic::String(course_name.to_string()));
+        data.insert("assignment_name".to_string(), Dynamic::String(assignment_name.to_string()));
+        data.insert("grade".to_string(), Dynamic::String(grade.to_string()));
+        data.insert("feedback".to_string(), Dynamic::String(feedback.to_string()));
+        data.insert("grade_url".to_string(), Dynamic::String(format!("{}/grades/{}", self.config.base_url, grade_id)));
+        data.insert("platform_name".to_string(), Dynamic::String("Intelligo".to_string()));
+
+        self.send_templated(
+            EmailTemplateType::GradePosted,
+            EmailAddress::with_name(user_email, user_name),
+            data
+        ).await
+    }
+
+    /// Send certificate
+    pub async fn send_certificate(
+        &mut self,
+        user_email: &str,
+        user_name: &str,
+        course_name: &str,
+        certificate_id: &CertificateId,
+        final_grade: &str
+    ) -> Result<SendResult, EmailError> {
+        let mut data = Map::new();
+        data.insert("user_name".to_string(), Dynamic::String(user_name.to_string()));
+        data.insert("course_name".to_string(), Dynamic::String(course_name.to_string()));
+        data.insert("completion_date".to_string(), Dynamic::String(DateTime::now().format("%B %d, %Y")));
+        data.insert("final_grade".to_string(), Dynamic::String(final_grade.to_string()));
+        data.insert("certificate_id".to_string(), Dynamic::String(certificate_id.to_string()));
+        data.insert("certificate_url".to_string(), Dynamic::String(format!("{}/certificates/{}", self.config.base_url, certificate_id)));
+        data.insert("verification_url".to_string(), Dynamic::String(format!("{}/verify/{}", self.config.base_url, certificate_id)));
+        data.insert("platform_name".to_string(), Dynamic::String("Intelligo".to_string()));
+
+        self.send_templated(
+            EmailTemplateType::Certificate,
+            EmailAddress::with_name(user_email, user_name),
+            data
+        ).await
+    }
+
+    /// Send course announcement
+    pub async fn send_course_announcement(
+        &mut self,
+        recipients: List<BulkRecipient>,
+        course_name: &str,
+        instructor_name: &str,
+        announcement_title: &str,
+        announcement_body: &str,
+        announcement_url: &str
+    ) -> Result<BulkSendResult, EmailError> {
+        let mut data = Map::new();
+        data.insert("course_name".to_string(), Dynamic::String(course_name.to_string()));
+        data.insert("instructor_name".to_string(), Dynamic::String(instructor_name.to_string()));
+        data.insert("announcement_title".to_string(), Dynamic::String(announcement_title.to_string()));
+        data.insert("announcement_body".to_string(), Dynamic::String(announcement_body.to_string()));
+        data.insert("announcement_url".to_string(), Dynamic::String(announcement_url.to_string()));
+
+        self.send_bulk(EmailTemplateType::CourseAnnouncement, recipients, data).await
+    }
+}
+
+// =============================================================================
+// BULK SEND TYPES
+// =============================================================================
+
+/// Bulk email recipient
+type BulkRecipient {
+    email: String,
+    name: Option<String>,
+    user_id: Option<UserId>,
+    data: Map<String, Dynamic>
+}
+
+/// Bulk send result
+type BulkSendResult {
+    total: i32,
+    sent: i32,
+    failed: i32,
+    failures: List<BulkSendFailure>
+}
+
+/// Bulk send failure
+type BulkSendFailure {
+    email: String,
+    error: String
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn generate_token() -> String {
+    let bytes = std::crypto::random_bytes(32);
+    base64::encode_url_safe(&bytes)
+}
+
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut encoded = String::new();
+        for c in s.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                    encoded.push(c);
+                }
+                _ => {
+                    for byte in c.to_string().as_bytes() {
+                        encoded.push_str(&format!("%{:02X}", byte));
+                    }
+                }
+            }
+        }
+        encoded
+    }
+}
+
+mod base64 {
+    const URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    pub fn encode_url_safe(input: &[u8]) -> String {
+        let mut output = String::new();
+        let mut i = 0;
+
+        while i < input.len() {
+            let b0 = input[i];
+            let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+            let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+
+            output.push(URL_ALPHABET[(b0 >> 2) as usize] as char);
+            output.push(URL_ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
+
+            if i + 1 < input.len() {
+                output.push(URL_ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
+            }
+
+            if i + 2 < input.len() {
+                output.push(URL_ALPHABET[(b2 & 0x3f) as usize] as char);
+            }
+
+            i += 3;
+        }
+
+        output
+    }
+}

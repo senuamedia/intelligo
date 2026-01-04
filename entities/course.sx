@@ -1,0 +1,799 @@
+/// Intelligo LMS - Course Entity
+///
+/// The Course entity is the primary container for learning content.
+/// Courses contain modules, which contain lessons and assessments.
+/// Different course bundles support various delivery modes.
+
+module intelligo::entities::course
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// COURSE ENTITY
+// =============================================================================
+
+/// A course is the primary learning container
+type Course {
+    /// Unique identifier
+    id: CourseId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Bundle type (self_paced, instructor_led, hybrid, scorm)
+    bundle: String,
+
+    /// Tenant this course belongs to (for multi-tenancy)
+    tenant_id: TenantId,
+
+    // =========================================================================
+    // Core Fields
+    // =========================================================================
+
+    /// Course title
+    title: String,
+
+    /// Course code (e.g., CS101, MATH200)
+    code: String,
+
+    /// Full course description (rich text)
+    description: String,
+
+    /// Short summary for listings
+    summary: Option<String>,
+
+    // =========================================================================
+    // Media
+    // =========================================================================
+
+    /// Thumbnail image for course cards
+    thumbnail: Option<MediaId>,
+
+    /// Banner image for course page
+    banner_image: Option<MediaId>,
+
+    /// Introductory video
+    intro_video: Option<MediaId>,
+
+    // =========================================================================
+    // Structure
+    // =========================================================================
+
+    /// Ordered list of module IDs
+    modules: List<ModuleId>,
+
+    /// How content is organized
+    learning_path_type: LearningPathType,
+
+    // =========================================================================
+    // Timing
+    // =========================================================================
+
+    /// When the course starts (for instructor-led)
+    start_date: Option<DateTime>,
+
+    /// When the course ends
+    end_date: Option<DateTime>,
+
+    /// Expected duration in weeks
+    duration_weeks: Option<i32>,
+
+    /// Estimated hours to complete
+    estimated_hours: Option<f32>,
+
+    // =========================================================================
+    // Access Control
+    // =========================================================================
+
+    /// How students can enroll
+    enrollment_type: EnrollmentType,
+
+    /// Maximum enrollment (None = unlimited)
+    max_enrollment: Option<i32>,
+
+    /// Courses that must be completed first
+    prerequisites: List<CourseId>,
+
+    // =========================================================================
+    // Grading
+    // =========================================================================
+
+    /// Grading scheme for the course
+    grading_scheme: GradingScheme,
+
+    /// Minimum grade to pass (percentage)
+    passing_grade: f32,
+
+    // =========================================================================
+    // Taxonomy
+    // =========================================================================
+
+    /// Category terms
+    categories: List<TermId>,
+
+    /// Competencies taught
+    competencies: List<CompetencyId>,
+
+    /// Skills developed
+    skills: List<TermId>,
+
+    /// Difficulty level
+    level: Option<TermId>,
+
+    // =========================================================================
+    // Compliance
+    // =========================================================================
+
+    /// SCORM package reference (for SCORM bundle)
+    scorm_package: Option<ScormPackageRef>,
+
+    /// xAPI activity identifier
+    xapi_activity_id: Option<String>,
+
+    // =========================================================================
+    // AI Features
+    // =========================================================================
+
+    /// Whether AI tutor is enabled
+    ai_tutor_enabled: Bool,
+
+    /// AI tutor configuration
+    ai_tutor_config: Option<AiTutorConfig>,
+
+    /// Whether adaptive learning is enabled
+    adaptive_learning_enabled: Bool,
+
+    // =========================================================================
+    // Status & Visibility
+    // =========================================================================
+
+    /// Course status
+    status: CourseStatus,
+
+    /// Course visibility
+    visibility: Visibility,
+
+    // =========================================================================
+    // Authorship
+    // =========================================================================
+
+    /// Original author
+    author_id: UserId,
+
+    /// All instructors for this course
+    instructors: List<UserId>,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// Last updated
+    updated_at: DateTime,
+
+    /// When published (if published)
+    published_at: Option<DateTime>,
+
+    // =========================================================================
+    // Metadata
+    // =========================================================================
+
+    /// Additional metadata
+    metadata: CourseMetadata,
+
+    /// Current revision ID
+    revision_id: RevisionId
+}
+
+// =============================================================================
+// GRADING SCHEME
+// =============================================================================
+
+/// Configuration for how a course is graded
+type GradingScheme {
+    /// Type of grading (points, percentage, letter, etc.)
+    scheme_type: GradingType,
+
+    /// Custom grading scale (for letter grades)
+    scale: Option<GradingScale>,
+
+    /// Weight of each category (e.g., "Quizzes": 0.2, "Exams": 0.4)
+    weights: Map<String, f32>,
+
+    /// How many lowest scores to drop per category
+    drop_lowest: Map<String, i32>,
+
+    /// Late submission policy
+    late_policy: LatePolicy
+}
+
+/// Custom grading scale
+type GradingScale {
+    id: String,
+    name: String,
+    levels: List<GradeLevel>
+}
+
+/// A level in a grading scale
+type GradeLevel {
+    /// Letter or label (e.g., "A", "B+", "Excellent")
+    label: String,
+
+    /// Minimum percentage for this level
+    min_percentage: f32,
+
+    /// Maximum percentage for this level
+    max_percentage: f32,
+
+    /// GPA points (optional)
+    gpa_points: Option<f32>
+}
+
+/// Policy for late submissions
+type LatePolicy {
+    /// Grace period before penalties apply
+    grace_period: Duration,
+
+    /// Type of penalty
+    penalty_type: PenaltyType,
+
+    /// Penalty amount (interpretation depends on type)
+    penalty_value: f32,
+
+    /// Maximum total penalty (percentage)
+    max_penalty: Option<f32>
+}
+
+/// Type of late penalty
+enum PenaltyType {
+    /// No penalty
+    None,
+    /// Percentage deducted per day
+    PercentPerDay,
+    /// Flat percentage deducted
+    FlatPercent,
+    /// Zero score after deadline
+    ZeroAfterDeadline
+}
+
+// =============================================================================
+// SCORM PACKAGE REFERENCE
+// =============================================================================
+
+/// Reference to a SCORM package
+type ScormPackageRef {
+    /// Package ID
+    package_id: ScormPackageId,
+
+    /// SCORM version
+    version: ScormVersion,
+
+    /// Entry point URL
+    entry_point: String,
+
+    /// Launch parameters
+    launch_data: Option<String>
+}
+
+// =============================================================================
+// AI TUTOR CONFIGURATION
+// =============================================================================
+
+/// Configuration for AI tutoring in a course
+type AiTutorConfig {
+    /// Model to use for tutoring
+    model: String,
+
+    /// Tutor persona/style
+    persona: String,
+
+    /// How much context to include
+    context_depth: i32,
+
+    /// Can the tutor provide hints?
+    can_give_hints: Bool,
+
+    /// Can the tutor explain correct answers?
+    can_explain_answers: Bool,
+
+    /// Maximum interactions per day per student
+    max_interactions_per_day: Option<i32>,
+
+    /// Topics the tutor should avoid
+    restricted_topics: List<String>,
+
+    /// Custom system prompt additions
+    custom_instructions: Option<String>
+}
+
+// =============================================================================
+// COURSE METADATA
+// =============================================================================
+
+/// Additional course metadata
+type CourseMetadata {
+    /// Primary language
+    language: String,
+
+    /// SEO data
+    seo: SeoData,
+
+    /// Custom fields
+    custom_fields: Map<String, Dynamic>,
+
+    /// Analytics configuration
+    analytics_config: Option<AnalyticsConfig>,
+
+    /// LTI configuration
+    lti_config: Option<LtiConfig>,
+
+    /// External course ID (from SIS)
+    external_id: Option<String>,
+
+    /// Tags for search/filtering
+    tags: List<String>
+}
+
+/// Analytics configuration
+type AnalyticsConfig {
+    /// Track time on page
+    track_time: Bool,
+
+    /// Track content interactions
+    track_interactions: Bool,
+
+    /// Track assessment attempts
+    track_attempts: Bool,
+
+    /// Track video progress
+    track_video: Bool
+}
+
+/// LTI configuration for external tool integration
+type LtiConfig {
+    /// Whether this course can be launched via LTI
+    lti_enabled: Bool,
+
+    /// LTI context ID
+    context_id: Option<String>,
+
+    /// Resource link ID
+    resource_link_id: Option<String>
+}
+
+// =============================================================================
+// BUNDLE DEFINITIONS
+// =============================================================================
+
+/// Bundle-specific fields for self-paced courses
+type SelfPacedBundle {
+    /// How content is released
+    content_release: ContentRelease,
+
+    /// Minimum time between modules (optional pacing)
+    min_time_between_modules: Option<Duration>,
+
+    /// Whether to show estimated completion
+    show_estimated_completion: Bool
+}
+
+/// Content release strategy
+enum ContentRelease {
+    /// All content available immediately
+    AllAtOnce,
+    /// Content unlocks sequentially
+    Sequential,
+    /// Content unlocks on schedule
+    TimeBased { schedule: List<ReleaseSchedule> }
+}
+
+/// Scheduled content release
+type ReleaseSchedule {
+    module_id: ModuleId,
+    release_date: DateTime
+}
+
+/// Bundle-specific fields for instructor-led courses
+type InstructorLedBundle {
+    /// Class sessions
+    sessions: List<ClassSession>,
+
+    /// Default meeting link
+    meeting_link: Option<String>,
+
+    /// Meeting platform
+    meeting_platform: Option<MeetingPlatform>,
+
+    /// Office hours
+    office_hours: List<OfficeHours>,
+
+    /// Whether attendance is tracked
+    track_attendance: Bool
+}
+
+/// A class session
+type ClassSession {
+    id: String,
+    title: String,
+    description: Option<String>,
+    start_time: DateTime,
+    end_time: DateTime,
+    location: Option<String>,
+    meeting_url: Option<String>,
+    recording_url: Option<String>,
+    is_required: Bool
+}
+
+/// Meeting platform
+enum MeetingPlatform {
+    Zoom,
+    MicrosoftTeams,
+    GoogleMeet,
+    Custom { name: String, url_pattern: String }
+}
+
+/// Office hours schedule
+type OfficeHours {
+    instructor_id: UserId,
+    day_of_week: i32,
+    start_time: String,
+    end_time: String,
+    location: Option<String>,
+    meeting_url: Option<String>,
+    notes: Option<String>
+}
+
+/// Bundle-specific fields for hybrid courses
+type HybridBundle {
+    /// Self-paced configuration
+    self_paced: SelfPacedBundle,
+
+    /// Instructor-led configuration
+    instructor_led: InstructorLedBundle,
+
+    /// Percentage of grade from self-paced activities
+    self_paced_weight: f32,
+
+    /// Percentage of grade from instructor-led activities
+    instructor_led_weight: f32
+}
+
+/// Bundle-specific fields for SCORM courses
+type ScormBundle {
+    /// SCORM version
+    scorm_version: ScormVersion,
+
+    /// Package file reference
+    package_file: MediaId,
+
+    /// Whether to use SCORM completion
+    use_scorm_completion: Bool,
+
+    /// Whether to use SCORM scoring
+    use_scorm_scoring: Bool,
+
+    /// Minimum score to pass (from SCORM)
+    mastery_score: Option<f32>,
+
+    /// Time limit (from SCORM)
+    time_limit: Option<Duration>
+}
+
+// =============================================================================
+// COURSE FILTERS
+// =============================================================================
+
+/// Filter options for course queries
+type CourseFilter {
+    /// Filter by tenant
+    tenant_id: Option<TenantId>,
+
+    /// Filter by status
+    status: Option<CourseStatus>,
+
+    /// Filter by visibility
+    visibility: Option<Visibility>,
+
+    /// Filter by bundle type
+    bundle: Option<String>,
+
+    /// Filter by instructor
+    instructor_id: Option<UserId>,
+
+    /// Filter by category
+    category: Option<TermId>,
+
+    /// Filter by level
+    level: Option<TermId>,
+
+    /// Full-text search
+    search: Option<String>,
+
+    /// Filter by date range
+    date_range: Option<DateRange>,
+
+    /// Include archived courses
+    include_archived: Bool
+}
+
+// =============================================================================
+// COURSE STRUCTURE
+// =============================================================================
+
+/// Full course structure with all nested content
+type CourseStructure {
+    course: Course,
+    modules: List<ModuleStructure>,
+    total_lessons: i32,
+    total_assessments: i32,
+    total_duration_minutes: i32
+}
+
+/// Module with nested lessons
+type ModuleStructure {
+    module: Module,
+    lessons: List<Lesson>,
+    assessments: List<Assessment>
+}
+
+// =============================================================================
+// COURSE INPUT TYPES
+// =============================================================================
+
+/// Input for creating a new course
+type CreateCourseInput {
+    bundle: String,
+    title: String,
+    code: String,
+    description: String,
+    summary: Option<String>,
+    enrollment_type: EnrollmentType,
+    visibility: Visibility,
+    passing_grade: f32,
+    categories: List<TermId>,
+    level: Option<TermId>,
+    ai_tutor_enabled: Bool,
+    metadata: Option<CourseMetadata>
+}
+
+/// Input for updating a course
+type UpdateCourseInput {
+    title: Option<String>,
+    code: Option<String>,
+    description: Option<String>,
+    summary: Option<String>,
+    thumbnail: Option<MediaId>,
+    banner_image: Option<MediaId>,
+    intro_video: Option<MediaId>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    duration_weeks: Option<i32>,
+    estimated_hours: Option<f32>,
+    enrollment_type: Option<EnrollmentType>,
+    max_enrollment: Option<i32>,
+    prerequisites: Option<List<CourseId>>,
+    grading_scheme: Option<GradingScheme>,
+    passing_grade: Option<f32>,
+    visibility: Option<Visibility>,
+    ai_tutor_enabled: Option<Bool>,
+    ai_tutor_config: Option<AiTutorConfig>,
+    adaptive_learning_enabled: Option<Bool>,
+    metadata: Option<CourseMetadata>
+}
+
+/// Input for cloning a course
+type CloneCourseInput {
+    /// New course title
+    new_title: String,
+
+    /// New course code
+    new_code: String,
+
+    /// Whether to clone modules
+    clone_modules: Bool,
+
+    /// Whether to clone lessons
+    clone_lessons: Bool,
+
+    /// Whether to clone assessments
+    clone_assessments: Bool,
+
+    /// Whether to clone question banks
+    clone_question_banks: Bool,
+
+    /// Reset dates in cloned course
+    reset_dates: Bool
+}
+
+// =============================================================================
+// COURSE ANALYSIS (AI)
+// =============================================================================
+
+/// AI analysis of a course
+type CourseAnalysis {
+    /// Overall quality score
+    quality_score: f32,
+
+    /// Learning objective coverage
+    objective_coverage: Map<LearningObjectiveId, f32>,
+
+    /// Bloom's taxonomy distribution
+    bloom_distribution: Map<BloomLevel, f32>,
+
+    /// Content type distribution
+    content_type_distribution: Map<ContentType, f32>,
+
+    /// Estimated difficulty level
+    difficulty_level: SkillLevel,
+
+    /// Suggested improvements
+    suggestions: List<CourseSuggestion>,
+
+    /// Accessibility score
+    accessibility_score: f32,
+
+    /// Analyzed at
+    analyzed_at: DateTime
+}
+
+/// Suggestion for course improvement
+type CourseSuggestion {
+    category: String,
+    priority: SuggestionPriority,
+    description: String,
+    action: String,
+    affected_items: List<String>
+}
+
+/// Suggestion priority
+enum SuggestionPriority {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Course {
+    /// Create a new course with defaults
+    fn new(
+        bundle: String,
+        title: String,
+        code: String,
+        description: String,
+        tenant_id: TenantId,
+        author_id: UserId
+    ) -> Course {
+        let now = DateTime::now();
+        Course {
+            id: generate_course_id(),
+            uuid: generate_uuid(),
+            bundle,
+            tenant_id,
+            title,
+            code,
+            description,
+            summary: None,
+            thumbnail: None,
+            banner_image: None,
+            intro_video: None,
+            modules: vec![],
+            learning_path_type: LearningPathType::Linear,
+            start_date: None,
+            end_date: None,
+            duration_weeks: None,
+            estimated_hours: None,
+            enrollment_type: EnrollmentType::Open,
+            max_enrollment: None,
+            prerequisites: vec![],
+            grading_scheme: GradingScheme::default(),
+            passing_grade: 60.0,
+            categories: vec![],
+            competencies: vec![],
+            skills: vec![],
+            level: None,
+            scorm_package: None,
+            xapi_activity_id: None,
+            ai_tutor_enabled: false,
+            ai_tutor_config: None,
+            adaptive_learning_enabled: false,
+            status: CourseStatus::Draft,
+            visibility: Visibility::Private,
+            author_id,
+            instructors: vec![author_id.clone()],
+            created_at: now,
+            updated_at: now,
+            published_at: None,
+            metadata: CourseMetadata::default(),
+            revision_id: generate_uuid()
+        }
+    }
+
+    /// Check if course is currently active
+    fn is_active(&self) -> Bool {
+        if self.status != CourseStatus::Published {
+            return false
+        }
+
+        let now = DateTime::now();
+
+        if let Some(start) = &self.start_date {
+            if now < *start {
+                return false
+            }
+        }
+
+        if let Some(end) = &self.end_date {
+            if now > *end {
+                return false
+            }
+        }
+
+        true
+    }
+
+    /// Check if user is an instructor
+    fn is_instructor(&self, user_id: &UserId) -> Bool {
+        self.instructors.contains(user_id)
+    }
+
+    /// Get total number of modules
+    fn module_count(&self) -> i32 {
+        self.modules.len() as i32
+    }
+}
+
+impl GradingScheme {
+    fn default() -> GradingScheme {
+        GradingScheme {
+            scheme_type: GradingType::Percentage,
+            scale: None,
+            weights: Map::new(),
+            drop_lowest: Map::new(),
+            late_policy: LatePolicy::default()
+        }
+    }
+}
+
+impl LatePolicy {
+    fn default() -> LatePolicy {
+        LatePolicy {
+            grace_period: Duration::hours(0),
+            penalty_type: PenaltyType::None,
+            penalty_value: 0.0,
+            max_penalty: None
+        }
+    }
+}
+
+impl CourseMetadata {
+    fn default() -> CourseMetadata {
+        CourseMetadata {
+            language: "en".to_string(),
+            seo: SeoData {
+                title: None,
+                description: None,
+                keywords: vec![],
+                og_image: None,
+                canonical_url: None
+            },
+            custom_fields: Map::new(),
+            analytics_config: Some(AnalyticsConfig {
+                track_time: true,
+                track_interactions: true,
+                track_attempts: true,
+                track_video: true
+            }),
+            lti_config: None,
+            external_id: None,
+            tags: vec![]
+        }
+    }
+}

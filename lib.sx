@@ -1,0 +1,118 @@
+/// Intelligo LMS - Main Library Entry Point
+///
+/// Intelligo is an AI-powered Learning Management System built on the
+/// Modulus runtime. It provides comprehensive learning, compliance,
+/// and analytics capabilities.
+///
+/// # Architecture
+///
+/// The system is organized into several key modules:
+///
+/// - **entities**: Core domain entities (Course, Module, Lesson, etc.)
+/// - **api**: REST API endpoints and handlers
+/// - **ai**: AI-powered features via the hive swarm system
+/// - **compliance**: SCORM 1.2, SCORM 2004, and xAPI support
+/// - **taxonomy**: Skills, competencies, and learning objectives
+/// - **runtime**: Actor system, messaging, and scheduling
+/// - **integrations**: Third-party service integrations
+/// - **admin**: Administrative dashboards and reporting
+/// - **learner**: Learner-facing content delivery
+/// - **tenant**: Multi-tenancy support
+///
+/// # Example
+///
+/// ```sx
+/// use intelligo::*
+///
+/// fn main() {
+///     // Initialize the LMS
+///     let config = Config::from_file("config.toml");
+///     let app = Application::new(config);
+///
+///     // Start the server
+///     app.run();
+/// }
+/// ```
+
+module intelligo
+
+// Core modules
+pub mod core { pub use intelligo::core::*; }
+pub mod entities { pub use intelligo::entities::*; }
+pub mod api { pub use intelligo::api::*; }
+
+// AI and learning
+pub mod ai { pub use intelligo::ai::*; }
+pub mod taxonomy { pub use intelligo::taxonomy::*; }
+
+// Compliance
+pub mod compliance { pub use intelligo::compliance::*; }
+
+// Infrastructure
+pub mod runtime { pub use intelligo::runtime::*; }
+pub mod config { pub use intelligo::config::*; }
+
+// User interfaces
+pub mod admin { pub use intelligo::admin::*; }
+pub mod learner { pub use intelligo::learner::*; }
+
+// Integrations
+pub mod integrations { pub use intelligo::integrations::*; }
+
+// Multi-tenancy
+pub mod tenant { pub use intelligo::tenant::*; }
+
+// Presentation
+pub mod themes { pub use intelligo::themes::*; }
+pub mod templates { pub use intelligo::templates::*; }
+pub mod publishing { pub use intelligo::publishing::*; }
+
+// Testing
+pub mod chai { pub use intelligo::chai::*; }
+
+// Re-export commonly used types at the top level
+pub use core::DateTime
+pub use core::Duration
+pub use core::Uuid
+pub use core::Map
+pub use core::Result
+pub use core::AuthService
+pub use core::StorageService
+
+pub use entities::Course
+pub use entities::Module
+pub use entities::Lesson
+pub use entities::Assessment
+pub use entities::Enrollment
+pub use entities::Activity
+
+pub use ai::AiCoordinator
+pub use ai::hives::TutorHive
+pub use ai::hives::ContentHive
+pub use ai::hives::AssessmentHive
+pub use ai::hives::LearningPathHive
+
+pub use compliance::XapiStatement
+pub use compliance::LearningRecordStore
+pub use compliance::scorm::Scorm12Runtime
+pub use compliance::scorm::Scorm2004Runtime
+
+pub use taxonomy::Category
+pub use taxonomy::Skill
+pub use taxonomy::Competency
+pub use taxonomy::LearningObjective
+
+pub use runtime::ActorSystem
+pub use runtime::ActorRef
+pub use runtime::Scheduler
+pub use runtime::Logger
+
+pub use config::Config
+pub use config::FeatureFlags
+
+pub use tenant::Tenant
+pub use tenant::TenantManager
+
+// Version information
+pub const VERSION: &str = "0.1.0"
+pub const NAME: &str = "Intelligo LMS"

@@ -1,0 +1,10 @@
+/// Intelligo LMS - Unit Tests Module
+///
+/// Exports all unit test suites.
+
+module intelligo::tests::unit
+
+pub use intelligo::tests::unit::entities::*
+pub use intelligo::tests::unit::compliance::*
+pub use intelligo::tests::unit::taxonomy::*
+pub use intelligo::tests::unit::ai::*

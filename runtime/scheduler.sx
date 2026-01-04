@@ -1,0 +1,749 @@
+/// Intelligo LMS - Task Scheduler
+///
+/// Provides job scheduling, cron-like tasks, and background processing.
+
+module intelligo::runtime::scheduler
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock, Mutex}
+use std::time::{Duration, Instant, DateTime}
+use std::thread::{JoinHandle, spawn}
+
+// =============================================================================
+// JOB SCHEDULER
+// =============================================================================
+
+/// Central job scheduler for background tasks
+pub type JobScheduler {
+    jobs: Arc<RwLock<Map<String, ScheduledJob>>>,
+    running: Arc<Mutex<bool>>,
+    workers: Arc<Mutex<List<JoinHandle<()>>>>,
+    config: SchedulerConfig
+}
+
+/// Configuration for the scheduler
+pub type SchedulerConfig {
+    max_workers: usize,
+    default_retry_count: i32,
+    retry_delay: Duration,
+    job_timeout: Duration
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> SchedulerConfig {
+        SchedulerConfig {
+            max_workers: 4,
+            default_retry_count: 3,
+            retry_delay: Duration::from_secs(60),
+            job_timeout: Duration::from_secs(300)
+        }
+    }
+}
+
+/// A scheduled job
+pub type ScheduledJob {
+    id: String,
+    name: String,
+    schedule: JobSchedule,
+    handler: Arc<dyn Fn(JobContext) -> Result<(), JobError> + Send + Sync>,
+    state: Arc<RwLock<JobState>>,
+    config: JobConfig,
+    last_run: Arc<Mutex<Option<Instant>>>,
+    next_run: Arc<Mutex<Option<DateTime>>>,
+    run_count: Arc<Mutex<i64>>,
+    failure_count: Arc<Mutex<i64>>
+}
+
+/// Job schedule type
+#[derive(Clone)]
+pub enum JobSchedule {
+    Once(DateTime),
+    Interval(Duration),
+    Cron(CronExpression),
+    Immediate
+}
+
+/// Cron expression for scheduling
+#[derive(Clone)]
+pub type CronExpression {
+    minute: CronField,
+    hour: CronField,
+    day_of_month: CronField,
+    month: CronField,
+    day_of_week: CronField
+}
+
+/// Cron field values
+#[derive(Clone)]
+pub enum CronField {
+    Any,
+    Value(i32),
+    Range(i32, i32),
+    Step(i32),
+    List(List<i32>)
+}
+
+impl CronExpression {
+    /// Parse a cron expression string
+    pub fn parse(expr: &str) -> Result<CronExpression, String> {
+        let parts: Vec<&str> = expr.split_whitespace().collect();
+        if parts.len() != 5 {
+            return Err("Invalid cron expression: expected 5 fields".to_string());
+        }
+
+        Ok(CronExpression {
+            minute: parse_cron_field(parts[0])?,
+            hour: parse_cron_field(parts[1])?,
+            day_of_month: parse_cron_field(parts[2])?,
+            month: parse_cron_field(parts[3])?,
+            day_of_week: parse_cron_field(parts[4])?
+        })
+    }
+
+    /// Check if the expression matches a given time
+    pub fn matches(&self, dt: &DateTime) -> bool {
+        field_matches(&self.minute, dt.minute() as i32)
+            && field_matches(&self.hour, dt.hour() as i32)
+            && field_matches(&self.day_of_month, dt.day() as i32)
+            && field_matches(&self.month, dt.month() as i32)
+            && field_matches(&self.day_of_week, dt.weekday() as i32)
+    }
+
+    /// Get next run time
+    pub fn next_run(&self, from: &DateTime) -> DateTime {
+        let mut dt = *from;
+        for _ in 0..525600 { // Max one year of minutes
+            dt = dt + Duration::from_secs(60);
+            if self.matches(&dt) {
+                return dt;
+            }
+        }
+        dt
+    }
+}
+
+fn parse_cron_field(s: &str) -> Result<CronField, String> {
+    if s == "*" {
+        return Ok(CronField::Any);
+    }
+    if let Ok(n) = s.parse::<i32>() {
+        return Ok(CronField::Value(n));
+    }
+    if s.contains('-') {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() == 2 {
+            let start = parts[0].parse().map_err(|_| "Invalid range start")?;
+            let end = parts[1].parse().map_err(|_| "Invalid range end")?;
+            return Ok(CronField::Range(start, end));
+        }
+    }
+    if s.contains('/') {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() == 2 && parts[0] == "*" {
+            let step = parts[1].parse().map_err(|_| "Invalid step")?;
+            return Ok(CronField::Step(step));
+        }
+    }
+    if s.contains(',') {
+        let values: Result<Vec<i32>, _> = s.split(',').map(|p| p.parse()).collect();
+        return Ok(CronField::List(values.map_err(|_| "Invalid list")?));
+    }
+    Err(format!("Invalid cron field: {}", s))
+}
+
+fn field_matches(field: &CronField, value: i32) -> bool {
+    match field {
+        CronField::Any => true,
+        CronField::Value(v) => *v == value,
+        CronField::Range(start, end) => value >= *start && value <= *end,
+        CronField::Step(step) => value % step == 0,
+        CronField::List(values) => values.contains(&value)
+    }
+}
+
+/// Job configuration
+#[derive(Clone)]
+pub type JobConfig {
+    retry_count: i32,
+    retry_delay: Duration,
+    timeout: Duration,
+    priority: JobPriority,
+    tags: List<String>
+}
+
+impl Default for JobConfig {
+    fn default() -> JobConfig {
+        JobConfig {
+            retry_count: 3,
+            retry_delay: Duration::from_secs(60),
+            timeout: Duration::from_secs(300),
+            priority: JobPriority::Normal,
+            tags: vec![]
+        }
+    }
+}
+
+/// Job priority
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JobPriority {
+    Low,
+    Normal,
+    High,
+    Critical
+}
+
+/// Job state
+#[derive(Clone)]
+pub enum JobState {
+    Pending,
+    Running,
+    Completed,
+    Failed(String),
+    Cancelled,
+    Retrying(i32)
+}
+
+/// Context provided to job handlers
+pub type JobContext {
+    job_id: String,
+    run_id: String,
+    started_at: Instant,
+    data: Map<String, Dynamic>,
+    progress: Arc<Mutex<f64>>
+}
+
+impl JobContext {
+    /// Report progress (0.0 - 1.0)
+    pub fn set_progress(&self, progress: f64) {
+        *self.progress.lock().unwrap() = progress.max(0.0).min(1.0);
+    }
+
+    /// Get current progress
+    pub fn get_progress(&self) -> f64 {
+        *self.progress.lock().unwrap()
+    }
+
+    /// Get data value
+    pub fn get<T: Clone + 'static>(&self, key: &str) -> Option<T> {
+        self.data.get(key).and_then(|v| v.downcast_ref::<T>()).cloned()
+    }
+}
+
+/// Job error types
+#[derive(Clone, Debug)]
+pub enum JobError {
+    Failed(String),
+    Timeout,
+    Cancelled,
+    InvalidState(String),
+    RetryExhausted
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            JobError::Failed(msg) => write!(f, "Job failed: {}", msg),
+            JobError::Timeout => write!(f, "Job timeout"),
+            JobError::Cancelled => write!(f, "Job cancelled"),
+            JobError::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
+            JobError::RetryExhausted => write!(f, "Retry attempts exhausted")
+        }
+    }
+}
+
+impl JobScheduler {
+    pub fn new() -> JobScheduler {
+        JobScheduler::with_config(SchedulerConfig::default())
+    }
+
+    pub fn with_config(config: SchedulerConfig) -> JobScheduler {
+        JobScheduler {
+            jobs: Arc::new(RwLock::new(Map::new())),
+            running: Arc::new(Mutex::new(false)),
+            workers: Arc::new(Mutex::new(vec![])),
+            config
+        }
+    }
+
+    /// Schedule a job
+    pub fn schedule<F>(&self, name: &str, schedule: JobSchedule, handler: F) -> String
+    where
+        F: Fn(JobContext) -> Result<(), JobError> + Send + Sync + 'static
+    {
+        self.schedule_with_config(name, schedule, JobConfig::default(), handler)
+    }
+
+    /// Schedule a job with custom config
+    pub fn schedule_with_config<F>(
+        &self,
+        name: &str,
+        schedule: JobSchedule,
+        config: JobConfig,
+        handler: F
+    ) -> String
+    where
+        F: Fn(JobContext) -> Result<(), JobError> + Send + Sync + 'static
+    {
+        let job_id = format!("job-{}", generate_id());
+
+        let next_run = match &schedule {
+            JobSchedule::Once(dt) => Some(*dt),
+            JobSchedule::Immediate => Some(DateTime::now()),
+            JobSchedule::Interval(_) => Some(DateTime::now()),
+            JobSchedule::Cron(cron) => Some(cron.next_run(&DateTime::now()))
+        };
+
+        let job = ScheduledJob {
+            id: job_id.clone(),
+            name: name.to_string(),
+            schedule,
+            handler: Arc::new(handler),
+            state: Arc::new(RwLock::new(JobState::Pending)),
+            config,
+            last_run: Arc::new(Mutex::new(None)),
+            next_run: Arc::new(Mutex::new(next_run)),
+            run_count: Arc::new(Mutex::new(0)),
+            failure_count: Arc::new(Mutex::new(0))
+        };
+
+        self.jobs.write().unwrap().insert(job_id.clone(), job);
+        job_id
+    }
+
+    /// Start the scheduler
+    pub fn start(&self) {
+        *self.running.lock().unwrap() = true;
+
+        let jobs = self.jobs.clone();
+        let running = self.running.clone();
+        let config = self.config.clone();
+
+        let handle = spawn(move || {
+            while *running.lock().unwrap() {
+                let now = DateTime::now();
+
+                // Find jobs ready to run
+                let mut ready_jobs = vec![];
+                for (id, job) in jobs.read().unwrap().iter() {
+                    if let Some(next_run) = *job.next_run.lock().unwrap() {
+                        if next_run <= now {
+                            if matches!(*job.state.read().unwrap(), JobState::Pending) {
+                                ready_jobs.push(id.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Execute ready jobs
+                for job_id in ready_jobs {
+                    if let Some(job) = jobs.read().unwrap().get(&job_id) {
+                        execute_job(job, &config);
+                    }
+                }
+
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+        self.workers.lock().unwrap().push(handle);
+    }
+
+    /// Stop the scheduler
+    pub fn stop(&self) {
+        *self.running.lock().unwrap() = false;
+    }
+
+    /// Cancel a job
+    pub fn cancel(&self, job_id: &str) -> Result<(), JobError> {
+        if let Some(job) = self.jobs.write().unwrap().get_mut(job_id) {
+            *job.state.write().unwrap() = JobState::Cancelled;
+            Ok(())
+        } else {
+            Err(JobError::InvalidState("Job not found".to_string()))
+        }
+    }
+
+    /// Get job status
+    pub fn status(&self, job_id: &str) -> Option<JobStatus> {
+        self.jobs.read().unwrap().get(job_id).map(|job| JobStatus {
+            id: job.id.clone(),
+            name: job.name.clone(),
+            state: job.state.read().unwrap().clone(),
+            run_count: *job.run_count.lock().unwrap(),
+            failure_count: *job.failure_count.lock().unwrap(),
+            last_run: *job.last_run.lock().unwrap(),
+            next_run: *job.next_run.lock().unwrap()
+        })
+    }
+
+    /// List all jobs
+    pub fn list_jobs(&self) -> List<JobStatus> {
+        self.jobs.read().unwrap()
+            .keys()
+            .filter_map(|id| self.status(id))
+            .collect()
+    }
+
+    /// Run a job immediately
+    pub fn run_now(&self, job_id: &str) -> Result<(), JobError> {
+        if let Some(job) = self.jobs.read().unwrap().get(job_id) {
+            execute_job(job, &self.config);
+            Ok(())
+        } else {
+            Err(JobError::InvalidState("Job not found".to_string()))
+        }
+    }
+}
+
+/// Job status snapshot
+pub type JobStatus {
+    id: String,
+    name: String,
+    state: JobState,
+    run_count: i64,
+    failure_count: i64,
+    last_run: Option<Instant>,
+    next_run: Option<DateTime>
+}
+
+fn execute_job(job: &ScheduledJob, config: &SchedulerConfig) {
+    *job.state.write().unwrap() = JobState::Running;
+    *job.last_run.lock().unwrap() = Some(Instant::now());
+    *job.run_count.lock().unwrap() += 1;
+
+    let ctx = JobContext {
+        job_id: job.id.clone(),
+        run_id: generate_id(),
+        started_at: Instant::now(),
+        data: Map::new(),
+        progress: Arc::new(Mutex::new(0.0))
+    };
+
+    let result = (job.handler)(ctx);
+
+    match result {
+        Ok(()) => {
+            *job.state.write().unwrap() = JobState::Completed;
+
+            // Schedule next run
+            match &job.schedule {
+                JobSchedule::Interval(duration) => {
+                    *job.next_run.lock().unwrap() = Some(DateTime::now() + *duration);
+                    *job.state.write().unwrap() = JobState::Pending;
+                }
+                JobSchedule::Cron(cron) => {
+                    *job.next_run.lock().unwrap() = Some(cron.next_run(&DateTime::now()));
+                    *job.state.write().unwrap() = JobState::Pending;
+                }
+                _ => {}
+            }
+        }
+        Err(e) => {
+            *job.failure_count.lock().unwrap() += 1;
+            *job.state.write().unwrap() = JobState::Failed(e.to_string());
+        }
+    }
+}
+
+// =============================================================================
+// BACKGROUND WORKER
+// =============================================================================
+
+/// Worker pool for processing background tasks
+pub type WorkerPool {
+    workers: List<Worker>,
+    queue: Arc<Mutex<List<Task>>>,
+    running: Arc<Mutex<bool>>
+}
+
+/// A worker in the pool
+type Worker {
+    id: String,
+    handle: JoinHandle<()>
+}
+
+/// A task to be processed
+pub type Task {
+    id: String,
+    handler: Box<dyn FnOnce() + Send>,
+    priority: TaskPriority
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskPriority {
+    Low = 0,
+    Normal = 1,
+    High = 2
+}
+
+impl WorkerPool {
+    pub fn new(size: usize) -> WorkerPool {
+        let queue = Arc::new(Mutex::new(vec![]));
+        let running = Arc::new(Mutex::new(true));
+        let mut workers = vec![];
+
+        for i in 0..size {
+            let queue_clone = queue.clone();
+            let running_clone = running.clone();
+
+            let handle = spawn(move || {
+                while *running_clone.lock().unwrap() {
+                    let task = {
+                        let mut q = queue_clone.lock().unwrap();
+                        if q.is_empty() {
+                            None
+                        } else {
+                            // Get highest priority task
+                            q.sort_by(|a, b| b.priority.cmp(&a.priority));
+                            Some(q.remove(0))
+                        }
+                    };
+
+                    if let Some(task) = task {
+                        (task.handler)();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            });
+
+            workers.push(Worker {
+                id: format!("worker-{}", i),
+                handle
+            });
+        }
+
+        WorkerPool {
+            workers,
+            queue,
+            running
+        }
+    }
+
+    /// Submit a task to the pool
+    pub fn submit<F: FnOnce() + Send + 'static>(&self, handler: F) -> String {
+        self.submit_with_priority(handler, TaskPriority::Normal)
+    }
+
+    /// Submit with priority
+    pub fn submit_with_priority<F: FnOnce() + Send + 'static>(
+        &self,
+        handler: F,
+        priority: TaskPriority
+    ) -> String {
+        let task_id = generate_id();
+        self.queue.lock().unwrap().push(Task {
+            id: task_id.clone(),
+            handler: Box::new(handler),
+            priority
+        });
+        task_id
+    }
+
+    /// Shutdown the pool
+    pub fn shutdown(&self) {
+        *self.running.lock().unwrap() = false;
+    }
+
+    /// Get queue size
+    pub fn queue_size(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+}
+
+// =============================================================================
+// RATE LIMITER
+// =============================================================================
+
+/// Rate limiter for controlling execution rate
+pub type RateLimiter {
+    tokens: Arc<Mutex<f64>>,
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
+    last_refill: Arc<Mutex<Instant>>
+}
+
+impl RateLimiter {
+    pub fn new(max_tokens: f64, refill_rate: f64) -> RateLimiter {
+        RateLimiter {
+            tokens: Arc::new(Mutex::new(max_tokens)),
+            max_tokens,
+            refill_rate,
+            last_refill: Arc::new(Mutex::new(Instant::now()))
+        }
+    }
+
+    /// Try to acquire tokens
+    pub fn try_acquire(&self, count: f64) -> bool {
+        self.refill();
+
+        let mut tokens = self.tokens.lock().unwrap();
+        if *tokens >= count {
+            *tokens -= count;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Acquire tokens, blocking if necessary
+    pub fn acquire(&self, count: f64) {
+        while !self.try_acquire(count) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn refill(&self) {
+        let mut last = self.last_refill.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = now.duration_since(*last).as_secs_f64();
+        let refill_amount = elapsed * self.refill_rate;
+
+        let mut tokens = self.tokens.lock().unwrap();
+        *tokens = (*tokens + refill_amount).min(self.max_tokens);
+        *last = now;
+    }
+}
+
+// =============================================================================
+// CIRCUIT BREAKER
+// =============================================================================
+
+/// Circuit breaker for fault tolerance
+pub type CircuitBreaker {
+    name: String,
+    state: Arc<RwLock<CircuitState>>,
+    failure_count: Arc<Mutex<i32>>,
+    success_count: Arc<Mutex<i32>>,
+    config: CircuitBreakerConfig
+}
+
+/// Circuit breaker configuration
+pub type CircuitBreakerConfig {
+    failure_threshold: i32,
+    success_threshold: i32,
+    timeout: Duration
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
+            failure_threshold: 5,
+            success_threshold: 3,
+            timeout: Duration::from_secs(30)
+        }
+    }
+}
+
+/// Circuit state
+#[derive(Clone)]
+pub enum CircuitState {
+    Closed,
+    Open(Instant),  // When it opened
+    HalfOpen
+}
+
+impl CircuitBreaker {
+    pub fn new(name: &str) -> CircuitBreaker {
+        CircuitBreaker::with_config(name, CircuitBreakerConfig::default())
+    }
+
+    pub fn with_config(name: &str, config: CircuitBreakerConfig) -> CircuitBreaker {
+        CircuitBreaker {
+            name: name.to_string(),
+            state: Arc::new(RwLock::new(CircuitState::Closed)),
+            failure_count: Arc::new(Mutex::new(0)),
+            success_count: Arc::new(Mutex::new(0)),
+            config
+        }
+    }
+
+    /// Execute a function through the circuit breaker
+    pub fn call<F, T, E>(&self, f: F) -> Result<T, CircuitError<E>>
+    where
+        F: FnOnce() -> Result<T, E>
+    {
+        // Check state
+        let current_state = self.state.read().unwrap().clone();
+
+        match current_state {
+            CircuitState::Open(opened_at) => {
+                if opened_at.elapsed() >= self.config.timeout {
+                    *self.state.write().unwrap() = CircuitState::HalfOpen;
+                } else {
+                    return Err(CircuitError::Open);
+                }
+            }
+            _ => {}
+        }
+
+        // Execute
+        match f() {
+            Ok(result) => {
+                self.on_success();
+                Ok(result)
+            }
+            Err(e) => {
+                self.on_failure();
+                Err(CircuitError::Failure(e))
+            }
+        }
+    }
+
+    fn on_success(&self) {
+        *self.failure_count.lock().unwrap() = 0;
+
+        let state = self.state.read().unwrap().clone();
+        if matches!(state, CircuitState::HalfOpen) {
+            let mut success = self.success_count.lock().unwrap();
+            *success += 1;
+            if *success >= self.config.success_threshold {
+                *self.state.write().unwrap() = CircuitState::Closed;
+                *success = 0;
+            }
+        }
+    }
+
+    fn on_failure(&self) {
+        let mut failures = self.failure_count.lock().unwrap();
+        *failures += 1;
+
+        if *failures >= self.config.failure_threshold {
+            *self.state.write().unwrap() = CircuitState::Open(Instant::now());
+            *self.success_count.lock().unwrap() = 0;
+        }
+    }
+
+    /// Check if circuit is open
+    pub fn is_open(&self) -> bool {
+        matches!(*self.state.read().unwrap(), CircuitState::Open(_))
+    }
+
+    /// Reset the circuit breaker
+    pub fn reset(&self) {
+        *self.state.write().unwrap() = CircuitState::Closed;
+        *self.failure_count.lock().unwrap() = 0;
+        *self.success_count.lock().unwrap() = 0;
+    }
+}
+
+/// Circuit breaker errors
+pub enum CircuitError<E> {
+    Open,
+    Failure(E)
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id() -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:x}", nanos)
+}
+
+type Dynamic = Box<dyn std::any::Any + Send + Sync>;

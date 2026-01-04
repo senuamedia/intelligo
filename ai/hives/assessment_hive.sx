@@ -1,0 +1,2703 @@
+// =============================================================================
+// INTELLIGO LMS - Assessment Hive
+// =============================================================================
+// AI-powered grading, evaluation, and feedback system following CHAI patterns.
+// Provides automated essay grading, code evaluation, rubric application,
+// personalized feedback, plagiarism detection, and grading calibration.
+// =============================================================================
+
+module intelligo::ai::hives::assessment_hive
+
+use intelligo::core::types::*
+use simplex_inference::{Model, Prompt, EmbeddingModel}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::sync::{Arc, RwLock}
+
+// =============================================================================
+// Assessment Hive Types
+// =============================================================================
+
+type GradingTaskId = String
+type CalibrationId = String
+type FeedbackId = String
+type PlagiarismCheckId = String
+
+/// Assessment Hive Configuration
+pub struct AssessmentHiveConfig {
+    /// Default model for grading
+    default_model: ModelConfig,
+    /// Code evaluation model (may need different capabilities)
+    code_model: ModelConfig,
+    /// Embedding model for plagiarism detection
+    embedding_model: EmbeddingModelConfig,
+    /// Minimum confidence for auto-grading
+    min_confidence_threshold: f64,
+    /// Whether to require human review below threshold
+    require_review_below_threshold: bool,
+    /// Plagiarism similarity threshold
+    plagiarism_threshold: f64,
+    /// Cache grading results
+    cache_enabled: bool,
+    /// Cache TTL
+    cache_ttl: Duration,
+    /// Maximum concurrent grading tasks
+    max_concurrent_tasks: usize,
+    /// Enable grading calibration
+    calibration_enabled: bool,
+}
+
+impl Default for AssessmentHiveConfig {
+    fn default() -> Self {
+        AssessmentHiveConfig {
+            default_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.2,
+                max_tokens: 4096,
+                top_p: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            code_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.1,
+                max_tokens: 8192,
+                top_p: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            embedding_model: EmbeddingModelConfig {
+                provider: ModelProvider::OpenAI,
+                model_id: "text-embedding-3-large".to_string(),
+                dimensions: 1536,
+                input_cost_per_1k: 0.00013,
+            },
+            min_confidence_threshold: 0.85,
+            require_review_below_threshold: true,
+            plagiarism_threshold: 0.85,
+            cache_enabled: true,
+            cache_ttl: Duration::hours(24),
+            max_concurrent_tasks: 10,
+            calibration_enabled: true,
+        }
+    }
+}
+
+/// Model configuration
+pub struct ModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    temperature: f64,
+    max_tokens: i32,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    stop_sequences: List<String>,
+    input_cost_per_1k: f64,
+    output_cost_per_1k: f64,
+}
+
+/// Embedding model configuration
+pub struct EmbeddingModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    dimensions: i32,
+    input_cost_per_1k: f64,
+}
+
+/// Model provider
+pub enum ModelProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+    Local { endpoint: String },
+}
+
+/// Grading task request
+pub struct GradingTask {
+    id: GradingTaskId,
+    task_type: GradingTaskType,
+    submission: SubmissionContent,
+    assessment_context: AssessmentContext,
+    grading_config: GradingConfig,
+    status: GradingTaskStatus,
+    result: Option<GradingResult>,
+    created_at: DateTime,
+    completed_at: Option<DateTime>,
+    cost: f64,
+}
+
+/// Type of grading task
+pub enum GradingTaskType {
+    /// Grade an essay response
+    Essay,
+    /// Evaluate code submission
+    Code { language: String, test_cases: List<TestCase> },
+    /// Apply rubric to submission
+    Rubric { rubric: Rubric },
+    /// Grade short answer
+    ShortAnswer { expected_concepts: List<String> },
+    /// Grade fill-in-the-blank
+    FillInBlank { blanks: List<BlankDefinition> },
+    /// Multi-question assessment
+    MultiQuestion { questions: List<Question> },
+}
+
+/// Grading task status
+pub enum GradingTaskStatus {
+    Pending,
+    Processing,
+    Completed,
+    RequiresReview,
+    Failed { error: String },
+}
+
+/// Submission content for grading
+pub struct SubmissionContent {
+    /// Student ID
+    student_id: StudentId,
+    /// Submission ID
+    submission_id: SubmissionId,
+    /// Text content
+    text: Option<String>,
+    /// Code content
+    code: Option<CodeSubmission>,
+    /// File attachments
+    files: List<FileAttachment>,
+    /// Submission timestamp
+    submitted_at: DateTime,
+}
+
+/// Code submission details
+pub struct CodeSubmission {
+    /// Programming language
+    language: String,
+    /// Source code
+    source_code: String,
+    /// Additional files
+    additional_files: Map<String, String>,
+    /// Entry point
+    entry_point: Option<String>,
+}
+
+/// File attachment
+pub struct FileAttachment {
+    filename: String,
+    mime_type: String,
+    content: Vec<u8>,
+    size_bytes: i64,
+}
+
+/// Assessment context for grading
+pub struct AssessmentContext {
+    /// Assessment ID
+    assessment_id: AssessmentId,
+    /// Course ID
+    course_id: CourseId,
+    /// Question being graded
+    question: Option<Question>,
+    /// Learning objectives
+    learning_objectives: List<LearningObjective>,
+    /// Rubric if available
+    rubric: Option<Rubric>,
+    /// Example answers for calibration
+    example_answers: List<ExampleAnswer>,
+    /// Grading criteria
+    criteria: List<String>,
+    /// Maximum points
+    max_points: f32,
+    /// Custom grading instructions
+    custom_instructions: Option<String>,
+}
+
+/// Learning objective for context
+pub struct LearningObjective {
+    id: LearningObjectiveId,
+    description: String,
+    bloom_level: BloomLevel,
+}
+
+/// Example answer for calibration
+pub struct ExampleAnswer {
+    answer: String,
+    score: f32,
+    feedback: String,
+    explanation: String,
+}
+
+/// Grading configuration
+pub struct GradingConfig {
+    /// Generate detailed feedback
+    generate_feedback: bool,
+    /// Include suggestions for improvement
+    include_suggestions: bool,
+    /// Check for plagiarism
+    check_plagiarism: bool,
+    /// Align feedback with learning objectives
+    align_with_objectives: bool,
+    /// Feedback tone
+    feedback_tone: FeedbackTone,
+    /// Detail level
+    detail_level: DetailLevel,
+    /// Language for feedback
+    language: String,
+}
+
+impl Default for GradingConfig {
+    fn default() -> Self {
+        GradingConfig {
+            generate_feedback: true,
+            include_suggestions: true,
+            check_plagiarism: true,
+            align_with_objectives: true,
+            feedback_tone: FeedbackTone::Encouraging,
+            detail_level: DetailLevel::Standard,
+            language: "en".to_string(),
+        }
+    }
+}
+
+/// Feedback tone options
+pub enum FeedbackTone {
+    /// Warm and encouraging
+    Encouraging,
+    /// Professional and neutral
+    Professional,
+    /// Direct and concise
+    Direct,
+    /// Socratic (questioning)
+    Socratic,
+}
+
+/// Detail level for feedback
+pub enum DetailLevel {
+    /// Brief summary only
+    Brief,
+    /// Standard feedback
+    Standard,
+    /// Comprehensive with examples
+    Comprehensive,
+}
+
+/// Grading result
+pub struct GradingResult {
+    /// Assigned score
+    score: f32,
+    /// Maximum possible score
+    max_score: f32,
+    /// Percentage score
+    percentage: f32,
+    /// Confidence in the grade (0.0 - 1.0)
+    confidence: f64,
+    /// Overall feedback
+    feedback: GradingFeedback,
+    /// Rubric scores (if rubric used)
+    rubric_scores: Option<List<RubricCriterionScore>>,
+    /// Per-question scores (for multi-question)
+    question_scores: Option<List<QuestionScore>>,
+    /// Learning objective alignment
+    objective_alignment: List<ObjectiveAlignment>,
+    /// Plagiarism result
+    plagiarism_result: Option<PlagiarismResult>,
+    /// Grading metadata
+    metadata: GradingMetadata,
+}
+
+/// Grading feedback structure
+pub struct GradingFeedback {
+    /// Summary feedback
+    summary: String,
+    /// Strengths identified
+    strengths: List<String>,
+    /// Areas for improvement
+    improvements: List<String>,
+    /// Specific suggestions
+    suggestions: List<FeedbackSuggestion>,
+    /// Inline annotations (for essays/code)
+    annotations: List<InlineAnnotation>,
+}
+
+/// Feedback suggestion
+pub struct FeedbackSuggestion {
+    category: String,
+    suggestion: String,
+    priority: SuggestionPriority,
+    resource_link: Option<String>,
+}
+
+/// Suggestion priority
+pub enum SuggestionPriority {
+    Low,
+    Medium,
+    High,
+}
+
+/// Inline annotation for specific text/code
+pub struct InlineAnnotation {
+    start_offset: i32,
+    end_offset: i32,
+    line_number: Option<i32>,
+    annotation_type: AnnotationType,
+    comment: String,
+}
+
+/// Annotation type
+pub enum AnnotationType {
+    Praise,
+    Suggestion,
+    Error,
+    Question,
+    Reference,
+}
+
+/// Score for a rubric criterion
+pub struct RubricCriterionScore {
+    criterion_id: String,
+    criterion_name: String,
+    score: f32,
+    max_score: f32,
+    level_achieved: String,
+    feedback: String,
+}
+
+/// Score for a question
+pub struct QuestionScore {
+    question_id: String,
+    score: f32,
+    max_score: f32,
+    feedback: String,
+    correct: Option<bool>,
+}
+
+/// Learning objective alignment
+pub struct ObjectiveAlignment {
+    objective_id: LearningObjectiveId,
+    alignment_score: f32,
+    evidence: String,
+}
+
+/// Grading metadata
+pub struct GradingMetadata {
+    model_id: String,
+    processing_time_ms: i64,
+    input_tokens: i32,
+    output_tokens: i32,
+    calibration_applied: bool,
+    review_recommended: bool,
+}
+
+/// Plagiarism detection result
+pub struct PlagiarismResult {
+    /// Overall similarity score (0.0 - 1.0)
+    similarity_score: f64,
+    /// Whether plagiarism was detected
+    plagiarism_detected: bool,
+    /// Matched sources
+    matches: List<PlagiarismMatch>,
+    /// Overall assessment
+    assessment: String,
+}
+
+/// Plagiarism match
+pub struct PlagiarismMatch {
+    /// Source type
+    source_type: PlagiarismSourceType,
+    /// Source identifier
+    source_id: Option<String>,
+    /// Source description
+    source_description: String,
+    /// Similarity percentage
+    similarity: f64,
+    /// Matched text segments
+    segments: List<MatchedSegment>,
+}
+
+/// Source type for plagiarism
+pub enum PlagiarismSourceType {
+    /// Another student submission
+    StudentSubmission { student_id: StudentId },
+    /// External source
+    External { url: Option<String> },
+    /// AI-generated content
+    AiGenerated,
+    /// Known source material
+    SourceMaterial { title: String },
+}
+
+/// Matched text segment
+pub struct MatchedSegment {
+    start_offset: i32,
+    end_offset: i32,
+    matched_text: String,
+    source_text: String,
+}
+
+/// Test case for code evaluation
+pub struct TestCase {
+    id: String,
+    name: String,
+    description: Option<String>,
+    input: String,
+    expected_output: String,
+    timeout_ms: i64,
+    points: f32,
+    is_hidden: bool,
+}
+
+/// Code evaluation result
+pub struct CodeEvaluationResult {
+    /// Overall score
+    score: f32,
+    max_score: f32,
+    /// Test case results
+    test_results: List<TestCaseResult>,
+    /// Code quality analysis
+    quality_analysis: CodeQualityAnalysis,
+    /// Compilation/runtime errors
+    errors: List<CodeError>,
+    /// Execution time
+    execution_time_ms: i64,
+    /// Memory usage
+    memory_usage_bytes: i64,
+}
+
+/// Result of a single test case
+pub struct TestCaseResult {
+    test_case_id: String,
+    passed: bool,
+    actual_output: String,
+    expected_output: String,
+    execution_time_ms: i64,
+    points_earned: f32,
+    error: Option<String>,
+}
+
+/// Code quality analysis
+pub struct CodeQualityAnalysis {
+    /// Overall quality score
+    quality_score: f32,
+    /// Style adherence
+    style_score: f32,
+    /// Efficiency analysis
+    efficiency_score: f32,
+    /// Readability score
+    readability_score: f32,
+    /// Issues found
+    issues: List<CodeIssue>,
+    /// Positive aspects
+    positives: List<String>,
+    /// Suggestions
+    suggestions: List<String>,
+}
+
+/// Code issue
+pub struct CodeIssue {
+    severity: IssueSeverity,
+    category: String,
+    message: String,
+    line_number: Option<i32>,
+    suggestion: Option<String>,
+}
+
+/// Issue severity
+pub enum IssueSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+/// Code error
+pub struct CodeError {
+    error_type: CodeErrorType,
+    message: String,
+    line_number: Option<i32>,
+    column: Option<i32>,
+}
+
+/// Code error type
+pub enum CodeErrorType {
+    Compilation,
+    Runtime,
+    Timeout,
+    MemoryLimit,
+    SecurityViolation,
+}
+
+/// Calibration session for grading consistency
+pub struct CalibrationSession {
+    id: CalibrationId,
+    assessment_id: AssessmentId,
+    calibration_samples: List<CalibrationSample>,
+    current_adjustments: CalibrationAdjustments,
+    created_at: DateTime,
+    updated_at: DateTime,
+}
+
+/// Calibration sample
+pub struct CalibrationSample {
+    submission_id: SubmissionId,
+    ai_score: f32,
+    human_score: f32,
+    ai_feedback: String,
+    human_feedback: Option<String>,
+    discrepancy: f32,
+}
+
+/// Calibration adjustments
+pub struct CalibrationAdjustments {
+    /// Score adjustment factor
+    score_factor: f64,
+    /// Score offset
+    score_offset: f64,
+    /// Criterion-specific adjustments
+    criterion_adjustments: Map<String, f64>,
+    /// Feedback style adjustments
+    feedback_adjustments: List<String>,
+}
+
+// =============================================================================
+// Assessment Hive Specialists
+// =============================================================================
+
+/// Essay Grader Specialist
+pub struct EssayGrader {
+    config: ModelConfig,
+    system_prompt: String,
+    calibration: Option<CalibrationAdjustments>,
+}
+
+impl EssayGrader {
+    pub fn new(config: ModelConfig) -> Self {
+        EssayGrader {
+            config,
+            system_prompt: r#"You are an expert essay grader for educational assessments. Your role is to:
+
+1. Evaluate essays against the provided rubric and learning objectives
+2. Provide constructive, encouraging feedback that helps students improve
+3. Identify specific strengths and areas for improvement
+4. Score consistently and fairly across all submissions
+5. Align feedback with the course's learning objectives
+
+When grading:
+- Read the entire essay carefully before scoring
+- Consider thesis clarity, argument structure, evidence use, and writing quality
+- Apply the rubric criteria systematically
+- Provide specific examples from the text to support your feedback
+- Suggest concrete improvements the student can make
+- Maintain an encouraging tone while being honest about weaknesses
+
+Output your evaluation in the structured format requested."#.to_string(),
+            calibration: None,
+        }
+    }
+
+    pub async fn grade(&self, submission: &SubmissionContent, context: &AssessmentContext) -> Result<GradingResult, GradingError> {
+        let essay_text = submission.text.as_ref()
+            .ok_or(GradingError::InvalidSubmission { reason: "No essay text provided".to_string() })?;
+
+        // Build the grading prompt
+        let prompt = self.build_grading_prompt(essay_text, context);
+
+        // Call the model
+        let response = self.invoke_model(&prompt).await?;
+
+        // Parse the response into structured result
+        let mut result = self.parse_grading_response(&response, context)?;
+
+        // Apply calibration if available
+        if let Some(cal) = &self.calibration {
+            result = self.apply_calibration(result, cal);
+        }
+
+        Ok(result)
+    }
+
+    fn build_grading_prompt(&self, essay: &str, context: &AssessmentContext) -> String {
+        let mut prompt = String::new();
+
+        // Add question context
+        if let Some(q) = &context.question {
+            prompt.push_str(&format!("## Question\n{}\n\n", q.text));
+        }
+
+        // Add rubric
+        if let Some(rubric) = &context.rubric {
+            prompt.push_str("## Rubric\n");
+            for criterion in &rubric.criteria {
+                prompt.push_str(&format!("### {} ({} points)\n{}\n",
+                    criterion.name, criterion.max_points,
+                    criterion.description.as_ref().unwrap_or(&String::new())));
+                for level in &criterion.levels {
+                    prompt.push_str(&format!("- {} ({} pts): {}\n",
+                        level.name, level.points, level.description));
+                }
+                prompt.push_str("\n");
+            }
+        }
+
+        // Add learning objectives
+        if !context.learning_objectives.is_empty() {
+            prompt.push_str("## Learning Objectives\n");
+            for obj in &context.learning_objectives {
+                prompt.push_str(&format!("- {}\n", obj.description));
+            }
+            prompt.push_str("\n");
+        }
+
+        // Add example answers for calibration
+        if !context.example_answers.is_empty() {
+            prompt.push_str("## Example Answers for Reference\n");
+            for (i, example) in context.example_answers.iter().enumerate() {
+                prompt.push_str(&format!("### Example {} (Score: {}/{})\n{}\n\nFeedback: {}\n\n",
+                    i + 1, example.score, context.max_points, example.answer, example.feedback));
+            }
+        }
+
+        // Add custom instructions
+        if let Some(instructions) = &context.custom_instructions {
+            prompt.push_str(&format!("## Additional Instructions\n{}\n\n", instructions));
+        }
+
+        // Add the student essay
+        prompt.push_str(&format!("## Student Essay to Grade\n{}\n\n", essay));
+
+        // Request structured output
+        prompt.push_str(r#"## Required Output Format
+Please provide your evaluation in the following JSON format:
+{
+  "score": <numeric score>,
+  "max_score": <maximum possible score>,
+  "confidence": <confidence level 0.0-1.0>,
+  "feedback": {
+    "summary": "<overall feedback summary>",
+    "strengths": ["<strength 1>", "<strength 2>"],
+    "improvements": ["<area 1>", "<area 2>"],
+    "suggestions": [
+      {"category": "<category>", "suggestion": "<suggestion>", "priority": "high|medium|low"}
+    ]
+  },
+  "rubric_scores": [
+    {"criterion_id": "<id>", "criterion_name": "<name>", "score": <score>, "max_score": <max>, "level_achieved": "<level>", "feedback": "<feedback>"}
+  ],
+  "objective_alignment": [
+    {"objective_id": "<id>", "alignment_score": <0.0-1.0>, "evidence": "<evidence from essay>"}
+  ]
+}"#);
+
+        prompt
+    }
+
+    async fn invoke_model(&self, prompt: &str) -> Result<String, GradingError> {
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(prompt))
+            .await
+            .map_err(|e| GradingError::ModelError { message: e.to_string() })?;
+
+        Ok(response.content)
+    }
+
+    fn parse_grading_response(&self, response: &str, context: &AssessmentContext) -> Result<GradingResult, GradingError> {
+        // Extract JSON from response
+        let json_start = response.find('{').unwrap_or(0);
+        let json_end = response.rfind('}').map(|i| i + 1).unwrap_or(response.len());
+        let json_str = &response[json_start..json_end];
+
+        // Parse JSON (simplified - in production would use proper JSON parsing)
+        let parsed: GradingResponseJson = parse_json(json_str)
+            .map_err(|e| GradingError::ParseError { message: e.to_string() })?;
+
+        Ok(GradingResult {
+            score: parsed.score,
+            max_score: parsed.max_score,
+            percentage: (parsed.score / parsed.max_score) * 100.0,
+            confidence: parsed.confidence,
+            feedback: GradingFeedback {
+                summary: parsed.feedback.summary,
+                strengths: parsed.feedback.strengths,
+                improvements: parsed.feedback.improvements,
+                suggestions: parsed.feedback.suggestions.into_iter().map(|s| FeedbackSuggestion {
+                    category: s.category,
+                    suggestion: s.suggestion,
+                    priority: match s.priority.as_str() {
+                        "high" => SuggestionPriority::High,
+                        "medium" => SuggestionPriority::Medium,
+                        _ => SuggestionPriority::Low,
+                    },
+                    resource_link: None,
+                }).collect(),
+                annotations: vec![],
+            },
+            rubric_scores: Some(parsed.rubric_scores.into_iter().map(|rs| RubricCriterionScore {
+                criterion_id: rs.criterion_id,
+                criterion_name: rs.criterion_name,
+                score: rs.score,
+                max_score: rs.max_score,
+                level_achieved: rs.level_achieved,
+                feedback: rs.feedback,
+            }).collect()),
+            question_scores: None,
+            objective_alignment: parsed.objective_alignment.into_iter().map(|oa| ObjectiveAlignment {
+                objective_id: LearningObjectiveId(oa.objective_id),
+                alignment_score: oa.alignment_score,
+                evidence: oa.evidence,
+            }).collect(),
+            plagiarism_result: None,
+            metadata: GradingMetadata {
+                model_id: self.config.model_id.clone(),
+                processing_time_ms: 0, // Would be set by caller
+                input_tokens: 0,
+                output_tokens: 0,
+                calibration_applied: self.calibration.is_some(),
+                review_recommended: parsed.confidence < 0.85,
+            },
+        })
+    }
+
+    fn apply_calibration(&self, mut result: GradingResult, calibration: &CalibrationAdjustments) -> GradingResult {
+        // Apply score adjustment
+        result.score = (result.score * calibration.score_factor as f32 + calibration.score_offset as f32)
+            .max(0.0)
+            .min(result.max_score);
+        result.percentage = (result.score / result.max_score) * 100.0;
+
+        // Apply criterion-specific adjustments
+        if let Some(rubric_scores) = &mut result.rubric_scores {
+            for score in rubric_scores.iter_mut() {
+                if let Some(adj) = calibration.criterion_adjustments.get(&score.criterion_id) {
+                    score.score = (score.score * *adj as f32).max(0.0).min(score.max_score);
+                }
+            }
+        }
+
+        result.metadata.calibration_applied = true;
+        result
+    }
+
+    pub fn set_calibration(&mut self, calibration: CalibrationAdjustments) {
+        self.calibration = Some(calibration);
+    }
+}
+
+/// Code Evaluator Specialist
+pub struct CodeEvaluator {
+    config: ModelConfig,
+    system_prompt: String,
+    supported_languages: Set<String>,
+}
+
+impl CodeEvaluator {
+    pub fn new(config: ModelConfig) -> Self {
+        let mut supported = Set::new();
+        supported.insert("python".to_string());
+        supported.insert("javascript".to_string());
+        supported.insert("typescript".to_string());
+        supported.insert("java".to_string());
+        supported.insert("cpp".to_string());
+        supported.insert("c".to_string());
+        supported.insert("rust".to_string());
+        supported.insert("go".to_string());
+        supported.insert("ruby".to_string());
+        supported.insert("swift".to_string());
+        supported.insert("kotlin".to_string());
+
+        CodeEvaluator {
+            config,
+            system_prompt: r#"You are an expert code evaluator for programming education. Your role is to:
+
+1. Execute and evaluate code against provided test cases
+2. Analyze code quality, style, and efficiency
+3. Identify bugs, security issues, and potential improvements
+4. Provide educational feedback that helps students learn
+5. Assess algorithmic thinking and problem-solving approach
+
+When evaluating:
+- Test the code against all provided test cases
+- Check for edge cases and error handling
+- Evaluate time and space complexity
+- Review code organization and readability
+- Suggest best practices and improvements
+- Identify common beginner mistakes and explain them
+
+Be encouraging while being thorough in your analysis."#.to_string(),
+            supported_languages: supported,
+        }
+    }
+
+    pub async fn evaluate(&self, submission: &SubmissionContent, context: &AssessmentContext, test_cases: &List<TestCase>) -> Result<CodeEvaluationResult, GradingError> {
+        let code = submission.code.as_ref()
+            .ok_or(GradingError::InvalidSubmission { reason: "No code submission provided".to_string() })?;
+
+        // Validate language
+        if !self.supported_languages.contains(&code.language.to_lowercase()) {
+            return Err(GradingError::UnsupportedLanguage { language: code.language.clone() });
+        }
+
+        // Execute test cases in sandboxed environment
+        let test_results = self.run_test_cases(code, test_cases).await?;
+
+        // Analyze code quality with AI
+        let quality_analysis = self.analyze_code_quality(code, context).await?;
+
+        // Calculate overall score
+        let test_score: f32 = test_results.iter()
+            .filter(|r| r.passed)
+            .map(|r| r.points_earned)
+            .sum();
+        let max_test_score: f32 = test_cases.iter().map(|t| t.points).sum();
+
+        // Combine test score with quality score
+        let quality_weight = 0.2; // 20% weight for code quality
+        let test_weight = 0.8;    // 80% weight for test cases
+
+        let quality_points = quality_analysis.quality_score * max_test_score * quality_weight;
+        let total_score = test_score * test_weight + quality_points;
+        let max_score = max_test_score;
+
+        Ok(CodeEvaluationResult {
+            score: total_score,
+            max_score,
+            test_results,
+            quality_analysis,
+            errors: vec![], // Populated during test execution
+            execution_time_ms: 0,
+            memory_usage_bytes: 0,
+        })
+    }
+
+    async fn run_test_cases(&self, code: &CodeSubmission, test_cases: &List<TestCase>) -> Result<List<TestCaseResult>, GradingError> {
+        let mut results = vec![];
+
+        for test in test_cases {
+            let result = self.execute_test(code, test).await?;
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
+    async fn execute_test(&self, code: &CodeSubmission, test: &TestCase) -> Result<TestCaseResult, GradingError> {
+        // In production, this would use a sandboxed code execution environment
+        // For now, we simulate the execution
+
+        // Call sandbox execution service
+        let execution_result = self.sandbox_execute(code, &test.input, test.timeout_ms).await;
+
+        match execution_result {
+            Ok(output) => {
+                let passed = output.trim() == test.expected_output.trim();
+                Ok(TestCaseResult {
+                    test_case_id: test.id.clone(),
+                    passed,
+                    actual_output: output,
+                    expected_output: test.expected_output.clone(),
+                    execution_time_ms: 0,
+                    points_earned: if passed { test.points } else { 0.0 },
+                    error: None,
+                })
+            },
+            Err(e) => {
+                Ok(TestCaseResult {
+                    test_case_id: test.id.clone(),
+                    passed: false,
+                    actual_output: String::new(),
+                    expected_output: test.expected_output.clone(),
+                    execution_time_ms: 0,
+                    points_earned: 0.0,
+                    error: Some(e.to_string()),
+                })
+            }
+        }
+    }
+
+    async fn sandbox_execute(&self, code: &CodeSubmission, input: &str, timeout_ms: i64) -> Result<String, GradingError> {
+        // Create sandbox execution request
+        let request = SandboxExecutionRequest {
+            language: code.language.clone(),
+            source_code: code.source_code.clone(),
+            additional_files: code.additional_files.clone(),
+            entry_point: code.entry_point.clone(),
+            stdin: input.to_string(),
+            timeout_ms,
+            memory_limit_mb: 256,
+            cpu_limit_percent: 100,
+            network_enabled: false,
+            filesystem_readonly: true,
+        };
+
+        // Get sandbox executor instance
+        let executor = self.get_sandbox_executor(&code.language)?;
+
+        // Execute in isolated container
+        let result = executor.execute(&request).await
+            .map_err(|e| GradingError::SandboxError { message: e.to_string() })?;
+
+        // Check for execution errors
+        if let Some(error) = result.error {
+            return Err(GradingError::SandboxError { message: error });
+        }
+
+        // Check exit code
+        if result.exit_code != 0 {
+            let error_msg = if !result.stderr.is_empty() {
+                result.stderr
+            } else {
+                format!("Process exited with code {}", result.exit_code)
+            };
+            return Err(GradingError::SandboxError { message: error_msg });
+        }
+
+        Ok(result.stdout)
+    }
+
+    fn get_sandbox_executor(&self, language: &str) -> Result<Box<dyn SandboxExecutor>, GradingError> {
+        // Get appropriate executor based on configured sandbox provider
+        match std::env::var("SANDBOX_PROVIDER").unwrap_or("docker".to_string()).as_str() {
+            "docker" => Ok(Box::new(DockerSandboxExecutor::new(language))),
+            "firecracker" => Ok(Box::new(FirecrackerSandboxExecutor::new(language))),
+            "lambda" => Ok(Box::new(LambdaSandboxExecutor::new(language))),
+            "nsjail" => Ok(Box::new(NsjailSandboxExecutor::new(language))),
+            provider => Err(GradingError::SandboxError {
+                message: format!("Unknown sandbox provider: {}", provider)
+            })
+        }
+    }
+
+    async fn analyze_code_quality(&self, code: &CodeSubmission, context: &AssessmentContext) -> Result<CodeQualityAnalysis, GradingError> {
+        let prompt = format!(
+            r#"Analyze the following {} code for quality, style, and efficiency.
+
+Code:
+```{}
+{}
+```
+
+Question/Requirements:
+{}
+
+Provide a JSON analysis with:
+{{
+  "quality_score": <0.0-1.0>,
+  "style_score": <0.0-1.0>,
+  "efficiency_score": <0.0-1.0>,
+  "readability_score": <0.0-1.0>,
+  "issues": [
+    {{"severity": "info|warning|error|critical", "category": "<category>", "message": "<message>", "line_number": <optional>, "suggestion": "<optional>"}}
+  ],
+  "positives": ["<positive aspect>"],
+  "suggestions": ["<improvement suggestion>"]
+}}"#,
+            code.language,
+            code.language,
+            code.source_code,
+            context.question.as_ref().map(|q| q.text.as_str()).unwrap_or("No specific requirements")
+        );
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| GradingError::ModelError { message: e.to_string() })?;
+
+        // Parse response
+        let analysis: CodeQualityJson = parse_json(&response.content)
+            .map_err(|e| GradingError::ParseError { message: e.to_string() })?;
+
+        Ok(CodeQualityAnalysis {
+            quality_score: analysis.quality_score,
+            style_score: analysis.style_score,
+            efficiency_score: analysis.efficiency_score,
+            readability_score: analysis.readability_score,
+            issues: analysis.issues.into_iter().map(|i| CodeIssue {
+                severity: match i.severity.as_str() {
+                    "critical" => IssueSeverity::Critical,
+                    "error" => IssueSeverity::Error,
+                    "warning" => IssueSeverity::Warning,
+                    _ => IssueSeverity::Info,
+                },
+                category: i.category,
+                message: i.message,
+                line_number: i.line_number,
+                suggestion: i.suggestion,
+            }).collect(),
+            positives: analysis.positives,
+            suggestions: analysis.suggestions,
+        })
+    }
+}
+
+/// Rubric Applicator Specialist
+pub struct RubricApplicator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl RubricApplicator {
+    pub fn new(config: ModelConfig) -> Self {
+        RubricApplicator {
+            config,
+            system_prompt: r#"You are an expert at applying grading rubrics consistently and fairly. Your role is to:
+
+1. Carefully read and understand each rubric criterion
+2. Evaluate the submission against each criterion individually
+3. Select the most appropriate performance level for each criterion
+4. Provide specific evidence from the submission to justify each score
+5. Ensure consistent application across all submissions
+
+Apply the rubric objectively, avoiding:
+- Halo effects (letting one aspect influence others)
+- Recency bias (over-weighting recent parts)
+- Central tendency (avoiding extreme scores)
+
+Always cite specific examples from the submission to support your ratings."#.to_string(),
+        }
+    }
+
+    pub async fn apply(&self, submission: &SubmissionContent, rubric: &Rubric, context: &AssessmentContext) -> Result<List<RubricCriterionScore>, GradingError> {
+        let content = submission.text.as_ref()
+            .ok_or(GradingError::InvalidSubmission { reason: "No content to evaluate".to_string() })?;
+
+        let mut scores = vec![];
+
+        // Evaluate each criterion
+        for criterion in &rubric.criteria {
+            let score = self.evaluate_criterion(content, criterion, context).await?;
+            scores.push(score);
+        }
+
+        Ok(scores)
+    }
+
+    async fn evaluate_criterion(&self, content: &str, criterion: &RubricCriterion, context: &AssessmentContext) -> Result<RubricCriterionScore, GradingError> {
+        let levels_description: String = criterion.levels.iter()
+            .map(|l| format!("- {} ({} points): {}", l.name, l.points, l.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            r#"Evaluate the following submission for this rubric criterion:
+
+## Criterion: {}
+(Maximum {} points)
+{}
+
+## Performance Levels:
+{}
+
+## Submission:
+{}
+
+Provide your evaluation as JSON:
+{{
+  "level_achieved": "<level name>",
+  "score": <points>,
+  "evidence": "<specific quotes/examples from submission>",
+  "feedback": "<constructive feedback>"
+}}"#,
+            criterion.name,
+            criterion.max_points,
+            criterion.description.as_ref().unwrap_or(&String::new()),
+            levels_description,
+            content
+        );
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| GradingError::ModelError { message: e.to_string() })?;
+
+        let evaluation: CriterionEvalJson = parse_json(&response.content)
+            .map_err(|e| GradingError::ParseError { message: e.to_string() })?;
+
+        Ok(RubricCriterionScore {
+            criterion_id: criterion.id.clone(),
+            criterion_name: criterion.name.clone(),
+            score: evaluation.score,
+            max_score: criterion.max_points,
+            level_achieved: evaluation.level_achieved,
+            feedback: evaluation.feedback,
+        })
+    }
+}
+
+/// Feedback Generator Specialist
+pub struct FeedbackGenerator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl FeedbackGenerator {
+    pub fn new(config: ModelConfig) -> Self {
+        FeedbackGenerator {
+            config,
+            system_prompt: r#"You are an expert educational feedback writer. Your role is to:
+
+1. Provide personalized, constructive feedback that helps students learn
+2. Balance positive reinforcement with areas for improvement
+3. Use the student's name and reference specific work when possible
+4. Align feedback with learning objectives
+5. Suggest concrete next steps and resources
+
+Feedback principles:
+- Be specific, not vague ("Your thesis statement clearly states..." not "Good job")
+- Be actionable (provide specific steps to improve)
+- Be encouraging (maintain growth mindset)
+- Be appropriate for the student's level
+- Connect feedback to learning goals
+
+Adjust tone and detail level based on the configuration provided."#.to_string(),
+        }
+    }
+
+    pub async fn generate(&self, result: &GradingResult, context: &AssessmentContext, config: &GradingConfig) -> Result<GradingFeedback, GradingError> {
+        let prompt = self.build_feedback_prompt(result, context, config);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.7) // Slightly higher for more natural feedback
+            .with_max_tokens(2048);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| GradingError::ModelError { message: e.to_string() })?;
+
+        self.parse_feedback_response(&response.content)
+    }
+
+    fn build_feedback_prompt(&self, result: &GradingResult, context: &AssessmentContext, config: &GradingConfig) -> String {
+        let tone = match config.feedback_tone {
+            FeedbackTone::Encouraging => "warm, encouraging, and supportive",
+            FeedbackTone::Professional => "professional and constructive",
+            FeedbackTone::Direct => "direct and concise",
+            FeedbackTone::Socratic => "questioning and thought-provoking (Socratic method)",
+        };
+
+        let detail = match config.detail_level {
+            DetailLevel::Brief => "brief (2-3 sentences)",
+            DetailLevel::Standard => "standard (paragraph with key points)",
+            DetailLevel::Comprehensive => "comprehensive (detailed with examples)",
+        };
+
+        let mut prompt = format!(
+            r#"Generate feedback for a student's assessment based on the following:
+
+## Score
+{:.1}/{:.1} ({:.1}%)
+
+## Tone
+{}
+
+## Detail Level
+{}
+"#,
+            result.score, result.max_score, result.percentage,
+            tone, detail
+        );
+
+        // Add rubric scores if available
+        if let Some(rubric_scores) = &result.rubric_scores {
+            prompt.push_str("\n## Criterion Scores\n");
+            for rs in rubric_scores {
+                prompt.push_str(&format!("- {}: {}/{} ({})\n",
+                    rs.criterion_name, rs.score, rs.max_score, rs.level_achieved));
+            }
+        }
+
+        // Add learning objectives
+        if config.align_with_objectives && !context.learning_objectives.is_empty() {
+            prompt.push_str("\n## Learning Objectives to Address\n");
+            for obj in &context.learning_objectives {
+                prompt.push_str(&format!("- {}\n", obj.description));
+            }
+        }
+
+        prompt.push_str(&format!(r#"
+## Language
+{}
+
+Provide feedback in JSON format:
+{{
+  "summary": "<overall feedback>",
+  "strengths": ["<specific strength>"],
+  "improvements": ["<area for improvement>"],
+  "suggestions": [
+    {{"category": "<category>", "suggestion": "<actionable suggestion>", "priority": "high|medium|low", "resource_link": "<optional>"}}
+  ]
+}}"#, config.language));
+
+        prompt
+    }
+
+    fn parse_feedback_response(&self, response: &str) -> Result<GradingFeedback, GradingError> {
+        let feedback: FeedbackJson = parse_json(response)
+            .map_err(|e| GradingError::ParseError { message: e.to_string() })?;
+
+        Ok(GradingFeedback {
+            summary: feedback.summary,
+            strengths: feedback.strengths,
+            improvements: feedback.improvements,
+            suggestions: feedback.suggestions.into_iter().map(|s| FeedbackSuggestion {
+                category: s.category,
+                suggestion: s.suggestion,
+                priority: match s.priority.as_str() {
+                    "high" => SuggestionPriority::High,
+                    "medium" => SuggestionPriority::Medium,
+                    _ => SuggestionPriority::Low,
+                },
+                resource_link: s.resource_link,
+            }).collect(),
+            annotations: vec![],
+        })
+    }
+}
+
+/// Plagiarism Detector Specialist
+pub struct PlagiarismDetector {
+    embedding_config: EmbeddingModelConfig,
+    similarity_threshold: f64,
+    submission_embeddings: Map<SubmissionId, Vec<f64>>,
+}
+
+impl PlagiarismDetector {
+    pub fn new(config: EmbeddingModelConfig, threshold: f64) -> Self {
+        PlagiarismDetector {
+            embedding_config: config,
+            similarity_threshold: threshold,
+            submission_embeddings: Map::new(),
+        }
+    }
+
+    pub async fn check(&self, submission: &SubmissionContent, comparison_pool: &List<SubmissionId>) -> Result<PlagiarismResult, GradingError> {
+        let content = submission.text.as_ref()
+            .ok_or(GradingError::InvalidSubmission { reason: "No text content for plagiarism check".to_string() })?;
+
+        // Generate embedding for the submission
+        let embedding = self.generate_embedding(content).await?;
+
+        // Compare against pool of previous submissions
+        let mut matches = vec![];
+        let mut max_similarity: f64 = 0.0;
+
+        for other_id in comparison_pool {
+            if other_id == &submission.submission_id {
+                continue;
+            }
+
+            if let Some(other_embedding) = self.submission_embeddings.get(other_id) {
+                let similarity = self.cosine_similarity(&embedding, other_embedding);
+
+                if similarity > self.similarity_threshold * 0.7 {
+                    // Only flag if above 70% of threshold for review
+                    matches.push(PlagiarismMatch {
+                        source_type: PlagiarismSourceType::StudentSubmission {
+                            student_id: StudentId(other_id.0.clone())
+                        },
+                        source_id: Some(other_id.0.clone()),
+                        source_description: format!("Previous submission {}", other_id.0),
+                        similarity,
+                        segments: vec![], // Would require more detailed analysis
+                    });
+                }
+
+                max_similarity = max_similarity.max(similarity);
+            }
+        }
+
+        // Check for AI-generated content patterns
+        let ai_detection = self.detect_ai_generated(content).await?;
+        if ai_detection.probability > 0.7 {
+            matches.push(PlagiarismMatch {
+                source_type: PlagiarismSourceType::AiGenerated,
+                source_id: None,
+                source_description: "Potential AI-generated content detected".to_string(),
+                similarity: ai_detection.probability,
+                segments: vec![],
+            });
+        }
+
+        let plagiarism_detected = max_similarity >= self.similarity_threshold || ai_detection.probability > 0.8;
+
+        Ok(PlagiarismResult {
+            similarity_score: max_similarity,
+            plagiarism_detected,
+            matches,
+            assessment: if plagiarism_detected {
+                "Potential academic integrity concern detected. Human review recommended.".to_string()
+            } else {
+                "No significant similarity or AI-generation patterns detected.".to_string()
+            },
+        })
+    }
+
+    async fn generate_embedding(&self, text: &str) -> Result<Vec<f64>, GradingError> {
+        let model = EmbeddingModel::new(&self.embedding_config.model_id);
+
+        model.embed(text)
+            .await
+            .map_err(|e| GradingError::ModelError { message: e.to_string() })
+    }
+
+    fn cosine_similarity(&self, a: &Vec<f64>, b: &Vec<f64>) -> f64 {
+        let dot_product: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let magnitude_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let magnitude_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+
+        if magnitude_a == 0.0 || magnitude_b == 0.0 {
+            0.0
+        } else {
+            dot_product / (magnitude_a * magnitude_b)
+        }
+    }
+
+    async fn detect_ai_generated(&self, text: &str) -> Result<AiDetectionResult, GradingError> {
+        // Analyze text for AI-generated content indicators
+        let mut indicators: List<String> = vec![];
+        let mut probability: f64 = 0.0;
+
+        // Statistical analysis of text patterns
+        let analysis = self.analyze_text_patterns(text);
+
+        // Check for uniform sentence length (AI tends to produce consistent lengths)
+        if analysis.sentence_length_variance < 15.0 {
+            indicators.push("Unusually uniform sentence length distribution".to_string());
+            probability += 0.15;
+        }
+
+        // Check for low perplexity (AI text tends to be more predictable)
+        if analysis.estimated_perplexity < 30.0 {
+            indicators.push("Low perplexity indicating predictable text patterns".to_string());
+            probability += 0.2;
+        }
+
+        // Check for repetitive phrase patterns
+        if analysis.repetition_score > 0.3 {
+            indicators.push("Repetitive phrase structures detected".to_string());
+            probability += 0.15;
+        }
+
+        // Check vocabulary diversity (AI may have less diverse word choice)
+        if analysis.vocabulary_richness < 0.4 {
+            indicators.push("Limited vocabulary diversity".to_string());
+            probability += 0.1;
+        }
+
+        // Check for overly formal or consistent tone
+        if analysis.tone_consistency > 0.85 {
+            indicators.push("Unusually consistent writing tone".to_string());
+            probability += 0.1;
+        }
+
+        // Check for common AI writing patterns
+        let ai_patterns = self.detect_common_ai_patterns(text);
+        for pattern in ai_patterns {
+            indicators.push(format!("AI writing pattern detected: {}", pattern));
+            probability += 0.05;
+        }
+
+        // Check for lack of personal voice or anecdotes
+        if !analysis.has_personal_elements {
+            indicators.push("Absence of personal voice or anecdotes".to_string());
+            probability += 0.05;
+        }
+
+        // Burstiness analysis (human writing has more variation in complexity)
+        if analysis.burstiness_score < 0.3 {
+            indicators.push("Low burstiness - uniform complexity throughout".to_string());
+            probability += 0.15;
+        }
+
+        // Cap probability at 1.0
+        probability = probability.min(1.0);
+
+        // If we have external AI detection service configured, use it for additional verification
+        if let Some(ref service_url) = self.config.ai_detection_service_url {
+            match self.call_external_detection_service(service_url, text).await {
+                Ok(external_result) => {
+                    // Weight external service result more heavily
+                    probability = (probability * 0.3) + (external_result.probability * 0.7);
+                    indicators.extend(external_result.indicators);
+                }
+                Err(e) => {
+                    // Log error but continue with local analysis
+                    log::warn!("External AI detection service failed: {}", e);
+                }
+            }
+        }
+
+        Ok(AiDetectionResult {
+            probability,
+            indicators,
+        })
+    }
+
+    /// Analyze text patterns for AI detection
+    fn analyze_text_patterns(&self, text: &str) -> TextPatternAnalysis {
+        let sentences: Vec<&str> = text.split(|c| c == '.' || c == '!' || c == '?')
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        // Calculate sentence length variance
+        let lengths: Vec<f64> = sentences.iter().map(|s| s.split_whitespace().count() as f64).collect();
+        let mean_length = lengths.iter().sum::<f64>() / lengths.len().max(1) as f64;
+        let variance = lengths.iter()
+            .map(|l| (l - mean_length).powi(2))
+            .sum::<f64>() / lengths.len().max(1) as f64;
+
+        // Calculate vocabulary richness (unique words / total words)
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let unique_words: Set<&str> = words.iter().cloned().collect();
+        let vocabulary_richness = unique_words.len() as f64 / words.len().max(1) as f64;
+
+        // Estimate perplexity using n-gram frequency (simplified)
+        let bigrams = self.count_bigrams(&words);
+        let estimated_perplexity = self.estimate_perplexity_from_bigrams(&bigrams, words.len());
+
+        // Calculate repetition score
+        let repetition_score = self.calculate_repetition_score(&words);
+
+        // Calculate tone consistency
+        let tone_consistency = self.calculate_tone_consistency(&sentences);
+
+        // Check for personal elements
+        let has_personal_elements = self.detect_personal_elements(text);
+
+        // Calculate burstiness (variation in sentence complexity)
+        let burstiness_score = self.calculate_burstiness(&sentences);
+
+        TextPatternAnalysis {
+            sentence_length_variance: variance,
+            vocabulary_richness,
+            estimated_perplexity,
+            repetition_score,
+            tone_consistency,
+            has_personal_elements,
+            burstiness_score,
+        }
+    }
+
+    fn count_bigrams(&self, words: &[&str]) -> Map<(String, String), i32> {
+        let mut bigrams = Map::new();
+        for window in words.windows(2) {
+            let key = (window[0].to_lowercase(), window[1].to_lowercase());
+            *bigrams.entry(key).or_insert(0) += 1;
+        }
+        bigrams
+    }
+
+    fn estimate_perplexity_from_bigrams(&self, bigrams: &Map<(String, String), i32>, total_words: usize) -> f64 {
+        if bigrams.is_empty() || total_words == 0 {
+            return 100.0; // High perplexity for empty text
+        }
+        let unique_bigrams = bigrams.len() as f64;
+        let total_bigrams = bigrams.values().sum::<i32>() as f64;
+        // Simplified perplexity estimate based on bigram diversity
+        (unique_bigrams / total_bigrams) * 100.0
+    }
+
+    fn calculate_repetition_score(&self, words: &[&str]) -> f64 {
+        let total = words.len();
+        if total < 10 {
+            return 0.0;
+        }
+        let unique: Set<&str> = words.iter().cloned().collect();
+        1.0 - (unique.len() as f64 / total as f64)
+    }
+
+    fn calculate_tone_consistency(&self, sentences: &[&str]) -> f64 {
+        // Analyze sentence starters and structure consistency
+        let starters: Vec<String> = sentences.iter()
+            .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_lowercase())
+            .collect();
+
+        if starters.len() < 3 {
+            return 0.5; // Neutral for short texts
+        }
+
+        // Check variety in sentence starters
+        let unique_starters: Set<&str> = starters.iter().map(|s| s.as_str()).collect();
+        let starter_variety = unique_starters.len() as f64 / starters.len() as f64;
+
+        // High consistency = low variety = potentially AI
+        1.0 - starter_variety
+    }
+
+    fn detect_personal_elements(&self, text: &str) -> bool {
+        let personal_indicators = [
+            "I think", "I believe", "In my experience", "I remember",
+            "personally", "my opinion", "I feel", "I've seen",
+            "when I was", "I noticed", "I realized"
+        ];
+
+        let text_lower = text.to_lowercase();
+        personal_indicators.iter().any(|indicator| text_lower.contains(&indicator.to_lowercase()))
+    }
+
+    fn calculate_burstiness(&self, sentences: &[&str]) -> f64 {
+        if sentences.len() < 3 {
+            return 0.5;
+        }
+
+        // Calculate complexity variation between sentences
+        let complexities: Vec<f64> = sentences.iter().map(|s| {
+            let words = s.split_whitespace().count() as f64;
+            let unique_words: Set<&str> = s.split_whitespace().collect();
+            words * (unique_words.len() as f64 / words.max(1.0))
+        }).collect();
+
+        let mean = complexities.iter().sum::<f64>() / complexities.len() as f64;
+        let variance = complexities.iter()
+            .map(|c| (c - mean).abs())
+            .sum::<f64>() / complexities.len() as f64;
+
+        // Normalize to 0-1 range
+        (variance / mean.max(1.0)).min(1.0)
+    }
+
+    fn detect_common_ai_patterns(&self, text: &str) -> List<String> {
+        let mut patterns = vec![];
+        let text_lower = text.to_lowercase();
+
+        // Common AI transition patterns
+        let ai_transitions = [
+            "it is important to note",
+            "it should be noted that",
+            "in conclusion",
+            "furthermore",
+            "moreover",
+            "additionally",
+            "in summary",
+            "to summarize",
+            "as mentioned earlier",
+            "as previously stated",
+        ];
+
+        let mut transition_count = 0;
+        for transition in &ai_transitions {
+            if text_lower.contains(transition) {
+                transition_count += 1;
+            }
+        }
+        if transition_count >= 3 {
+            patterns.push("Overuse of formal transition phrases".to_string());
+        }
+
+        // Check for hedging language common in AI
+        let hedging_phrases = ["may", "might", "could", "potentially", "possibly"];
+        let hedging_count = hedging_phrases.iter()
+            .map(|p| text_lower.matches(p).count())
+            .sum::<usize>();
+        if hedging_count > text.split_whitespace().count() / 20 {
+            patterns.push("Excessive hedging language".to_string());
+        }
+
+        patterns
+    }
+
+    async fn call_external_detection_service(&self, url: &str, text: &str) -> Result<AiDetectionResult, GradingError> {
+        let response = http::post(url)
+            .json(&json!({ "text": text }))
+            .send()
+            .await
+            .map_err(|e| GradingError::ExternalServiceError { message: e.to_string() })?;
+
+        response.json::<AiDetectionResult>()
+            .await
+            .map_err(|e| GradingError::ExternalServiceError { message: e.to_string() })
+    }
+
+    pub fn store_embedding(&mut self, submission_id: SubmissionId, embedding: Vec<f64>) {
+        self.submission_embeddings.insert(submission_id, embedding);
+    }
+}
+
+/// AI detection result
+struct AiDetectionResult {
+    probability: f64,
+    indicators: List<String>,
+}
+
+/// Grading Calibrator Specialist
+pub struct GradingCalibrator {
+    config: ModelConfig,
+    calibration_sessions: Map<AssessmentId, CalibrationSession>,
+}
+
+impl GradingCalibrator {
+    pub fn new(config: ModelConfig) -> Self {
+        GradingCalibrator {
+            config,
+            calibration_sessions: Map::new(),
+        }
+    }
+
+    pub async fn calibrate(&mut self, assessment_id: &AssessmentId, samples: List<CalibrationSample>) -> Result<CalibrationAdjustments, GradingError> {
+        if samples.len() < 5 {
+            return Err(GradingError::InsufficientSamples {
+                required: 5,
+                provided: samples.len()
+            });
+        }
+
+        // Calculate score adjustment factors
+        let mut score_diffs: Vec<f64> = vec![];
+        let mut criterion_diffs: Map<String, Vec<f64>> = Map::new();
+
+        for sample in &samples {
+            let ratio = sample.human_score as f64 / sample.ai_score.max(0.001) as f64;
+            score_diffs.push(ratio);
+        }
+
+        // Calculate average adjustment factor
+        let score_factor = score_diffs.iter().sum::<f64>() / score_diffs.len() as f64;
+
+        // Calculate offset (bias correction)
+        let avg_ai: f64 = samples.iter().map(|s| s.ai_score as f64).sum::<f64>() / samples.len() as f64;
+        let avg_human: f64 = samples.iter().map(|s| s.human_score as f64).sum::<f64>() / samples.len() as f64;
+        let score_offset = avg_human - (avg_ai * score_factor);
+
+        let adjustments = CalibrationAdjustments {
+            score_factor,
+            score_offset,
+            criterion_adjustments: Map::new(), // Would be populated with per-criterion analysis
+            feedback_adjustments: vec![],
+        };
+
+        // Store calibration session
+        let session = CalibrationSession {
+            id: CalibrationId(generate_uuid()),
+            assessment_id: assessment_id.clone(),
+            calibration_samples: samples,
+            current_adjustments: adjustments.clone(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+
+        self.calibration_sessions.insert(assessment_id.clone(), session);
+
+        Ok(adjustments)
+    }
+
+    pub fn get_adjustments(&self, assessment_id: &AssessmentId) -> Option<&CalibrationAdjustments> {
+        self.calibration_sessions.get(assessment_id).map(|s| &s.current_adjustments)
+    }
+
+    pub async fn validate_grading(&self, result: &GradingResult, context: &AssessmentContext) -> Result<ValidationResult, GradingError> {
+        // Check if grading seems reasonable
+        let mut concerns = vec![];
+
+        // Check for extreme scores
+        if result.percentage > 98.0 || result.percentage < 5.0 {
+            concerns.push("Extreme score may warrant review".to_string());
+        }
+
+        // Check confidence
+        if result.confidence < 0.7 {
+            concerns.push("Low confidence score suggests uncertain grading".to_string());
+        }
+
+        // Check rubric consistency
+        if let Some(rubric_scores) = &result.rubric_scores {
+            let scores: Vec<f32> = rubric_scores.iter()
+                .map(|r| r.score / r.max_score)
+                .collect();
+
+            if let (Some(&min), Some(&max)) = (scores.iter().min_by(|a, b| a.partial_cmp(b).unwrap()),
+                                                scores.iter().max_by(|a, b| a.partial_cmp(b).unwrap())) {
+                if max - min > 0.5 {
+                    concerns.push("Large variance in criterion scores".to_string());
+                }
+            }
+        }
+
+        Ok(ValidationResult {
+            is_valid: concerns.is_empty(),
+            concerns,
+            recommended_action: if concerns.is_empty() {
+                ValidationAction::Accept
+            } else {
+                ValidationAction::Review
+            },
+        })
+    }
+}
+
+/// Validation result
+pub struct ValidationResult {
+    is_valid: bool,
+    concerns: List<String>,
+    recommended_action: ValidationAction,
+}
+
+/// Validation action
+pub enum ValidationAction {
+    Accept,
+    Review,
+    Reject,
+}
+
+// =============================================================================
+// Assessment Hive Actor
+// =============================================================================
+
+/// Main Assessment Hive actor
+pub actor AssessmentHive {
+    var config: AssessmentHiveConfig = AssessmentHiveConfig::default()
+    var essay_grader: EssayGrader
+    var code_evaluator: CodeEvaluator
+    var rubric_applicator: RubricApplicator
+    var feedback_generator: FeedbackGenerator
+    var plagiarism_detector: PlagiarismDetector
+    var calibrator: GradingCalibrator
+
+    var active_tasks: Map<GradingTaskId, GradingTask> = Map::new()
+    var completed_tasks: Map<GradingTaskId, GradingTask> = Map::new()
+    var task_queue: List<GradingTaskId> = vec![]
+
+    var metrics: AssessmentMetrics = AssessmentMetrics::default()
+    var is_running: bool = false
+
+    pub fn new() -> Self {
+        let config = AssessmentHiveConfig::default();
+
+        AssessmentHive {
+            config: config.clone(),
+            essay_grader: EssayGrader::new(config.default_model.clone()),
+            code_evaluator: CodeEvaluator::new(config.code_model.clone()),
+            rubric_applicator: RubricApplicator::new(config.default_model.clone()),
+            feedback_generator: FeedbackGenerator::new(config.default_model.clone()),
+            plagiarism_detector: PlagiarismDetector::new(config.embedding_model.clone(), config.plagiarism_threshold),
+            calibrator: GradingCalibrator::new(config.default_model.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// Start the assessment hive
+    pub receive Start() -> Result<(), AssessmentError> {
+        if self.is_running {
+            return Err(AssessmentError::AlreadyRunning);
+        }
+
+        self.is_running = true;
+        println!("[AssessmentHive] Started");
+
+        // Start task processing loop
+        spawn self.process_task_queue();
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Stop the assessment hive
+    pub receive Stop() {
+        self.is_running = false;
+        println!("[AssessmentHive] Stopped");
+        checkpoint();
+    }
+
+    /// Submit a grading task
+    pub receive SubmitGradingTask(
+        task_type: GradingTaskType,
+        submission: SubmissionContent,
+        context: AssessmentContext,
+        config: GradingConfig
+    ) -> Result<GradingTaskId, AssessmentError> {
+        let task_id = GradingTaskId(generate_uuid());
+
+        let task = GradingTask {
+            id: task_id.clone(),
+            task_type,
+            submission,
+            assessment_context: context,
+            grading_config: config,
+            status: GradingTaskStatus::Pending,
+            result: None,
+            created_at: DateTime::now(),
+            completed_at: None,
+            cost: 0.0,
+        };
+
+        self.active_tasks.insert(task_id.clone(), task);
+        self.task_queue.push(task_id.clone());
+        self.metrics.tasks_submitted += 1;
+
+        checkpoint();
+        Ok(task_id)
+    }
+
+    /// Grade an essay synchronously
+    pub receive GradeEssay(
+        submission: SubmissionContent,
+        context: AssessmentContext,
+        config: GradingConfig
+    ) -> Result<GradingResult, AssessmentError> {
+        let start_time = DateTime::now();
+
+        // Check for plagiarism if enabled
+        let plagiarism_result = if config.check_plagiarism {
+            let pool = self.get_submission_pool(&context.assessment_id);
+            Some(self.plagiarism_detector.check(&submission, &pool).await
+                .map_err(|e| AssessmentError::GradingFailed { reason: e.to_string() })?)
+        } else {
+            None
+        };
+
+        // Grade with essay grader
+        let mut result = self.essay_grader.grade(&submission, &context).await
+            .map_err(|e| AssessmentError::GradingFailed { reason: e.to_string() })?;
+
+        // Enhance feedback if requested
+        if config.generate_feedback {
+            result.feedback = self.feedback_generator.generate(&result, &context, &config).await
+                .map_err(|e| AssessmentError::FeedbackFailed { reason: e.to_string() })?;
+        }
+
+        result.plagiarism_result = plagiarism_result;
+        result.metadata.processing_time_ms = DateTime::now().duration_since(start_time).as_millis() as i64;
+
+        // Update metrics
+        self.metrics.essays_graded += 1;
+        self.metrics.total_processing_time_ms += result.metadata.processing_time_ms;
+
+        checkpoint();
+        Ok(result)
+    }
+
+    /// Evaluate code submission
+    pub receive EvaluateCode(
+        submission: SubmissionContent,
+        context: AssessmentContext,
+        test_cases: List<TestCase>
+    ) -> Result<CodeEvaluationResult, AssessmentError> {
+        let result = self.code_evaluator.evaluate(&submission, &context, &test_cases).await
+            .map_err(|e| AssessmentError::EvaluationFailed { reason: e.to_string() })?;
+
+        self.metrics.code_evaluated += 1;
+
+        checkpoint();
+        Ok(result)
+    }
+
+    /// Apply rubric to submission
+    pub receive ApplyRubric(
+        submission: SubmissionContent,
+        rubric: Rubric,
+        context: AssessmentContext
+    ) -> Result<List<RubricCriterionScore>, AssessmentError> {
+        let scores = self.rubric_applicator.apply(&submission, &rubric, &context).await
+            .map_err(|e| AssessmentError::RubricFailed { reason: e.to_string() })?;
+
+        checkpoint();
+        Ok(scores)
+    }
+
+    /// Check for plagiarism
+    pub receive CheckPlagiarism(
+        submission: SubmissionContent,
+        comparison_pool: List<SubmissionId>
+    ) -> Result<PlagiarismResult, AssessmentError> {
+        let result = self.plagiarism_detector.check(&submission, &comparison_pool).await
+            .map_err(|e| AssessmentError::PlagiarismCheckFailed { reason: e.to_string() })?;
+
+        self.metrics.plagiarism_checks += 1;
+
+        checkpoint();
+        Ok(result)
+    }
+
+    /// Calibrate grading for an assessment
+    pub receive CalibrateGrading(
+        assessment_id: AssessmentId,
+        samples: List<CalibrationSample>
+    ) -> Result<CalibrationAdjustments, AssessmentError> {
+        let adjustments = self.calibrator.calibrate(&assessment_id, samples).await
+            .map_err(|e| AssessmentError::CalibrationFailed { reason: e.to_string() })?;
+
+        // Apply calibration to essay grader
+        self.essay_grader.set_calibration(adjustments.clone());
+
+        checkpoint();
+        Ok(adjustments)
+    }
+
+    /// Get task status
+    pub receive GetTaskStatus(task_id: GradingTaskId) -> Option<GradingTaskStatus> {
+        self.active_tasks.get(&task_id)
+            .or_else(|| self.completed_tasks.get(&task_id))
+            .map(|t| t.status.clone())
+    }
+
+    /// Get task result
+    pub receive GetTaskResult(task_id: GradingTaskId) -> Option<GradingResult> {
+        self.completed_tasks.get(&task_id)
+            .and_then(|t| t.result.clone())
+    }
+
+    /// Get assessment metrics
+    pub receive GetMetrics() -> AssessmentMetrics {
+        self.metrics.clone()
+    }
+
+    /// Bulk grade multiple submissions
+    pub receive BulkGrade(
+        submissions: List<(SubmissionContent, AssessmentContext)>,
+        config: GradingConfig
+    ) -> Result<List<GradingResult>, AssessmentError> {
+        let mut results = vec![];
+
+        for (submission, context) in submissions {
+            let result = send self <- GradeEssay(submission, context, config.clone())?;
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
+    // Internal methods
+    async fn process_task_queue(&mut self) {
+        while self.is_running {
+            if let Some(task_id) = self.task_queue.pop() {
+                if let Some(task) = self.active_tasks.get_mut(&task_id) {
+                    task.status = GradingTaskStatus::Processing;
+
+                    let result = self.process_task(task).await;
+
+                    match result {
+                        Ok(grading_result) => {
+                            task.result = Some(grading_result);
+                            task.status = if grading_result.metadata.review_recommended {
+                                GradingTaskStatus::RequiresReview
+                            } else {
+                                GradingTaskStatus::Completed
+                            };
+                            task.completed_at = Some(DateTime::now());
+                        },
+                        Err(e) => {
+                            task.status = GradingTaskStatus::Failed { error: e.to_string() };
+                        }
+                    }
+
+                    // Move to completed
+                    if let Some(completed_task) = self.active_tasks.remove(&task_id) {
+                        self.completed_tasks.insert(task_id, completed_task);
+                    }
+                }
+            }
+
+            sleep(Duration::millis(100)).await;
+        }
+    }
+
+    async fn process_task(&self, task: &GradingTask) -> Result<GradingResult, GradingError> {
+        match &task.task_type {
+            GradingTaskType::Essay => {
+                self.essay_grader.grade(&task.submission, &task.assessment_context).await
+            },
+            GradingTaskType::ShortAnswer { expected_concepts } => {
+                // Use essay grader with short answer context
+                self.essay_grader.grade(&task.submission, &task.assessment_context).await
+            },
+            _ => Err(GradingError::UnsupportedTaskType),
+        }
+    }
+
+    fn get_submission_pool(&self, assessment_id: &AssessmentId) -> List<SubmissionId> {
+        // Return list of previous submission IDs for this assessment
+        // In production, would query from storage
+        vec![]
+    }
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+#[derive(Clone, Default)]
+pub struct AssessmentMetrics {
+    pub tasks_submitted: i64,
+    pub tasks_completed: i64,
+    pub tasks_failed: i64,
+    pub essays_graded: i64,
+    pub code_evaluated: i64,
+    pub plagiarism_checks: i64,
+    pub calibration_sessions: i64,
+    pub total_processing_time_ms: i64,
+    pub average_confidence: f64,
+    pub reviews_required: i64,
+}
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+pub enum AssessmentError {
+    AlreadyRunning,
+    NotRunning,
+    TaskNotFound { id: GradingTaskId },
+    GradingFailed { reason: String },
+    EvaluationFailed { reason: String },
+    RubricFailed { reason: String },
+    FeedbackFailed { reason: String },
+    PlagiarismCheckFailed { reason: String },
+    CalibrationFailed { reason: String },
+    InvalidSubmission { reason: String },
+}
+
+pub enum GradingError {
+    InvalidSubmission { reason: String },
+    ModelError { message: String },
+    ParseError { message: String },
+    UnsupportedLanguage { language: String },
+    SandboxError { message: String },
+    InsufficientSamples { required: usize, provided: usize },
+    UnsupportedTaskType,
+}
+
+// =============================================================================
+// JSON Helper Types (for parsing model responses)
+// =============================================================================
+
+struct GradingResponseJson {
+    score: f32,
+    max_score: f32,
+    confidence: f64,
+    feedback: FeedbackJsonInner,
+    rubric_scores: List<RubricScoreJson>,
+    objective_alignment: List<ObjectiveAlignmentJson>,
+}
+
+struct FeedbackJsonInner {
+    summary: String,
+    strengths: List<String>,
+    improvements: List<String>,
+    suggestions: List<SuggestionJson>,
+}
+
+struct SuggestionJson {
+    category: String,
+    suggestion: String,
+    priority: String,
+}
+
+struct RubricScoreJson {
+    criterion_id: String,
+    criterion_name: String,
+    score: f32,
+    max_score: f32,
+    level_achieved: String,
+    feedback: String,
+}
+
+struct ObjectiveAlignmentJson {
+    objective_id: String,
+    alignment_score: f32,
+    evidence: String,
+}
+
+struct CodeQualityJson {
+    quality_score: f32,
+    style_score: f32,
+    efficiency_score: f32,
+    readability_score: f32,
+    issues: List<CodeIssueJson>,
+    positives: List<String>,
+    suggestions: List<String>,
+}
+
+struct CodeIssueJson {
+    severity: String,
+    category: String,
+    message: String,
+    line_number: Option<i32>,
+    suggestion: Option<String>,
+}
+
+struct CriterionEvalJson {
+    level_achieved: String,
+    score: f32,
+    evidence: String,
+    feedback: String,
+}
+
+struct FeedbackJson {
+    summary: String,
+    strengths: List<String>,
+    improvements: List<String>,
+    suggestions: List<FeedbackSuggestionJson>,
+}
+
+struct FeedbackSuggestionJson {
+    category: String,
+    suggestion: String,
+    priority: String,
+    resource_link: Option<String>,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// Sandbox Execution Types and Implementations
+// =============================================================================
+
+/// Request for sandbox code execution
+pub struct SandboxExecutionRequest {
+    /// Programming language
+    language: String,
+    /// Source code to execute
+    source_code: String,
+    /// Additional files needed
+    additional_files: Map<String, String>,
+    /// Entry point file or function
+    entry_point: Option<String>,
+    /// Standard input
+    stdin: String,
+    /// Execution timeout in milliseconds
+    timeout_ms: i64,
+    /// Memory limit in MB
+    memory_limit_mb: i64,
+    /// CPU limit as percentage
+    cpu_limit_percent: i32,
+    /// Allow network access
+    network_enabled: bool,
+    /// Mount filesystem as read-only
+    filesystem_readonly: bool,
+}
+
+/// Result from sandbox execution
+pub struct SandboxExecutionResult {
+    /// Standard output
+    stdout: String,
+    /// Standard error
+    stderr: String,
+    /// Exit code
+    exit_code: i32,
+    /// Execution time in milliseconds
+    execution_time_ms: i64,
+    /// Memory used in bytes
+    memory_used_bytes: i64,
+    /// Error message if execution failed
+    error: Option<String>,
+}
+
+/// Trait for sandbox executors
+pub trait SandboxExecutor: Send + Sync {
+    /// Execute code in sandbox
+    async fn execute(&self, request: &SandboxExecutionRequest) -> Result<SandboxExecutionResult, String>;
+
+    /// Check if executor is available
+    fn is_available(&self) -> bool;
+
+    /// Get supported languages
+    fn supported_languages(&self) -> List<String>;
+}
+
+/// Docker-based sandbox executor
+pub struct DockerSandboxExecutor {
+    language: String,
+    image_map: Map<String, String>,
+}
+
+impl DockerSandboxExecutor {
+    pub fn new(language: &str) -> Self {
+        let mut image_map = Map::new();
+        image_map.insert("python".to_string(), "intelligo/sandbox-python:3.11".to_string());
+        image_map.insert("javascript".to_string(), "intelligo/sandbox-node:20".to_string());
+        image_map.insert("typescript".to_string(), "intelligo/sandbox-node:20".to_string());
+        image_map.insert("java".to_string(), "intelligo/sandbox-java:17".to_string());
+        image_map.insert("cpp".to_string(), "intelligo/sandbox-cpp:gcc13".to_string());
+        image_map.insert("c".to_string(), "intelligo/sandbox-cpp:gcc13".to_string());
+        image_map.insert("rust".to_string(), "intelligo/sandbox-rust:1.74".to_string());
+        image_map.insert("go".to_string(), "intelligo/sandbox-go:1.21".to_string());
+        image_map.insert("ruby".to_string(), "intelligo/sandbox-ruby:3.2".to_string());
+        image_map.insert("swift".to_string(), "intelligo/sandbox-swift:5.9".to_string());
+        image_map.insert("kotlin".to_string(), "intelligo/sandbox-kotlin:1.9".to_string());
+
+        DockerSandboxExecutor {
+            language: language.to_lowercase(),
+            image_map,
+        }
+    }
+
+    fn get_image(&self) -> Result<String, String> {
+        self.image_map.get(&self.language)
+            .cloned()
+            .ok_or_else(|| format!("No Docker image for language: {}", self.language))
+    }
+
+    fn get_run_command(&self) -> String {
+        match self.language.as_str() {
+            "python" => "python3 main.py".to_string(),
+            "javascript" => "node main.js".to_string(),
+            "typescript" => "npx ts-node main.ts".to_string(),
+            "java" => "javac Main.java && java Main".to_string(),
+            "cpp" => "g++ -o main main.cpp && ./main".to_string(),
+            "c" => "gcc -o main main.c && ./main".to_string(),
+            "rust" => "rustc main.rs && ./main".to_string(),
+            "go" => "go run main.go".to_string(),
+            "ruby" => "ruby main.rb".to_string(),
+            "swift" => "swift main.swift".to_string(),
+            "kotlin" => "kotlinc main.kt -include-runtime -d main.jar && java -jar main.jar".to_string(),
+            _ => format!("echo 'Unsupported language: {}'", self.language),
+        }
+    }
+
+    fn get_main_filename(&self) -> String {
+        match self.language.as_str() {
+            "python" => "main.py".to_string(),
+            "javascript" => "main.js".to_string(),
+            "typescript" => "main.ts".to_string(),
+            "java" => "Main.java".to_string(),
+            "cpp" => "main.cpp".to_string(),
+            "c" => "main.c".to_string(),
+            "rust" => "main.rs".to_string(),
+            "go" => "main.go".to_string(),
+            "ruby" => "main.rb".to_string(),
+            "swift" => "main.swift".to_string(),
+            "kotlin" => "main.kt".to_string(),
+            _ => "main.txt".to_string(),
+        }
+    }
+}
+
+impl SandboxExecutor for DockerSandboxExecutor {
+    async fn execute(&self, request: &SandboxExecutionRequest) -> Result<SandboxExecutionResult, String> {
+        let image = self.get_image()?;
+        let run_cmd = self.get_run_command();
+        let main_file = self.get_main_filename();
+
+        // Create temporary directory for code
+        let temp_dir = std::temp::create_dir()?;
+        let code_path = format!("{}/{}", temp_dir, main_file);
+
+        // Write source code to file
+        std::fs::write(&code_path, &request.source_code)?;
+
+        // Write additional files
+        for (filename, content) in &request.additional_files {
+            let file_path = format!("{}/{}", temp_dir, filename);
+            std::fs::write(&file_path, content)?;
+        }
+
+        // Write stdin to file if provided
+        let stdin_file = format!("{}/stdin.txt", temp_dir);
+        std::fs::write(&stdin_file, &request.stdin)?;
+
+        // Build Docker command with security constraints
+        let docker_args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network=none".to_string(),  // No network access
+            format!("--memory={}m", request.memory_limit_mb),
+            format!("--cpus={}", request.cpu_limit_percent as f64 / 100.0),
+            "--pids-limit=64".to_string(),  // Limit processes
+            "--read-only".to_string(),  // Read-only filesystem
+            "--tmpfs=/tmp:rw,size=64m".to_string(),  // Writeable /tmp
+            "--security-opt=no-new-privileges".to_string(),
+            "--cap-drop=ALL".to_string(),  // Drop all capabilities
+            format!("-v={}:/code:ro", temp_dir),  // Mount code read-only
+            "-w=/code".to_string(),
+            image,
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("timeout {} sh -c '{} < stdin.txt'", request.timeout_ms / 1000, run_cmd),
+        ];
+
+        // Execute Docker command
+        let start_time = std::time::Instant::now();
+        let output = std::process::Command::new("docker")
+            .args(&docker_args)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute Docker: {}", e))?;
+
+        let execution_time_ms = start_time.elapsed().as_millis() as i64;
+
+        // Cleanup temp directory
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        // Check for timeout
+        if execution_time_ms >= request.timeout_ms {
+            return Ok(SandboxExecutionResult {
+                stdout: String::new(),
+                stderr: "Execution timed out".to_string(),
+                exit_code: 124,  // Standard timeout exit code
+                execution_time_ms,
+                memory_used_bytes: 0,
+                error: Some("Execution exceeded time limit".to_string()),
+            });
+        }
+
+        Ok(SandboxExecutionResult {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.exit_code.unwrap_or(-1),
+            execution_time_ms,
+            memory_used_bytes: 0,  // Would need cgroup stats for accurate measurement
+            error: None,
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        std::process::Command::new("docker")
+            .arg("version")
+            .output()
+            .is_ok()
+    }
+
+    fn supported_languages(&self) -> List<String> {
+        self.image_map.keys().cloned().collect()
+    }
+}
+
+/// Firecracker microVM-based sandbox executor (more secure than Docker)
+pub struct FirecrackerSandboxExecutor {
+    language: String,
+    kernel_path: String,
+    rootfs_map: Map<String, String>,
+}
+
+impl FirecrackerSandboxExecutor {
+    pub fn new(language: &str) -> Self {
+        let mut rootfs_map = Map::new();
+        rootfs_map.insert("python".to_string(), "/var/lib/firecracker/rootfs/python.ext4".to_string());
+        rootfs_map.insert("javascript".to_string(), "/var/lib/firecracker/rootfs/node.ext4".to_string());
+        rootfs_map.insert("java".to_string(), "/var/lib/firecracker/rootfs/java.ext4".to_string());
+
+        FirecrackerSandboxExecutor {
+            language: language.to_lowercase(),
+            kernel_path: "/var/lib/firecracker/vmlinux".to_string(),
+            rootfs_map,
+        }
+    }
+}
+
+impl SandboxExecutor for FirecrackerSandboxExecutor {
+    async fn execute(&self, request: &SandboxExecutionRequest) -> Result<SandboxExecutionResult, String> {
+        let rootfs = self.rootfs_map.get(&self.language)
+            .ok_or_else(|| format!("No Firecracker rootfs for language: {}", self.language))?;
+
+        // Create Firecracker configuration
+        let config = json!({
+            "boot-source": {
+                "kernel_image_path": self.kernel_path,
+                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+            },
+            "drives": [{
+                "drive_id": "rootfs",
+                "path_on_host": rootfs,
+                "is_root_device": true,
+                "is_read_only": true
+            }],
+            "machine-config": {
+                "vcpu_count": 1,
+                "mem_size_mib": request.memory_limit_mb,
+                "smt": false
+            },
+            "network-interfaces": []
+        });
+
+        // Start Firecracker microVM
+        let socket_path = format!("/tmp/firecracker-{}.sock", generate_uuid());
+
+        let fc_process = std::process::Command::new("firecracker")
+            .args(&["--api-sock", &socket_path, "--config-file", "/dev/stdin"])
+            .stdin(config.to_string())
+            .spawn()
+            .map_err(|e| format!("Failed to start Firecracker: {}", e))?;
+
+        // Wait for VM to boot and execute code
+        // This is simplified - real implementation would use vsock for communication
+        let start_time = std::time::Instant::now();
+
+        // Send code to VM via API
+        let response = http::put(&format!("http+unix://{}/actions", socket_path))
+            .json(&json!({
+                "action_type": "SendCode",
+                "payload": {
+                    "source": request.source_code,
+                    "stdin": request.stdin,
+                    "language": request.language
+                }
+            }))
+            .timeout(Duration::from_millis(request.timeout_ms as u64))
+            .send()
+            .await;
+
+        let execution_time_ms = start_time.elapsed().as_millis() as i64;
+
+        // Cleanup - terminate VM
+        fc_process.kill().ok();
+        std::fs::remove_file(&socket_path).ok();
+
+        match response {
+            Ok(resp) => {
+                let result: SandboxExecutionResult = resp.json().await
+                    .map_err(|e| format!("Failed to parse response: {}", e))?;
+                Ok(result)
+            }
+            Err(e) => Ok(SandboxExecutionResult {
+                stdout: String::new(),
+                stderr: e.to_string(),
+                exit_code: -1,
+                execution_time_ms,
+                memory_used_bytes: 0,
+                error: Some(e.to_string()),
+            })
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        std::path::Path::new("/usr/bin/firecracker").exists()
+    }
+
+    fn supported_languages(&self) -> List<String> {
+        self.rootfs_map.keys().cloned().collect()
+    }
+}
+
+/// AWS Lambda-based sandbox executor
+pub struct LambdaSandboxExecutor {
+    language: String,
+    function_map: Map<String, String>,
+    region: String,
+}
+
+impl LambdaSandboxExecutor {
+    pub fn new(language: &str) -> Self {
+        let mut function_map = Map::new();
+        function_map.insert("python".to_string(), "intelligo-sandbox-python".to_string());
+        function_map.insert("javascript".to_string(), "intelligo-sandbox-node".to_string());
+        function_map.insert("java".to_string(), "intelligo-sandbox-java".to_string());
+
+        LambdaSandboxExecutor {
+            language: language.to_lowercase(),
+            function_map,
+            region: std::env::var("AWS_REGION").unwrap_or("us-east-1".to_string()),
+        }
+    }
+}
+
+impl SandboxExecutor for LambdaSandboxExecutor {
+    async fn execute(&self, request: &SandboxExecutionRequest) -> Result<SandboxExecutionResult, String> {
+        let function_name = self.function_map.get(&self.language)
+            .ok_or_else(|| format!("No Lambda function for language: {}", self.language))?;
+
+        // Create Lambda invocation payload
+        let payload = json!({
+            "source_code": request.source_code,
+            "additional_files": request.additional_files,
+            "stdin": request.stdin,
+            "timeout_ms": request.timeout_ms,
+            "memory_limit_mb": request.memory_limit_mb
+        });
+
+        // Invoke Lambda function
+        let start_time = std::time::Instant::now();
+
+        let lambda_client = aws::lambda::Client::new(&self.region);
+        let response = lambda_client.invoke(&function_name, &payload)
+            .await
+            .map_err(|e| format!("Lambda invocation failed: {}", e))?;
+
+        let execution_time_ms = start_time.elapsed().as_millis() as i64;
+
+        // Parse Lambda response
+        let result: SandboxExecutionResult = serde_json::from_value(response)
+            .map_err(|e| format!("Failed to parse Lambda response: {}", e))?;
+
+        Ok(SandboxExecutionResult {
+            execution_time_ms,
+            ..result
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+    }
+
+    fn supported_languages(&self) -> List<String> {
+        self.function_map.keys().cloned().collect()
+    }
+}
+
+/// nsjail-based sandbox executor (Linux sandboxing)
+pub struct NsjailSandboxExecutor {
+    language: String,
+    config_dir: String,
+}
+
+impl NsjailSandboxExecutor {
+    pub fn new(language: &str) -> Self {
+        NsjailSandboxExecutor {
+            language: language.to_lowercase(),
+            config_dir: "/etc/nsjail".to_string(),
+        }
+    }
+
+    fn get_config_path(&self) -> String {
+        format!("{}/{}.cfg", self.config_dir, self.language)
+    }
+}
+
+impl SandboxExecutor for NsjailSandboxExecutor {
+    async fn execute(&self, request: &SandboxExecutionRequest) -> Result<SandboxExecutionResult, String> {
+        let config_path = self.get_config_path();
+
+        if !std::path::Path::new(&config_path).exists() {
+            return Err(format!("nsjail config not found for language: {}", self.language));
+        }
+
+        // Create temp directory for code
+        let temp_dir = std::temp::create_dir()?;
+        let code_path = format!("{}/code", temp_dir);
+        std::fs::write(&code_path, &request.source_code)?;
+
+        // Build nsjail command
+        let nsjail_args = vec![
+            "--config".to_string(),
+            config_path,
+            "--time_limit".to_string(),
+            (request.timeout_ms / 1000).to_string(),
+            "--rlimit_as".to_string(),
+            (request.memory_limit_mb * 1024 * 1024).to_string(),
+            "--cwd".to_string(),
+            temp_dir.clone(),
+            "--".to_string(),
+        ];
+
+        let start_time = std::time::Instant::now();
+
+        let output = std::process::Command::new("nsjail")
+            .args(&nsjail_args)
+            .stdin(request.stdin.as_bytes())
+            .output()
+            .await
+            .map_err(|e| format!("nsjail execution failed: {}", e))?;
+
+        let execution_time_ms = start_time.elapsed().as_millis() as i64;
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        Ok(SandboxExecutionResult {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.exit_code.unwrap_or(-1),
+            execution_time_ms,
+            memory_used_bytes: 0,
+            error: None,
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        std::path::Path::new("/usr/bin/nsjail").exists()
+    }
+
+    fn supported_languages(&self) -> List<String> {
+        // List languages by scanning config directory
+        std::fs::read_dir(&self.config_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".cfg") {
+                            Some(name.trim_end_matches(".cfg").to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn parse_json<T>(json_str: &str) -> Result<T, String> {
+    // JSON parsing implementation
+    std::json::parse(json_str)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_assessment_hive_creation() {
+        let hive = AssessmentHive::new();
+        assert!(!hive.is_running);
+    }
+
+    #[test]
+    fn test_cosine_similarity() {
+        let detector = PlagiarismDetector::new(
+            EmbeddingModelConfig::default(),
+            0.85
+        );
+
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert_eq!(detector.cosine_similarity(&a, &b), 1.0);
+
+        let c = vec![0.0, 1.0, 0.0];
+        assert_eq!(detector.cosine_similarity(&a, &c), 0.0);
+    }
+
+    #[test]
+    fn test_calibration_adjustments() {
+        let mut calibrator = GradingCalibrator::new(ModelConfig::default());
+
+        let samples = vec![
+            CalibrationSample {
+                submission_id: SubmissionId("1".to_string()),
+                ai_score: 80.0,
+                human_score: 85.0,
+                ai_feedback: "Good work".to_string(),
+                human_feedback: None,
+                discrepancy: 5.0,
+            },
+            // Add more samples...
+        ];
+
+        // Would need 5+ samples for actual test
+    }
+
+    #[test]
+    async fn test_essay_grading() {
+        let hive = AssessmentHive::new();
+
+        // Test grading workflow
+        // Would mock model responses in actual test
+    }
+}

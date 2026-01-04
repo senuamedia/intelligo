@@ -1,0 +1,53 @@
+/// Intelligo LMS - Core Module
+///
+/// Exports core functionality: types, authentication, security, storage,
+/// plugins, webhooks, notifications, search, and file management.
+
+module intelligo::core
+
+pub use intelligo::core::types::*
+pub use intelligo::core::auth::*
+pub use intelligo::core::security::*
+pub use intelligo::core::storage::*
+pub use intelligo::core::plugins::*
+pub use intelligo::core::webhooks::*
+pub use intelligo::core::notifications::*
+pub use intelligo::core::search::*
+pub use intelligo::core::files::*
+
+// Re-export commonly used types
+pub use DateTime
+pub use Duration
+pub use Uuid
+pub use Map
+pub use Result
+pub use AuthService
+pub use AuthToken
+pub use SecurityPolicy
+pub use StorageService
+pub use StorageBackend
+
+// Plugin system
+pub use PluginManager
+pub use PluginManifest
+pub use PluginInstance
+
+// Webhooks
+pub use WebhookManager
+pub use Webhook
+pub use WebhookEvent
+
+// Notifications
+pub use NotificationService
+pub use Notification
+pub use NotificationType
+
+// Search
+pub use SearchService
+pub use SearchQuery
+pub use SearchResults
+
+// Files
+pub use FileService
+pub use FileMetadata
+pub use Folder

@@ -1,0 +1,1315 @@
+/// Intelligo LMS - File Management System
+///
+/// File upload, storage, and management with CDN support.
+
+module intelligo::core::files
+
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// File Service
+// ============================================================================
+
+/// Central file management service
+pub actor FileService {
+    tenant_id: String,
+    storage: Box<dyn StorageProvider>,
+    metadata_store: FileMetadataStore,
+    virus_scanner: Option<VirusScanner>,
+    image_processor: ImageProcessor,
+    config: FileServiceConfig,
+
+    pub fn new(tenant_id: &str, config: FileServiceConfig) -> Self {
+        let storage: Box<dyn StorageProvider> = match &config.storage_provider {
+            StorageProviderType::Local(cfg) => Box::new(LocalStorageProvider::new(cfg)),
+            StorageProviderType::S3(cfg) => Box::new(S3StorageProvider::new(cfg)),
+            StorageProviderType::Azure(cfg) => Box::new(AzureBlobProvider::new(cfg)),
+            StorageProviderType::GCS(cfg) => Box::new(GCSStorageProvider::new(cfg))
+        };
+
+        FileService {
+            tenant_id: tenant_id.to_string(),
+            storage,
+            metadata_store: FileMetadataStore::new(),
+            virus_scanner: config.enable_virus_scanning.then(|| VirusScanner::new()),
+            image_processor: ImageProcessor::new(),
+            config
+        }
+    }
+
+    // ========================================================================
+    // Upload Operations
+    // ========================================================================
+
+    /// Initiate a file upload (returns upload URL for direct upload)
+    pub fn initiate_upload(mut self, request: InitiateUploadRequest) -> Result<UploadSession, FileError> {
+        // Validate file type
+        self.validate_file_type(&request.content_type)?;
+
+        // Check quota
+        self.check_quota(request.size)?;
+
+        // Create upload session
+        let session = UploadSession {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: self.tenant_id.clone(),
+            filename: request.filename.clone(),
+            content_type: request.content_type.clone(),
+            size: request.size,
+            folder_id: request.folder_id,
+            upload_url: self.generate_upload_url()?,
+            expires_at: DateTime::now() + Duration::from_secs(3600),
+            status: UploadStatus::Pending,
+            created_at: DateTime::now()
+        };
+
+        self.metadata_store.save_session(&session)?;
+
+        Ok(session)
+    }
+
+    /// Complete an upload (after file is uploaded to storage)
+    pub fn complete_upload(mut self, session_id: &str) -> Result<FileMetadata, FileError> {
+        let session = self.metadata_store.get_session(session_id)?;
+
+        if session.status != UploadStatus::Pending {
+            return Err(FileError::InvalidState("Upload already processed".to_string()));
+        }
+
+        // Verify file exists in storage
+        let storage_path = self.get_storage_path(&session);
+        if !self.storage.exists(&storage_path)? {
+            return Err(FileError::FileNotFound("File not found in storage".to_string()));
+        }
+
+        // Get actual file size
+        let actual_size = self.storage.get_size(&storage_path)?;
+
+        // Virus scan if enabled
+        if let Some(ref scanner) = self.virus_scanner {
+            let scan_result = scanner.scan(&storage_path)?;
+            if scan_result.is_infected {
+                self.storage.delete(&storage_path)?;
+                return Err(FileError::VirusDetected(scan_result.threat_name.unwrap_or_default()));
+            }
+        }
+
+        // Process image if applicable
+        let variants = if self.is_image(&session.content_type) {
+            self.process_image(&storage_path)?
+        } else {
+            vec![]
+        };
+
+        // Create file metadata
+        let file = FileMetadata {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: self.tenant_id.clone(),
+            filename: session.filename.clone(),
+            original_filename: session.filename.clone(),
+            content_type: session.content_type.clone(),
+            size: actual_size,
+            storage_path: storage_path.clone(),
+            folder_id: session.folder_id.clone(),
+            variants,
+            checksum: self.calculate_checksum(&storage_path)?,
+            metadata: Map::new(),
+            access_control: AccessControl::default(),
+            download_count: 0,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            created_by: None,
+            deleted_at: None
+        };
+
+        self.metadata_store.save_file(&file)?;
+
+        // Update quota
+        self.update_quota(actual_size)?;
+
+        // Mark session complete
+        self.metadata_store.update_session_status(session_id, UploadStatus::Completed)?;
+
+        Ok(file)
+    }
+
+    /// Upload file directly (for small files)
+    pub fn upload(mut self, request: UploadRequest) -> Result<FileMetadata, FileError> {
+        // Validate
+        self.validate_file_type(&request.content_type)?;
+        self.check_quota(request.data.len() as i64)?;
+
+        // Generate storage path
+        let storage_path = self.generate_storage_path(&request.filename);
+
+        // Virus scan if enabled
+        if let Some(ref scanner) = self.virus_scanner {
+            let scan_result = scanner.scan_bytes(&request.data)?;
+            if scan_result.is_infected {
+                return Err(FileError::VirusDetected(scan_result.threat_name.unwrap_or_default()));
+            }
+        }
+
+        // Upload to storage
+        self.storage.upload(&storage_path, &request.data, &request.content_type)?;
+
+        // Process image if applicable
+        let variants = if self.is_image(&request.content_type) {
+            self.process_image(&storage_path)?
+        } else {
+            vec![]
+        };
+
+        // Create file metadata
+        let file = FileMetadata {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: self.tenant_id.clone(),
+            filename: request.filename.clone(),
+            original_filename: request.filename.clone(),
+            content_type: request.content_type.clone(),
+            size: request.data.len() as i64,
+            storage_path: storage_path.clone(),
+            folder_id: request.folder_id,
+            variants,
+            checksum: self.calculate_checksum_bytes(&request.data),
+            metadata: request.metadata.unwrap_or_default(),
+            access_control: AccessControl::default(),
+            download_count: 0,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            created_by: request.uploaded_by,
+            deleted_at: None
+        };
+
+        self.metadata_store.save_file(&file)?;
+        self.update_quota(request.data.len() as i64)?;
+
+        Ok(file)
+    }
+
+    // ========================================================================
+    // Download Operations
+    // ========================================================================
+
+    /// Get download URL
+    pub fn get_download_url(self, file_id: &str, options: DownloadOptions) -> Result<String, FileError> {
+        let file = self.get_file(file_id)?;
+
+        // Check access
+        self.check_access(&file, &options.user_id, AccessType::Read)?;
+
+        // Generate signed URL
+        let url = self.storage.generate_signed_url(
+            &file.storage_path,
+            options.expires_in.unwrap_or(Duration::from_secs(3600)),
+            SignedUrlOptions {
+                content_disposition: Some(format!("attachment; filename=\"{}\"", file.filename))
+            }
+        )?;
+
+        // Increment download count
+        self.metadata_store.increment_download_count(file_id)?;
+
+        Ok(url)
+    }
+
+    /// Get file content directly
+    pub fn download(self, file_id: &str, user_id: Option<String>) -> Result<FileContent, FileError> {
+        let file = self.get_file(file_id)?;
+
+        self.check_access(&file, &user_id, AccessType::Read)?;
+
+        let data = self.storage.download(&file.storage_path)?;
+
+        self.metadata_store.increment_download_count(file_id)?;
+
+        Ok(FileContent {
+            data,
+            content_type: file.content_type,
+            filename: file.filename
+        })
+    }
+
+    /// Get image variant URL
+    pub fn get_variant_url(self, file_id: &str, variant: &str) -> Result<String, FileError> {
+        let file = self.get_file(file_id)?;
+
+        let variant_info = file.variants.iter()
+            .find(|v| v.name == variant)
+            .ok_or_else(|| FileError::VariantNotFound(variant.to_string()))?;
+
+        self.storage.generate_signed_url(
+            &variant_info.storage_path,
+            Duration::from_secs(3600),
+            SignedUrlOptions::default()
+        )
+    }
+
+    // ========================================================================
+    // File Management
+    // ========================================================================
+
+    /// Get file metadata
+    pub fn get_file(self, file_id: &str) -> Result<FileMetadata, FileError> {
+        self.metadata_store.get_file(file_id)
+    }
+
+    /// List files
+    pub fn list_files(self, query: FileQuery) -> Result<PagedResult<FileMetadata>, FileError> {
+        self.metadata_store.list_files(&self.tenant_id, &query)
+    }
+
+    /// Update file metadata
+    pub fn update_file(mut self, file_id: &str, update: UpdateFileRequest) -> Result<FileMetadata, FileError> {
+        let mut file = self.get_file(file_id)?;
+
+        if let Some(filename) = update.filename {
+            file.filename = filename;
+        }
+
+        if let Some(folder_id) = update.folder_id {
+            file.folder_id = Some(folder_id);
+        }
+
+        if let Some(metadata) = update.metadata {
+            file.metadata.extend(metadata);
+        }
+
+        if let Some(access_control) = update.access_control {
+            file.access_control = access_control;
+        }
+
+        file.updated_at = DateTime::now();
+
+        self.metadata_store.save_file(&file)?;
+
+        Ok(file)
+    }
+
+    /// Delete file
+    pub fn delete_file(mut self, file_id: &str, hard_delete: bool) -> Result<(), FileError> {
+        let file = self.get_file(file_id)?;
+
+        if hard_delete {
+            // Delete from storage
+            self.storage.delete(&file.storage_path)?;
+
+            // Delete variants
+            for variant in &file.variants {
+                self.storage.delete(&variant.storage_path)?;
+            }
+
+            // Delete metadata
+            self.metadata_store.delete_file(file_id)?;
+
+            // Update quota
+            self.update_quota(-file.size)?;
+        } else {
+            // Soft delete
+            self.metadata_store.soft_delete_file(file_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy file
+    pub fn copy_file(mut self, file_id: &str, destination_folder: Option<String>) -> Result<FileMetadata, FileError> {
+        let source = self.get_file(file_id)?;
+
+        // Generate new storage path
+        let new_path = self.generate_storage_path(&source.filename);
+
+        // Copy in storage
+        self.storage.copy(&source.storage_path, &new_path)?;
+
+        // Copy variants
+        let mut new_variants = vec![];
+        for variant in &source.variants {
+            let new_variant_path = self.generate_storage_path(&format!("{}_{}", variant.name, source.filename));
+            self.storage.copy(&variant.storage_path, &new_variant_path)?;
+            new_variants.push(FileVariant {
+                name: variant.name.clone(),
+                storage_path: new_variant_path,
+                width: variant.width,
+                height: variant.height,
+                size: variant.size
+            });
+        }
+
+        // Create new file metadata
+        let new_file = FileMetadata {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: self.tenant_id.clone(),
+            filename: source.filename.clone(),
+            original_filename: source.original_filename.clone(),
+            content_type: source.content_type.clone(),
+            size: source.size,
+            storage_path: new_path,
+            folder_id: destination_folder.or(source.folder_id),
+            variants: new_variants,
+            checksum: source.checksum.clone(),
+            metadata: source.metadata.clone(),
+            access_control: source.access_control.clone(),
+            download_count: 0,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            created_by: None,
+            deleted_at: None
+        };
+
+        self.metadata_store.save_file(&new_file)?;
+        self.update_quota(source.size)?;
+
+        Ok(new_file)
+    }
+
+    /// Move file to folder
+    pub fn move_file(mut self, file_id: &str, folder_id: Option<String>) -> Result<FileMetadata, FileError> {
+        self.update_file(file_id, UpdateFileRequest {
+            filename: None,
+            folder_id: folder_id,
+            metadata: None,
+            access_control: None
+        })
+    }
+
+    // ========================================================================
+    // Folder Management
+    // ========================================================================
+
+    /// Create folder
+    pub fn create_folder(mut self, request: CreateFolderRequest) -> Result<Folder, FileError> {
+        let folder = Folder {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: self.tenant_id.clone(),
+            name: request.name,
+            parent_id: request.parent_id,
+            path: self.calculate_folder_path(&request.parent_id)?,
+            metadata: request.metadata.unwrap_or_default(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            created_by: request.created_by
+        };
+
+        self.metadata_store.save_folder(&folder)?;
+
+        Ok(folder)
+    }
+
+    /// Get folder
+    pub fn get_folder(self, folder_id: &str) -> Result<Folder, FileError> {
+        self.metadata_store.get_folder(folder_id)
+    }
+
+    /// List folders
+    pub fn list_folders(self, parent_id: Option<String>) -> Result<Vec<Folder>, FileError> {
+        self.metadata_store.list_folders(&self.tenant_id, parent_id)
+    }
+
+    /// Update folder
+    pub fn update_folder(mut self, folder_id: &str, update: UpdateFolderRequest) -> Result<Folder, FileError> {
+        let mut folder = self.get_folder(folder_id)?;
+
+        if let Some(name) = update.name {
+            folder.name = name;
+        }
+
+        if let Some(parent_id) = update.parent_id {
+            folder.parent_id = Some(parent_id.clone());
+            folder.path = self.calculate_folder_path(&Some(parent_id))?;
+        }
+
+        if let Some(metadata) = update.metadata {
+            folder.metadata.extend(metadata);
+        }
+
+        folder.updated_at = DateTime::now();
+
+        self.metadata_store.save_folder(&folder)?;
+
+        Ok(folder)
+    }
+
+    /// Delete folder
+    pub fn delete_folder(mut self, folder_id: &str, recursive: bool) -> Result<(), FileError> {
+        if recursive {
+            // Delete all files in folder
+            let files = self.list_files(FileQuery {
+                folder_id: Some(folder_id.to_string()),
+                ..Default::default()
+            })?;
+
+            for file in files.items {
+                self.delete_file(&file.id, true)?;
+            }
+
+            // Delete subfolders
+            let subfolders = self.list_folders(Some(folder_id.to_string()))?;
+            for subfolder in subfolders {
+                self.delete_folder(&subfolder.id, true)?;
+            }
+        } else {
+            // Check if folder is empty
+            let files = self.list_files(FileQuery {
+                folder_id: Some(folder_id.to_string()),
+                page_size: Some(1),
+                ..Default::default()
+            })?;
+
+            if files.total > 0 {
+                return Err(FileError::FolderNotEmpty(folder_id.to_string()));
+            }
+        }
+
+        self.metadata_store.delete_folder(folder_id)?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Quota Management
+    // ========================================================================
+
+    /// Get storage usage
+    pub fn get_usage(self) -> Result<StorageUsage, FileError> {
+        self.metadata_store.get_usage(&self.tenant_id)
+    }
+
+    /// Get quota
+    pub fn get_quota(self) -> Result<StorageQuota, FileError> {
+        let usage = self.get_usage()?;
+        Ok(StorageQuota {
+            tenant_id: self.tenant_id.clone(),
+            quota_bytes: usage.quota_bytes,
+            used_bytes: usage.used_bytes,
+            remaining_bytes: usage.quota_bytes - usage.used_bytes,
+        })
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn validate_file_type(self, content_type: &str) -> Result<(), FileError> {
+        if let Some(ref allowed) = self.config.allowed_types {
+            if !allowed.contains(&content_type.to_string()) {
+                return Err(FileError::InvalidFileType(content_type.to_string()));
+            }
+        }
+
+        if let Some(ref denied) = self.config.denied_types {
+            if denied.contains(&content_type.to_string()) {
+                return Err(FileError::InvalidFileType(content_type.to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_quota(self, size: i64) -> Result<(), FileError> {
+        let usage = self.get_usage()?;
+        let quota = self.get_quota()?;
+
+        if usage.used_bytes + size > quota.max_bytes {
+            return Err(FileError::QuotaExceeded);
+        }
+
+        Ok(())
+    }
+
+    fn update_quota(self, delta: i64) -> Result<(), FileError> {
+        self.metadata_store.update_usage(&self.tenant_id, delta)
+    }
+
+    fn check_access(self, file: &FileMetadata, user_id: &Option<String>, access_type: AccessType) -> Result<(), FileError> {
+        // Check public access
+        if file.access_control.public && access_type == AccessType::Read {
+            return Ok(());
+        }
+
+        // Check user access
+        if let Some(ref uid) = user_id {
+            if file.access_control.allowed_users.contains(uid) {
+                return Ok(());
+            }
+
+            // Check owner
+            if file.created_by.as_ref() == Some(uid) {
+                return Ok(());
+            }
+        }
+
+        Err(FileError::AccessDenied)
+    }
+
+    fn generate_upload_url(self) -> Result<String, FileError> {
+        // Generate unique upload URL path
+        let upload_id = Uuid::new_v4().to_string();
+        Ok(format!("/api/v1/files/upload/{}", upload_id))
+    }
+
+    fn generate_storage_path(self, filename: &str) -> String {
+        let date = DateTime::now();
+        format!(
+            "{}/{}/{}/{}/{}",
+            self.tenant_id,
+            date.year(),
+            date.month(),
+            Uuid::new_v4(),
+            filename
+        )
+    }
+
+    fn get_storage_path(self, session: &UploadSession) -> String {
+        self.generate_storage_path(&session.filename)
+    }
+
+    fn calculate_folder_path(self, parent_id: &Option<String>) -> Result<String, FileError> {
+        match parent_id {
+            Some(id) => {
+                let parent = self.get_folder(id)?;
+                Ok(format!("{}/{}", parent.path, parent.name))
+            }
+            None => Ok("/".to_string())
+        }
+    }
+
+    fn is_image(self, content_type: &str) -> bool {
+        content_type.starts_with("image/")
+    }
+
+    fn process_image(self, storage_path: &str) -> Result<Vec<FileVariant>, FileError> {
+        let data = self.storage.download(storage_path)?;
+
+        let mut variants = vec![];
+
+        // Generate thumbnail
+        if let Ok(thumb) = self.image_processor.resize(&data, 150, 150) {
+            let thumb_path = format!("{}_thumb", storage_path);
+            self.storage.upload(&thumb_path, &thumb.data, "image/jpeg")?;
+            variants.push(FileVariant {
+                name: "thumbnail".to_string(),
+                storage_path: thumb_path,
+                width: thumb.width,
+                height: thumb.height,
+                size: thumb.data.len() as i64
+            });
+        }
+
+        // Generate medium
+        if let Ok(medium) = self.image_processor.resize(&data, 800, 600) {
+            let medium_path = format!("{}_medium", storage_path);
+            self.storage.upload(&medium_path, &medium.data, "image/jpeg")?;
+            variants.push(FileVariant {
+                name: "medium".to_string(),
+                storage_path: medium_path,
+                width: medium.width,
+                height: medium.height,
+                size: medium.data.len() as i64
+            });
+        }
+
+        Ok(variants)
+    }
+
+    fn calculate_checksum(self, storage_path: &str) -> Result<String, FileError> {
+        let data = self.storage.download(storage_path)?;
+        Ok(self.calculate_checksum_bytes(&data))
+    }
+
+    fn calculate_checksum_bytes(self, data: &[u8]) -> String {
+        // SHA-256 hash
+        let hash = sha256(data);
+        hex::encode(hash)
+    }
+}
+
+// ============================================================================
+// Storage Providers
+// ============================================================================
+
+/// Storage provider trait
+pub trait StorageProvider {
+    fn upload(self, path: &str, data: &[u8], content_type: &str) -> Result<(), FileError>;
+    fn download(self, path: &str) -> Result<Vec<u8>, FileError>;
+    fn delete(self, path: &str) -> Result<(), FileError>;
+    fn exists(self, path: &str) -> Result<bool, FileError>;
+    fn get_size(self, path: &str) -> Result<i64, FileError>;
+    fn copy(self, source: &str, destination: &str) -> Result<(), FileError>;
+    fn generate_signed_url(self, path: &str, expires_in: Duration, options: SignedUrlOptions) -> Result<String, FileError>;
+}
+
+/// Local storage provider
+pub actor LocalStorageProvider {
+    base_path: String,
+
+    pub fn new(config: &LocalStorageConfig) -> Self {
+        LocalStorageProvider { base_path: config.base_path.clone() }
+    }
+}
+
+impl StorageProvider for LocalStorageProvider {
+    fn upload(self, path: &str, data: &[u8], content_type: &str) -> Result<(), FileError> {
+        let full_path = format!("{}/{}", self.base_path, path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&full_path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e|
+                FileError::StorageError { message: format!("Failed to create directory: {}", e) }
+            )?;
+        }
+
+        std::fs::write(&full_path, data).map_err(|e|
+            FileError::StorageError { message: format!("Failed to write file: {}", e) }
+        )
+    }
+
+    fn download(self, path: &str) -> Result<Vec<u8>, FileError> {
+        let full_path = format!("{}/{}", self.base_path, path);
+        std::fs::read(&full_path).map_err(|e|
+            FileError::NotFound { id: path.to_string() }
+        )
+    }
+
+    fn delete(self, path: &str) -> Result<(), FileError> {
+        let full_path = format!("{}/{}", self.base_path, path);
+        std::fs::remove_file(&full_path).map_err(|e|
+            FileError::StorageError { message: format!("Failed to delete file: {}", e) }
+        )
+    }
+
+    fn exists(self, path: &str) -> Result<bool, FileError> {
+        let full_path = format!("{}/{}", self.base_path, path);
+        Ok(std::path::Path::new(&full_path).exists())
+    }
+
+    fn get_size(self, path: &str) -> Result<i64, FileError> {
+        let full_path = format!("{}/{}", self.base_path, path);
+        let metadata = std::fs::metadata(&full_path).map_err(|e|
+            FileError::NotFound { id: path.to_string() }
+        )?;
+        Ok(metadata.len() as i64)
+    }
+
+    fn copy(self, source: &str, destination: &str) -> Result<(), FileError> {
+        let src_path = format!("{}/{}", self.base_path, source);
+        let dst_path = format!("{}/{}", self.base_path, destination);
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&dst_path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e|
+                FileError::StorageError { message: format!("Failed to create directory: {}", e) }
+            )?;
+        }
+
+        std::fs::copy(&src_path, &dst_path).map_err(|e|
+            FileError::StorageError { message: format!("Failed to copy file: {}", e) }
+        )?;
+        Ok(())
+    }
+
+    fn generate_signed_url(self, path: &str, expires_in: Duration, options: SignedUrlOptions) -> Result<String, FileError> {
+        // Local storage doesn't support signed URLs - return file:// URL instead
+        let full_path = format!("{}/{}", self.base_path, path);
+        Ok(format!("file://{}", full_path))
+    }
+}
+
+/// S3 storage provider
+pub actor S3StorageProvider {
+    config: S3StorageConfig,
+
+    pub fn new(config: &S3StorageConfig) -> Self {
+        S3StorageProvider { config: config.clone() }
+    }
+}
+
+impl StorageProvider for S3StorageProvider {
+    fn upload(self, path: &str, data: &[u8], content_type: &str) -> Result<(), FileError> {
+        // S3 SDK integration required
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+
+    fn download(self, path: &str) -> Result<Vec<u8>, FileError> {
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+
+    fn delete(self, path: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+
+    fn exists(self, path: &str) -> Result<bool, FileError> {
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+
+    fn get_size(self, path: &str) -> Result<i64, FileError> {
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+
+    fn copy(self, source: &str, destination: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+
+    fn generate_signed_url(self, path: &str, expires_in: Duration, options: SignedUrlOptions) -> Result<String, FileError> {
+        Err(FileError::StorageError { message: "S3 storage provider not yet implemented - requires AWS SDK integration".to_string() })
+    }
+}
+
+/// Azure Blob storage provider
+pub actor AzureBlobProvider {
+    config: AzureStorageConfig,
+
+    pub fn new(config: &AzureStorageConfig) -> Self {
+        AzureBlobProvider { config: config.clone() }
+    }
+}
+
+impl StorageProvider for AzureBlobProvider {
+    fn upload(self, path: &str, data: &[u8], content_type: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+
+    fn download(self, path: &str) -> Result<Vec<u8>, FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+
+    fn delete(self, path: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+
+    fn exists(self, path: &str) -> Result<bool, FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+
+    fn get_size(self, path: &str) -> Result<i64, FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+
+    fn copy(self, source: &str, destination: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+
+    fn generate_signed_url(self, path: &str, expires_in: Duration, options: SignedUrlOptions) -> Result<String, FileError> {
+        Err(FileError::StorageError { message: "Azure Blob storage not yet implemented - requires Azure SDK integration".to_string() })
+    }
+}
+
+/// Google Cloud Storage provider
+pub actor GCSStorageProvider {
+    config: GCSStorageConfig,
+
+    pub fn new(config: &GCSStorageConfig) -> Self {
+        GCSStorageProvider { config: config.clone() }
+    }
+}
+
+impl StorageProvider for GCSStorageProvider {
+    fn upload(self, path: &str, data: &[u8], content_type: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+
+    fn download(self, path: &str) -> Result<Vec<u8>, FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+
+    fn delete(self, path: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+
+    fn exists(self, path: &str) -> Result<bool, FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+
+    fn get_size(self, path: &str) -> Result<i64, FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+
+    fn copy(self, source: &str, destination: &str) -> Result<(), FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+
+    fn generate_signed_url(self, path: &str, expires_in: Duration, options: SignedUrlOptions) -> Result<String, FileError> {
+        Err(FileError::StorageError { message: "GCS storage not yet implemented - requires Google Cloud SDK integration".to_string() })
+    }
+}
+
+// ============================================================================
+// Supporting Services
+// ============================================================================
+
+/// Virus scanner
+pub type VirusScanner = type {
+    enabled: bool
+}
+
+impl VirusScanner {
+    pub fn new() -> Self { VirusScanner { enabled: false } }
+
+    pub fn scan(self, path: &str) -> Result<ScanResult, FileError> {
+        // Virus scanning requires ClamAV or similar integration
+        if !self.enabled {
+            // Return clean result when scanning is disabled
+            return Ok(ScanResult { is_infected: false, threat_name: None });
+        }
+        Err(FileError::ProcessingError { message: "Virus scanning not yet implemented - requires ClamAV integration".to_string() })
+    }
+
+    pub fn scan_bytes(self, data: &[u8]) -> Result<ScanResult, FileError> {
+        if !self.enabled {
+            return Ok(ScanResult { is_infected: false, threat_name: None });
+        }
+        Err(FileError::ProcessingError { message: "Virus scanning not yet implemented - requires ClamAV integration".to_string() })
+    }
+}
+
+pub type ScanResult = type {
+    is_infected: bool,
+    threat_name: Option<String>
+}
+
+/// Image processor
+pub type ImageProcessor = type {
+    max_size: i32
+}
+
+impl ImageProcessor {
+    pub fn new() -> Self { ImageProcessor { max_size: 4096 } }
+
+    pub fn resize(self, data: &[u8], max_width: i32, max_height: i32) -> Result<ProcessedImage, FileError> {
+        // Image processing requires image library integration
+        Err(FileError::ProcessingError { message: "Image processing not yet implemented - requires image library integration".to_string() })
+    }
+
+    pub fn crop(self, data: &[u8], x: i32, y: i32, width: i32, height: i32) -> Result<ProcessedImage, FileError> {
+        Err(FileError::ProcessingError { message: "Image processing not yet implemented - requires image library integration".to_string() })
+    }
+
+    pub fn rotate(self, data: &[u8], degrees: i32) -> Result<ProcessedImage, FileError> {
+        Err(FileError::ProcessingError { message: "Image processing not yet implemented - requires image library integration".to_string() })
+    }
+}
+
+pub type ProcessedImage = type {
+    data: Vec<u8>,
+    width: i32,
+    height: i32
+}
+
+/// File metadata store trait
+pub trait FileMetadataStore {
+    fn save_session(self, session: &UploadSession) -> Result<(), FileError>;
+    fn get_session(self, id: &str) -> Result<UploadSession, FileError>;
+    fn update_session_status(self, id: &str, status: UploadStatus) -> Result<(), FileError>;
+
+    fn save_file(self, file: &FileMetadata) -> Result<(), FileError>;
+    fn get_file(self, id: &str) -> Result<FileMetadata, FileError>;
+    fn list_files(self, tenant_id: &str, query: &FileQuery) -> Result<PagedResult<FileMetadata>, FileError>;
+    fn delete_file(self, id: &str) -> Result<(), FileError>;
+    fn soft_delete_file(self, id: &str) -> Result<(), FileError>;
+    fn increment_download_count(self, id: &str) -> Result<(), FileError>;
+
+    fn save_folder(self, folder: &Folder) -> Result<(), FileError>;
+    fn get_folder(self, id: &str) -> Result<Folder, FileError>;
+    fn list_folders(self, tenant_id: &str, parent_id: Option<String>) -> Result<Vec<Folder>, FileError>;
+    fn delete_folder(self, id: &str) -> Result<(), FileError>;
+
+    fn get_usage(self, tenant_id: &str) -> Result<StorageUsage, FileError>;
+    fn update_usage(self, tenant_id: &str, delta: i64) -> Result<(), FileError>;
+}
+
+/// In-memory file metadata store (for testing/development)
+pub actor InMemoryFileStore {
+    sessions: HashMap<String, UploadSession>,
+    files: HashMap<String, FileMetadata>,
+    folders: HashMap<String, Folder>,
+    usage: HashMap<String, StorageUsage>,
+
+    pub fn new() -> Self {
+        InMemoryFileStore {
+            sessions: HashMap::new(),
+            files: HashMap::new(),
+            folders: HashMap::new(),
+            usage: HashMap::new(),
+        }
+    }
+}
+
+impl FileMetadataStore for InMemoryFileStore {
+    fn save_session(mut self, session: &UploadSession) -> Result<(), FileError> {
+        self.sessions.insert(session.id.clone(), session.clone());
+        Ok(())
+    }
+
+    fn get_session(self, id: &str) -> Result<UploadSession, FileError> {
+        self.sessions.get(id).cloned().ok_or(FileError::NotFound { id: id.to_string() })
+    }
+
+    fn update_session_status(mut self, id: &str, status: UploadStatus) -> Result<(), FileError> {
+        match self.sessions.get_mut(id) {
+            Some(session) => {
+                session.status = status;
+                Ok(())
+            },
+            None => Err(FileError::NotFound { id: id.to_string() })
+        }
+    }
+
+    fn save_file(mut self, file: &FileMetadata) -> Result<(), FileError> {
+        self.files.insert(file.id.clone(), file.clone());
+        Ok(())
+    }
+
+    fn get_file(self, id: &str) -> Result<FileMetadata, FileError> {
+        self.files.get(id).cloned().ok_or(FileError::NotFound { id: id.to_string() })
+    }
+
+    fn list_files(self, tenant_id: &str, query: &FileQuery) -> Result<PagedResult<FileMetadata>, FileError> {
+        let files: Vec<FileMetadata> = self.files.values()
+            .filter(|f| f.tenant_id == tenant_id && f.deleted_at.is_none())
+            .cloned()
+            .collect();
+
+        Ok(PagedResult {
+            items: files.clone(),
+            total: files.len() as i64,
+            page: 1,
+            page_size: files.len() as i32,
+            has_more: false,
+        })
+    }
+
+    fn delete_file(mut self, id: &str) -> Result<(), FileError> {
+        self.files.remove(id);
+        Ok(())
+    }
+
+    fn soft_delete_file(mut self, id: &str) -> Result<(), FileError> {
+        match self.files.get_mut(id) {
+            Some(file) => {
+                file.deleted_at = Some(DateTime::now());
+                Ok(())
+            },
+            None => Err(FileError::NotFound { id: id.to_string() })
+        }
+    }
+
+    fn increment_download_count(mut self, id: &str) -> Result<(), FileError> {
+        match self.files.get_mut(id) {
+            Some(file) => {
+                file.download_count += 1;
+                Ok(())
+            },
+            None => Err(FileError::NotFound { id: id.to_string() })
+        }
+    }
+
+    fn save_folder(mut self, folder: &Folder) -> Result<(), FileError> {
+        self.folders.insert(folder.id.clone(), folder.clone());
+        Ok(())
+    }
+
+    fn get_folder(self, id: &str) -> Result<Folder, FileError> {
+        self.folders.get(id).cloned().ok_or(FileError::NotFound { id: id.to_string() })
+    }
+
+    fn list_folders(self, tenant_id: &str, parent_id: Option<String>) -> Result<Vec<Folder>, FileError> {
+        let folders: Vec<Folder> = self.folders.values()
+            .filter(|f| f.tenant_id == tenant_id && f.parent_id == parent_id)
+            .cloned()
+            .collect();
+        Ok(folders)
+    }
+
+    fn delete_folder(mut self, id: &str) -> Result<(), FileError> {
+        self.folders.remove(id);
+        Ok(())
+    }
+
+    fn get_usage(self, tenant_id: &str) -> Result<StorageUsage, FileError> {
+        Ok(self.usage.get(tenant_id).cloned().unwrap_or(StorageUsage {
+            tenant_id: tenant_id.to_string(),
+            used_bytes: 0,
+            quota_bytes: 10737418240, // 10GB default
+            file_count: 0,
+        }))
+    }
+
+    fn update_usage(mut self, tenant_id: &str, delta: i64) -> Result<(), FileError> {
+        let usage = self.usage.entry(tenant_id.to_string()).or_insert(StorageUsage {
+            tenant_id: tenant_id.to_string(),
+            used_bytes: 0,
+            quota_bytes: 10737418240,
+            file_count: 0,
+        });
+        usage.used_bytes = (usage.used_bytes as i64 + delta).max(0) as i64;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// File metadata
+pub type FileMetadata = type {
+    id: String,
+    tenant_id: String,
+    filename: String,
+    original_filename: String,
+    content_type: String,
+    size: i64,
+    storage_path: String,
+    folder_id: Option<String>,
+    variants: Vec<FileVariant>,
+    checksum: String,
+    metadata: Map<String, String>,
+    access_control: AccessControl,
+    download_count: i64,
+    created_at: DateTime,
+    updated_at: DateTime,
+    created_by: Option<String>,
+    deleted_at: Option<DateTime>
+}
+
+/// File variant (for images)
+pub type FileVariant = type {
+    name: String,
+    storage_path: String,
+    width: i32,
+    height: i32,
+    size: i64
+}
+
+/// Access control
+pub type AccessControl = type {
+    public: bool,
+    allowed_users: Vec<String>,
+    allowed_groups: Vec<String>,
+    expires_at: Option<DateTime>
+}
+
+impl Default for AccessControl {
+    fn default() -> Self {
+        AccessControl {
+            public: false,
+            allowed_users: vec![],
+            allowed_groups: vec![],
+            expires_at: None
+        }
+    }
+}
+
+/// Folder
+pub type Folder = type {
+    id: String,
+    tenant_id: String,
+    name: String,
+    parent_id: Option<String>,
+    path: String,
+    metadata: Map<String, String>,
+    created_at: DateTime,
+    updated_at: DateTime,
+    created_by: Option<String>
+}
+
+/// Upload session
+pub type UploadSession = type {
+    id: String,
+    tenant_id: String,
+    filename: String,
+    content_type: String,
+    size: i64,
+    folder_id: Option<String>,
+    upload_url: String,
+    expires_at: DateTime,
+    status: UploadStatus,
+    created_at: DateTime
+}
+
+pub enum UploadStatus {
+    Pending,
+    Uploading,
+    Completed,
+    Failed,
+    Expired
+}
+
+/// Request/Response types
+pub type InitiateUploadRequest = type {
+    filename: String,
+    content_type: String,
+    size: i64,
+    folder_id: Option<String>
+}
+
+pub type UploadRequest = type {
+    filename: String,
+    content_type: String,
+    data: Vec<u8>,
+    folder_id: Option<String>,
+    metadata: Option<Map<String, String>>,
+    uploaded_by: Option<String>
+}
+
+pub type UpdateFileRequest = type {
+    filename: Option<String>,
+    folder_id: Option<String>,
+    metadata: Option<Map<String, String>>,
+    access_control: Option<AccessControl>
+}
+
+pub type DownloadOptions = type {
+    user_id: Option<String>,
+    expires_in: Option<Duration>
+}
+
+pub type FileContent = type {
+    data: Vec<u8>,
+    content_type: String,
+    filename: String
+}
+
+pub type CreateFolderRequest = type {
+    name: String,
+    parent_id: Option<String>,
+    metadata: Option<Map<String, String>>,
+    created_by: Option<String>
+}
+
+pub type UpdateFolderRequest = type {
+    name: Option<String>,
+    parent_id: Option<String>,
+    metadata: Option<Map<String, String>>
+}
+
+pub type FileQuery = type {
+    folder_id: Option<String>,
+    content_type: Option<String>,
+    search: Option<String>,
+    created_after: Option<DateTime>,
+    created_before: Option<DateTime>,
+    page: Option<i32>,
+    page_size: Option<i32>
+}
+
+impl Default for FileQuery {
+    fn default() -> Self {
+        FileQuery {
+            folder_id: None,
+            content_type: None,
+            search: None,
+            created_after: None,
+            created_before: None,
+            page: Some(1),
+            page_size: Some(20)
+        }
+    }
+}
+
+pub type PagedResult<T> = type {
+    items: Vec<T>,
+    total: i64,
+    page: i32,
+    page_size: i32
+}
+
+/// Storage usage
+pub type StorageUsage = type {
+    used_bytes: i64,
+    file_count: i64,
+    by_type: Map<String, i64>
+}
+
+/// Storage quota
+pub type StorageQuota = type {
+    max_bytes: i64,
+    max_files: Option<i64>,
+    max_file_size: Option<i64>
+}
+
+pub type SignedUrlOptions = type {
+    content_disposition: Option<String>
+}
+
+impl Default for SignedUrlOptions {
+    fn default() -> Self {
+        SignedUrlOptions { content_disposition: None }
+    }
+}
+
+pub enum AccessType {
+    Read,
+    Write,
+    Delete
+}
+
+/// Configuration
+pub type FileServiceConfig = type {
+    storage_provider: StorageProviderType,
+    allowed_types: Option<Vec<String>>,
+    denied_types: Option<Vec<String>>,
+    max_file_size: i64,
+    enable_virus_scanning: bool,
+    generate_image_variants: bool
+}
+
+pub enum StorageProviderType {
+    Local(LocalStorageConfig),
+    S3(S3StorageConfig),
+    Azure(AzureStorageConfig),
+    GCS(GCSStorageConfig)
+}
+
+pub type LocalStorageConfig = type { base_path: String }
+pub type S3StorageConfig = type { bucket: String, region: String, access_key: String, secret_key: String }
+pub type AzureStorageConfig = type { account: String, container: String, access_key: String }
+pub type GCSStorageConfig = type { bucket: String, credentials_path: String }
+
+/// File error
+pub enum FileError {
+    FileNotFound(String),
+    FolderNotFound(String),
+    VariantNotFound(String),
+    FolderNotEmpty(String),
+    InvalidFileType(String),
+    InvalidState(String),
+    QuotaExceeded,
+    AccessDenied,
+    VirusDetected(String),
+    StorageError(String),
+    ProcessingError(String)
+}
+
+impl FileError {
+    pub fn to_string(self) -> String {
+        match self {
+            FileError::FileNotFound(m) => format!("File not found: {}", m),
+            FileError::FolderNotFound(m) => format!("Folder not found: {}", m),
+            FileError::VariantNotFound(m) => format!("Variant not found: {}", m),
+            FileError::FolderNotEmpty(m) => format!("Folder not empty: {}", m),
+            FileError::InvalidFileType(m) => format!("Invalid file type: {}", m),
+            FileError::InvalidState(m) => m,
+            FileError::QuotaExceeded => "Storage quota exceeded".to_string(),
+            FileError::AccessDenied => "Access denied".to_string(),
+            FileError::VirusDetected(m) => format!("Virus detected: {}", m),
+            FileError::StorageError(m) => format!("Storage error: {}", m),
+            FileError::ProcessingError(m) => format!("Processing error: {}", m)
+        }
+    }
+}
+
+// Crypto utilities
+fn sha256(data: &[u8]) -> Vec<u8> {
+    // SHA-256 implementation using std::crypto
+    std::crypto::sha256(data)
+}
+
+mod hex {
+    pub fn encode(data: Vec<u8>) -> String {
+        data.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<String>>()
+            .join("")
+    }
+}

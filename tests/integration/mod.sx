@@ -1,0 +1,9 @@
+/// Intelligo LMS - Integration Tests Module
+///
+/// Exports all integration test suites.
+
+module intelligo::tests::integration
+
+pub use intelligo::tests::integration::enrollment_flow::*
+pub use intelligo::tests::integration::scorm_player::*
+pub use intelligo::tests::integration::learning_path::*

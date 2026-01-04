@@ -1,0 +1,646 @@
+/// Intelligo LMS - API Module
+///
+/// This is the main API module that configures and exports the REST API router.
+/// It aggregates all API sub-modules and sets up global middleware.
+
+module intelligo::api
+
+use modulus::http::{Router, Request, Response, StatusCode, Server, ServerConfig}
+use modulus::runtime::{Context, Error as RuntimeError}
+use std::time::DateTime
+
+// Import all API sub-modules
+use intelligo::api::middleware::*
+use intelligo::api::auth as auth_api
+use intelligo::api::users as users_api
+use intelligo::api::courses as courses_api
+use intelligo::api::modules as modules_api
+use intelligo::api::lessons as lessons_api
+use intelligo::api::assessments as assessments_api
+use intelligo::api::submissions as submissions_api
+use intelligo::api::grades as grades_api
+use intelligo::api::enrollments as enrollments_api
+use intelligo::api::ai as ai_api
+use intelligo::api::progress as progress_api
+
+// Import core modules
+use intelligo::core::types::*
+use intelligo::core::storage::Database
+
+// =============================================================================
+// API CONFIGURATION
+// =============================================================================
+
+/// API configuration
+type ApiConfig {
+    /// Base path for API (e.g., "/api/v1")
+    base_path: String,
+
+    /// API version
+    version: String,
+
+    /// Whether to enable API documentation
+    enable_docs: Bool,
+
+    /// Documentation path
+    docs_path: String,
+
+    /// CORS configuration
+    cors: CorsConfig,
+
+    /// Rate limiting configuration
+    rate_limit: RateLimitConfig,
+
+    /// Body size limits
+    body_limits: BodyLimitConfig,
+
+    /// Logging configuration
+    logging: LoggingConfig,
+
+    /// Authentication configuration
+    auth: AuthConfig
+}
+
+impl ApiConfig {
+    /// Default API configuration
+    fn default() -> ApiConfig {
+        ApiConfig {
+            base_path: "/api/v1".to_string(),
+            version: "1.0.0".to_string(),
+            enable_docs: true,
+            docs_path: "/docs".to_string(),
+            cors: CorsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            body_limits: BodyLimitConfig::default(),
+            logging: LoggingConfig::default(),
+            auth: AuthConfig::default().with_skip_paths(vec![
+                "/api/v1/auth/login".to_string(),
+                "/api/v1/auth/register".to_string(),
+                "/api/v1/auth/forgot-password".to_string(),
+                "/api/v1/auth/reset-password".to_string(),
+                "/api/v1/auth/oauth/*".to_string(),
+                "/api/v1/health".to_string(),
+                "/api/v1/ready".to_string(),
+                "/docs/*".to_string()
+            ])
+        }
+    }
+
+    /// Development configuration
+    fn development() -> ApiConfig {
+        let mut config = ApiConfig::default();
+        config.cors.allow_any_origin = true;
+        config.logging.log_body = true;
+        config.logging.log_response = true;
+        config
+    }
+
+    /// Production configuration
+    fn production() -> ApiConfig {
+        let mut config = ApiConfig::default();
+        config.enable_docs = false;
+        config.rate_limit = RateLimitConfig::strict();
+        config
+    }
+}
+
+// =============================================================================
+// ROUTER BUILDER
+// =============================================================================
+
+/// Build the main API router
+fn build_router(config: &ApiConfig, db: Database) -> Router {
+    let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+
+    Router::new()
+        // Global middleware
+        .middleware(move |req, next| {
+            cors_middleware(req, &config.cors, next)
+        })
+        .middleware(move |req, next| {
+            let mut ctx = RequestContext::from_request(&req);
+            error_handler_middleware(req, &ctx, next)
+        })
+        .middleware(move |req, next| {
+            let mut ctx = RequestContext::from_request(&req);
+            logging_middleware(req, &ctx, &config.logging, next)
+        })
+        .middleware(move |req, next| {
+            let mut ctx = RequestContext::from_request(&req);
+            body_limit_middleware(req, &config.body_limits, &ctx, next)
+        })
+        .middleware(move |req, next| {
+            let mut ctx = RequestContext::from_request(&req);
+            rate_limit_middleware(req, &ctx, &rate_limiter, next)
+        })
+        .middleware(move |req, next| {
+            let mut ctx = RequestContext::from_request(&req);
+            auth_middleware(req, &mut ctx, &config.auth, next)
+        })
+        .middleware(move |req, next| {
+            let mut ctx = RequestContext::from_request(&req);
+            tenant_middleware(req, &mut ctx, next)
+        })
+
+        // Health check endpoints
+        .get("/api/v1/health", health_check)
+        .get("/api/v1/ready", readiness_check)
+
+        // API info endpoint
+        .get("/api/v1", |req| api_info(req, &config))
+
+        // Mount sub-routers
+        .mount("/api/v1/auth", auth_api::router(db.clone()))
+        .mount("/api/v1/users", users_api::router(db.clone()))
+        .mount("/api/v1/courses", courses_api::router(db.clone()))
+        .mount("/api/v1/modules", modules_api::router(db.clone()))
+        .mount("/api/v1/lessons", lessons_api::router(db.clone()))
+        .mount("/api/v1/assessments", assessments_api::router(db.clone()))
+        .mount("/api/v1/submissions", submissions_api::router(db.clone()))
+        .mount("/api/v1/grades", grades_api::router(db.clone()))
+        .mount("/api/v1/enrollments", enrollments_api::router(db.clone()))
+        .mount("/api/v1/ai", ai_api::router(db.clone()))
+        .mount("/api/v1/progress", progress_api::router(db.clone()))
+
+        // API documentation
+        .get("/docs", serve_docs)
+        .get("/docs/openapi.json", serve_openapi_spec)
+
+        // Catch-all 404
+        .fallback(not_found_handler)
+}
+
+// =============================================================================
+// HEALTH CHECK ENDPOINTS
+// =============================================================================
+
+/// Health check endpoint
+async fn health_check(req: Request) -> Response {
+    let health = HealthStatus {
+        status: "healthy".to_string(),
+        timestamp: DateTime::now(),
+        version: env!("CARGO_PKG_VERSION").to_string()
+    };
+
+    Response::json(health).with_status(StatusCode::OK)
+}
+
+/// Readiness check endpoint (checks all dependencies)
+async fn readiness_check(req: Request) -> Response {
+    let mut checks = Map::new();
+    let mut all_ready = true;
+
+    // Check database
+    let db_status = check_database().await;
+    checks.insert("database".to_string(), db_status.clone());
+    if !db_status.ready {
+        all_ready = false;
+    }
+
+    // Check cache
+    let cache_status = check_cache().await;
+    checks.insert("cache".to_string(), cache_status.clone());
+    if !cache_status.ready {
+        all_ready = false;
+    }
+
+    // Check external services
+    let services_status = check_external_services().await;
+    for (name, status) in services_status {
+        checks.insert(name, status.clone());
+        if !status.ready {
+            all_ready = false;
+        }
+    }
+
+    let response = ReadinessStatus {
+        ready: all_ready,
+        timestamp: DateTime::now(),
+        checks
+    };
+
+    let status_code = if all_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    Response::json(response).with_status(status_code)
+}
+
+type HealthStatus {
+    status: String,
+    timestamp: DateTime,
+    version: String
+}
+
+type ReadinessStatus {
+    ready: Bool,
+    timestamp: DateTime,
+    checks: Map<String, DependencyStatus>
+}
+
+type DependencyStatus {
+    ready: Bool,
+    latency_ms: Option<i64>,
+    error: Option<String>
+}
+
+async fn check_database() -> DependencyStatus {
+    let start = std::time::Instant::now();
+
+    // Actually ping the database with a simple query
+    match db::query_one("SELECT 1 as health_check", []).await {
+        Ok(Some(_)) => DependencyStatus {
+            ready: true,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: None
+        },
+        Ok(None) => DependencyStatus {
+            ready: false,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: Some("Database returned no result".to_string())
+        },
+        Err(e) => DependencyStatus {
+            ready: false,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: Some(format!("Database connection failed: {}", e))
+        }
+    }
+}
+
+async fn check_cache() -> DependencyStatus {
+    let start = std::time::Instant::now();
+
+    // Actually ping the cache (Redis/Memcached)
+    match cache::ping().await {
+        Ok(_) => DependencyStatus {
+            ready: true,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: None
+        },
+        Err(e) => DependencyStatus {
+            ready: false,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: Some(format!("Cache connection failed: {}", e))
+        }
+    }
+}
+
+async fn check_search() -> DependencyStatus {
+    let start = std::time::Instant::now();
+
+    // Check search engine (Elasticsearch/OpenSearch/Meilisearch)
+    match search::health_check().await {
+        Ok(healthy) => DependencyStatus {
+            ready: healthy,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: if healthy { None } else { Some("Search engine unhealthy".to_string()) }
+        },
+        Err(e) => DependencyStatus {
+            ready: false,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: Some(format!("Search engine connection failed: {}", e))
+        }
+    }
+}
+
+async fn check_storage() -> DependencyStatus {
+    let start = std::time::Instant::now();
+
+    // Check file storage (S3/GCS/Azure Blob)
+    match storage::health_check().await {
+        Ok(_) => DependencyStatus {
+            ready: true,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: None
+        },
+        Err(e) => DependencyStatus {
+            ready: false,
+            latency_ms: Some(start.elapsed().as_millis() as i64),
+            error: Some(format!("Storage connection failed: {}", e))
+        }
+    }
+}
+
+async fn check_external_services() -> Map<String, DependencyStatus> {
+    let mut statuses = Map::new();
+
+    // Check AI service
+    let ai_start = std::time::Instant::now();
+    match ai::health_check().await {
+        Ok(_) => {
+            statuses.insert("ai_service".to_string(), DependencyStatus {
+                ready: true,
+                latency_ms: Some(ai_start.elapsed().as_millis() as i64),
+                error: None
+            });
+        },
+        Err(e) => {
+            statuses.insert("ai_service".to_string(), DependencyStatus {
+                ready: false,
+                latency_ms: Some(ai_start.elapsed().as_millis() as i64),
+                error: Some(format!("AI service unavailable: {}", e))
+            });
+        }
+    }
+
+    // Check storage service
+    let storage_status = check_storage().await;
+    statuses.insert("storage_service".to_string(), storage_status);
+
+    // Check search service
+    let search_status = check_search().await;
+    statuses.insert("search_service".to_string(), search_status);
+
+    statuses
+}
+
+// =============================================================================
+// API INFO ENDPOINT
+// =============================================================================
+
+/// API information endpoint
+async fn api_info(req: Request, config: &ApiConfig) -> Response {
+    let info = ApiInfo {
+        name: "Intelligo LMS API".to_string(),
+        version: config.version.clone(),
+        description: "REST API for Intelligo Learning Management System".to_string(),
+        documentation_url: if config.enable_docs {
+            Some(format!("{}", config.docs_path))
+        } else {
+            None
+        },
+        endpoints: get_endpoint_summary(),
+        contact: ApiContact {
+            email: "support@intelligo.io".to_string(),
+            url: "https://intelligo.io".to_string()
+        }
+    };
+
+    Response::json(info)
+}
+
+type ApiInfo {
+    name: String,
+    version: String,
+    description: String,
+    documentation_url: Option<String>,
+    endpoints: List<EndpointGroup>,
+    contact: ApiContact
+}
+
+type EndpointGroup {
+    name: String,
+    base_path: String,
+    description: String
+}
+
+type ApiContact {
+    email: String,
+    url: String
+}
+
+fn get_endpoint_summary() -> List<EndpointGroup> {
+    vec![
+        EndpointGroup {
+            name: "Authentication".to_string(),
+            base_path: "/api/v1/auth".to_string(),
+            description: "User authentication, registration, and password management".to_string()
+        },
+        EndpointGroup {
+            name: "Users".to_string(),
+            base_path: "/api/v1/users".to_string(),
+            description: "User management and profiles".to_string()
+        },
+        EndpointGroup {
+            name: "Courses".to_string(),
+            base_path: "/api/v1/courses".to_string(),
+            description: "Course CRUD operations".to_string()
+        },
+        EndpointGroup {
+            name: "Modules".to_string(),
+            base_path: "/api/v1/modules".to_string(),
+            description: "Course module management".to_string()
+        },
+        EndpointGroup {
+            name: "Lessons".to_string(),
+            base_path: "/api/v1/lessons".to_string(),
+            description: "Lesson content management".to_string()
+        },
+        EndpointGroup {
+            name: "Assessments".to_string(),
+            base_path: "/api/v1/assessments".to_string(),
+            description: "Assessment creation and management".to_string()
+        },
+        EndpointGroup {
+            name: "Submissions".to_string(),
+            base_path: "/api/v1/submissions".to_string(),
+            description: "Student submission handling".to_string()
+        },
+        EndpointGroup {
+            name: "Grades".to_string(),
+            base_path: "/api/v1/grades".to_string(),
+            description: "Grading and gradebook".to_string()
+        },
+        EndpointGroup {
+            name: "Enrollments".to_string(),
+            base_path: "/api/v1/enrollments".to_string(),
+            description: "Course enrollment management".to_string()
+        },
+        EndpointGroup {
+            name: "AI".to_string(),
+            base_path: "/api/v1/ai".to_string(),
+            description: "AI-powered tutoring and content generation".to_string()
+        },
+        EndpointGroup {
+            name: "Progress".to_string(),
+            base_path: "/api/v1/progress".to_string(),
+            description: "Learning progress and xAPI/SCORM integration".to_string()
+        }
+    ]
+}
+
+// =============================================================================
+// DOCUMENTATION ENDPOINTS
+// =============================================================================
+
+/// Serve API documentation page
+async fn serve_docs(req: Request) -> Response {
+    let html = r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Intelligo LMS API Documentation</title>
+    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+    <script>
+        SwaggerUIBundle({
+            url: "/docs/openapi.json",
+            dom_id: '#swagger-ui',
+            presets: [
+                SwaggerUIBundle.presets.apis,
+                SwaggerUIBundle.SwaggerUIStandalonePreset
+            ],
+            layout: "BaseLayout"
+        });
+    </script>
+</body>
+</html>
+    "#;
+
+    Response::html(html)
+}
+
+/// Serve OpenAPI specification
+async fn serve_openapi_spec(req: Request) -> Response {
+    let spec = generate_openapi_spec();
+    Response::json(spec)
+}
+
+fn generate_openapi_spec() -> Map<String, Dynamic> {
+    let mut spec = Map::new();
+
+    spec.insert("openapi".to_string(), Dynamic::String("3.0.3".to_string()));
+
+    let mut info = Map::new();
+    info.insert("title".to_string(), Dynamic::String("Intelligo LMS API".to_string()));
+    info.insert("version".to_string(), Dynamic::String("1.0.0".to_string()));
+    info.insert("description".to_string(), Dynamic::String(
+        "REST API for Intelligo Learning Management System. Provides endpoints for course management, user authentication, assessments, grading, and AI-powered learning features.".to_string()
+    ));
+    spec.insert("info".to_string(), Dynamic::Map(info));
+
+    let mut servers = vec![];
+    let mut server = Map::new();
+    server.insert("url".to_string(), Dynamic::String("/api/v1".to_string()));
+    server.insert("description".to_string(), Dynamic::String("API v1".to_string()));
+    servers.push(Dynamic::Map(server));
+    spec.insert("servers".to_string(), Dynamic::List(servers));
+
+    // Security schemes
+    let mut security_schemes = Map::new();
+    let mut bearer = Map::new();
+    bearer.insert("type".to_string(), Dynamic::String("http".to_string()));
+    bearer.insert("scheme".to_string(), Dynamic::String("bearer".to_string()));
+    bearer.insert("bearerFormat".to_string(), Dynamic::String("JWT".to_string()));
+    security_schemes.insert("bearerAuth".to_string(), Dynamic::Map(bearer));
+
+    let mut components = Map::new();
+    components.insert("securitySchemes".to_string(), Dynamic::Map(security_schemes));
+    spec.insert("components".to_string(), Dynamic::Map(components));
+
+    // Paths would be generated dynamically from route definitions
+    // For brevity, this is a placeholder
+    spec.insert("paths".to_string(), Dynamic::Map(Map::new()));
+
+    spec
+}
+
+// =============================================================================
+// ERROR HANDLERS
+// =============================================================================
+
+/// 404 Not Found handler
+async fn not_found_handler(req: Request) -> Response {
+    let error = ApiError::NotFound {
+        resource: "Endpoint".to_string(),
+        id: req.path().to_string()
+    };
+
+    error.to_response()
+}
+
+// =============================================================================
+// SERVER STARTUP
+// =============================================================================
+
+/// API server
+type ApiServer {
+    config: ApiConfig,
+    router: Router,
+    server_config: ServerConfig
+}
+
+impl ApiServer {
+    /// Create a new API server
+    fn new(config: ApiConfig, db: Database) -> ApiServer {
+        let router = build_router(&config, db);
+
+        let server_config = ServerConfig {
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            keep_alive: true,
+            request_timeout_secs: 30,
+            max_connections: 10000
+        };
+
+        ApiServer {
+            config,
+            router,
+            server_config
+        }
+    }
+
+    /// Configure server settings
+    fn with_config(mut self, server_config: ServerConfig) -> ApiServer {
+        self.server_config = server_config;
+        self
+    }
+
+    /// Start the server
+    async fn start(&self) -> Result<(), RuntimeError> {
+        println!(
+            "Starting Intelligo API server on {}:{}",
+            self.server_config.host,
+            self.server_config.port
+        );
+        println!("API version: {}", self.config.version);
+        println!("Documentation: {}", if self.config.enable_docs { "enabled" } else { "disabled" });
+
+        Server::new(self.server_config.clone())
+            .serve(self.router.clone())
+            .await
+    }
+
+    /// Start with graceful shutdown
+    async fn start_with_shutdown(&self, shutdown_signal: impl Future<Output = ()>) -> Result<(), RuntimeError> {
+        println!(
+            "Starting Intelligo API server on {}:{} with graceful shutdown",
+            self.server_config.host,
+            self.server_config.port
+        );
+
+        Server::new(self.server_config.clone())
+            .serve(self.router.clone())
+            .with_graceful_shutdown(shutdown_signal)
+            .await
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use ApiConfig;
+pub use ApiServer;
+pub use build_router;
+
+// Re-export middleware types
+pub use middleware::*;
+
+// Re-export sub-module routers for external composition
+pub mod auth { pub use intelligo::api::auth::*; }
+pub mod users { pub use intelligo::api::users::*; }
+pub mod courses { pub use intelligo::api::courses::*; }
+pub mod modules { pub use intelligo::api::modules::*; }
+pub mod lessons { pub use intelligo::api::lessons::*; }
+pub mod assessments { pub use intelligo::api::assessments::*; }
+pub mod submissions { pub use intelligo::api::submissions::*; }
+pub mod grades { pub use intelligo::api::grades::*; }
+pub mod enrollments { pub use intelligo::api::enrollments::*; }
+pub mod ai { pub use intelligo::api::ai::*; }
+pub mod progress { pub use intelligo::api::progress::*; }

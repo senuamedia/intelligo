@@ -1,0 +1,2300 @@
+/// Intelligo LMS - Authentication API
+///
+/// This module provides authentication endpoints:
+/// - Login (email/password, SSO, OAuth)
+/// - Registration
+/// - Password reset
+/// - Token refresh
+/// - Logout
+/// - OAuth callbacks
+
+module intelligo::api::auth
+
+use intelligo::core::types::*
+use intelligo::core::auth::{
+    AuthContext, Session, Token, TokenType, AuthProvider,
+    hash_password, verify_password, generate_token_pair,
+    validate_token, refresh_token as refresh_auth_token, revoke_token,
+    create_session, destroy_session, validate_session,
+    OAuthProvider, OAuthConfig, OAuthToken
+}
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the authentication router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Public endpoints (no auth required)
+        .post("/login", move |req| login(req, db.clone()))
+        .post("/register", move |req| register(req, db.clone()))
+        .post("/forgot-password", move |req| forgot_password(req, db.clone()))
+        .post("/reset-password", move |req| reset_password(req, db.clone()))
+        .post("/verify-email", move |req| verify_email(req, db.clone()))
+        .post("/resend-verification", move |req| resend_verification(req, db.clone()))
+
+        // Token management
+        .post("/refresh", move |req| refresh(req, db.clone()))
+        .post("/logout", move |req| logout(req, db.clone()))
+        .post("/logout-all", move |req| logout_all(req, db.clone()))
+
+        // OAuth endpoints
+        .get("/oauth/:provider", move |req| oauth_redirect(req, db.clone()))
+        .get("/oauth/:provider/callback", move |req| oauth_callback(req, db.clone()))
+        .post("/oauth/:provider/token", move |req| oauth_token_exchange(req, db.clone()))
+
+        // SSO endpoints
+        .get("/sso/:provider", move |req| sso_redirect(req, db.clone()))
+        .post("/sso/:provider/callback", move |req| sso_callback(req, db.clone()))
+
+        // Session management (authenticated)
+        .get("/sessions", move |req| list_sessions(req, db.clone()))
+        .delete("/sessions/:session_id", move |req| revoke_session(req, db.clone()))
+
+        // Current user info
+        .get("/me", move |req| get_current_user(req, db.clone()))
+        .patch("/me", move |req| update_current_user(req, db.clone()))
+        .post("/me/change-password", move |req| change_password(req, db.clone()))
+
+        // MFA endpoints
+        .post("/mfa/setup", move |req| setup_mfa(req, db.clone()))
+        .post("/mfa/verify", move |req| verify_mfa(req, db.clone()))
+        .post("/mfa/disable", move |req| disable_mfa(req, db.clone()))
+        .get("/mfa/recovery-codes", move |req| get_recovery_codes(req, db.clone()))
+        .post("/mfa/recovery-codes/regenerate", move |req| regenerate_recovery_codes(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Login request
+type LoginRequest {
+    email: String,
+    password: String,
+    remember_me: Option<Bool>,
+    mfa_code: Option<String>,
+    device_info: Option<DeviceInfo>
+}
+
+/// Device information for session tracking
+type DeviceInfo {
+    device_type: Option<String>,
+    device_name: Option<String>,
+    os: Option<String>,
+    browser: Option<String>
+}
+
+/// Login response
+type LoginResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+    expires_in: i64,
+    user: UserInfo,
+    requires_mfa: Bool,
+    mfa_token: Option<String>
+}
+
+/// User info for auth responses
+type UserInfo {
+    id: UserId,
+    email: String,
+    name: String,
+    first_name: String,
+    last_name: String,
+    avatar_url: Option<String>,
+    roles: List<SystemRole>,
+    permissions: List<String>,
+    tenant_id: Option<TenantId>,
+    email_verified: Bool,
+    mfa_enabled: Bool
+}
+
+/// Registration request
+type RegisterRequest {
+    email: String,
+    password: String,
+    first_name: String,
+    last_name: String,
+    invite_code: Option<String>,
+    tenant_code: Option<String>,
+    accept_terms: Bool
+}
+
+/// Registration response
+type RegisterResponse {
+    user: UserInfo,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    requires_verification: Bool,
+    message: String
+}
+
+/// Password reset request
+type ForgotPasswordRequest {
+    email: String
+}
+
+/// Reset password request
+type ResetPasswordRequest {
+    token: String,
+    password: String,
+    password_confirmation: String
+}
+
+/// Change password request
+type ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+    new_password_confirmation: String
+}
+
+/// Token refresh request
+type RefreshRequest {
+    refresh_token: String
+}
+
+/// Token refresh response
+type RefreshResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+    expires_in: i64
+}
+
+/// Email verification request
+type VerifyEmailRequest {
+    token: String
+}
+
+/// MFA setup response
+type MfaSetupResponse {
+    secret: String,
+    qr_code_url: String,
+    backup_codes: List<String>
+}
+
+/// MFA verify request
+type MfaVerifyRequest {
+    code: String,
+    mfa_token: Option<String>
+}
+
+/// Session info
+type SessionInfo {
+    id: String,
+    device_info: Option<DeviceInfo>,
+    ip_address: String,
+    location: Option<String>,
+    created_at: DateTime,
+    last_activity: DateTime,
+    is_current: Bool
+}
+
+// =============================================================================
+// LOGIN ENDPOINT
+// =============================================================================
+
+/// Handle user login
+async fn login(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Parse request body
+    let body: LoginRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate input
+    validate_login_input(&body)?;
+
+    // Find user by email
+    let user = db.users()
+        .find_by_email(&body.email)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Unauthorized {
+            message: "Invalid email or password".to_string()
+        })?;
+
+    // Check if account is active
+    if !user.is_active {
+        return Err(ApiError::Unauthorized {
+            message: "Account is disabled. Please contact support.".to_string()
+        })
+    }
+
+    // Check if account is locked
+    if user.is_locked() {
+        return Err(ApiError::Unauthorized {
+            message: "Account is temporarily locked due to too many failed login attempts.".to_string()
+        })
+    }
+
+    // Verify password
+    let password_valid = verify_password(&body.password, &user.password_hash)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if !password_valid {
+        // Record failed attempt
+        db.users().record_failed_login(&user.id).await.ok();
+
+        return Err(ApiError::Unauthorized {
+            message: "Invalid email or password".to_string()
+        })
+    }
+
+    // Check MFA if enabled
+    if user.mfa_enabled {
+        if let Some(mfa_code) = body.mfa_code {
+            // Verify MFA code
+            let mfa_valid = verify_mfa_code(&user, &mfa_code)
+                .map_err(|e| ApiError::Unauthorized {
+                    message: "Invalid MFA code".to_string()
+                })?;
+
+            if !mfa_valid {
+                return Err(ApiError::Unauthorized {
+                    message: "Invalid MFA code".to_string()
+                })
+            }
+        } else {
+            // MFA required but not provided - return partial response
+            let mfa_token = generate_mfa_token(&user.id);
+
+            return Ok(Response::json(LoginResponse {
+                access_token: "".to_string(),
+                refresh_token: "".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 0,
+                user: user_to_info(&user),
+                requires_mfa: true,
+                mfa_token: Some(mfa_token)
+            }).with_status(StatusCode::OK))
+        }
+    }
+
+    // Generate tokens
+    let token_duration = if body.remember_me.unwrap_or(false) {
+        Duration::days(30)
+    } else {
+        Duration::hours(24)
+    };
+
+    let (access_token, refresh_token) = generate_token_pair(&user, token_duration)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Create session
+    let session = create_session(
+        &user.id,
+        &ctx.ip_address,
+        body.device_info.as_ref()
+    ).await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })?;
+
+    // Record successful login
+    db.users().record_successful_login(&user.id, &ctx.ip_address).await.ok();
+
+    // Build response
+    let response = LoginResponse {
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+        token_type: "Bearer".to_string(),
+        expires_in: access_token.expires_in.as_seconds(),
+        user: user_to_info(&user),
+        requires_mfa: false,
+        mfa_token: None
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Validate login input
+fn validate_login_input(input: &LoginRequest) -> Result<(), ApiError> {
+    let mut errors = vec![];
+
+    if input.email.is_empty() {
+        errors.push(FieldError {
+            field: "email".to_string(),
+            code: "required".to_string(),
+            message: "Email is required".to_string()
+        });
+    } else if !is_valid_email(&input.email) {
+        errors.push(FieldError {
+            field: "email".to_string(),
+            code: "invalid".to_string(),
+            message: "Invalid email format".to_string()
+        });
+    }
+
+    if input.password.is_empty() {
+        errors.push(FieldError {
+            field: "password".to_string(),
+            code: "required".to_string(),
+            message: "Password is required".to_string()
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "".to_string(),
+            message: "Validation failed".to_string(),
+            errors
+        })
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// REGISTRATION ENDPOINT
+// =============================================================================
+
+/// Handle user registration
+async fn register(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Parse request body
+    let body: RegisterRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate input
+    validate_register_input(&body)?;
+
+    // Check terms acceptance
+    if !body.accept_terms {
+        return Err(ApiError::ValidationError {
+            field: "accept_terms".to_string(),
+            message: "You must accept the terms of service".to_string(),
+            errors: vec![FieldError {
+                field: "accept_terms".to_string(),
+                code: "required".to_string(),
+                message: "Terms acceptance is required".to_string()
+            }]
+        })
+    }
+
+    // Check if email already exists
+    let existing = db.users()
+        .find_by_email(&body.email)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if existing.is_some() {
+        return Err(ApiError::Conflict {
+            message: "An account with this email already exists".to_string()
+        })
+    }
+
+    // Hash password
+    let password_hash = hash_password(&body.password)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Determine tenant
+    let tenant_id = if let Some(code) = body.tenant_code {
+        db.tenants()
+            .find_by_code(&code)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+            .map(|t| t.id)
+    } else {
+        None
+    };
+
+    // Handle invite code
+    let invite = if let Some(code) = &body.invite_code {
+        db.invites()
+            .find_by_code(code)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    } else {
+        None
+    };
+
+    // Create user
+    let user = db.users().create(CreateUserInput {
+        email: body.email.clone(),
+        password_hash,
+        first_name: body.first_name.clone(),
+        last_name: body.last_name.clone(),
+        tenant_id,
+        role: SystemRole::Student,
+        email_verified: false
+    }).await.map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+        trace_id: ctx.trace_id.clone()
+    })?;
+
+    // Process invite if present
+    if let Some(invite) = invite {
+        db.invites().mark_used(&invite.id, &user.id).await.ok();
+
+        // Auto-enroll if invite has course
+        if let Some(course_id) = invite.course_id {
+            db.enrollments().create(CreateEnrollmentInput {
+                course_id,
+                user_id: user.id.clone(),
+                role: invite.role.unwrap_or(CourseRole::Student),
+                section_id: invite.section_id,
+                start_date: None,
+                end_date: None,
+                source: EnrollmentSource::Invite,
+                external_id: None,
+                metadata: None
+            }).await.ok();
+        }
+    }
+
+    // Send verification email
+    let verification_token = generate_verification_token(&user.id);
+    send_verification_email(&user.email, &user.first_name, &verification_token).await.ok();
+
+    // Build response (don't auto-login if email verification required)
+    let requires_verification = true; // Could be configurable
+
+    let response = if requires_verification {
+        RegisterResponse {
+            user: user_to_info(&user),
+            access_token: None,
+            refresh_token: None,
+            requires_verification: true,
+            message: "Registration successful. Please check your email to verify your account.".to_string()
+        }
+    } else {
+        // Auto-login
+        let (access_token, refresh_token) = generate_token_pair(&user, Duration::hours(24))
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?;
+
+        RegisterResponse {
+            user: user_to_info(&user),
+            access_token: Some(access_token.token),
+            refresh_token: Some(refresh_token.token),
+            requires_verification: false,
+            message: "Registration successful.".to_string()
+        }
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Validate registration input
+fn validate_register_input(input: &RegisterRequest) -> Result<(), ApiError> {
+    let mut errors = vec![];
+
+    if input.email.is_empty() {
+        errors.push(FieldError {
+            field: "email".to_string(),
+            code: "required".to_string(),
+            message: "Email is required".to_string()
+        });
+    } else if !is_valid_email(&input.email) {
+        errors.push(FieldError {
+            field: "email".to_string(),
+            code: "invalid".to_string(),
+            message: "Invalid email format".to_string()
+        });
+    }
+
+    if input.password.is_empty() {
+        errors.push(FieldError {
+            field: "password".to_string(),
+            code: "required".to_string(),
+            message: "Password is required".to_string()
+        });
+    } else if input.password.len() < 8 {
+        errors.push(FieldError {
+            field: "password".to_string(),
+            code: "too_short".to_string(),
+            message: "Password must be at least 8 characters".to_string()
+        });
+    } else if !is_strong_password(&input.password) {
+        errors.push(FieldError {
+            field: "password".to_string(),
+            code: "weak".to_string(),
+            message: "Password must contain uppercase, lowercase, number, and special character".to_string()
+        });
+    }
+
+    if input.first_name.is_empty() {
+        errors.push(FieldError {
+            field: "first_name".to_string(),
+            code: "required".to_string(),
+            message: "First name is required".to_string()
+        });
+    }
+
+    if input.last_name.is_empty() {
+        errors.push(FieldError {
+            field: "last_name".to_string(),
+            code: "required".to_string(),
+            message: "Last name is required".to_string()
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "".to_string(),
+            message: "Validation failed".to_string(),
+            errors
+        })
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// PASSWORD RESET ENDPOINTS
+// =============================================================================
+
+/// Handle forgot password request
+async fn forgot_password(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: ForgotPasswordRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Always return success to prevent email enumeration
+    let response_message = "If an account exists with this email, you will receive a password reset link.";
+
+    // Find user (don't reveal if not found)
+    let user = db.users()
+        .find_by_email(&body.email)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if let Some(user) = user {
+        // Generate reset token
+        let reset_token = generate_password_reset_token(&user.id);
+
+        // Store reset token
+        db.password_resets().create(&user.id, &reset_token, Duration::hours(24)).await.ok();
+
+        // Send email
+        send_password_reset_email(&user.email, &user.first_name, &reset_token).await.ok();
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String(response_message.to_string()))
+    ])))
+}
+
+/// Handle password reset
+async fn reset_password(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: ResetPasswordRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate passwords match
+    if body.password != body.password_confirmation {
+        return Err(ApiError::ValidationError {
+            field: "password_confirmation".to_string(),
+            message: "Passwords do not match".to_string(),
+            errors: vec![FieldError {
+                field: "password_confirmation".to_string(),
+                code: "mismatch".to_string(),
+                message: "Passwords do not match".to_string()
+            }]
+        })
+    }
+
+    // Validate password strength
+    if !is_strong_password(&body.password) {
+        return Err(ApiError::ValidationError {
+            field: "password".to_string(),
+            message: "Password is too weak".to_string(),
+            errors: vec![FieldError {
+                field: "password".to_string(),
+                code: "weak".to_string(),
+                message: "Password must contain uppercase, lowercase, number, and special character".to_string()
+            }]
+        })
+    }
+
+    // Find and validate reset token
+    let reset = db.password_resets()
+        .find_by_token(&body.token)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "Invalid or expired reset token".to_string()
+        })?;
+
+    // Check if expired
+    if reset.is_expired() {
+        return Err(ApiError::BadRequest {
+            message: "Reset token has expired".to_string()
+        })
+    }
+
+    // Hash new password
+    let password_hash = hash_password(&body.password)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Update password
+    db.users()
+        .update_password(&reset.user_id, &password_hash)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Invalidate all sessions for security
+    db.sessions().revoke_all_for_user(&reset.user_id).await.ok();
+
+    // Mark reset token as used
+    db.password_resets().mark_used(&body.token).await.ok();
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Password has been reset successfully.".to_string()))
+    ])))
+}
+
+/// Handle password change (authenticated)
+async fn change_password(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Require authentication
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let body: ChangePasswordRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate passwords match
+    if body.new_password != body.new_password_confirmation {
+        return Err(ApiError::ValidationError {
+            field: "new_password_confirmation".to_string(),
+            message: "Passwords do not match".to_string(),
+            errors: vec![FieldError {
+                field: "new_password_confirmation".to_string(),
+                code: "mismatch".to_string(),
+                message: "Passwords do not match".to_string()
+            }]
+        })
+    }
+
+    // Get user
+    let user = db.users()
+        .find_by_id(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: auth.user_id.to_string()
+        })?;
+
+    // Verify current password
+    let current_valid = verify_password(&body.current_password, &user.password_hash)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if !current_valid {
+        return Err(ApiError::Unauthorized {
+            message: "Current password is incorrect".to_string()
+        })
+    }
+
+    // Validate new password strength
+    if !is_strong_password(&body.new_password) {
+        return Err(ApiError::ValidationError {
+            field: "new_password".to_string(),
+            message: "Password is too weak".to_string(),
+            errors: vec![FieldError {
+                field: "new_password".to_string(),
+                code: "weak".to_string(),
+                message: "Password must contain uppercase, lowercase, number, and special character".to_string()
+            }]
+        })
+    }
+
+    // Hash and update password
+    let password_hash = hash_password(&body.new_password)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    db.users()
+        .update_password(&auth.user_id, &password_hash)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Password changed successfully.".to_string()))
+    ])))
+}
+
+// =============================================================================
+// TOKEN MANAGEMENT
+// =============================================================================
+
+/// Refresh access token
+async fn refresh(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: RefreshRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate and refresh token
+    let (new_access, new_refresh) = refresh_auth_token(&body.refresh_token)
+        .await
+        .map_err(|e| ApiError::Unauthorized {
+            message: "Invalid or expired refresh token".to_string()
+        })?;
+
+    let response = RefreshResponse {
+        access_token: new_access.token,
+        refresh_token: new_refresh.token,
+        token_type: "Bearer".to_string(),
+        expires_in: new_access.expires_in.as_seconds()
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Logout (invalidate current token)
+async fn logout(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    // Get token from request
+    if let Some(token) = extract_token_from_request(&req) {
+        // Revoke the token
+        revoke_token(&token).await.ok();
+    }
+
+    // Destroy session if exists
+    if let Some(auth) = &ctx.auth {
+        if let Some(session_id) = &auth.session_id {
+            destroy_session(session_id).await.ok();
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Logged out successfully.".to_string()))
+    ])))
+}
+
+/// Logout from all devices
+async fn logout_all(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    // Revoke all tokens for user
+    db.tokens().revoke_all_for_user(&auth.user_id).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Destroy all sessions
+    db.sessions().revoke_all_for_user(&auth.user_id).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Logged out from all devices.".to_string()))
+    ])))
+}
+
+// =============================================================================
+// EMAIL VERIFICATION
+// =============================================================================
+
+/// Verify email address
+async fn verify_email(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: VerifyEmailRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Find verification record
+    let verification = db.email_verifications()
+        .find_by_token(&body.token)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "Invalid or expired verification token".to_string()
+        })?;
+
+    // Check if expired
+    if verification.is_expired() {
+        return Err(ApiError::BadRequest {
+            message: "Verification token has expired".to_string()
+        })
+    }
+
+    // Mark email as verified
+    db.users()
+        .verify_email(&verification.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Mark token as used
+    db.email_verifications().mark_used(&body.token).await.ok();
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Email verified successfully.".to_string()))
+    ])))
+}
+
+/// Resend verification email
+async fn resend_verification(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    #[derive(Deserialize)]
+    struct ResendRequest {
+        email: String
+    }
+
+    let body: ResendRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Find user
+    let user = db.users()
+        .find_by_email(&body.email)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if let Some(user) = user {
+        if !user.email_verified {
+            // Generate new token
+            let token = generate_verification_token(&user.id);
+
+            // Send email
+            send_verification_email(&user.email, &user.first_name, &token).await.ok();
+        }
+    }
+
+    // Always return success to prevent enumeration
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("If the email exists and is not verified, a verification email has been sent.".to_string()))
+    ])))
+}
+
+// =============================================================================
+// OAUTH ENDPOINTS
+// =============================================================================
+
+/// Redirect to OAuth provider
+async fn oauth_redirect(req: Request, db: Database) -> Result<Response, ApiError> {
+    let provider = req.param("provider").ok_or_else(|| ApiError::BadRequest {
+        message: "Provider parameter required".to_string()
+    })?;
+
+    let oauth_provider = parse_oauth_provider(&provider)?;
+    let config = get_oauth_config(&oauth_provider)?;
+
+    // Generate state token for CSRF protection
+    let state = generate_oauth_state();
+
+    // Build authorization URL
+    let auth_url = build_oauth_auth_url(&config, &state);
+
+    // Store state for verification
+    store_oauth_state(&state, &provider).await;
+
+    Ok(Response::redirect(&auth_url))
+}
+
+/// Handle OAuth callback
+async fn oauth_callback(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let provider = req.param("provider").ok_or_else(|| ApiError::BadRequest {
+        message: "Provider parameter required".to_string()
+    })?;
+
+    let code = req.query_param("code").ok_or_else(|| ApiError::BadRequest {
+        message: "Authorization code required".to_string()
+    })?;
+
+    let state = req.query_param("state").ok_or_else(|| ApiError::BadRequest {
+        message: "State parameter required".to_string()
+    })?;
+
+    // Verify state
+    if !verify_oauth_state(&state).await {
+        return Err(ApiError::BadRequest {
+            message: "Invalid state parameter".to_string()
+        })
+    }
+
+    let oauth_provider = parse_oauth_provider(&provider)?;
+    let config = get_oauth_config(&oauth_provider)?;
+
+    // Exchange code for tokens
+    let oauth_tokens = exchange_oauth_code(&config, &code).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Get user info from provider
+    let oauth_user = get_oauth_user_info(&config, &oauth_tokens.access_token).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Find or create user
+    let user = find_or_create_oauth_user(&db, &oauth_provider, &oauth_user).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Generate tokens
+    let (access_token, refresh_token) = generate_token_pair(&user, Duration::hours(24))
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Create session
+    create_session(&user.id, &ctx.ip_address, None).await.ok();
+
+    let response = LoginResponse {
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+        token_type: "Bearer".to_string(),
+        expires_in: access_token.expires_in.as_seconds(),
+        user: user_to_info(&user),
+        requires_mfa: false,
+        mfa_token: None
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Exchange OAuth token (for mobile apps)
+async fn oauth_token_exchange(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let provider = req.param("provider").ok_or_else(|| ApiError::BadRequest {
+        message: "Provider parameter required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct TokenExchangeRequest {
+        access_token: String
+    }
+
+    let body: TokenExchangeRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let oauth_provider = parse_oauth_provider(&provider)?;
+    let config = get_oauth_config(&oauth_provider)?;
+
+    // Get user info using the provided token
+    let oauth_user = get_oauth_user_info(&config, &body.access_token).await
+        .map_err(|e| ApiError::Unauthorized {
+            message: "Invalid OAuth token".to_string()
+        })?;
+
+    // Find or create user
+    let user = find_or_create_oauth_user(&db, &oauth_provider, &oauth_user).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Generate our tokens
+    let (access_token, refresh_token) = generate_token_pair(&user, Duration::hours(24))
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = LoginResponse {
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+        token_type: "Bearer".to_string(),
+        expires_in: access_token.expires_in.as_seconds(),
+        user: user_to_info(&user),
+        requires_mfa: false,
+        mfa_token: None
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// SSO ENDPOINTS
+// =============================================================================
+
+/// Redirect to SSO provider
+async fn sso_redirect(req: Request, db: Database) -> Result<Response, ApiError> {
+    let provider = req.param("provider").ok_or_else(|| ApiError::BadRequest {
+        message: "Provider parameter required".to_string()
+    })?;
+
+    // Get SSO config from tenant settings
+    let tenant_id = req.query_param("tenant");
+    let sso_config = get_sso_config(&provider, tenant_id.as_deref()).await?;
+
+    // Generate SAML request or OIDC authorization URL
+    let redirect_url = build_sso_redirect_url(&sso_config).await?;
+
+    Ok(Response::redirect(&redirect_url))
+}
+
+/// Handle SSO callback
+async fn sso_callback(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let provider = req.param("provider").ok_or_else(|| ApiError::BadRequest {
+        message: "Provider parameter required".to_string()
+    })?;
+
+    // Parse SSO response (SAML assertion or OIDC tokens)
+    let sso_user = parse_sso_response(&req, &provider).await
+        .map_err(|e| ApiError::Unauthorized {
+            message: format!("SSO authentication failed: {}", e)
+        })?;
+
+    // Find or create user
+    let user = find_or_create_sso_user(&db, &provider, &sso_user).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Generate tokens
+    let (access_token, refresh_token) = generate_token_pair(&user, Duration::hours(24))
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = LoginResponse {
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+        token_type: "Bearer".to_string(),
+        expires_in: access_token.expires_in.as_seconds(),
+        user: user_to_info(&user),
+        requires_mfa: false,
+        mfa_token: None
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// SESSION MANAGEMENT
+// =============================================================================
+
+/// List active sessions
+async fn list_sessions(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let sessions = db.sessions()
+        .find_by_user(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let current_session_id = auth.session_id.clone();
+
+    let session_infos: List<SessionInfo> = sessions.iter().map(|s| SessionInfo {
+        id: s.id.clone(),
+        device_info: s.device_info.clone(),
+        ip_address: s.ip_address.clone(),
+        location: s.location.clone(),
+        created_at: s.created_at,
+        last_activity: s.last_activity,
+        is_current: current_session_id.as_ref() == Some(&s.id)
+    }).collect();
+
+    Ok(Response::json(ApiResponse::success(session_infos, &ctx)))
+}
+
+/// Revoke a specific session
+async fn revoke_session(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let session_id = req.param("session_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Session ID required".to_string()
+    })?;
+
+    // Verify session belongs to user
+    let session = db.sessions()
+        .find_by_id(&session_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Session".to_string(),
+            id: session_id.clone()
+        })?;
+
+    if session.user_id != auth.user_id {
+        return Err(ApiError::Forbidden {
+            message: "Cannot revoke another user's session".to_string(),
+            required_permission: None
+        })
+    }
+
+    // Revoke session
+    destroy_session(&session_id).await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Session revoked successfully.".to_string()))
+    ])))
+}
+
+// =============================================================================
+// CURRENT USER
+// =============================================================================
+
+/// Get current user info
+async fn get_current_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let user = db.users()
+        .find_by_id(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: auth.user_id.to_string()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(user_to_info(&user), &ctx)))
+}
+
+/// Update current user
+async fn update_current_user(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct UpdateUserRequest {
+        first_name: Option<String>,
+        last_name: Option<String>,
+        display_name: Option<String>,
+        phone: Option<String>,
+        timezone: Option<String>,
+        locale: Option<String>,
+        bio: Option<String>
+    }
+
+    let body: UpdateUserRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let user = db.users()
+        .update(&auth.user_id, UpdateUserInput {
+            first_name: body.first_name,
+            last_name: body.last_name,
+            display_name: body.display_name,
+            phone: body.phone,
+            timezone: body.timezone,
+            locale: body.locale,
+            bio: body.bio,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(user_to_info(&user), &ctx)))
+}
+
+// =============================================================================
+// MFA ENDPOINTS
+// =============================================================================
+
+/// Setup MFA for current user
+async fn setup_mfa(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    // Generate TOTP secret
+    let secret = generate_totp_secret();
+    let qr_code_url = generate_totp_qr_url(&auth.user_id, &secret);
+    let backup_codes = generate_backup_codes(10);
+
+    // Store pending MFA setup (not activated yet)
+    db.users()
+        .store_pending_mfa(&auth.user_id, &secret, &backup_codes)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = MfaSetupResponse {
+        secret,
+        qr_code_url,
+        backup_codes
+    };
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+/// Verify and activate MFA
+async fn verify_mfa(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: MfaVerifyRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Handle MFA verification during login (with mfa_token)
+    if let Some(mfa_token) = body.mfa_token {
+        return verify_login_mfa(&db, &ctx, &mfa_token, &body.code).await
+    }
+
+    // Handle MFA activation (authenticated user)
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    // Get pending MFA secret
+    let pending = db.users()
+        .get_pending_mfa(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "No pending MFA setup found".to_string()
+        })?;
+
+    // Verify code against pending secret
+    if !verify_totp(&pending.secret, &body.code) {
+        return Err(ApiError::Unauthorized {
+            message: "Invalid verification code".to_string()
+        })
+    }
+
+    // Activate MFA
+    db.users()
+        .activate_mfa(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("MFA enabled successfully.".to_string()))
+    ])))
+}
+
+/// Verify MFA during login
+async fn verify_login_mfa(
+    db: &Database,
+    ctx: &RequestContext,
+    mfa_token: &str,
+    code: &str
+) -> Result<Response, ApiError> {
+    // Validate MFA token and get user ID
+    let user_id = validate_mfa_token(mfa_token)
+        .map_err(|e| ApiError::Unauthorized {
+            message: "Invalid or expired MFA token".to_string()
+        })?;
+
+    // Get user
+    let user = db.users()
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: user_id.to_string()
+        })?;
+
+    // Verify code
+    let mfa_valid = verify_mfa_code(&user, code)
+        .map_err(|e| ApiError::Unauthorized {
+            message: "Invalid MFA code".to_string()
+        })?;
+
+    if !mfa_valid {
+        return Err(ApiError::Unauthorized {
+            message: "Invalid MFA code".to_string()
+        })
+    }
+
+    // Generate tokens
+    let (access_token, refresh_token) = generate_token_pair(&user, Duration::hours(24))
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = LoginResponse {
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+        token_type: "Bearer".to_string(),
+        expires_in: access_token.expires_in.as_seconds(),
+        user: user_to_info(&user),
+        requires_mfa: false,
+        mfa_token: None
+    };
+
+    Ok(Response::json(ApiResponse::success(response, ctx)))
+}
+
+/// Disable MFA
+async fn disable_mfa(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct DisableMfaRequest {
+        password: String,
+        code: String
+    }
+
+    let body: DisableMfaRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Get user
+    let user = db.users()
+        .find_by_id(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: auth.user_id.to_string()
+        })?;
+
+    // Verify password
+    let password_valid = verify_password(&body.password, &user.password_hash)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if !password_valid {
+        return Err(ApiError::Unauthorized {
+            message: "Invalid password".to_string()
+        })
+    }
+
+    // Verify MFA code
+    let mfa_valid = verify_mfa_code(&user, &body.code)
+        .map_err(|e| ApiError::Unauthorized {
+            message: "Invalid MFA code".to_string()
+        })?;
+
+    if !mfa_valid {
+        return Err(ApiError::Unauthorized {
+            message: "Invalid MFA code".to_string()
+        })
+    }
+
+    // Disable MFA
+    db.users()
+        .disable_mfa(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("MFA disabled successfully.".to_string()))
+    ])))
+}
+
+/// Get MFA recovery codes
+async fn get_recovery_codes(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let codes = db.users()
+        .get_recovery_codes(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(codes, &ctx)))
+}
+
+/// Regenerate MFA recovery codes
+async fn regenerate_recovery_codes(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let auth = ctx.auth.as_ref().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    #[derive(Deserialize)]
+    struct RegenerateRequest {
+        password: String
+    }
+
+    let body: RegenerateRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Get user
+    let user = db.users()
+        .find_by_id(&auth.user_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "User".to_string(),
+            id: auth.user_id.to_string()
+        })?;
+
+    // Verify password
+    let password_valid = verify_password(&body.password, &user.password_hash)
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if !password_valid {
+        return Err(ApiError::Unauthorized {
+            message: "Invalid password".to_string()
+        })
+    }
+
+    // Generate new codes
+    let new_codes = generate_backup_codes(10);
+
+    // Store new codes
+    db.users()
+        .update_recovery_codes(&auth.user_id, &new_codes)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(new_codes, &ctx)))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Convert user to info struct
+fn user_to_info(user: &User) -> UserInfo {
+    UserInfo {
+        id: user.id.clone(),
+        email: user.email.clone(),
+        name: format!("{} {}", user.first_name, user.last_name),
+        first_name: user.first_name.clone(),
+        last_name: user.last_name.clone(),
+        avatar_url: user.avatar_url.clone(),
+        roles: user.roles.clone(),
+        permissions: user.get_permission_strings(),
+        tenant_id: user.primary_tenant_id.clone(),
+        email_verified: user.email_verified,
+        mfa_enabled: user.mfa_enabled
+    }
+}
+
+/// Validate email format
+fn is_valid_email(email: &str) -> Bool {
+    // Basic email validation
+    email.contains('@') && email.contains('.') && email.len() >= 5
+}
+
+/// Check password strength
+fn is_strong_password(password: &str) -> Bool {
+    if password.len() < 8 {
+        return false
+    }
+
+    let has_upper = password.chars().any(|c| c.is_uppercase());
+    let has_lower = password.chars().any(|c| c.is_lowercase());
+    let has_digit = password.chars().any(|c| c.is_numeric());
+    let has_special = password.chars().any(|c| !c.is_alphanumeric());
+
+    has_upper && has_lower && has_digit && has_special
+}
+
+/// Extract token from request
+fn extract_token_from_request(req: &Request) -> Option<String> {
+    if let Some(auth_header) = req.header("Authorization") {
+        if auth_header.starts_with("Bearer ") {
+            return Some(auth_header[7..].to_string())
+        }
+    }
+    None
+}
+
+// Placeholder functions for external services
+fn generate_verification_token(user_id: &UserId) -> String {
+    format!("verify_{}", generate_uuid())
+}
+
+fn generate_password_reset_token(user_id: &UserId) -> String {
+    format!("reset_{}", generate_uuid())
+}
+
+fn generate_mfa_token(user_id: &UserId) -> String {
+    // Create a short-lived JWT for MFA challenge
+    let now = std::time::now().as_secs() as i64;
+    let exp = now + 300; // 5 minutes expiration
+
+    let header = base64::encode_url_safe(r#"{"alg":"HS256","typ":"JWT"}"#);
+
+    let payload = std::json::to_string(&Map::from([
+        ("sub".to_string(), Dynamic::String(user_id.0.clone())),
+        ("type".to_string(), Dynamic::String("mfa_challenge".to_string())),
+        ("iat".to_string(), Dynamic::Int(now)),
+        ("exp".to_string(), Dynamic::Int(exp)),
+        ("jti".to_string(), Dynamic::String(generate_uuid()))
+    ])).unwrap_or_default();
+
+    let payload_b64 = base64::encode_url_safe(&payload);
+
+    // Sign with MFA token secret
+    let mfa_secret = std::env::var("MFA_TOKEN_SECRET")
+        .unwrap_or_else(|_| "default_mfa_secret_change_in_production".to_string());
+
+    let header_payload = format!("{}.{}", header, payload_b64);
+    let signature = std::crypto::hmac_sha256(mfa_secret.as_bytes(), header_payload.as_bytes());
+    let signature_b64 = base64::encode_url_safe(&signature);
+
+    format!("mfa_{}.{}.{}", header, payload_b64, signature_b64)
+}
+
+fn validate_mfa_token(token: &str) -> Result<UserId, String> {
+    // MFA tokens are short-lived JWTs that grant access to complete MFA flow
+    // Format: mfa_<jwt>
+
+    if !token.starts_with("mfa_") {
+        return Err("Invalid MFA token format".to_string());
+    }
+
+    let jwt_part = &token[4..];
+
+    // Parse JWT structure
+    let parts: Vec<&str> = jwt_part.split('.').collect();
+    if parts.len() != 3 {
+        return Err("Invalid MFA token JWT structure".to_string());
+    }
+
+    // Decode payload
+    let payload_bytes = base64::decode_url_safe(parts[1])
+        .map_err(|e| format!("Failed to decode MFA token payload: {}", e))?;
+
+    let payload_str = String::from_utf8(payload_bytes)
+        .map_err(|e| format!("Invalid UTF-8 in MFA token: {}", e))?;
+
+    let claims: Map<String, Dynamic> = std::json::from_str(&payload_str)
+        .map_err(|e| format!("Failed to parse MFA token claims: {}", e))?;
+
+    // Check expiration
+    if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
+        let now = std::time::now().as_secs() as i64;
+        if now > exp {
+            return Err("MFA token has expired".to_string());
+        }
+    } else {
+        return Err("MFA token missing expiration".to_string());
+    }
+
+    // Check token type
+    if claims.get("type").and_then(|v| v.as_str()) != Some("mfa_challenge") {
+        return Err("Invalid MFA token type".to_string());
+    }
+
+    // Extract user ID
+    let user_id = claims.get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or("MFA token missing subject claim")?;
+
+    // Verify signature against MFA secret
+    let mfa_secret = std::env::var("MFA_TOKEN_SECRET")
+        .map_err(|_| "MFA token secret not configured")?;
+
+    let header_payload = format!("{}.{}", parts[0], parts[1]);
+    let signature = base64::decode_url_safe(parts[2])
+        .map_err(|_| "Invalid MFA token signature encoding")?;
+
+    let expected = std::crypto::hmac_sha256(mfa_secret.as_bytes(), header_payload.as_bytes());
+
+    if !std::crypto::constant_time_eq(&signature, &expected) {
+        return Err("Invalid MFA token signature".to_string());
+    }
+
+    Ok(UserId(user_id.to_string()))
+}
+
+fn verify_mfa_code(user: &User, code: &str) -> Result<Bool, String> {
+    // Check if code is a recovery code first
+    if code.len() == 8 && code.chars().all(|c| c.is_numeric()) {
+        return verify_recovery_code(user, code);
+    }
+
+    // Otherwise verify as TOTP code
+    verify_totp_code(user, code)
+}
+
+fn verify_totp_code(user: &User, code: &str) -> Result<Bool, String> {
+    // TOTP codes are 6 digits
+    if code.len() != 6 || !code.chars().all(|c| c.is_numeric()) {
+        return Ok(false);
+    }
+
+    let secret = user.mfa_secret.as_ref()
+        .ok_or("User does not have MFA configured")?;
+
+    // Decode the base32 secret
+    let secret_bytes = base32::decode(secret)
+        .ok_or("Invalid MFA secret format")?;
+
+    // Get current time step (30 seconds per step)
+    let now = std::time::now().as_secs();
+    let time_step = now / 30;
+
+    // Check current time step and adjacent steps for clock skew tolerance
+    for offset in [-1i64, 0, 1] {
+        let check_step = (time_step as i64 + offset) as u64;
+        let expected_code = generate_totp(&secret_bytes, check_step);
+
+        if code == expected_code {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn generate_totp(secret: &[u8], time_step: u64) -> String {
+    // HMAC-SHA1 based TOTP generation (RFC 6238)
+    let time_bytes = time_step.to_be_bytes();
+
+    let hmac = std::crypto::hmac_sha1(secret, &time_bytes);
+
+    // Dynamic truncation
+    let offset = (hmac[19] & 0x0f) as usize;
+    let binary = ((hmac[offset] & 0x7f) as u32) << 24
+        | (hmac[offset + 1] as u32) << 16
+        | (hmac[offset + 2] as u32) << 8
+        | (hmac[offset + 3] as u32);
+
+    // Generate 6-digit code
+    let code = binary % 1_000_000;
+    format!("{:06}", code)
+}
+
+fn verify_recovery_code(user: &User, code: &str) -> Result<Bool, String> {
+    // Recovery codes are stored hashed
+    let code_hash = std::crypto::sha256(code.as_bytes());
+    let hash_hex = std::hex::encode(&code_hash);
+
+    // Check against stored recovery codes
+    if let Some(ref recovery_codes) = user.recovery_codes {
+        for stored in recovery_codes {
+            if stored.hash == hash_hex && !stored.used {
+                // Mark code as used (would need database update)
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn generate_totp_secret() -> String {
+    // Would generate base32 secret
+    "JBSWY3DPEHPK3PXP".to_string()
+}
+
+fn generate_totp_qr_url(user_id: &UserId, secret: &str) -> String {
+    format!("otpauth://totp/Intelligo:{}?secret={}&issuer=Intelligo", user_id, secret)
+}
+
+fn verify_totp(secret: &str, code: &str) -> Bool {
+    // Would verify TOTP code against secret
+    true
+}
+
+fn generate_backup_codes(count: i32) -> List<String> {
+    (0..count).map(|_| format!("{:08}", std::random::random::<u32>() % 100000000)).collect()
+}
+
+async fn send_verification_email(email: &str, name: &str, token: &str) -> Result<(), String> {
+    // Would send email via email service
+    Ok(())
+}
+
+async fn send_password_reset_email(email: &str, name: &str, token: &str) -> Result<(), String> {
+    // Would send email via email service
+    Ok(())
+}
+
+fn parse_oauth_provider(provider: &str) -> Result<OAuthProvider, ApiError> {
+    match provider.to_lowercase().as_str() {
+        "google" => Ok(OAuthProvider::Google),
+        "microsoft" => Ok(OAuthProvider::Microsoft),
+        "github" => Ok(OAuthProvider::GitHub),
+        "apple" => Ok(OAuthProvider::Apple),
+        _ => Err(ApiError::BadRequest {
+            message: format!("Unknown OAuth provider: {}", provider)
+        })
+    }
+}
+
+fn get_oauth_config(provider: &OAuthProvider) -> Result<OAuthConfig, ApiError> {
+    // Would load from environment/config
+    Ok(OAuthConfig {
+        client_id: "".to_string(),
+        client_secret: "".to_string(),
+        redirect_uri: "".to_string(),
+        scopes: vec![],
+        auth_url: "".to_string(),
+        token_url: "".to_string(),
+        user_info_url: "".to_string()
+    })
+}
+
+fn generate_oauth_state() -> String {
+    generate_uuid()
+}
+
+fn build_oauth_auth_url(config: &OAuthConfig, state: &str) -> String {
+    format!("{}?client_id={}&redirect_uri={}&state={}&response_type=code&scope={}",
+        config.auth_url,
+        config.client_id,
+        config.redirect_uri,
+        state,
+        config.scopes.join(" ")
+    )
+}
+
+async fn store_oauth_state(state: &str, provider: &str) {
+    // Would store in Redis/session
+}
+
+async fn verify_oauth_state(state: &str) -> Bool {
+    // Would verify against stored state
+    true
+}
+
+async fn exchange_oauth_code(config: &OAuthConfig, code: &str) -> Result<OAuthToken, String> {
+    // Would exchange code for tokens
+    Ok(OAuthToken {
+        access_token: "".to_string(),
+        refresh_token: None,
+        expires_in: 3600,
+        token_type: "Bearer".to_string()
+    })
+}
+
+async fn get_oauth_user_info(config: &OAuthConfig, access_token: &str) -> Result<OAuthUserInfo, String> {
+    // Would fetch user info from provider
+    Ok(OAuthUserInfo {
+        id: "".to_string(),
+        email: "".to_string(),
+        name: "".to_string(),
+        first_name: None,
+        last_name: None,
+        avatar_url: None,
+        email_verified: true
+    })
+}
+
+type OAuthUserInfo {
+    id: String,
+    email: String,
+    name: String,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    avatar_url: Option<String>,
+    email_verified: Bool
+}
+
+async fn find_or_create_oauth_user(
+    db: &Database,
+    provider: &OAuthProvider,
+    oauth_user: &OAuthUserInfo
+) -> Result<User, String> {
+    let provider_name = match provider {
+        OAuthProvider::Google => "google",
+        OAuthProvider::Microsoft => "microsoft",
+        OAuthProvider::GitHub => "github",
+        OAuthProvider::Apple => "apple",
+    };
+
+    // Try to find existing user by OAuth provider identity
+    let existing = db.user_identities()
+        .find_by_provider_id(provider_name, &oauth_user.id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(identity) = existing {
+        // Found existing linked identity, get the user
+        let user = db.users()
+            .find_by_id(&identity.user_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("User linked to identity not found")?;
+
+        // Update last login timestamp
+        db.user_identities()
+            .update_last_used(&identity.id)
+            .await
+            .ok();
+
+        return Ok(user);
+    }
+
+    // Check if user exists by email
+    let existing_user = db.users()
+        .find_by_email(&oauth_user.email)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(user) = existing_user {
+        // User exists but doesn't have this OAuth provider linked
+        // Link the new OAuth identity to existing user
+        db.user_identities().create(CreateUserIdentityInput {
+            user_id: user.id.clone(),
+            provider: provider_name.to_string(),
+            provider_user_id: oauth_user.id.clone(),
+            email: oauth_user.email.clone(),
+            name: oauth_user.name.clone(),
+            avatar_url: oauth_user.avatar_url.clone(),
+            access_token: None, // Don't store tokens by default
+            refresh_token: None,
+            expires_at: None,
+        }).await.map_err(|e| e.to_string())?;
+
+        return Ok(user);
+    }
+
+    // Create new user from OAuth data
+    let (first_name, last_name) = if let (Some(first), Some(last)) = (&oauth_user.first_name, &oauth_user.last_name) {
+        (first.clone(), last.clone())
+    } else {
+        // Parse name into first/last
+        let parts: Vec<&str> = oauth_user.name.splitn(2, ' ').collect();
+        (
+            parts.get(0).unwrap_or(&"").to_string(),
+            parts.get(1).unwrap_or(&"").to_string()
+        )
+    };
+
+    // Generate a random password for OAuth users (they won't use it)
+    let random_password = format!("oauth_{}", generate_uuid());
+    let password_hash = hash_password(&random_password)
+        .map_err(|e| e.to_string())?;
+
+    let user = db.users().create(CreateUserInput {
+        email: oauth_user.email.clone(),
+        password_hash,
+        first_name,
+        last_name,
+        tenant_id: None,
+        role: SystemRole::Student,
+        email_verified: oauth_user.email_verified, // Trust OAuth provider's verification
+    }).await.map_err(|e| e.to_string())?;
+
+    // Set avatar if provided
+    if let Some(avatar_url) = &oauth_user.avatar_url {
+        db.users()
+            .update(&user.id, UpdateUserInput {
+                avatar_url: Some(avatar_url.clone()),
+                ..Default::default()
+            })
+            .await
+            .ok();
+    }
+
+    // Create the OAuth identity link
+    db.user_identities().create(CreateUserIdentityInput {
+        user_id: user.id.clone(),
+        provider: provider_name.to_string(),
+        provider_user_id: oauth_user.id.clone(),
+        email: oauth_user.email.clone(),
+        name: oauth_user.name.clone(),
+        avatar_url: oauth_user.avatar_url.clone(),
+        access_token: None,
+        refresh_token: None,
+        expires_at: None,
+    }).await.map_err(|e| e.to_string())?;
+
+    Ok(user)
+}
+
+async fn get_sso_config(provider: &str, tenant_id: Option<&str>) -> Result<SsoConfig, ApiError> {
+    // Would load SSO config from tenant settings
+    Ok(SsoConfig {
+        provider: provider.to_string(),
+        entity_id: "".to_string(),
+        sso_url: "".to_string(),
+        certificate: "".to_string()
+    })
+}
+
+type SsoConfig {
+    provider: String,
+    entity_id: String,
+    sso_url: String,
+    certificate: String
+}
+
+async fn build_sso_redirect_url(config: &SsoConfig) -> Result<String, ApiError> {
+    Ok(config.sso_url.clone())
+}
+
+async fn parse_sso_response(req: &Request, provider: &str) -> Result<SsoUser, String> {
+    // Would parse SAML response or OIDC tokens
+    Ok(SsoUser {
+        id: "".to_string(),
+        email: "".to_string(),
+        name: "".to_string(),
+        groups: vec![]
+    })
+}
+
+type SsoUser {
+    id: String,
+    email: String,
+    name: String,
+    groups: List<String>
+}
+
+async fn find_or_create_sso_user(
+    db: &Database,
+    provider: &str,
+    sso_user: &SsoUser
+) -> Result<User, String> {
+    // SSO users are typically enterprise users, so we need to:
+    // 1. Find by SSO external ID
+    // 2. Fall back to email lookup
+    // 3. Create new user if neither found
+
+    // Try to find by SSO external ID
+    let existing = db.users()
+        .find_by_external_id(provider, &sso_user.id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(user) = existing {
+        // Update SSO attributes that may have changed
+        let updated = db.users()
+            .update(&user.id, UpdateUserInput {
+                display_name: Some(sso_user.name.clone()),
+                sso_groups: Some(sso_user.groups.clone()),
+                last_sso_login: Some(DateTime::now()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Sync group memberships if enabled
+        if !sso_user.groups.is_empty() {
+            sync_sso_groups(db, &user.id, &sso_user.groups).await.ok();
+        }
+
+        return Ok(updated);
+    }
+
+    // Try to find by email
+    let existing_by_email = db.users()
+        .find_by_email(&sso_user.email)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(user) = existing_by_email {
+        // Link SSO identity to existing user
+        db.users()
+            .update(&user.id, UpdateUserInput {
+                external_id: Some(sso_user.id.clone()),
+                external_provider: Some(provider.to_string()),
+                sso_groups: Some(sso_user.groups.clone()),
+                last_sso_login: Some(DateTime::now()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Sync groups
+        if !sso_user.groups.is_empty() {
+            sync_sso_groups(db, &user.id, &sso_user.groups).await.ok();
+        }
+
+        return Ok(user);
+    }
+
+    // Determine tenant from SSO configuration
+    let tenant_id = db.sso_configs()
+        .get_tenant_for_provider(provider)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Parse name into first/last
+    let parts: Vec<&str> = sso_user.name.splitn(2, ' ').collect();
+    let first_name = parts.get(0).unwrap_or(&"").to_string();
+    let last_name = parts.get(1).unwrap_or(&"").to_string();
+
+    // Generate a random password (SSO users authenticate via SSO, not password)
+    let random_password = format!("sso_{}", generate_uuid());
+    let password_hash = hash_password(&random_password)
+        .map_err(|e| e.to_string())?;
+
+    // Determine role from SSO groups
+    let role = determine_role_from_groups(&sso_user.groups);
+
+    let user = db.users().create(CreateUserInput {
+        email: sso_user.email.clone(),
+        password_hash,
+        first_name,
+        last_name,
+        tenant_id,
+        role,
+        email_verified: true, // SSO users are considered verified
+    }).await.map_err(|e| e.to_string())?;
+
+    // Set SSO-specific attributes
+    db.users()
+        .update(&user.id, UpdateUserInput {
+            external_id: Some(sso_user.id.clone()),
+            external_provider: Some(provider.to_string()),
+            sso_groups: Some(sso_user.groups.clone()),
+            auth_method: Some(AuthMethod::SSO { provider: provider.to_string() }),
+            last_sso_login: Some(DateTime::now()),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Sync group memberships
+    if !sso_user.groups.is_empty() {
+        sync_sso_groups(db, &user.id, &sso_user.groups).await.ok();
+    }
+
+    Ok(user)
+}
+
+/// Sync user's group memberships based on SSO groups
+async fn sync_sso_groups(db: &Database, user_id: &UserId, sso_groups: &List<String>) -> Result<(), String> {
+    // Get group mapping configuration
+    let mappings = db.sso_group_mappings()
+        .get_all()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut target_roles: List<SystemRole> = vec![];
+    let mut target_course_enrollments: List<(CourseId, CourseRole)> = vec![];
+
+    for sso_group in sso_groups {
+        for mapping in &mappings {
+            if mapping.sso_group == *sso_group {
+                match &mapping.target {
+                    GroupMappingTarget::SystemRole(role) => {
+                        if !target_roles.contains(role) {
+                            target_roles.push(role.clone());
+                        }
+                    }
+                    GroupMappingTarget::CourseEnrollment { course_id, role } => {
+                        target_course_enrollments.push((course_id.clone(), role.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Update system roles
+    if !target_roles.is_empty() {
+        db.users()
+            .set_roles(user_id, &target_roles)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Create/update course enrollments
+    for (course_id, role) in target_course_enrollments {
+        db.enrollments()
+            .upsert_sso_enrollment(user_id, &course_id, &role)
+            .await
+            .ok();
+    }
+
+    Ok(())
+}
+
+/// Determine initial system role from SSO groups
+fn determine_role_from_groups(groups: &List<String>) -> SystemRole {
+    // Check for admin-like groups
+    let admin_patterns = ["admin", "administrator", "superuser", "super_admin"];
+    for group in groups {
+        let lower = group.to_lowercase();
+        for pattern in &admin_patterns {
+            if lower.contains(pattern) {
+                return SystemRole::Admin;
+            }
+        }
+    }
+
+    // Check for instructor/teacher groups
+    let instructor_patterns = ["instructor", "teacher", "faculty", "professor"];
+    for group in groups {
+        let lower = group.to_lowercase();
+        for pattern in &instructor_patterns {
+            if lower.contains(pattern) {
+                return SystemRole::Instructor;
+            }
+        }
+    }
+
+    // Check for staff groups
+    let staff_patterns = ["staff", "support", "helpdesk"];
+    for group in groups {
+        let lower = group.to_lowercase();
+        for pattern in &staff_patterns {
+            if lower.contains(pattern) {
+                return SystemRole::Staff;
+            }
+        }
+    }
+
+    // Default to student
+    SystemRole::Student
+}
+
+/// Group mapping target type
+enum GroupMappingTarget {
+    SystemRole(SystemRole),
+    CourseEnrollment { course_id: CourseId, role: CourseRole }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use LoginRequest;
+pub use LoginResponse;
+pub use RegisterRequest;
+pub use RegisterResponse;
+pub use UserInfo;

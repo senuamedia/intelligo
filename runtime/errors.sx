@@ -1,0 +1,638 @@
+/// Intelligo LMS - Error Handling
+///
+/// Provides comprehensive error types and handling utilities.
+
+module intelligo::runtime::errors
+
+use std::collections::{Map, List}
+use std::time::DateTime
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// Base error trait
+pub trait Error: std::fmt::Display + std::fmt::Debug + Send + Sync {
+    /// Error code
+    fn code(&self) -> &str;
+
+    /// Error message
+    fn message(&self) -> &str;
+
+    /// Source error if any
+    fn source(&self) -> Option<&dyn Error> {
+        None
+    }
+
+    /// HTTP status code
+    fn status_code(&self) -> i32 {
+        500
+    }
+
+    /// Is this error retryable?
+    fn is_retryable(&self) -> bool {
+        false
+    }
+
+    /// Convert to LMS error
+    fn to_lms_error(&self) -> LmsError {
+        LmsError {
+            code: self.code().to_string(),
+            message: self.message().to_string(),
+            status_code: self.status_code(),
+            details: Map::new(),
+            source: None,
+            stack_trace: None,
+            timestamp: DateTime::now()
+        }
+    }
+}
+
+/// Main LMS error type
+#[derive(Clone, Debug)]
+pub type LmsError {
+    code: String,
+    message: String,
+    status_code: i32,
+    details: Map<String, String>,
+    source: Option<Box<LmsError>>,
+    stack_trace: Option<String>,
+    timestamp: DateTime
+}
+
+impl LmsError {
+    /// Create a new error
+    pub fn new(code: &str, message: &str) -> LmsError {
+        LmsError {
+            code: code.to_string(),
+            message: message.to_string(),
+            status_code: 500,
+            details: Map::new(),
+            source: None,
+            stack_trace: None,
+            timestamp: DateTime::now()
+        }
+    }
+
+    /// Create with status code
+    pub fn with_status(code: &str, message: &str, status_code: i32) -> LmsError {
+        LmsError {
+            code: code.to_string(),
+            message: message.to_string(),
+            status_code,
+            details: Map::new(),
+            source: None,
+            stack_trace: None,
+            timestamp: DateTime::now()
+        }
+    }
+
+    /// Add a detail
+    pub fn with_detail(mut self, key: &str, value: &str) -> Self {
+        self.details.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Set source error
+    pub fn with_source(mut self, source: LmsError) -> Self {
+        self.source = Some(Box::new(source));
+        self
+    }
+
+    /// Capture stack trace
+    pub fn with_stack_trace(mut self) -> Self {
+        // In a real implementation, capture actual stack trace
+        self.stack_trace = Some("Stack trace captured".to_string());
+        self
+    }
+
+    /// Convert to JSON
+    pub fn to_json(&self) -> String {
+        let mut json = format!(
+            r#"{{"code":"{}","message":"{}","status_code":{}"#,
+            escape_json(&self.code),
+            escape_json(&self.message),
+            self.status_code
+        );
+
+        if !self.details.is_empty() {
+            let details: Vec<String> = self.details.iter()
+                .map(|(k, v)| format!(r#""{}":"{}""#, escape_json(k), escape_json(v)))
+                .collect();
+            json.push_str(&format!(r#","details":{{{}}}"#, details.join(",")));
+        }
+
+        json.push_str(&format!(r#","timestamp":"{}""#, self.timestamp.to_rfc3339()));
+        json.push('}');
+        json
+    }
+}
+
+impl std::fmt::Display for LmsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+}
+
+// =============================================================================
+// COMMON ERRORS
+// =============================================================================
+
+/// Not found error
+pub fn not_found(resource: &str, id: &str) -> LmsError {
+    LmsError::with_status(
+        "NOT_FOUND",
+        &format!("{} with ID '{}' not found", resource, id),
+        404
+    ).with_detail("resource", resource)
+     .with_detail("id", id)
+}
+
+/// Validation error
+pub fn validation_error(message: &str) -> LmsError {
+    LmsError::with_status("VALIDATION_ERROR", message, 400)
+}
+
+/// Validation errors (multiple)
+pub fn validation_errors(errors: List<ValidationError>) -> LmsError {
+    let messages: Vec<String> = errors.iter()
+        .map(|e| format!("{}: {}", e.field, e.message))
+        .collect();
+
+    let mut error = LmsError::with_status(
+        "VALIDATION_ERROR",
+        &format!("Validation failed: {}", messages.join("; ")),
+        400
+    );
+
+    for (i, e) in errors.iter().enumerate() {
+        error = error.with_detail(&format!("error_{}_field", i), &e.field);
+        error = error.with_detail(&format!("error_{}_message", i), &e.message);
+    }
+
+    error
+}
+
+#[derive(Clone)]
+pub type ValidationError {
+    field: String,
+    message: String,
+    code: Option<String>
+}
+
+impl ValidationError {
+    pub fn new(field: &str, message: &str) -> ValidationError {
+        ValidationError {
+            field: field.to_string(),
+            message: message.to_string(),
+            code: None
+        }
+    }
+
+    pub fn with_code(field: &str, message: &str, code: &str) -> ValidationError {
+        ValidationError {
+            field: field.to_string(),
+            message: message.to_string(),
+            code: Some(code.to_string())
+        }
+    }
+}
+
+/// Unauthorized error
+pub fn unauthorized(message: &str) -> LmsError {
+    LmsError::with_status("UNAUTHORIZED", message, 401)
+}
+
+/// Forbidden error
+pub fn forbidden(message: &str) -> LmsError {
+    LmsError::with_status("FORBIDDEN", message, 403)
+}
+
+/// Conflict error
+pub fn conflict(message: &str) -> LmsError {
+    LmsError::with_status("CONFLICT", message, 409)
+}
+
+/// Rate limit error
+pub fn rate_limited(retry_after: i32) -> LmsError {
+    LmsError::with_status(
+        "RATE_LIMITED",
+        "Too many requests. Please try again later.",
+        429
+    ).with_detail("retry_after_seconds", &retry_after.to_string())
+}
+
+/// Internal error
+pub fn internal_error(message: &str) -> LmsError {
+    LmsError::with_status("INTERNAL_ERROR", message, 500)
+}
+
+/// Service unavailable
+pub fn service_unavailable(service: &str) -> LmsError {
+    LmsError::with_status(
+        "SERVICE_UNAVAILABLE",
+        &format!("Service '{}' is temporarily unavailable", service),
+        503
+    ).with_detail("service", service)
+}
+
+/// Timeout error
+pub fn timeout(operation: &str) -> LmsError {
+    LmsError::with_status(
+        "TIMEOUT",
+        &format!("Operation '{}' timed out", operation),
+        504
+    ).with_detail("operation", operation)
+}
+
+// =============================================================================
+// DOMAIN ERRORS
+// =============================================================================
+
+/// Course errors
+pub mod course {
+    use super::*;
+
+    pub fn not_found(course_id: &str) -> LmsError {
+        super::not_found("Course", course_id)
+    }
+
+    pub fn not_published(course_id: &str) -> LmsError {
+        LmsError::with_status(
+            "COURSE_NOT_PUBLISHED",
+            &format!("Course '{}' is not published", course_id),
+            400
+        ).with_detail("course_id", course_id)
+    }
+
+    pub fn enrollment_required(course_id: &str) -> LmsError {
+        LmsError::with_status(
+            "ENROLLMENT_REQUIRED",
+            &format!("Enrollment required to access course '{}'", course_id),
+            403
+        ).with_detail("course_id", course_id)
+    }
+
+    pub fn prerequisite_not_met(course_id: &str, prerequisite_id: &str) -> LmsError {
+        LmsError::with_status(
+            "PREREQUISITE_NOT_MET",
+            &format!("Prerequisite '{}' must be completed before accessing course '{}'", prerequisite_id, course_id),
+            403
+        ).with_detail("course_id", course_id)
+         .with_detail("prerequisite_id", prerequisite_id)
+    }
+
+    pub fn already_completed(course_id: &str) -> LmsError {
+        LmsError::with_status(
+            "COURSE_ALREADY_COMPLETED",
+            &format!("Course '{}' has already been completed", course_id),
+            400
+        ).with_detail("course_id", course_id)
+    }
+}
+
+/// Enrollment errors
+pub mod enrollment {
+    use super::*;
+
+    pub fn not_found(enrollment_id: &str) -> LmsError {
+        super::not_found("Enrollment", enrollment_id)
+    }
+
+    pub fn already_enrolled(user_id: &str, course_id: &str) -> LmsError {
+        LmsError::with_status(
+            "ALREADY_ENROLLED",
+            "User is already enrolled in this course",
+            409
+        ).with_detail("user_id", user_id)
+         .with_detail("course_id", course_id)
+    }
+
+    pub fn enrollment_closed(course_id: &str) -> LmsError {
+        LmsError::with_status(
+            "ENROLLMENT_CLOSED",
+            "Enrollment for this course is closed",
+            400
+        ).with_detail("course_id", course_id)
+    }
+
+    pub fn capacity_reached(course_id: &str) -> LmsError {
+        LmsError::with_status(
+            "CAPACITY_REACHED",
+            "Course has reached maximum enrollment capacity",
+            400
+        ).with_detail("course_id", course_id)
+    }
+
+    pub fn expired(enrollment_id: &str) -> LmsError {
+        LmsError::with_status(
+            "ENROLLMENT_EXPIRED",
+            "Enrollment has expired",
+            400
+        ).with_detail("enrollment_id", enrollment_id)
+    }
+}
+
+/// Assessment errors
+pub mod assessment {
+    use super::*;
+
+    pub fn not_found(assessment_id: &str) -> LmsError {
+        super::not_found("Assessment", assessment_id)
+    }
+
+    pub fn attempts_exhausted(assessment_id: &str, max_attempts: i32) -> LmsError {
+        LmsError::with_status(
+            "ATTEMPTS_EXHAUSTED",
+            &format!("Maximum attempts ({}) reached for this assessment", max_attempts),
+            400
+        ).with_detail("assessment_id", assessment_id)
+         .with_detail("max_attempts", &max_attempts.to_string())
+    }
+
+    pub fn time_expired(assessment_id: &str) -> LmsError {
+        LmsError::with_status(
+            "ASSESSMENT_TIME_EXPIRED",
+            "Time limit for this assessment has expired",
+            400
+        ).with_detail("assessment_id", assessment_id)
+    }
+
+    pub fn not_available(assessment_id: &str) -> LmsError {
+        LmsError::with_status(
+            "ASSESSMENT_NOT_AVAILABLE",
+            "Assessment is not currently available",
+            400
+        ).with_detail("assessment_id", assessment_id)
+    }
+
+    pub fn invalid_submission(message: &str) -> LmsError {
+        LmsError::with_status("INVALID_SUBMISSION", message, 400)
+    }
+}
+
+/// SCORM errors
+pub mod scorm {
+    use super::*;
+
+    pub fn invalid_package(message: &str) -> LmsError {
+        LmsError::with_status("INVALID_SCORM_PACKAGE", message, 400)
+    }
+
+    pub fn manifest_error(message: &str) -> LmsError {
+        LmsError::with_status("SCORM_MANIFEST_ERROR", message, 400)
+    }
+
+    pub fn runtime_error(code: &str, message: &str) -> LmsError {
+        LmsError::with_status("SCORM_RUNTIME_ERROR", message, 400)
+            .with_detail("scorm_error_code", code)
+    }
+
+    pub fn sequencing_error(message: &str) -> LmsError {
+        LmsError::with_status("SCORM_SEQUENCING_ERROR", message, 400)
+    }
+
+    pub fn unsupported_version(version: &str) -> LmsError {
+        LmsError::with_status(
+            "UNSUPPORTED_SCORM_VERSION",
+            &format!("SCORM version '{}' is not supported", version),
+            400
+        ).with_detail("version", version)
+    }
+}
+
+/// xAPI errors
+pub mod xapi {
+    use super::*;
+
+    pub fn invalid_statement(message: &str) -> LmsError {
+        LmsError::with_status("INVALID_XAPI_STATEMENT", message, 400)
+    }
+
+    pub fn lrs_error(message: &str) -> LmsError {
+        LmsError::with_status("LRS_ERROR", message, 502)
+    }
+
+    pub fn statement_conflict(statement_id: &str) -> LmsError {
+        LmsError::with_status(
+            "STATEMENT_CONFLICT",
+            &format!("Statement with ID '{}' already exists with different content", statement_id),
+            409
+        ).with_detail("statement_id", statement_id)
+    }
+}
+
+/// Authentication errors
+pub mod auth {
+    use super::*;
+
+    pub fn invalid_credentials() -> LmsError {
+        LmsError::with_status("INVALID_CREDENTIALS", "Invalid email or password", 401)
+    }
+
+    pub fn token_expired() -> LmsError {
+        LmsError::with_status("TOKEN_EXPIRED", "Authentication token has expired", 401)
+    }
+
+    pub fn token_invalid() -> LmsError {
+        LmsError::with_status("TOKEN_INVALID", "Authentication token is invalid", 401)
+    }
+
+    pub fn session_expired() -> LmsError {
+        LmsError::with_status("SESSION_EXPIRED", "Session has expired. Please log in again.", 401)
+    }
+
+    pub fn account_locked(until: Option<&DateTime>) -> LmsError {
+        let message = match until {
+            Some(dt) => format!("Account is locked until {}", dt.to_rfc3339()),
+            None => "Account is locked".to_string()
+        };
+        LmsError::with_status("ACCOUNT_LOCKED", &message, 403)
+    }
+
+    pub fn account_disabled() -> LmsError {
+        LmsError::with_status("ACCOUNT_DISABLED", "Account has been disabled", 403)
+    }
+
+    pub fn mfa_required() -> LmsError {
+        LmsError::with_status("MFA_REQUIRED", "Multi-factor authentication required", 401)
+    }
+
+    pub fn mfa_invalid() -> LmsError {
+        LmsError::with_status("MFA_INVALID", "Invalid multi-factor authentication code", 401)
+    }
+}
+
+/// Tenant errors
+pub mod tenant {
+    use super::*;
+
+    pub fn not_found(tenant_id: &str) -> LmsError {
+        super::not_found("Tenant", tenant_id)
+    }
+
+    pub fn suspended(tenant_id: &str) -> LmsError {
+        LmsError::with_status(
+            "TENANT_SUSPENDED",
+            "This tenant has been suspended",
+            403
+        ).with_detail("tenant_id", tenant_id)
+    }
+
+    pub fn quota_exceeded(resource: &str, limit: i64) -> LmsError {
+        LmsError::with_status(
+            "QUOTA_EXCEEDED",
+            &format!("Quota exceeded for '{}'. Limit: {}", resource, limit),
+            402
+        ).with_detail("resource", resource)
+         .with_detail("limit", &limit.to_string())
+    }
+
+    pub fn feature_not_enabled(feature: &str) -> LmsError {
+        LmsError::with_status(
+            "FEATURE_NOT_ENABLED",
+            &format!("Feature '{}' is not enabled for this tenant", feature),
+            403
+        ).with_detail("feature", feature)
+    }
+}
+
+// =============================================================================
+// RESULT TYPE
+// =============================================================================
+
+/// Result type alias
+pub type Result<T> = std::result::Result<T, LmsError>;
+
+// =============================================================================
+// ERROR HANDLER
+// =============================================================================
+
+/// Error handler for logging and reporting
+pub type ErrorHandler {
+    handlers: List<Box<dyn Fn(&LmsError) + Send + Sync>>,
+    report_to_external: bool
+}
+
+impl ErrorHandler {
+    pub fn new() -> ErrorHandler {
+        ErrorHandler {
+            handlers: vec![],
+            report_to_external: false
+        }
+    }
+
+    /// Add an error handler
+    pub fn on_error<F>(&mut self, handler: F)
+    where
+        F: Fn(&LmsError) + Send + Sync + 'static
+    {
+        self.handlers.push(Box::new(handler));
+    }
+
+    /// Handle an error
+    pub fn handle(&self, error: &LmsError) {
+        for handler in &self.handlers {
+            handler(error);
+        }
+    }
+
+    /// Enable external error reporting
+    pub fn enable_external_reporting(&mut self) {
+        self.report_to_external = true;
+    }
+}
+
+// =============================================================================
+// ERROR ACCUMULATOR
+// =============================================================================
+
+/// Accumulates multiple errors
+pub type ErrorAccumulator {
+    errors: List<LmsError>
+}
+
+impl ErrorAccumulator {
+    pub fn new() -> ErrorAccumulator {
+        ErrorAccumulator { errors: vec![] }
+    }
+
+    /// Add an error
+    pub fn add(&mut self, error: LmsError) {
+        self.errors.push(error);
+    }
+
+    /// Check if has errors
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// Get error count
+    pub fn count(&self) -> usize {
+        self.errors.len()
+    }
+
+    /// Get all errors
+    pub fn errors(&self) -> &List<LmsError> {
+        &self.errors
+    }
+
+    /// Convert to combined error
+    pub fn to_error(&self) -> Option<LmsError> {
+        if self.errors.is_empty() {
+            return None;
+        }
+
+        if self.errors.len() == 1 {
+            return Some(self.errors[0].clone());
+        }
+
+        let messages: Vec<String> = self.errors.iter()
+            .map(|e| e.message.clone())
+            .collect();
+
+        Some(LmsError::with_status(
+            "MULTIPLE_ERRORS",
+            &format!("{} errors occurred: {}", self.errors.len(), messages.join("; ")),
+            400
+        ))
+    }
+
+    /// Clear errors
+    pub fn clear(&mut self) {
+        self.errors.clear();
+    }
+}
+
+// =============================================================================
+// TRY MACROS
+// =============================================================================
+
+/// Try with context
+#[macro]
+pub fn try_with_context!(result: Result<T>, context: &str) -> Result<T> {
+    result.map_err(|e| {
+        LmsError::new(&e.code, &format!("{}: {}", context, e.message))
+            .with_source(e)
+    })
+}
+
+/// Ensure condition
+#[macro]
+pub fn ensure!(condition: bool, error: LmsError) {
+    if !condition {
+        return Err(error);
+    }
+}
+
+/// Ensure some
+#[macro]
+pub fn ensure_some!(option: Option<T>, error: LmsError) -> Result<T> {
+    option.ok_or(error)
+}

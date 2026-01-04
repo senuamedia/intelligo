@@ -1,0 +1,693 @@
+/// Intelligo LMS - Logging System
+///
+/// Provides structured logging with levels, formatters, and multiple outputs.
+
+module intelligo::runtime::logging
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock, Mutex}
+use std::time::{DateTime, Instant}
+use std::io::Write
+
+// =============================================================================
+// LOG LEVELS
+// =============================================================================
+
+/// Log levels
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Level {
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Warn = 3,
+    Error = 4,
+    Fatal = 5
+}
+
+impl Level {
+    pub fn from_str(s: &str) -> Level {
+        match s.to_lowercase().as_str() {
+            "trace" => Level::Trace,
+            "debug" => Level::Debug,
+            "info" => Level::Info,
+            "warn" | "warning" => Level::Warn,
+            "error" => Level::Error,
+            "fatal" => Level::Fatal,
+            _ => Level::Info
+        }
+    }
+
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            Level::Trace => "TRACE",
+            Level::Debug => "DEBUG",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Error => "ERROR",
+            Level::Fatal => "FATAL"
+        }
+    }
+
+    pub fn color(&self) -> &'static str {
+        match self {
+            Level::Trace => "\x1b[90m",   // Gray
+            Level::Debug => "\x1b[36m",   // Cyan
+            Level::Info => "\x1b[32m",    // Green
+            Level::Warn => "\x1b[33m",    // Yellow
+            Level::Error => "\x1b[31m",   // Red
+            Level::Fatal => "\x1b[35m"    // Magenta
+        }
+    }
+}
+
+// =============================================================================
+// LOG RECORD
+// =============================================================================
+
+/// A log record
+#[derive(Clone)]
+pub type LogRecord {
+    level: Level,
+    message: String,
+    timestamp: DateTime,
+    target: String,
+    module_path: Option<String>,
+    file: Option<String>,
+    line: Option<u32>,
+    fields: Map<String, String>,
+    span_id: Option<String>,
+    trace_id: Option<String>
+}
+
+impl LogRecord {
+    pub fn new(level: Level, message: &str) -> LogRecord {
+        LogRecord {
+            level,
+            message: message.to_string(),
+            timestamp: DateTime::now(),
+            target: String::new(),
+            module_path: None,
+            file: None,
+            line: None,
+            fields: Map::new(),
+            span_id: None,
+            trace_id: None
+        }
+    }
+
+    pub fn with_target(mut self, target: &str) -> Self {
+        self.target = target.to_string();
+        self
+    }
+
+    pub fn with_field(mut self, key: &str, value: &str) -> Self {
+        self.fields.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    pub fn with_fields(mut self, fields: Map<String, String>) -> Self {
+        self.fields.extend(fields);
+        self
+    }
+
+    pub fn with_location(mut self, file: &str, line: u32) -> Self {
+        self.file = Some(file.to_string());
+        self.line = Some(line);
+        self
+    }
+
+    pub fn with_trace(mut self, trace_id: &str, span_id: &str) -> Self {
+        self.trace_id = Some(trace_id.to_string());
+        self.span_id = Some(span_id.to_string());
+        self
+    }
+}
+
+// =============================================================================
+// LOGGER
+// =============================================================================
+
+/// The main logger
+pub type Logger {
+    name: String,
+    level: Arc<RwLock<Level>>,
+    handlers: Arc<RwLock<List<Box<dyn LogHandler>>>>,
+    filters: Arc<RwLock<List<Box<dyn LogFilter>>>>,
+    context: Arc<RwLock<Map<String, String>>>
+}
+
+impl Logger {
+    /// Create a new logger
+    pub fn new(name: &str) -> Logger {
+        Logger {
+            name: name.to_string(),
+            level: Arc::new(RwLock::new(Level::Info)),
+            handlers: Arc::new(RwLock::new(vec![])),
+            filters: Arc::new(RwLock::new(vec![])),
+            context: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    /// Set log level
+    pub fn set_level(&self, level: Level) {
+        *self.level.write().unwrap() = level;
+    }
+
+    /// Add a handler
+    pub fn add_handler<H: LogHandler + 'static>(&self, handler: H) {
+        self.handlers.write().unwrap().push(Box::new(handler));
+    }
+
+    /// Add a filter
+    pub fn add_filter<F: LogFilter + 'static>(&self, filter: F) {
+        self.filters.write().unwrap().push(Box::new(filter));
+    }
+
+    /// Add context field
+    pub fn with_context(&self, key: &str, value: &str) {
+        self.context.write().unwrap().insert(key.to_string(), value.to_string());
+    }
+
+    /// Create a child logger
+    pub fn child(&self, name: &str) -> Logger {
+        let child_name = format!("{}.{}", self.name, name);
+        let child = Logger::new(&child_name);
+        *child.level.write().unwrap() = *self.level.read().unwrap();
+        child.handlers.write().unwrap().extend(
+            self.handlers.read().unwrap().iter().map(|h| h.clone_box())
+        );
+        child.context.write().unwrap().extend(self.context.read().unwrap().clone());
+        child
+    }
+
+    /// Log a record
+    pub fn log(&self, record: LogRecord) {
+        // Check level
+        if record.level < *self.level.read().unwrap() {
+            return;
+        }
+
+        // Apply filters
+        for filter in self.filters.read().unwrap().iter() {
+            if !filter.filter(&record) {
+                return;
+            }
+        }
+
+        // Add context
+        let mut record = record;
+        record.target = self.name.clone();
+        for (k, v) in self.context.read().unwrap().iter() {
+            record.fields.entry(k.clone()).or_insert(v.clone());
+        }
+
+        // Send to handlers
+        for handler in self.handlers.read().unwrap().iter() {
+            handler.handle(&record);
+        }
+    }
+
+    /// Convenience methods
+    pub fn trace(&self, message: &str) {
+        self.log(LogRecord::new(Level::Trace, message));
+    }
+
+    pub fn debug(&self, message: &str) {
+        self.log(LogRecord::new(Level::Debug, message));
+    }
+
+    pub fn info(&self, message: &str) {
+        self.log(LogRecord::new(Level::Info, message));
+    }
+
+    pub fn warn(&self, message: &str) {
+        self.log(LogRecord::new(Level::Warn, message));
+    }
+
+    pub fn error(&self, message: &str) {
+        self.log(LogRecord::new(Level::Error, message));
+    }
+
+    pub fn fatal(&self, message: &str) {
+        self.log(LogRecord::new(Level::Fatal, message));
+    }
+
+    /// Log with fields
+    pub fn info_with(&self, message: &str, fields: Map<String, String>) {
+        self.log(LogRecord::new(Level::Info, message).with_fields(fields));
+    }
+
+    pub fn error_with(&self, message: &str, fields: Map<String, String>) {
+        self.log(LogRecord::new(Level::Error, message).with_fields(fields));
+    }
+}
+
+// =============================================================================
+// LOG HANDLERS
+// =============================================================================
+
+/// Trait for log handlers
+pub trait LogHandler: Send + Sync {
+    fn handle(&self, record: &LogRecord);
+    fn clone_box(&self) -> Box<dyn LogHandler>;
+}
+
+/// Console handler
+pub type ConsoleHandler {
+    formatter: Box<dyn LogFormatter>,
+    use_stderr_for_errors: bool,
+    use_colors: bool
+}
+
+impl ConsoleHandler {
+    pub fn new() -> ConsoleHandler {
+        ConsoleHandler {
+            formatter: Box::new(TextFormatter::new()),
+            use_stderr_for_errors: true,
+            use_colors: true
+        }
+    }
+
+    pub fn with_formatter<F: LogFormatter + 'static>(mut self, formatter: F) -> Self {
+        self.formatter = Box::new(formatter);
+        self
+    }
+
+    pub fn with_colors(mut self, use_colors: bool) -> Self {
+        self.use_colors = use_colors;
+        self
+    }
+}
+
+impl LogHandler for ConsoleHandler {
+    fn handle(&self, record: &LogRecord) {
+        let output = self.formatter.format(record);
+
+        let colored_output = if self.use_colors {
+            format!("{}{}{}",
+                record.level.color(),
+                output,
+                "\x1b[0m" // Reset
+            )
+        } else {
+            output
+        };
+
+        if self.use_stderr_for_errors && record.level >= Level::Error {
+            eprintln!("{}", colored_output);
+        } else {
+            println!("{}", colored_output);
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn LogHandler> {
+        Box::new(ConsoleHandler {
+            formatter: self.formatter.clone_box(),
+            use_stderr_for_errors: self.use_stderr_for_errors,
+            use_colors: self.use_colors
+        })
+    }
+}
+
+/// File handler
+pub type FileHandler {
+    path: String,
+    formatter: Box<dyn LogFormatter>,
+    max_size: Option<usize>,
+    max_files: i32,
+    buffer: Arc<Mutex<Vec<u8>>>
+}
+
+impl FileHandler {
+    pub fn new(path: &str) -> FileHandler {
+        FileHandler {
+            path: path.to_string(),
+            formatter: Box::new(JsonFormatter::new()),
+            max_size: Some(10 * 1024 * 1024), // 10MB
+            max_files: 5,
+            buffer: Arc::new(Mutex::new(Vec::new()))
+        }
+    }
+
+    pub fn with_formatter<F: LogFormatter + 'static>(mut self, formatter: F) -> Self {
+        self.formatter = Box::new(formatter);
+        self
+    }
+
+    pub fn with_rotation(mut self, max_size: usize, max_files: i32) -> Self {
+        self.max_size = Some(max_size);
+        self.max_files = max_files;
+        self
+    }
+}
+
+impl LogHandler for FileHandler {
+    fn handle(&self, record: &LogRecord) {
+        let output = self.formatter.format(record);
+        let line = format!("{}\n", output);
+
+        // In production, write to file
+        // For now, buffer the output
+        self.buffer.lock().unwrap().extend(line.as_bytes());
+    }
+
+    fn clone_box(&self) -> Box<dyn LogHandler> {
+        Box::new(FileHandler {
+            path: self.path.clone(),
+            formatter: self.formatter.clone_box(),
+            max_size: self.max_size,
+            max_files: self.max_files,
+            buffer: Arc::new(Mutex::new(Vec::new()))
+        })
+    }
+}
+
+/// Memory handler (for testing)
+pub type MemoryHandler {
+    records: Arc<Mutex<List<LogRecord>>>,
+    max_records: usize
+}
+
+impl MemoryHandler {
+    pub fn new(max_records: usize) -> MemoryHandler {
+        MemoryHandler {
+            records: Arc::new(Mutex::new(vec![])),
+            max_records
+        }
+    }
+
+    pub fn get_records(&self) -> List<LogRecord> {
+        self.records.lock().unwrap().clone()
+    }
+
+    pub fn clear(&self) {
+        self.records.lock().unwrap().clear();
+    }
+}
+
+impl LogHandler for MemoryHandler {
+    fn handle(&self, record: &LogRecord) {
+        let mut records = self.records.lock().unwrap();
+        if records.len() >= self.max_records {
+            records.remove(0);
+        }
+        records.push(record.clone());
+    }
+
+    fn clone_box(&self) -> Box<dyn LogHandler> {
+        Box::new(MemoryHandler {
+            records: self.records.clone(),
+            max_records: self.max_records
+        })
+    }
+}
+
+// =============================================================================
+// LOG FORMATTERS
+// =============================================================================
+
+/// Trait for log formatters
+pub trait LogFormatter: Send + Sync {
+    fn format(&self, record: &LogRecord) -> String;
+    fn clone_box(&self) -> Box<dyn LogFormatter>;
+}
+
+/// Text formatter
+pub type TextFormatter {
+    timestamp_format: String,
+    include_fields: bool
+}
+
+impl TextFormatter {
+    pub fn new() -> TextFormatter {
+        TextFormatter {
+            timestamp_format: "%Y-%m-%d %H:%M:%S%.3f".to_string(),
+            include_fields: true
+        }
+    }
+}
+
+impl LogFormatter for TextFormatter {
+    fn format(&self, record: &LogRecord) -> String {
+        let mut output = format!(
+            "{} [{}] {}: {}",
+            record.timestamp.format(&self.timestamp_format),
+            record.level.to_string(),
+            record.target,
+            record.message
+        );
+
+        if self.include_fields && !record.fields.is_empty() {
+            let fields: Vec<String> = record.fields.iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            output.push_str(&format!(" {{{}}}", fields.join(", ")));
+        }
+
+        if let Some(ref trace_id) = record.trace_id {
+            output.push_str(&format!(" trace_id={}", trace_id));
+        }
+
+        output
+    }
+
+    fn clone_box(&self) -> Box<dyn LogFormatter> {
+        Box::new(TextFormatter {
+            timestamp_format: self.timestamp_format.clone(),
+            include_fields: self.include_fields
+        })
+    }
+}
+
+/// JSON formatter
+pub type JsonFormatter {
+    pretty: bool
+}
+
+impl JsonFormatter {
+    pub fn new() -> JsonFormatter {
+        JsonFormatter { pretty: false }
+    }
+
+    pub fn pretty() -> JsonFormatter {
+        JsonFormatter { pretty: true }
+    }
+}
+
+impl LogFormatter for JsonFormatter {
+    fn format(&self, record: &LogRecord) -> String {
+        let mut json = format!(
+            r#"{{"timestamp":"{}","level":"{}","target":"{}","message":"{}""#,
+            record.timestamp.to_rfc3339(),
+            record.level.to_string(),
+            escape_json(&record.target),
+            escape_json(&record.message)
+        );
+
+        if !record.fields.is_empty() {
+            let fields: Vec<String> = record.fields.iter()
+                .map(|(k, v)| format!(r#""{}":"{}""#, escape_json(k), escape_json(v)))
+                .collect();
+            json.push_str(&format!(r#","fields":{{{}}}"#, fields.join(",")));
+        }
+
+        if let Some(ref trace_id) = record.trace_id {
+            json.push_str(&format!(r#","trace_id":"{}""#, trace_id));
+        }
+
+        if let Some(ref span_id) = record.span_id {
+            json.push_str(&format!(r#","span_id":"{}""#, span_id));
+        }
+
+        if let Some(ref file) = record.file {
+            json.push_str(&format!(r#","file":"{}""#, escape_json(file)));
+        }
+
+        if let Some(line) = record.line {
+            json.push_str(&format!(r#","line":{}"#, line));
+        }
+
+        json.push('}');
+        json
+    }
+
+    fn clone_box(&self) -> Box<dyn LogFormatter> {
+        Box::new(JsonFormatter { pretty: self.pretty })
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+     .replace('\r', "\\r")
+     .replace('\t', "\\t")
+}
+
+// =============================================================================
+// LOG FILTERS
+// =============================================================================
+
+/// Trait for log filters
+pub trait LogFilter: Send + Sync {
+    fn filter(&self, record: &LogRecord) -> bool;
+}
+
+/// Level filter
+pub type LevelFilter {
+    min_level: Level
+}
+
+impl LevelFilter {
+    pub fn new(min_level: Level) -> LevelFilter {
+        LevelFilter { min_level }
+    }
+}
+
+impl LogFilter for LevelFilter {
+    fn filter(&self, record: &LogRecord) -> bool {
+        record.level >= self.min_level
+    }
+}
+
+/// Target filter
+pub type TargetFilter {
+    targets: List<String>,
+    exclude: bool
+}
+
+impl TargetFilter {
+    pub fn include(targets: Vec<&str>) -> TargetFilter {
+        TargetFilter {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            exclude: false
+        }
+    }
+
+    pub fn exclude(targets: Vec<&str>) -> TargetFilter {
+        TargetFilter {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            exclude: true
+        }
+    }
+}
+
+impl LogFilter for TargetFilter {
+    fn filter(&self, record: &LogRecord) -> bool {
+        let matches = self.targets.iter().any(|t| record.target.starts_with(t));
+        if self.exclude {
+            !matches
+        } else {
+            matches
+        }
+    }
+}
+
+/// Field filter
+pub type FieldFilter {
+    field: String,
+    value: String
+}
+
+impl FieldFilter {
+    pub fn new(field: &str, value: &str) -> FieldFilter {
+        FieldFilter {
+            field: field.to_string(),
+            value: value.to_string()
+        }
+    }
+}
+
+impl LogFilter for FieldFilter {
+    fn filter(&self, record: &LogRecord) -> bool {
+        record.fields.get(&self.field).map(|v| v == &self.value).unwrap_or(false)
+    }
+}
+
+// =============================================================================
+// GLOBAL LOGGER
+// =============================================================================
+
+static mut GLOBAL_LOGGER: Option<Logger> = None;
+
+/// Initialize the global logger
+pub fn init_logger(logger: Logger) {
+    unsafe {
+        GLOBAL_LOGGER = Some(logger);
+    }
+}
+
+/// Get the global logger
+pub fn logger() -> &'static Logger {
+    unsafe {
+        GLOBAL_LOGGER.as_ref().expect("Logger not initialized")
+    }
+}
+
+/// Quick logging functions
+pub fn trace(message: &str) {
+    logger().trace(message);
+}
+
+pub fn debug(message: &str) {
+    logger().debug(message);
+}
+
+pub fn info(message: &str) {
+    logger().info(message);
+}
+
+pub fn warn(message: &str) {
+    logger().warn(message);
+}
+
+pub fn error(message: &str) {
+    logger().error(message);
+}
+
+pub fn fatal(message: &str) {
+    logger().fatal(message);
+}
+
+// =============================================================================
+// LOGGING MACROS
+// =============================================================================
+
+#[macro]
+pub fn log!(level: Level, message: &str, $($field:ident = $value:expr),*) {
+    let mut record = LogRecord::new(level, message);
+    $(
+        record = record.with_field(stringify!($field), &$value.to_string());
+    )*
+    logger().log(record);
+}
+
+#[macro]
+pub fn trace!($($arg:tt)*) {
+    log!(Level::Trace, $($arg)*);
+}
+
+#[macro]
+pub fn debug!($($arg:tt)*) {
+    log!(Level::Debug, $($arg)*);
+}
+
+#[macro]
+pub fn info!($($arg:tt)*) {
+    log!(Level::Info, $($arg)*);
+}
+
+#[macro]
+pub fn warn!($($arg:tt)*) {
+    log!(Level::Warn, $($arg)*);
+}
+
+#[macro]
+pub fn error!($($arg:tt)*) {
+    log!(Level::Error, $($arg)*);
+}
+
+#[macro]
+pub fn fatal!($($arg:tt)*) {
+    log!(Level::Fatal, $($arg)*);
+}

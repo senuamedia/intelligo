@@ -1,0 +1,1121 @@
+/// Intelligo LMS - Application Settings
+///
+/// Application settings with defaults, validation, and hierarchical overrides
+/// for tenant-specific customization.
+
+module intelligo::config::settings
+
+use intelligo::core::types::*
+use intelligo::tenant::core::TenantId
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// APPLICATION SETTINGS
+// =============================================================================
+
+/// Complete application settings
+type AppSettings {
+    /// General settings
+    general: GeneralSettings,
+
+    /// Server settings
+    server: ServerSettings,
+
+    /// Database settings
+    database: DatabaseSettings,
+
+    /// Cache settings
+    cache: CacheSettings,
+
+    /// Session settings
+    session: SessionSettings,
+
+    /// Email settings
+    email: EmailSettings,
+
+    /// Storage settings
+    storage: StorageSettings,
+
+    /// Security settings
+    security: SecuritySettings,
+
+    /// AI settings
+    ai: AiSettings,
+
+    /// Notification settings
+    notifications: NotificationSettings,
+
+    /// Logging settings
+    logging: LoggingSettings,
+
+    /// Performance settings
+    performance: PerformanceSettings
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings {
+            general: GeneralSettings::default(),
+            server: ServerSettings::default(),
+            database: DatabaseSettings::default(),
+            cache: CacheSettings::default(),
+            session: SessionSettings::default(),
+            email: EmailSettings::default(),
+            storage: StorageSettings::default(),
+            security: SecuritySettings::default(),
+            ai: AiSettings::default(),
+            notifications: NotificationSettings::default(),
+            logging: LoggingSettings::default(),
+            performance: PerformanceSettings::default()
+        }
+    }
+}
+
+// =============================================================================
+// GENERAL SETTINGS
+// =============================================================================
+
+/// General application settings
+type GeneralSettings {
+    /// Application name
+    app_name: String,
+
+    /// Application version
+    app_version: String,
+
+    /// Environment
+    environment: String,
+
+    /// Debug mode
+    debug: Bool,
+
+    /// Default timezone
+    default_timezone: String,
+
+    /// Default locale
+    default_locale: String,
+
+    /// Supported locales
+    supported_locales: List<String>,
+
+    /// Base URL
+    base_url: String,
+
+    /// API base URL
+    api_base_url: String
+}
+
+impl Default for GeneralSettings {
+    fn default() -> Self {
+        GeneralSettings {
+            app_name: "Intelligo LMS".to_string(),
+            app_version: "1.0.0".to_string(),
+            environment: "development".to_string(),
+            debug: false,
+            default_timezone: "UTC".to_string(),
+            default_locale: "en-US".to_string(),
+            supported_locales: vec![
+                "en-US".to_string(),
+                "en-GB".to_string(),
+                "es-ES".to_string(),
+                "fr-FR".to_string(),
+                "de-DE".to_string()
+            ],
+            base_url: "http://localhost:8080".to_string(),
+            api_base_url: "http://localhost:8080/api".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// SERVER SETTINGS
+// =============================================================================
+
+/// HTTP server settings
+type ServerSettings {
+    /// Bind host
+    host: String,
+
+    /// Bind port
+    port: i32,
+
+    /// Enable TLS
+    tls_enabled: Bool,
+
+    /// TLS cert path
+    tls_cert_path: Option<String>,
+
+    /// TLS key path
+    tls_key_path: Option<String>,
+
+    /// Worker threads
+    worker_threads: i32,
+
+    /// Max connections
+    max_connections: i32,
+
+    /// Keep-alive timeout
+    keep_alive_timeout: Duration,
+
+    /// Request timeout
+    request_timeout: Duration,
+
+    /// Body size limit
+    body_size_limit: i64,
+
+    /// Enable compression
+    compression_enabled: Bool,
+
+    /// CORS settings
+    cors: CorsSettings
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        ServerSettings {
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            worker_threads: 4,
+            max_connections: 10000,
+            keep_alive_timeout: Duration::seconds(75),
+            request_timeout: Duration::seconds(30),
+            body_size_limit: 10 * 1024 * 1024, // 10MB
+            compression_enabled: true,
+            cors: CorsSettings::default()
+        }
+    }
+}
+
+/// CORS settings
+type CorsSettings {
+    enabled: Bool,
+    allowed_origins: List<String>,
+    allowed_methods: List<String>,
+    allowed_headers: List<String>,
+    expose_headers: List<String>,
+    allow_credentials: Bool,
+    max_age: Duration
+}
+
+impl Default for CorsSettings {
+    fn default() -> Self {
+        CorsSettings {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec![
+                "GET".to_string(),
+                "POST".to_string(),
+                "PUT".to_string(),
+                "PATCH".to_string(),
+                "DELETE".to_string(),
+                "OPTIONS".to_string()
+            ],
+            allowed_headers: vec![
+                "Content-Type".to_string(),
+                "Authorization".to_string(),
+                "X-Requested-With".to_string()
+            ],
+            expose_headers: vec![
+                "X-Total-Count".to_string(),
+                "X-Page-Count".to_string()
+            ],
+            allow_credentials: true,
+            max_age: Duration::hours(24)
+        }
+    }
+}
+
+// =============================================================================
+// DATABASE SETTINGS
+// =============================================================================
+
+/// Database settings
+type DatabaseSettings {
+    /// Database URL
+    url: String,
+
+    /// Database driver
+    driver: String,
+
+    /// Connection pool size
+    pool_size: i32,
+
+    /// Min pool connections
+    pool_min: i32,
+
+    /// Connection timeout
+    connect_timeout: Duration,
+
+    /// Query timeout
+    query_timeout: Duration,
+
+    /// Idle timeout
+    idle_timeout: Duration,
+
+    /// Max lifetime
+    max_lifetime: Duration,
+
+    /// Enable SSL
+    ssl_enabled: Bool,
+
+    /// SSL mode
+    ssl_mode: String,
+
+    /// Run migrations on start
+    auto_migrate: Bool,
+
+    /// Enable query logging
+    log_queries: Bool
+}
+
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        DatabaseSettings {
+            url: "postgres://localhost/intelligo".to_string(),
+            driver: "postgres".to_string(),
+            pool_size: 20,
+            pool_min: 5,
+            connect_timeout: Duration::seconds(10),
+            query_timeout: Duration::seconds(30),
+            idle_timeout: Duration::minutes(10),
+            max_lifetime: Duration::hours(1),
+            ssl_enabled: false,
+            ssl_mode: "prefer".to_string(),
+            auto_migrate: true,
+            log_queries: false
+        }
+    }
+}
+
+// =============================================================================
+// CACHE SETTINGS
+// =============================================================================
+
+/// Cache settings
+type CacheSettings {
+    /// Enable caching
+    enabled: Bool,
+
+    /// Cache driver
+    driver: String,
+
+    /// Redis URL
+    redis_url: Option<String>,
+
+    /// Default TTL
+    default_ttl: Duration,
+
+    /// Max entries (for memory cache)
+    max_entries: i64,
+
+    /// Enable compression
+    compression: Bool,
+
+    /// Key prefix
+    key_prefix: String,
+
+    /// Cache levels
+    levels: CacheLevels
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        CacheSettings {
+            enabled: true,
+            driver: "memory".to_string(),
+            redis_url: None,
+            default_ttl: Duration::hours(1),
+            max_entries: 10000,
+            compression: false,
+            key_prefix: "intelligo:".to_string(),
+            levels: CacheLevels::default()
+        }
+    }
+}
+
+/// Multi-level cache configuration
+type CacheLevels {
+    l1_enabled: Bool,
+    l1_max_size: i64,
+    l1_ttl: Duration,
+    l2_enabled: Bool,
+    l2_ttl: Duration
+}
+
+impl Default for CacheLevels {
+    fn default() -> Self {
+        CacheLevels {
+            l1_enabled: true,
+            l1_max_size: 1000,
+            l1_ttl: Duration::minutes(5),
+            l2_enabled: true,
+            l2_ttl: Duration::hours(1)
+        }
+    }
+}
+
+// =============================================================================
+// SESSION SETTINGS
+// =============================================================================
+
+/// Session settings
+type SessionSettings {
+    /// Session driver
+    driver: String,
+
+    /// Session cookie name
+    cookie_name: String,
+
+    /// Session lifetime
+    lifetime: Duration,
+
+    /// Cookie secure flag
+    cookie_secure: Bool,
+
+    /// Cookie http only
+    cookie_http_only: Bool,
+
+    /// Cookie same site
+    cookie_same_site: String,
+
+    /// Cookie domain
+    cookie_domain: Option<String>,
+
+    /// Cookie path
+    cookie_path: String,
+
+    /// Enable remember me
+    remember_enabled: Bool,
+
+    /// Remember me duration
+    remember_duration: Duration,
+
+    /// Max concurrent sessions per user
+    max_sessions: i32
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        SessionSettings {
+            driver: "database".to_string(),
+            cookie_name: "intelligo_session".to_string(),
+            lifetime: Duration::hours(24),
+            cookie_secure: true,
+            cookie_http_only: true,
+            cookie_same_site: "Lax".to_string(),
+            cookie_domain: None,
+            cookie_path: "/".to_string(),
+            remember_enabled: true,
+            remember_duration: Duration::days(30),
+            max_sessions: 5
+        }
+    }
+}
+
+// =============================================================================
+// EMAIL SETTINGS
+// =============================================================================
+
+/// Email settings
+type EmailSettings {
+    /// Email driver
+    driver: String,
+
+    /// SMTP host
+    smtp_host: Option<String>,
+
+    /// SMTP port
+    smtp_port: Option<i32>,
+
+    /// SMTP username
+    smtp_username: Option<String>,
+
+    /// SMTP password (reference to secret)
+    smtp_password_secret: Option<String>,
+
+    /// SMTP encryption
+    smtp_encryption: Option<String>,
+
+    /// From address
+    from_address: String,
+
+    /// From name
+    from_name: String,
+
+    /// Reply-to address
+    reply_to: Option<String>,
+
+    /// Enable email queue
+    queue_enabled: Bool,
+
+    /// Batch size
+    batch_size: i32,
+
+    /// Rate limit per minute
+    rate_limit: i32
+}
+
+impl Default for EmailSettings {
+    fn default() -> Self {
+        EmailSettings {
+            driver: "smtp".to_string(),
+            smtp_host: Some("localhost".to_string()),
+            smtp_port: Some(587),
+            smtp_username: None,
+            smtp_password_secret: None,
+            smtp_encryption: Some("tls".to_string()),
+            from_address: "noreply@example.com".to_string(),
+            from_name: "Intelligo LMS".to_string(),
+            reply_to: None,
+            queue_enabled: true,
+            batch_size: 100,
+            rate_limit: 60
+        }
+    }
+}
+
+// =============================================================================
+// STORAGE SETTINGS
+// =============================================================================
+
+/// Storage settings
+type StorageSettings {
+    /// Default storage driver
+    driver: String,
+
+    /// Local storage path
+    local_path: Option<String>,
+
+    /// S3 configuration
+    s3: Option<S3Settings>,
+
+    /// Max upload size
+    max_upload_size: i64,
+
+    /// Allowed file types
+    allowed_types: List<String>,
+
+    /// Generate thumbnails
+    thumbnails_enabled: Bool,
+
+    /// Thumbnail sizes
+    thumbnail_sizes: List<ThumbnailSize>,
+
+    /// CDN URL
+    cdn_url: Option<String>,
+
+    /// Enable signed URLs
+    signed_urls: Bool,
+
+    /// Signed URL expiry
+    signed_url_expiry: Duration
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        StorageSettings {
+            driver: "local".to_string(),
+            local_path: Some("./storage".to_string()),
+            s3: None,
+            max_upload_size: 100 * 1024 * 1024, // 100MB
+            allowed_types: vec![
+                "image/*".to_string(),
+                "application/pdf".to_string(),
+                "video/*".to_string(),
+                "audio/*".to_string()
+            ],
+            thumbnails_enabled: true,
+            thumbnail_sizes: vec![
+                ThumbnailSize { name: "small".to_string(), width: 150, height: 150 },
+                ThumbnailSize { name: "medium".to_string(), width: 400, height: 400 },
+                ThumbnailSize { name: "large".to_string(), width: 800, height: 800 }
+            ],
+            cdn_url: None,
+            signed_urls: true,
+            signed_url_expiry: Duration::hours(1)
+        }
+    }
+}
+
+/// S3 configuration
+type S3Settings {
+    bucket: String,
+    region: String,
+    access_key_secret: String,
+    secret_key_secret: String,
+    endpoint: Option<String>,
+    path_style: Bool
+}
+
+/// Thumbnail size
+type ThumbnailSize {
+    name: String,
+    width: i32,
+    height: i32
+}
+
+// =============================================================================
+// SECURITY SETTINGS
+// =============================================================================
+
+/// Security settings
+type SecuritySettings {
+    /// Password requirements
+    password: PasswordSettings,
+
+    /// MFA settings
+    mfa: MfaSettings,
+
+    /// Rate limiting
+    rate_limiting: RateLimitSettings,
+
+    /// Allowed IPs (empty = all allowed)
+    allowed_ips: List<String>,
+
+    /// Blocked IPs
+    blocked_ips: List<String>,
+
+    /// Content Security Policy
+    csp_enabled: Bool,
+    csp_policy: Option<String>,
+
+    /// HSTS enabled
+    hsts_enabled: Bool,
+    hsts_max_age: Duration,
+
+    /// Enable audit logging
+    audit_enabled: Bool
+}
+
+impl Default for SecuritySettings {
+    fn default() -> Self {
+        SecuritySettings {
+            password: PasswordSettings::default(),
+            mfa: MfaSettings::default(),
+            rate_limiting: RateLimitSettings::default(),
+            allowed_ips: vec![],
+            blocked_ips: vec![],
+            csp_enabled: true,
+            csp_policy: None,
+            hsts_enabled: true,
+            hsts_max_age: Duration::days(365),
+            audit_enabled: true
+        }
+    }
+}
+
+/// Password requirements
+type PasswordSettings {
+    min_length: i32,
+    max_length: i32,
+    require_uppercase: Bool,
+    require_lowercase: Bool,
+    require_numbers: Bool,
+    require_special: Bool,
+    forbidden_passwords: List<String>,
+    history_count: i32,
+    expiry_days: Option<i32>,
+    hash_algorithm: String,
+    hash_cost: i32
+}
+
+impl Default for PasswordSettings {
+    fn default() -> Self {
+        PasswordSettings {
+            min_length: 8,
+            max_length: 128,
+            require_uppercase: true,
+            require_lowercase: true,
+            require_numbers: true,
+            require_special: false,
+            forbidden_passwords: vec![
+                "password".to_string(),
+                "123456".to_string(),
+                "qwerty".to_string()
+            ],
+            history_count: 5,
+            expiry_days: None,
+            hash_algorithm: "argon2id".to_string(),
+            hash_cost: 12
+        }
+    }
+}
+
+/// MFA settings
+type MfaSettings {
+    enabled: Bool,
+    required_for_admins: Bool,
+    totp_issuer: String,
+    totp_digits: i32,
+    totp_period: i32,
+    backup_codes_count: i32,
+    remember_device_days: i32
+}
+
+impl Default for MfaSettings {
+    fn default() -> Self {
+        MfaSettings {
+            enabled: true,
+            required_for_admins: true,
+            totp_issuer: "Intelligo".to_string(),
+            totp_digits: 6,
+            totp_period: 30,
+            backup_codes_count: 10,
+            remember_device_days: 30
+        }
+    }
+}
+
+/// Rate limiting settings
+type RateLimitSettings {
+    enabled: Bool,
+    requests_per_minute: i32,
+    requests_per_hour: i32,
+    login_attempts: i32,
+    lockout_duration: Duration
+}
+
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        RateLimitSettings {
+            enabled: true,
+            requests_per_minute: 60,
+            requests_per_hour: 1000,
+            login_attempts: 5,
+            lockout_duration: Duration::minutes(15)
+        }
+    }
+}
+
+// =============================================================================
+// AI SETTINGS
+// =============================================================================
+
+/// AI-related settings
+type AiSettings {
+    /// AI features enabled
+    enabled: Bool,
+
+    /// Default model provider
+    default_provider: String,
+
+    /// Default model ID
+    default_model: String,
+
+    /// API key secret reference
+    api_key_secret: Option<String>,
+
+    /// Max tokens per request
+    max_tokens: i32,
+
+    /// Temperature
+    default_temperature: f64,
+
+    /// Embedding model
+    embedding_model: String,
+
+    /// Content moderation enabled
+    moderation_enabled: Bool,
+
+    /// Cache AI responses
+    cache_responses: Bool,
+
+    /// Cache TTL
+    cache_ttl: Duration,
+
+    /// Rate limit per tenant per hour
+    rate_limit_per_tenant: i32
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        AiSettings {
+            enabled: true,
+            default_provider: "anthropic".to_string(),
+            default_model: "claude-sonnet-4-20250514".to_string(),
+            api_key_secret: None,
+            max_tokens: 4096,
+            default_temperature: 0.7,
+            embedding_model: "text-embedding-3-small".to_string(),
+            moderation_enabled: true,
+            cache_responses: true,
+            cache_ttl: Duration::hours(24),
+            rate_limit_per_tenant: 1000
+        }
+    }
+}
+
+// =============================================================================
+// NOTIFICATION SETTINGS
+// =============================================================================
+
+/// Notification settings
+type NotificationSettings {
+    /// Enable notifications
+    enabled: Bool,
+
+    /// Email notifications
+    email_enabled: Bool,
+
+    /// Push notifications
+    push_enabled: Bool,
+
+    /// In-app notifications
+    in_app_enabled: Bool,
+
+    /// SMS notifications
+    sms_enabled: Bool,
+
+    /// Slack integration
+    slack_enabled: Bool,
+
+    /// Notification digest settings
+    digest: DigestSettings,
+
+    /// Quiet hours
+    quiet_hours: Option<QuietHours>
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        NotificationSettings {
+            enabled: true,
+            email_enabled: true,
+            push_enabled: true,
+            in_app_enabled: true,
+            sms_enabled: false,
+            slack_enabled: false,
+            digest: DigestSettings::default(),
+            quiet_hours: None
+        }
+    }
+}
+
+/// Digest settings
+type DigestSettings {
+    enabled: Bool,
+    frequency: String,
+    send_time: String
+}
+
+impl Default for DigestSettings {
+    fn default() -> Self {
+        DigestSettings {
+            enabled: true,
+            frequency: "daily".to_string(),
+            send_time: "09:00".to_string()
+        }
+    }
+}
+
+/// Quiet hours
+type QuietHours {
+    enabled: Bool,
+    start_time: String,
+    end_time: String,
+    timezone: String
+}
+
+// =============================================================================
+// LOGGING SETTINGS
+// =============================================================================
+
+/// Logging settings
+type LoggingSettings {
+    /// Log level
+    level: String,
+
+    /// Log format
+    format: String,
+
+    /// Output destinations
+    outputs: List<String>,
+
+    /// Log file path
+    file_path: Option<String>,
+
+    /// Log rotation
+    rotation: LogRotation,
+
+    /// Include request IDs
+    include_request_id: Bool,
+
+    /// Include user context
+    include_user_context: Bool,
+
+    /// Structured logging
+    structured: Bool
+}
+
+impl Default for LoggingSettings {
+    fn default() -> Self {
+        LoggingSettings {
+            level: "info".to_string(),
+            format: "json".to_string(),
+            outputs: vec!["stdout".to_string()],
+            file_path: None,
+            rotation: LogRotation::default(),
+            include_request_id: true,
+            include_user_context: true,
+            structured: true
+        }
+    }
+}
+
+/// Log rotation settings
+type LogRotation {
+    enabled: Bool,
+    max_size_mb: i32,
+    max_files: i32,
+    max_age_days: i32
+}
+
+impl Default for LogRotation {
+    fn default() -> Self {
+        LogRotation {
+            enabled: true,
+            max_size_mb: 100,
+            max_files: 10,
+            max_age_days: 30
+        }
+    }
+}
+
+// =============================================================================
+// PERFORMANCE SETTINGS
+// =============================================================================
+
+/// Performance settings
+type PerformanceSettings {
+    /// Enable query caching
+    query_cache_enabled: Bool,
+
+    /// Query cache size
+    query_cache_size: i64,
+
+    /// Enable connection pooling
+    connection_pooling: Bool,
+
+    /// Lazy loading enabled
+    lazy_loading: Bool,
+
+    /// Batch size for bulk operations
+    batch_size: i32,
+
+    /// Enable gzip compression
+    gzip_enabled: Bool,
+
+    /// Gzip compression level
+    gzip_level: i32,
+
+    /// Enable HTTP/2
+    http2_enabled: Bool,
+
+    /// Enable request queuing
+    request_queue_enabled: Bool,
+
+    /// Request queue size
+    request_queue_size: i32
+}
+
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        PerformanceSettings {
+            query_cache_enabled: true,
+            query_cache_size: 1000,
+            connection_pooling: true,
+            lazy_loading: true,
+            batch_size: 100,
+            gzip_enabled: true,
+            gzip_level: 6,
+            http2_enabled: true,
+            request_queue_enabled: false,
+            request_queue_size: 1000
+        }
+    }
+}
+
+// =============================================================================
+// SETTINGS MANAGER
+// =============================================================================
+
+/// Settings manager actor
+actor SettingsManager {
+    var app_settings: AppSettings = AppSettings::default()
+    var tenant_overrides: Map<TenantId, Map<String, Dynamic>> = Map::new()
+
+    fn new() -> Self {
+        SettingsManager::default()
+    }
+
+    /// Get all settings
+    receive GetAll() -> AppSettings {
+        self.app_settings.clone()
+    }
+
+    /// Get setting value
+    receive Get(key: String) -> Option<Dynamic> {
+        self.get_nested_value(&key)
+    }
+
+    /// Get setting with tenant override
+    receive GetForTenant(key: String, tenant_id: TenantId) -> Option<Dynamic> {
+        // Check tenant override first
+        if let Some(overrides) = self.tenant_overrides.get(&tenant_id) {
+            if let Some(value) = overrides.get(&key) {
+                return Some(value.clone());
+            }
+        }
+
+        // Fall back to global setting
+        self.get_nested_value(&key)
+    }
+
+    /// Update setting
+    receive Set(key: String, value: Dynamic) -> Result<(), SettingsError> {
+        self.set_nested_value(&key, value)?;
+        checkpoint();
+        Ok(())
+    }
+
+    /// Set tenant override
+    receive SetTenantOverride(tenant_id: TenantId, key: String, value: Dynamic) {
+        self.tenant_overrides.entry(tenant_id)
+            .or_insert(Map::new())
+            .insert(key, value);
+        checkpoint();
+    }
+
+    /// Remove tenant override
+    receive RemoveTenantOverride(tenant_id: TenantId, key: String) {
+        if let Some(overrides) = self.tenant_overrides.get_mut(&tenant_id) {
+            overrides.remove(&key);
+        }
+        checkpoint();
+    }
+
+    /// Get all tenant overrides
+    receive GetTenantOverrides(tenant_id: TenantId) -> Map<String, Dynamic> {
+        self.tenant_overrides.get(&tenant_id).cloned().unwrap_or_default()
+    }
+
+    /// Load settings from config
+    receive LoadFromConfig(config: Map<String, Dynamic>) {
+        // Apply configuration values to settings
+        for (key, value) in config {
+            let _ = self.set_nested_value(&key, value);
+        }
+        checkpoint();
+    }
+
+    /// Reset to defaults
+    receive ResetToDefaults() {
+        self.app_settings = AppSettings::default();
+        checkpoint();
+    }
+
+    // Internal methods
+
+    fn get_nested_value(&self, key: &str) -> Option<Dynamic> {
+        let parts: Vec<_> = key.split('.').collect();
+
+        // Simplified - would need proper reflection
+        match parts.as_slice() {
+            ["general", "app_name"] => Some(Dynamic::String(self.app_settings.general.app_name.clone())),
+            ["general", "debug"] => Some(Dynamic::Bool(self.app_settings.general.debug)),
+            ["server", "port"] => Some(Dynamic::Int(self.app_settings.server.port as i64)),
+            ["server", "host"] => Some(Dynamic::String(self.app_settings.server.host.clone())),
+            ["database", "pool_size"] => Some(Dynamic::Int(self.app_settings.database.pool_size as i64)),
+            ["cache", "enabled"] => Some(Dynamic::Bool(self.app_settings.cache.enabled)),
+            ["security", "password", "min_length"] => Some(Dynamic::Int(self.app_settings.security.password.min_length as i64)),
+            ["ai", "enabled"] => Some(Dynamic::Bool(self.app_settings.ai.enabled)),
+            ["logging", "level"] => Some(Dynamic::String(self.app_settings.logging.level.clone())),
+            _ => None
+        }
+    }
+
+    fn set_nested_value(&mut self, key: &str, value: Dynamic) -> Result<(), SettingsError> {
+        let parts: Vec<_> = key.split('.').collect();
+
+        match parts.as_slice() {
+            ["general", "app_name"] => {
+                if let Dynamic::String(s) = value {
+                    self.app_settings.general.app_name = s;
+                }
+            },
+            ["general", "debug"] => {
+                if let Dynamic::Bool(b) = value {
+                    self.app_settings.general.debug = b;
+                }
+            },
+            ["server", "port"] => {
+                if let Dynamic::Int(i) = value {
+                    self.app_settings.server.port = i as i32;
+                }
+            },
+            ["cache", "enabled"] => {
+                if let Dynamic::Bool(b) = value {
+                    self.app_settings.cache.enabled = b;
+                }
+            },
+            ["ai", "enabled"] => {
+                if let Dynamic::Bool(b) = value {
+                    self.app_settings.ai.enabled = b;
+                }
+            },
+            _ => {
+                return Err(SettingsError::InvalidKey { key: key.to_string() });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// ERRORS
+// =============================================================================
+
+enum SettingsError {
+    InvalidKey { key: String },
+    InvalidValue { key: String, message: String },
+    ReadOnly { key: String }
+}
+
+impl SettingsError {
+    fn to_string(&self) -> String {
+        match self {
+            SettingsError::InvalidKey { key } => format!("Invalid settings key: {}", key),
+            SettingsError::InvalidValue { key, message } => format!("Invalid value for {}: {}", key, message),
+            SettingsError::ReadOnly { key } => format!("Setting {} is read-only", key)
+        }
+    }
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_default_settings() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.general.app_name, "Intelligo LMS");
+        assert_eq!(settings.server.port, 8080);
+        assert!(settings.cache.enabled);
+    }
+
+    #[test]
+    fn test_password_settings() {
+        let password = PasswordSettings::default();
+        assert_eq!(password.min_length, 8);
+        assert!(password.require_uppercase);
+    }
+}

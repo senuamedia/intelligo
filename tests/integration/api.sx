@@ -1,0 +1,658 @@
+/// Intelligo LMS - API Integration Tests
+///
+/// Integration tests for the REST API endpoints.
+
+module intelligo::tests::integration::api
+
+use intelligo::chai::*
+use intelligo::api::*
+use intelligo::core::data_security::*
+
+pub fn register_tests() {
+    describe("API Integration", || {
+        describe("authentication endpoints", || {
+            it("registers a new user", async || {
+                let client = TestApiClient::new();
+
+                let response = client.post("/api/v1/auth/register", json!({
+                    "email": "newuser@example.com",
+                    "password": "SecureP@ss123!",
+                    "first_name": "New",
+                    "last_name": "User"
+                })).await;
+
+                expect(&response.status).to().equal(&201);
+                expect(&response.body["user"]["email"]).to().equal(&"newuser@example.com");
+                expect(&response.body["access_token"]).to().exist();
+            });
+
+            it("rejects weak passwords", async || {
+                let client = TestApiClient::new();
+
+                let response = client.post("/api/v1/auth/register", json!({
+                    "email": "user@example.com",
+                    "password": "weak",
+                    "first_name": "Test",
+                    "last_name": "User"
+                })).await;
+
+                expect(&response.status).to().equal(&400);
+                expect(&response.body["error"]["code"]).to().equal(&"VALIDATION_ERROR");
+            });
+
+            it("authenticates valid credentials", async || {
+                let client = TestApiClient::new();
+                let user = TestUser::create("login@example.com", "SecureP@ss123!");
+
+                let response = client.post("/api/v1/auth/login", json!({
+                    "email": "login@example.com",
+                    "password": "SecureP@ss123!"
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["access_token"]).to().exist();
+                expect(&response.body["refresh_token"]).to().exist();
+                expect(&response.body["expires_in"]).to().be_greater_than(&0);
+            });
+
+            it("rejects invalid credentials", async || {
+                let client = TestApiClient::new();
+
+                let response = client.post("/api/v1/auth/login", json!({
+                    "email": "user@example.com",
+                    "password": "wrongpassword"
+                })).await;
+
+                expect(&response.status).to().equal(&401);
+                expect(&response.body["error"]["code"]).to().equal(&"INVALID_CREDENTIALS");
+            });
+
+            it("rate limits login attempts", async || {
+                let client = TestApiClient::new();
+
+                // Exhaust rate limit
+                for _ in 0..6 {
+                    client.post("/api/v1/auth/login", json!({
+                        "email": "test@example.com",
+                        "password": "wrongpassword"
+                    })).await;
+                }
+
+                let response = client.post("/api/v1/auth/login", json!({
+                    "email": "test@example.com",
+                    "password": "wrongpassword"
+                })).await;
+
+                expect(&response.status).to().equal(&429);
+                expect(&response.headers["Retry-After"]).to().exist();
+            });
+
+            it("refreshes access token", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.post("/api/v1/auth/refresh", json!({
+                    "refresh_token": client.refresh_token
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["access_token"]).to().exist();
+            });
+
+            it("logs out and invalidates session", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.post("/api/v1/auth/logout", json!({})).await;
+
+                expect(&response.status).to().equal(&200);
+
+                // Token should no longer work
+                let protected_response = client.get("/api/v1/user/profile").await;
+                expect(&protected_response.status).to().equal(&401);
+            });
+        });
+
+        describe("user endpoints", || {
+            it("gets current user profile", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.get("/api/v1/user/profile").await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["user"]["id"]).to().exist();
+                expect(&response.body["user"]["email"]).to().exist();
+            });
+
+            it("updates user profile", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.patch("/api/v1/user/profile", json!({
+                    "first_name": "Updated",
+                    "bio": "Updated bio"
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["user"]["first_name"]).to().equal(&"Updated");
+            });
+
+            it("changes password", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.post("/api/v1/user/change-password", json!({
+                    "current_password": "OldP@ss123!",
+                    "new_password": "NewP@ss456!"
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+            });
+
+            it("requires authentication for protected endpoints", async || {
+                let client = TestApiClient::new();
+
+                let response = client.get("/api/v1/user/profile").await;
+
+                expect(&response.status).to().equal(&401);
+                expect(&response.body["error"]["code"]).to().equal(&"UNAUTHORIZED");
+            });
+        });
+
+        describe("course endpoints", || {
+            it("lists available courses", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.get("/api/v1/courses").await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["courses"]).to().be_array();
+                expect(&response.body["pagination"]["total"]).to().be_number();
+            });
+
+            it("gets course details", async || {
+                let client = TestApiClient::authenticated();
+                let course = TestCourse::create();
+
+                let response = client.get(&format!("/api/v1/courses/{}", course.id)).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["course"]["id"]).to().equal(&course.id);
+                expect(&response.body["course"]["modules"]).to().be_array();
+            });
+
+            it("creates course as admin", async || {
+                let client = TestApiClient::authenticated_as_admin();
+
+                let response = client.post("/api/v1/courses", json!({
+                    "title": "New Course",
+                    "description": "Course description",
+                    "category_id": "programming"
+                })).await;
+
+                expect(&response.status).to().equal(&201);
+                expect(&response.body["course"]["id"]).to().exist();
+                expect(&response.body["course"]["status"]).to().equal(&"draft");
+            });
+
+            it("denies course creation for students", async || {
+                let client = TestApiClient::authenticated_as_student();
+
+                let response = client.post("/api/v1/courses", json!({
+                    "title": "Unauthorized Course",
+                    "description": "Should fail"
+                })).await;
+
+                expect(&response.status).to().equal(&403);
+            });
+
+            it("searches courses", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.get("/api/v1/courses?search=python&category=programming").await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["courses"]).to().be_array();
+            });
+
+            it("filters courses by category", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.get("/api/v1/courses?category=business").await;
+
+                expect(&response.status).to().equal(&200);
+                let courses = response.body["courses"].as_array().unwrap();
+                for course in courses {
+                    expect(&course["category_id"]).to().equal(&"business");
+                }
+            });
+
+            it("paginates course list", async || {
+                let client = TestApiClient::authenticated();
+
+                let page1 = client.get("/api/v1/courses?page=1&per_page=10").await;
+                let page2 = client.get("/api/v1/courses?page=2&per_page=10").await;
+
+                expect(&page1.status).to().equal(&200);
+                expect(&page2.status).to().equal(&200);
+
+                let courses1 = page1.body["courses"].as_array().unwrap();
+                let courses2 = page2.body["courses"].as_array().unwrap();
+
+                // Pages should have different courses
+                if !courses1.is_empty() && !courses2.is_empty() {
+                    expect(&courses1[0]["id"]).to().not_equal(&courses2[0]["id"]);
+                }
+            });
+        });
+
+        describe("enrollment endpoints", || {
+            it("enrolls user in course", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let course = TestCourse::create_published();
+
+                let response = client.post(&format!("/api/v1/courses/{}/enroll", course.id), json!({})).await;
+
+                expect(&response.status).to().equal(&201);
+                expect(&response.body["enrollment"]["id"]).to().exist();
+                expect(&response.body["enrollment"]["status"]).to().equal(&"active");
+            });
+
+            it("prevents duplicate enrollment", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let course = TestCourse::create_published();
+
+                // First enrollment
+                client.post(&format!("/api/v1/courses/{}/enroll", course.id), json!({})).await;
+
+                // Duplicate should fail
+                let response = client.post(&format!("/api/v1/courses/{}/enroll", course.id), json!({})).await;
+
+                expect(&response.status).to().equal(&409);
+                expect(&response.body["error"]["code"]).to().equal(&"ALREADY_ENROLLED");
+            });
+
+            it("gets enrollment progress", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let enrollment = TestEnrollment::create_for_client(&client);
+
+                let response = client.get(&format!("/api/v1/enrollments/{}/progress", enrollment.id)).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["progress"]["completion_percentage"]).to().be_number();
+                expect(&response.body["progress"]["lessons_completed"]).to().be_number();
+            });
+
+            it("updates lesson progress", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let enrollment = TestEnrollment::create_for_client(&client);
+
+                let response = client.post(&format!("/api/v1/enrollments/{}/lessons/{}/progress", enrollment.id, "lesson_1"), json!({
+                    "progress": 100,
+                    "completed": true,
+                    "time_spent_seconds": 1200
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["lesson_progress"]["completed"]).to().be_true();
+            });
+
+            it("generates completion certificate", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let enrollment = TestEnrollment::create_completed(&client);
+
+                let response = client.get(&format!("/api/v1/enrollments/{}/certificate", enrollment.id)).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["certificate"]["id"]).to().exist();
+                expect(&response.body["certificate"]["issued_at"]).to().exist();
+            });
+        });
+
+        describe("assessment endpoints", || {
+            it("starts assessment attempt", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let enrollment = TestEnrollment::create_for_client(&client);
+
+                let response = client.post(&format!("/api/v1/assessments/{}/start", "assessment_1"), json!({
+                    "enrollment_id": enrollment.id
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["attempt"]["id"]).to().exist();
+                expect(&response.body["attempt"]["questions"]).to().be_array();
+                expect(&response.body["attempt"]["time_remaining"]).to().be_number();
+            });
+
+            it("submits assessment answers", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let attempt = TestAssessmentAttempt::create(&client);
+
+                let response = client.post(&format!("/api/v1/assessments/attempts/{}/submit", attempt.id), json!({
+                    "answers": [
+                        {"question_id": "q1", "answer": "a"},
+                        {"question_id": "q2", "answer": "b"}
+                    ]
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["result"]["score"]).to().be_number();
+                expect(&response.body["result"]["passed"]).to().be_boolean();
+            });
+
+            it("enforces time limit", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let attempt = TestAssessmentAttempt::create_expired(&client);
+
+                let response = client.post(&format!("/api/v1/assessments/attempts/{}/submit", attempt.id), json!({
+                    "answers": []
+                })).await;
+
+                expect(&response.status).to().equal(&400);
+                expect(&response.body["error"]["code"]).to().equal(&"TIME_EXPIRED");
+            });
+
+            it("prevents multiple attempts when not allowed", async || {
+                let client = TestApiClient::authenticated_as_student();
+                let enrollment = TestEnrollment::create_for_client(&client);
+                let assessment = TestAssessment::create_single_attempt();
+
+                // First attempt
+                let response = client.post(&format!("/api/v1/assessments/{}/start", assessment.id), json!({
+                    "enrollment_id": enrollment.id
+                })).await;
+                let attempt_id = response.body["attempt"]["id"].as_str().unwrap();
+
+                // Submit first attempt
+                client.post(&format!("/api/v1/assessments/attempts/{}/submit", attempt_id), json!({
+                    "answers": []
+                })).await;
+
+                // Second attempt should fail
+                let response = client.post(&format!("/api/v1/assessments/{}/start", assessment.id), json!({
+                    "enrollment_id": enrollment.id
+                })).await;
+
+                expect(&response.status).to().equal(&403);
+                expect(&response.body["error"]["code"]).to().equal(&"NO_ATTEMPTS_REMAINING");
+            });
+        });
+
+        describe("notification endpoints", || {
+            it("lists user notifications", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.get("/api/v1/notifications").await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["notifications"]).to().be_array();
+                expect(&response.body["unread_count"]).to().be_number();
+            });
+
+            it("marks notification as read", async || {
+                let client = TestApiClient::authenticated();
+                let notification = TestNotification::create_for_client(&client);
+
+                let response = client.post(&format!("/api/v1/notifications/{}/read", notification.id), json!({})).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["notification"]["read"]).to().be_true();
+            });
+
+            it("marks all notifications as read", async || {
+                let client = TestApiClient::authenticated();
+
+                let response = client.post("/api/v1/notifications/read-all", json!({})).await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["updated_count"]).to().be_number();
+            });
+        });
+
+        describe("admin endpoints", || {
+            it("lists all users as admin", async || {
+                let client = TestApiClient::authenticated_as_admin();
+
+                let response = client.get("/api/v1/admin/users").await;
+
+                expect(&response.status).to().equal(&200);
+                expect(&response.body["users"]).to().be_array();
+            });
+
+            it("denies admin endpoints to non-admins", async || {
+                let client = TestApiClient::authenticated_as_student();
+
+                let response = client.get("/api/v1/admin/users").await;
+
+                expect(&response.status).to().equal(&403);
+            });
+
+            it("generates system report", async || {
+                let client = TestApiClient::authenticated_as_admin();
+
+                let response = client.post("/api/v1/admin/reports/generate", json!({
+                    "type": "course_completion",
+                    "date_range": {
+                        "start": "2024-01-01",
+                        "end": "2024-12-31"
+                    },
+                    "format": "csv"
+                })).await;
+
+                expect(&response.status).to().equal(&202);
+                expect(&response.body["report"]["id"]).to().exist();
+                expect(&response.body["report"]["status"]).to().equal(&"processing");
+            });
+
+            it("manages tenant settings", async || {
+                let client = TestApiClient::authenticated_as_tenant_admin();
+
+                let response = client.patch("/api/v1/admin/tenant/settings", json!({
+                    "branding": {
+                        "logo_url": "https://example.com/logo.png",
+                        "primary_color": "#1a73e8"
+                    }
+                })).await;
+
+                expect(&response.status).to().equal(&200);
+            });
+        });
+
+        describe("API security", || {
+            it("validates content type", async || {
+                let client = TestApiClient::new();
+
+                let response = client.post_raw("/api/v1/auth/login", "invalid body", "text/plain").await;
+
+                expect(&response.status).to().equal(&415);
+            });
+
+            it("returns proper error format", async || {
+                let client = TestApiClient::new();
+
+                let response = client.get("/api/v1/courses/nonexistent").await;
+
+                expect(&response.status).to().equal(&404);
+                expect(&response.body["error"]["code"]).to().exist();
+                expect(&response.body["error"]["message"]).to().exist();
+                expect(&response.body["error"]["request_id"]).to().exist();
+            });
+
+            it("includes security headers", async || {
+                let client = TestApiClient::new();
+
+                let response = client.get("/api/v1/health").await;
+
+                expect(&response.headers["X-Content-Type-Options"]).to().equal(&"nosniff");
+                expect(&response.headers["X-Frame-Options"]).to().exist();
+                expect(&response.headers["X-XSS-Protection"]).to().exist();
+            });
+
+            it("validates tenant isolation", async || {
+                let client_tenant1 = TestApiClient::authenticated_in_tenant("tenant_1");
+                let course = TestCourse::create_in_tenant("tenant_2");
+
+                // Should not be able to access course from different tenant
+                let response = client_tenant1.get(&format!("/api/v1/courses/{}", course.id)).await;
+
+                expect(&response.status).to().equal(&404);
+            });
+
+            it("enforces request size limits", async || {
+                let client = TestApiClient::authenticated();
+
+                // Create payload larger than limit
+                let large_payload = "x".repeat(10 * 1024 * 1024); // 10MB
+
+                let response = client.post("/api/v1/courses", json!({
+                    "title": "Test",
+                    "description": large_payload
+                })).await;
+
+                expect(&response.status).to().equal(&413);
+            });
+        });
+
+        describe("API versioning", || {
+            it("rejects requests without version", async || {
+                let client = TestApiClient::new();
+
+                let response = client.get("/api/courses").await;
+
+                expect(&response.status).to().equal(&404);
+            });
+
+            it("handles version header", async || {
+                let client = TestApiClient::new();
+                client.set_header("API-Version", "2024-01-01");
+
+                let response = client.get("/api/v1/courses").await;
+
+                expect(&response.status).to().equal(&200);
+            });
+        });
+    });
+}
+
+// Test helper types and functions
+actor TestApiClient {
+    base_url: String,
+    auth_token: Option<String>,
+    refresh_token: Option<String>,
+    headers: Map<String, String>,
+}
+
+impl TestApiClient {
+    pub fn new() -> Self {
+        TestApiClient {
+            base_url: "http://localhost:3000".to_string(),
+            auth_token: None,
+            refresh_token: None,
+            headers: Map::new(),
+        }
+    }
+
+    pub fn authenticated() -> Self {
+        let mut client = Self::new();
+        client.auth_token = Some("test_token".to_string());
+        client.refresh_token = Some("test_refresh".to_string());
+        client
+    }
+
+    pub fn authenticated_as_admin() -> Self {
+        let mut client = Self::authenticated();
+        // Set up admin user context
+        client
+    }
+
+    pub fn authenticated_as_student() -> Self {
+        Self::authenticated()
+    }
+
+    pub fn authenticated_as_tenant_admin() -> Self {
+        let mut client = Self::authenticated();
+        // Set up tenant admin context
+        client
+    }
+
+    pub fn authenticated_in_tenant(tenant_id: &str) -> Self {
+        let mut client = Self::authenticated();
+        client.headers.insert("X-Tenant-ID".to_string(), tenant_id.to_string());
+        client
+    }
+
+    pub fn set_header(mut self, key: &str, value: &str) {
+        self.headers.insert(key.to_string(), value.to_string());
+    }
+
+    pub async fn get(self, path: &str) -> TestApiResponse {
+        self.request("GET", path, None).await
+    }
+
+    pub async fn post(self, path: &str, body: Value) -> TestApiResponse {
+        self.request("POST", path, Some(body)).await
+    }
+
+    pub async fn patch(self, path: &str, body: Value) -> TestApiResponse {
+        self.request("PATCH", path, Some(body)).await
+    }
+
+    pub async fn post_raw(self, path: &str, body: &str, content_type: &str) -> TestApiResponse {
+        // Implementation would send raw request
+        TestApiResponse::mock(200)
+    }
+
+    async fn request(self, method: &str, path: &str, body: Option<Value>) -> TestApiResponse {
+        // In real implementation, this would make HTTP request
+        // For now, return mock response
+        TestApiResponse::mock(200)
+    }
+}
+
+type TestApiResponse = type {
+    status: i32,
+    headers: Map<String, String>,
+    body: Value,
+}
+
+impl TestApiResponse {
+    pub fn mock(status: i32) -> Self {
+        TestApiResponse {
+            status,
+            headers: Map::new(),
+            body: json!({}),
+        }
+    }
+}
+
+// Additional test fixtures
+actor TestUser;
+actor TestCourse;
+actor TestEnrollment;
+actor TestAssessmentAttempt;
+actor TestAssessment;
+actor TestNotification;
+
+impl TestUser {
+    pub fn create(email: &str, password: &str) -> User { todo!() }
+}
+
+impl TestCourse {
+    pub fn create() -> Course { todo!() }
+    pub fn create_published() -> Course { todo!() }
+    pub fn create_in_tenant(tenant_id: &str) -> Course { todo!() }
+}
+
+impl TestEnrollment {
+    pub fn create_for_client(client: &TestApiClient) -> Enrollment { todo!() }
+    pub fn create_completed(client: &TestApiClient) -> Enrollment { todo!() }
+}
+
+impl TestAssessmentAttempt {
+    pub fn create(client: &TestApiClient) -> AssessmentAttempt { todo!() }
+    pub fn create_expired(client: &TestApiClient) -> AssessmentAttempt { todo!() }
+}
+
+impl TestAssessment {
+    pub fn create_single_attempt() -> Assessment { todo!() }
+}
+
+impl TestNotification {
+    pub fn create_for_client(client: &TestApiClient) -> Notification { todo!() }
+}

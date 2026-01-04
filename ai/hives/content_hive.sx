@@ -1,0 +1,2085 @@
+// =============================================================================
+// INTELLIGO LMS - Content Hive
+// =============================================================================
+// AI-powered content generation system following CHAI patterns.
+// Provides quiz question generation, lesson content creation, assessment
+// rubric building, learning objective mapping, content summarization,
+// and transcript generation for video/audio content.
+// =============================================================================
+
+module intelligo::ai::hives::content_hive
+
+use intelligo::core::types::*
+use simplex_inference::{Model, Prompt, EmbeddingModel, TranscriptionModel}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::sync::{Arc, RwLock}
+
+// =============================================================================
+// Content Hive Types
+// =============================================================================
+
+type GenerationTaskId = String
+type ContentId = String
+type TemplateId = String
+
+/// Content Hive Configuration
+pub struct ContentHiveConfig {
+    /// Default model for content generation
+    default_model: ModelConfig,
+    /// Model for creative content
+    creative_model: ModelConfig,
+    /// Transcription model
+    transcription_model: TranscriptionConfig,
+    /// Embedding model for similarity
+    embedding_model: EmbeddingModelConfig,
+    /// Cache generated content
+    cache_enabled: bool,
+    /// Cache TTL
+    cache_ttl: Duration,
+    /// Maximum concurrent generations
+    max_concurrent_tasks: usize,
+    /// Default language
+    default_language: String,
+}
+
+impl Default for ContentHiveConfig {
+    fn default() -> Self {
+        ContentHiveConfig {
+            default_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.5,
+                max_tokens: 8192,
+                top_p: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            creative_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.8,
+                max_tokens: 8192,
+                top_p: Some(0.95),
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            transcription_model: TranscriptionConfig {
+                provider: ModelProvider::OpenAI,
+                model_id: "whisper-1".to_string(),
+                language: None,
+                cost_per_minute: 0.006,
+            },
+            embedding_model: EmbeddingModelConfig {
+                provider: ModelProvider::OpenAI,
+                model_id: "text-embedding-3-large".to_string(),
+                dimensions: 1536,
+                input_cost_per_1k: 0.00013,
+            },
+            cache_enabled: true,
+            cache_ttl: Duration::hours(24),
+            max_concurrent_tasks: 5,
+            default_language: "en".to_string(),
+        }
+    }
+}
+
+/// Model configuration
+pub struct ModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    temperature: f64,
+    max_tokens: i32,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    stop_sequences: List<String>,
+    input_cost_per_1k: f64,
+    output_cost_per_1k: f64,
+}
+
+/// Transcription model configuration
+pub struct TranscriptionConfig {
+    provider: ModelProvider,
+    model_id: String,
+    language: Option<String>,
+    cost_per_minute: f64,
+}
+
+/// Embedding model configuration
+pub struct EmbeddingModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    dimensions: i32,
+    input_cost_per_1k: f64,
+}
+
+/// Model provider
+pub enum ModelProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+    Local { endpoint: String },
+}
+
+// =============================================================================
+// Quiz Question Generation Types
+// =============================================================================
+
+/// Request for quiz question generation
+pub struct QuestionGenerationRequest {
+    /// Source content to generate questions from
+    source_content: String,
+    /// Number of questions to generate
+    count: i32,
+    /// Desired question types
+    question_types: List<QuestionType>,
+    /// Target Bloom's taxonomy levels
+    bloom_levels: List<BloomLevel>,
+    /// Difficulty distribution
+    difficulty_distribution: DifficultyDistribution,
+    /// Learning objectives to assess
+    learning_objectives: List<LearningObjective>,
+    /// Include distractors analysis
+    include_distractor_analysis: bool,
+    /// Language
+    language: String,
+}
+
+/// Difficulty distribution for questions
+pub struct DifficultyDistribution {
+    novice_percent: f32,
+    beginner_percent: f32,
+    intermediate_percent: f32,
+    advanced_percent: f32,
+    expert_percent: f32,
+}
+
+impl Default for DifficultyDistribution {
+    fn default() -> Self {
+        DifficultyDistribution {
+            novice_percent: 0.1,
+            beginner_percent: 0.2,
+            intermediate_percent: 0.4,
+            advanced_percent: 0.2,
+            expert_percent: 0.1,
+        }
+    }
+}
+
+/// Learning objective for context
+pub struct LearningObjective {
+    id: LearningObjectiveId,
+    description: String,
+    bloom_level: BloomLevel,
+}
+
+/// Generated question with metadata
+pub struct GeneratedQuestion {
+    /// The question itself
+    question: Question,
+    /// Rationale for this question
+    rationale: String,
+    /// Why distractors are plausible but wrong
+    distractor_analysis: Option<List<DistractorAnalysis>>,
+    /// Mapped learning objectives
+    mapped_objectives: List<LearningObjectiveId>,
+    /// Generation confidence
+    confidence: f64,
+}
+
+/// Analysis of a distractor option
+pub struct DistractorAnalysis {
+    option_id: String,
+    option_text: String,
+    why_plausible: String,
+    why_wrong: String,
+    common_misconception: Option<String>,
+}
+
+// =============================================================================
+// Lesson Content Types
+// =============================================================================
+
+/// Request for lesson content creation
+pub struct LessonContentRequest {
+    /// Topic/title
+    topic: String,
+    /// Target audience level
+    audience_level: SkillLevel,
+    /// Desired duration (minutes)
+    target_duration: i32,
+    /// Content structure
+    structure: LessonStructure,
+    /// Learning objectives
+    learning_objectives: List<LearningObjective>,
+    /// Instructional design model
+    instructional_model: InstructionalModel,
+    /// Include examples
+    include_examples: bool,
+    /// Include practice activities
+    include_activities: bool,
+    /// Prerequisite knowledge
+    prerequisites: List<String>,
+    /// Language
+    language: String,
+}
+
+/// Lesson structure preference
+pub enum LessonStructure {
+    /// Linear narrative
+    Linear,
+    /// Modular/chunked
+    Modular { chunk_size_minutes: i32 },
+    /// Problem-based
+    ProblemBased,
+    /// Case study
+    CaseStudy,
+    /// Tutorial/hands-on
+    Tutorial,
+}
+
+/// Instructional design model
+pub enum InstructionalModel {
+    /// ADDIE model
+    Addie,
+    /// Gagne's Nine Events
+    GagneNineEvents,
+    /// Merrill's First Principles
+    MerrillFirstPrinciples,
+    /// 4C/ID
+    FourCID,
+    /// SAM (Successive Approximation)
+    Sam,
+    /// Custom
+    Custom { template: String },
+}
+
+/// Generated lesson content
+pub struct GeneratedLesson {
+    /// Lesson title
+    title: String,
+    /// Introduction/hook
+    introduction: LessonSection,
+    /// Main content sections
+    sections: List<LessonSection>,
+    /// Summary/conclusion
+    conclusion: LessonSection,
+    /// Key takeaways
+    key_takeaways: List<String>,
+    /// Vocabulary/glossary
+    vocabulary: List<VocabularyTerm>,
+    /// Practice activities
+    activities: List<LearningActivity>,
+    /// Suggested assessments
+    suggested_assessments: List<AssessmentSuggestion>,
+    /// Estimated duration
+    estimated_duration: i32,
+    /// Metadata
+    metadata: LessonMetadata,
+}
+
+/// Section of a lesson
+pub struct LessonSection {
+    /// Section title
+    title: String,
+    /// Section content (rich text/markdown)
+    content: String,
+    /// Media suggestions
+    media_suggestions: List<MediaSuggestion>,
+    /// Learning objectives addressed
+    objectives_addressed: List<LearningObjectiveId>,
+    /// Estimated duration (minutes)
+    duration: i32,
+    /// Instructor notes
+    instructor_notes: Option<String>,
+}
+
+/// Vocabulary term
+pub struct VocabularyTerm {
+    term: String,
+    definition: String,
+    context: Option<String>,
+    related_terms: List<String>,
+}
+
+/// Learning activity
+pub struct LearningActivity {
+    id: String,
+    title: String,
+    description: String,
+    activity_type: ActivityType,
+    instructions: String,
+    duration: i32,
+    materials_needed: List<String>,
+    objectives_addressed: List<LearningObjectiveId>,
+}
+
+/// Activity type
+pub enum ActivityType {
+    Discussion,
+    HandsOn,
+    Reflection,
+    GroupWork,
+    Research,
+    ProblemSolving,
+    CaseAnalysis,
+    Simulation,
+}
+
+/// Media suggestion
+pub struct MediaSuggestion {
+    media_type: MediaType,
+    description: String,
+    purpose: String,
+    suggested_sources: List<String>,
+}
+
+/// Media type
+pub enum MediaType {
+    Image,
+    Diagram,
+    Video,
+    Animation,
+    Infographic,
+    Audio,
+    Interactive,
+}
+
+/// Assessment suggestion
+pub struct AssessmentSuggestion {
+    assessment_type: AssessmentType,
+    description: String,
+    objectives_assessed: List<LearningObjectiveId>,
+    suggested_questions: i32,
+}
+
+/// Lesson metadata
+pub struct LessonMetadata {
+    bloom_levels_covered: List<BloomLevel>,
+    prerequisite_knowledge: List<String>,
+    difficulty_level: SkillLevel,
+    instructional_model_used: InstructionalModel,
+    generated_at: DateTime,
+}
+
+// =============================================================================
+// Rubric Generation Types
+// =============================================================================
+
+/// Request for rubric generation
+pub struct RubricGenerationRequest {
+    /// Assessment title/description
+    assessment_description: String,
+    /// Learning objectives to assess
+    learning_objectives: List<LearningObjective>,
+    /// Desired number of criteria
+    criteria_count: i32,
+    /// Number of performance levels
+    level_count: i32,
+    /// Total points
+    total_points: f32,
+    /// Rubric style
+    style: RubricStyle,
+    /// Language
+    language: String,
+}
+
+/// Rubric style
+pub enum RubricStyle {
+    /// Holistic (single overall score)
+    Holistic,
+    /// Analytic (separate criteria scores)
+    Analytic,
+    /// Single-point (describes proficiency only)
+    SinglePoint,
+    /// Developmental (growth-focused)
+    Developmental,
+}
+
+/// Generated rubric
+pub struct GeneratedRubric {
+    /// The rubric
+    rubric: Rubric,
+    /// Calibration examples
+    calibration_examples: List<CriterionExample>,
+    /// Usage guidance
+    usage_guidance: String,
+}
+
+/// Calibration example for a criterion
+pub struct CriterionExample {
+    criterion_id: String,
+    level_id: String,
+    example_work: String,
+    explanation: String,
+}
+
+// =============================================================================
+// Learning Objective Types
+// =============================================================================
+
+/// Request for learning objective mapping
+pub struct ObjectiveMappingRequest {
+    /// Content to analyze
+    content: String,
+    /// Existing objectives to map to
+    existing_objectives: List<LearningObjective>,
+    /// Generate new objectives if needed
+    generate_new: bool,
+    /// Desired Bloom's levels distribution
+    bloom_distribution: Option<Map<BloomLevel, f32>>,
+}
+
+/// Objective mapping result
+pub struct ObjectiveMappingResult {
+    /// Mappings to existing objectives
+    mappings: List<ObjectiveMapping>,
+    /// Suggested new objectives
+    suggested_objectives: List<SuggestedObjective>,
+    /// Coverage analysis
+    coverage: CoverageAnalysis,
+}
+
+/// Mapping between content and objective
+pub struct ObjectiveMapping {
+    objective_id: LearningObjectiveId,
+    content_segments: List<ContentSegment>,
+    alignment_score: f64,
+    evidence: String,
+}
+
+/// Content segment reference
+pub struct ContentSegment {
+    start_offset: i32,
+    end_offset: i32,
+    text_excerpt: String,
+}
+
+/// Suggested new objective
+pub struct SuggestedObjective {
+    description: String,
+    bloom_level: BloomLevel,
+    rationale: String,
+    verb: String,
+    measurable: bool,
+}
+
+/// Coverage analysis
+pub struct CoverageAnalysis {
+    /// Percentage of objectives covered
+    coverage_percent: f64,
+    /// Objectives not addressed
+    uncovered_objectives: List<LearningObjectiveId>,
+    /// Content not mapped to objectives
+    unmapped_content_percent: f64,
+    /// Bloom's level distribution in content
+    bloom_distribution: Map<BloomLevel, f64>,
+}
+
+// =============================================================================
+// Content Summarization Types
+// =============================================================================
+
+/// Request for content summarization
+pub struct SummarizationRequest {
+    /// Content to summarize
+    content: String,
+    /// Summary type
+    summary_type: SummaryType,
+    /// Target length (words or percentage)
+    target_length: LengthTarget,
+    /// Audience level
+    audience_level: SkillLevel,
+    /// Focus areas
+    focus_areas: List<String>,
+    /// Language
+    language: String,
+}
+
+/// Summary type
+pub enum SummaryType {
+    /// Executive summary
+    Executive,
+    /// Key points/bullet
+    KeyPoints,
+    /// Abstract
+    Abstract,
+    /// TLDR
+    Tldr,
+    /// Study guide
+    StudyGuide,
+    /// Lecture notes
+    LectureNotes,
+}
+
+/// Length target
+pub enum LengthTarget {
+    Words(i32),
+    Percentage(f32),
+    Sentences(i32),
+    Paragraphs(i32),
+}
+
+/// Generated summary
+pub struct GeneratedSummary {
+    /// Summary text
+    summary: String,
+    /// Key points extracted
+    key_points: List<String>,
+    /// Important terms
+    key_terms: List<VocabularyTerm>,
+    /// Word count
+    word_count: i32,
+    /// Compression ratio
+    compression_ratio: f64,
+}
+
+// =============================================================================
+// Transcription Types
+// =============================================================================
+
+/// Request for transcription
+pub struct TranscriptionRequest {
+    /// Media file URL or path
+    media_source: MediaSource,
+    /// Language (optional, auto-detect if not specified)
+    language: Option<String>,
+    /// Include timestamps
+    include_timestamps: bool,
+    /// Speaker diarization
+    speaker_diarization: bool,
+    /// Generate chapters/segments
+    generate_chapters: bool,
+}
+
+/// Media source
+pub enum MediaSource {
+    Url(String),
+    File { path: String, mime_type: String },
+    Bytes { data: Vec<u8>, mime_type: String },
+}
+
+/// Generated transcript
+pub struct GeneratedTranscript {
+    /// Full transcript text
+    text: String,
+    /// Segments with timestamps
+    segments: List<TranscriptSegment>,
+    /// Detected language
+    language: String,
+    /// Duration in seconds
+    duration: f64,
+    /// Chapters (if generated)
+    chapters: Option<List<TranscriptChapter>>,
+    /// Speakers (if diarization enabled)
+    speakers: Option<List<Speaker>>,
+    /// Confidence score
+    confidence: f64,
+}
+
+/// Transcript segment
+pub struct TranscriptSegment {
+    id: i32,
+    start_time: f64,
+    end_time: f64,
+    text: String,
+    speaker_id: Option<String>,
+    confidence: f64,
+}
+
+/// Transcript chapter
+pub struct TranscriptChapter {
+    title: String,
+    start_time: f64,
+    end_time: f64,
+    summary: String,
+}
+
+/// Speaker in diarization
+pub struct Speaker {
+    id: String,
+    label: String,
+    total_speaking_time: f64,
+}
+
+// =============================================================================
+// Content Hive Specialists
+// =============================================================================
+
+/// Quiz Question Generator Specialist
+pub struct QuizQuestionGenerator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl QuizQuestionGenerator {
+    pub fn new(config: ModelConfig) -> Self {
+        QuizQuestionGenerator {
+            config,
+            system_prompt: r#"You are an expert educational assessment designer. Your role is to:
+
+1. Generate high-quality quiz questions from learning content
+2. Align questions with Bloom's taxonomy levels
+3. Create plausible distractors that reveal common misconceptions
+4. Ensure questions are clear, unambiguous, and fair
+5. Match question difficulty to specified levels
+
+Question design principles:
+- One correct answer (or clearly multiple for multi-select)
+- Avoid negative phrasing ("which is NOT...")
+- Distractors should be plausible but clearly wrong
+- Questions should test understanding, not trick students
+- Include variety in question formats
+- Align with learning objectives
+
+Output questions in the structured JSON format specified."#.to_string(),
+        }
+    }
+
+    pub async fn generate(&self, request: &QuestionGenerationRequest) -> Result<List<GeneratedQuestion>, ContentError> {
+        let prompt = self.build_generation_prompt(request);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| ContentError::ModelError { message: e.to_string() })?;
+
+        self.parse_questions_response(&response.content, request)
+    }
+
+    fn build_generation_prompt(&self, request: &QuestionGenerationRequest) -> String {
+        let bloom_levels: String = request.bloom_levels.iter()
+            .map(|b| format!("{:?}", b))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let question_types: String = request.question_types.iter()
+            .map(|t| format!("{:?}", t))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let objectives: String = request.learning_objectives.iter()
+            .map(|o| format!("- {} ({})", o.description, format!("{:?}", o.bloom_level)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            r#"Generate {} quiz questions from the following content.
+
+## Source Content
+{}
+
+## Learning Objectives
+{}
+
+## Requirements
+- Question Types: {}
+- Bloom's Taxonomy Levels: {}
+- Difficulty Distribution:
+  - Novice: {}%
+  - Beginner: {}%
+  - Intermediate: {}%
+  - Advanced: {}%
+  - Expert: {}%
+- Language: {}
+{}
+
+## Output Format
+Provide questions as JSON array:
+[
+  {{
+    "question_type": "multiple_choice|true_false|short_answer|essay|fill_in_blank|matching|ordering",
+    "text": "<question text>",
+    "stem": "<optional question stem>",
+    "points": <suggested points>,
+    "difficulty": "novice|beginner|intermediate|advanced|expert",
+    "bloom_level": "remember|understand|apply|analyze|evaluate|create",
+    "options": [
+      {{"id": "a", "text": "<option text>", "is_correct": true/false}}
+    ],
+    "correct_answer": "<for short answer>",
+    "feedback": {{
+      "correct": "<feedback if correct>",
+      "incorrect": "<feedback if incorrect>"
+    }},
+    "explanation": "<why this is the answer>",
+    "mapped_objectives": ["<objective_id>"],
+    "rationale": "<why this question is valuable>",
+    "distractor_analysis": [
+      {{"option_id": "b", "why_plausible": "<reason>", "why_wrong": "<reason>", "misconception": "<common misconception>"}}
+    ]
+  }}
+]"#,
+            request.count,
+            request.source_content,
+            objectives,
+            question_types,
+            bloom_levels,
+            (request.difficulty_distribution.novice_percent * 100.0) as i32,
+            (request.difficulty_distribution.beginner_percent * 100.0) as i32,
+            (request.difficulty_distribution.intermediate_percent * 100.0) as i32,
+            (request.difficulty_distribution.advanced_percent * 100.0) as i32,
+            (request.difficulty_distribution.expert_percent * 100.0) as i32,
+            request.language,
+            if request.include_distractor_analysis { "- Include distractor analysis for each option" } else { "" }
+        )
+    }
+
+    fn parse_questions_response(&self, response: &str, request: &QuestionGenerationRequest) -> Result<List<GeneratedQuestion>, ContentError> {
+        let questions: List<QuestionJson> = parse_json(response)
+            .map_err(|e| ContentError::ParseError { message: e.to_string() })?;
+
+        Ok(questions.into_iter().map(|q| {
+            GeneratedQuestion {
+                question: Question {
+                    id: generate_uuid(),
+                    question_type: self.parse_question_type(&q.question_type),
+                    text: q.text,
+                    stem: q.stem,
+                    points: q.points,
+                    position: 0,
+                    is_required: true,
+                    options: q.options.into_iter().map(|o| QuestionOption {
+                        id: o.id,
+                        text: o.text,
+                        position: 0,
+                        is_correct: o.is_correct,
+                        partial_credit: None,
+                        media_id: None,
+                    }).collect(),
+                    correct_answers: vec![],
+                    matching_pairs: None,
+                    ordering_items: None,
+                    numeric_config: None,
+                    fill_blank_config: None,
+                    file_upload_config: None,
+                    images: vec![],
+                    audio: None,
+                    video: None,
+                    general_feedback: Some(q.explanation),
+                    correct_feedback: q.feedback.as_ref().map(|f| f.correct.clone()),
+                    incorrect_feedback: q.feedback.as_ref().map(|f| f.incorrect.clone()),
+                    option_feedback: Map::new(),
+                    hints: vec![],
+                    hint_penalty: 0.0,
+                    difficulty: self.parse_difficulty(&q.difficulty),
+                    bloom_level: self.parse_bloom(&q.bloom_level),
+                    tags: vec![],
+                    learning_objectives: q.mapped_objectives.iter()
+                        .map(|id| LearningObjectiveId(id.clone()))
+                        .collect(),
+                    source_bank_id: None,
+                    explanation: Some(q.explanation),
+                },
+                rationale: q.rationale,
+                distractor_analysis: q.distractor_analysis.map(|da| da.into_iter().map(|d| DistractorAnalysis {
+                    option_id: d.option_id,
+                    option_text: String::new(),
+                    why_plausible: d.why_plausible,
+                    why_wrong: d.why_wrong,
+                    common_misconception: d.misconception,
+                }).collect()),
+                mapped_objectives: q.mapped_objectives.iter()
+                    .map(|id| LearningObjectiveId(id.clone()))
+                    .collect(),
+                confidence: 0.9,
+            }
+        }).collect())
+    }
+
+    fn parse_question_type(&self, s: &str) -> QuestionType {
+        match s {
+            "multiple_choice" => QuestionType::MultipleChoice { single_answer: true },
+            "true_false" => QuestionType::TrueFalse,
+            "short_answer" => QuestionType::ShortAnswer,
+            "essay" => QuestionType::Essay,
+            "fill_in_blank" => QuestionType::FillInBlank,
+            "matching" => QuestionType::Matching,
+            "ordering" => QuestionType::Ordering,
+            _ => QuestionType::MultipleChoice { single_answer: true },
+        }
+    }
+
+    fn parse_difficulty(&self, s: &str) -> SkillLevel {
+        match s {
+            "novice" => SkillLevel::Novice,
+            "beginner" => SkillLevel::Beginner,
+            "intermediate" => SkillLevel::Intermediate,
+            "advanced" => SkillLevel::Advanced,
+            "expert" => SkillLevel::Expert,
+            _ => SkillLevel::Intermediate,
+        }
+    }
+
+    fn parse_bloom(&self, s: &str) -> BloomLevel {
+        match s {
+            "remember" => BloomLevel::Remember,
+            "understand" => BloomLevel::Understand,
+            "apply" => BloomLevel::Apply,
+            "analyze" => BloomLevel::Analyze,
+            "evaluate" => BloomLevel::Evaluate,
+            "create" => BloomLevel::Create,
+            _ => BloomLevel::Understand,
+        }
+    }
+}
+
+/// Lesson Content Creator Specialist
+pub struct LessonContentCreator {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl LessonContentCreator {
+    pub fn new(config: ModelConfig) -> Self {
+        LessonContentCreator {
+            config,
+            system_prompt: r#"You are an expert instructional designer and curriculum developer. Your role is to:
+
+1. Create engaging, well-structured lesson content
+2. Apply evidence-based instructional design principles
+3. Scaffold content for the target audience level
+4. Include varied examples, analogies, and practice opportunities
+5. Align all content with learning objectives
+
+Instructional design principles:
+- Start with a hook to engage learners
+- Activate prior knowledge
+- Present information in digestible chunks
+- Use concrete examples before abstractions
+- Provide opportunities for practice
+- Include formative checks
+- Summarize key takeaways
+- Connect to future learning
+
+Create content that is clear, engaging, and promotes deep understanding."#.to_string(),
+        }
+    }
+
+    pub async fn create(&self, request: &LessonContentRequest) -> Result<GeneratedLesson, ContentError> {
+        let prompt = self.build_creation_prompt(request);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.7)  // More creative for content
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| ContentError::ModelError { message: e.to_string() })?;
+
+        self.parse_lesson_response(&response.content, request)
+    }
+
+    fn build_creation_prompt(&self, request: &LessonContentRequest) -> String {
+        let objectives: String = request.learning_objectives.iter()
+            .map(|o| format!("- {} ({})", o.description, format!("{:?}", o.bloom_level)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let model_name = match &request.instructional_model {
+            InstructionalModel::Addie => "ADDIE",
+            InstructionalModel::GagneNineEvents => "Gagne's Nine Events of Instruction",
+            InstructionalModel::MerrillFirstPrinciples => "Merrill's First Principles of Instruction",
+            InstructionalModel::FourCID => "4C/ID Model",
+            InstructionalModel::Sam => "SAM (Successive Approximation Model)",
+            InstructionalModel::Custom { template } => template,
+        };
+
+        let structure_desc = match &request.structure {
+            LessonStructure::Linear => "Linear narrative flow",
+            LessonStructure::Modular { chunk_size_minutes } => &format!("Modular chunks of ~{} minutes each", chunk_size_minutes),
+            LessonStructure::ProblemBased => "Problem-based learning approach",
+            LessonStructure::CaseStudy => "Case study format",
+            LessonStructure::Tutorial => "Step-by-step tutorial format",
+        };
+
+        format!(
+            r#"Create a comprehensive lesson on the following topic.
+
+## Topic
+{}
+
+## Target Audience
+Level: {:?}
+Prerequisites: {}
+
+## Learning Objectives
+{}
+
+## Lesson Parameters
+- Target Duration: {} minutes
+- Structure: {}
+- Instructional Model: {}
+- Include Examples: {}
+- Include Activities: {}
+- Language: {}
+
+## Output Format (JSON)
+{{
+  "title": "<lesson title>",
+  "introduction": {{
+    "title": "Introduction",
+    "content": "<engaging hook and introduction - markdown format>",
+    "duration": <minutes>,
+    "objectives_addressed": [],
+    "media_suggestions": [{{"type": "image|video|diagram", "description": "<what media>", "purpose": "<why>"}}],
+    "instructor_notes": "<optional notes for instructor>"
+  }},
+  "sections": [
+    {{
+      "title": "<section title>",
+      "content": "<main content - markdown format with headers, examples, etc>",
+      "duration": <minutes>,
+      "objectives_addressed": ["<objective_id>"],
+      "media_suggestions": [],
+      "instructor_notes": "<optional>"
+    }}
+  ],
+  "conclusion": {{
+    "title": "Summary",
+    "content": "<wrap-up and summary>",
+    "duration": <minutes>,
+    "objectives_addressed": [],
+    "media_suggestions": [],
+    "instructor_notes": null
+  }},
+  "key_takeaways": ["<takeaway 1>", "<takeaway 2>"],
+  "vocabulary": [
+    {{"term": "<term>", "definition": "<definition>", "context": "<usage context>", "related_terms": ["<related>"]}}
+  ],
+  "activities": [
+    {{
+      "id": "<uuid>",
+      "title": "<activity title>",
+      "description": "<brief description>",
+      "activity_type": "discussion|hands_on|reflection|group_work|research|problem_solving|case_analysis|simulation",
+      "instructions": "<detailed instructions>",
+      "duration": <minutes>,
+      "materials_needed": ["<material>"],
+      "objectives_addressed": ["<objective_id>"]
+    }}
+  ],
+  "suggested_assessments": [
+    {{
+      "assessment_type": "quiz|assignment|discussion|project",
+      "description": "<what to assess>",
+      "objectives_assessed": ["<objective_id>"],
+      "suggested_questions": <count>
+    }}
+  ],
+  "estimated_duration": <total minutes>,
+  "metadata": {{
+    "bloom_levels_covered": ["remember", "understand", "apply", "analyze", "evaluate", "create"],
+    "prerequisite_knowledge": ["<prereq>"],
+    "difficulty_level": "novice|beginner|intermediate|advanced|expert"
+  }}
+}}"#,
+            request.topic,
+            request.audience_level,
+            request.prerequisites.join(", "),
+            objectives,
+            request.target_duration,
+            structure_desc,
+            model_name,
+            request.include_examples,
+            request.include_activities,
+            request.language
+        )
+    }
+
+    fn parse_lesson_response(&self, response: &str, request: &LessonContentRequest) -> Result<GeneratedLesson, ContentError> {
+        let lesson: LessonJson = parse_json(response)
+            .map_err(|e| ContentError::ParseError { message: e.to_string() })?;
+
+        Ok(GeneratedLesson {
+            title: lesson.title,
+            introduction: self.parse_section(&lesson.introduction),
+            sections: lesson.sections.into_iter().map(|s| self.parse_section(&s)).collect(),
+            conclusion: self.parse_section(&lesson.conclusion),
+            key_takeaways: lesson.key_takeaways,
+            vocabulary: lesson.vocabulary.into_iter().map(|v| VocabularyTerm {
+                term: v.term,
+                definition: v.definition,
+                context: v.context,
+                related_terms: v.related_terms,
+            }).collect(),
+            activities: lesson.activities.into_iter().map(|a| LearningActivity {
+                id: a.id,
+                title: a.title,
+                description: a.description,
+                activity_type: self.parse_activity_type(&a.activity_type),
+                instructions: a.instructions,
+                duration: a.duration,
+                materials_needed: a.materials_needed,
+                objectives_addressed: a.objectives_addressed.iter()
+                    .map(|id| LearningObjectiveId(id.clone()))
+                    .collect(),
+            }).collect(),
+            suggested_assessments: lesson.suggested_assessments.into_iter().map(|a| AssessmentSuggestion {
+                assessment_type: self.parse_assessment_type(&a.assessment_type),
+                description: a.description,
+                objectives_assessed: a.objectives_assessed.iter()
+                    .map(|id| LearningObjectiveId(id.clone()))
+                    .collect(),
+                suggested_questions: a.suggested_questions,
+            }).collect(),
+            estimated_duration: lesson.estimated_duration,
+            metadata: LessonMetadata {
+                bloom_levels_covered: lesson.metadata.bloom_levels_covered.iter()
+                    .map(|b| self.parse_bloom(b))
+                    .collect(),
+                prerequisite_knowledge: lesson.metadata.prerequisite_knowledge,
+                difficulty_level: self.parse_difficulty(&lesson.metadata.difficulty_level),
+                instructional_model_used: request.instructional_model.clone(),
+                generated_at: DateTime::now(),
+            },
+        })
+    }
+
+    fn parse_section(&self, section: &SectionJson) -> LessonSection {
+        LessonSection {
+            title: section.title.clone(),
+            content: section.content.clone(),
+            media_suggestions: section.media_suggestions.iter().map(|m| MediaSuggestion {
+                media_type: self.parse_media_type(&m.media_type),
+                description: m.description.clone(),
+                purpose: m.purpose.clone(),
+                suggested_sources: vec![],
+            }).collect(),
+            objectives_addressed: section.objectives_addressed.iter()
+                .map(|id| LearningObjectiveId(id.clone()))
+                .collect(),
+            duration: section.duration,
+            instructor_notes: section.instructor_notes.clone(),
+        }
+    }
+
+    fn parse_activity_type(&self, s: &str) -> ActivityType {
+        match s {
+            "discussion" => ActivityType::Discussion,
+            "hands_on" => ActivityType::HandsOn,
+            "reflection" => ActivityType::Reflection,
+            "group_work" => ActivityType::GroupWork,
+            "research" => ActivityType::Research,
+            "problem_solving" => ActivityType::ProblemSolving,
+            "case_analysis" => ActivityType::CaseAnalysis,
+            "simulation" => ActivityType::Simulation,
+            _ => ActivityType::Discussion,
+        }
+    }
+
+    fn parse_assessment_type(&self, s: &str) -> AssessmentType {
+        match s {
+            "quiz" => AssessmentType::Quiz,
+            "assignment" => AssessmentType::Assignment,
+            "discussion" => AssessmentType::Discussion,
+            "project" => AssessmentType::Project,
+            _ => AssessmentType::Quiz,
+        }
+    }
+
+    fn parse_media_type(&self, s: &str) -> MediaType {
+        match s {
+            "image" => MediaType::Image,
+            "diagram" => MediaType::Diagram,
+            "video" => MediaType::Video,
+            "animation" => MediaType::Animation,
+            "infographic" => MediaType::Infographic,
+            "audio" => MediaType::Audio,
+            "interactive" => MediaType::Interactive,
+            _ => MediaType::Image,
+        }
+    }
+
+    fn parse_bloom(&self, s: &str) -> BloomLevel {
+        match s {
+            "remember" => BloomLevel::Remember,
+            "understand" => BloomLevel::Understand,
+            "apply" => BloomLevel::Apply,
+            "analyze" => BloomLevel::Analyze,
+            "evaluate" => BloomLevel::Evaluate,
+            "create" => BloomLevel::Create,
+            _ => BloomLevel::Understand,
+        }
+    }
+
+    fn parse_difficulty(&self, s: &str) -> SkillLevel {
+        match s {
+            "novice" => SkillLevel::Novice,
+            "beginner" => SkillLevel::Beginner,
+            "intermediate" => SkillLevel::Intermediate,
+            "advanced" => SkillLevel::Advanced,
+            "expert" => SkillLevel::Expert,
+            _ => SkillLevel::Intermediate,
+        }
+    }
+}
+
+/// Assessment Rubric Builder Specialist
+pub struct AssessmentRubricBuilder {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl AssessmentRubricBuilder {
+    pub fn new(config: ModelConfig) -> Self {
+        AssessmentRubricBuilder {
+            config,
+            system_prompt: r#"You are an expert in educational assessment and rubric design. Your role is to:
+
+1. Create clear, comprehensive rubrics for assessments
+2. Define observable, measurable criteria
+3. Create distinct performance levels with clear descriptors
+4. Align rubric criteria with learning objectives
+5. Provide calibration examples for consistency
+
+Rubric design principles:
+- Criteria should be specific and observable
+- Performance levels should be clearly differentiated
+- Language should be student-friendly
+- Descriptors should describe what IS present, not what's missing
+- Include examples for each level when possible
+- Weight criteria based on learning objective importance
+
+Create rubrics that are fair, clear, and promote learning."#.to_string(),
+        }
+    }
+
+    pub async fn build(&self, request: &RubricGenerationRequest) -> Result<GeneratedRubric, ContentError> {
+        let prompt = self.build_rubric_prompt(request);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.4)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| ContentError::ModelError { message: e.to_string() })?;
+
+        self.parse_rubric_response(&response.content, request)
+    }
+
+    fn build_rubric_prompt(&self, request: &RubricGenerationRequest) -> String {
+        let objectives: String = request.learning_objectives.iter()
+            .map(|o| format!("- {} ({})", o.description, format!("{:?}", o.bloom_level)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let style_desc = match &request.style {
+            RubricStyle::Holistic => "Holistic (single overall score with level descriptions)",
+            RubricStyle::Analytic => "Analytic (separate scores for each criterion)",
+            RubricStyle::SinglePoint => "Single-Point (describes only the proficient level)",
+            RubricStyle::Developmental => "Developmental (focused on growth and progress)",
+        };
+
+        format!(
+            r#"Create a grading rubric for the following assessment.
+
+## Assessment Description
+{}
+
+## Learning Objectives to Assess
+{}
+
+## Rubric Parameters
+- Number of Criteria: {}
+- Number of Performance Levels: {}
+- Total Points: {}
+- Style: {}
+- Language: {}
+
+## Output Format (JSON)
+{{
+  "rubric": {{
+    "id": "<uuid>",
+    "title": "<rubric title>",
+    "description": "<rubric description>",
+    "total_points": {},
+    "criteria": [
+      {{
+        "id": "<uuid>",
+        "name": "<criterion name>",
+        "description": "<what this criterion assesses>",
+        "max_points": <points for this criterion>,
+        "position": <order>,
+        "learning_objectives": ["<objective_id>"],
+        "levels": [
+          {{
+            "id": "<uuid>",
+            "name": "<level name e.g., Exemplary, Proficient, Developing, Beginning>",
+            "description": "<detailed description of what work at this level looks like>",
+            "points": <points for this level>,
+            "position": <order from highest to lowest>
+          }}
+        ]
+      }}
+    ]
+  }},
+  "calibration_examples": [
+    {{
+      "criterion_id": "<criterion id>",
+      "level_id": "<level id>",
+      "example_work": "<example of student work at this level>",
+      "explanation": "<why this example represents this level>"
+    }}
+  ],
+  "usage_guidance": "<guidance for using this rubric consistently>"
+}}"#,
+            request.assessment_description,
+            objectives,
+            request.criteria_count,
+            request.level_count,
+            request.total_points,
+            style_desc,
+            request.language,
+            request.total_points
+        )
+    }
+
+    fn parse_rubric_response(&self, response: &str, request: &RubricGenerationRequest) -> Result<GeneratedRubric, ContentError> {
+        let result: RubricResponseJson = parse_json(response)
+            .map_err(|e| ContentError::ParseError { message: e.to_string() })?;
+
+        let rubric = Rubric {
+            id: RubricId(result.rubric.id),
+            uuid: generate_uuid(),
+            title: result.rubric.title,
+            description: Some(result.rubric.description),
+            criteria: result.rubric.criteria.into_iter().map(|c| RubricCriterion {
+                id: c.id,
+                name: c.name,
+                description: Some(c.description),
+                max_points: c.max_points,
+                position: c.position,
+                levels: c.levels.into_iter().map(|l| RubricLevel {
+                    id: l.id,
+                    name: l.name,
+                    description: l.description,
+                    points: l.points,
+                    min_points: None,
+                    max_points: None,
+                    position: l.position,
+                }).collect(),
+                learning_objectives: c.learning_objectives.iter()
+                    .map(|id| LearningObjectiveId(id.clone()))
+                    .collect(),
+            }).collect(),
+            total_points: result.rubric.total_points,
+            use_ranges: false,
+            is_reusable: true,
+            shared_with_courses: vec![],
+            created_by: UserId("system".to_string()),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+
+        Ok(GeneratedRubric {
+            rubric,
+            calibration_examples: result.calibration_examples.into_iter().map(|e| CriterionExample {
+                criterion_id: e.criterion_id,
+                level_id: e.level_id,
+                example_work: e.example_work,
+                explanation: e.explanation,
+            }).collect(),
+            usage_guidance: result.usage_guidance,
+        })
+    }
+}
+
+/// Learning Objective Mapper Specialist
+pub struct LearningObjectiveMapper {
+    config: ModelConfig,
+    embedding_config: EmbeddingModelConfig,
+    system_prompt: String,
+}
+
+impl LearningObjectiveMapper {
+    pub fn new(config: ModelConfig, embedding_config: EmbeddingModelConfig) -> Self {
+        LearningObjectiveMapper {
+            config,
+            embedding_config,
+            system_prompt: r#"You are an expert in curriculum alignment and learning objective mapping. Your role is to:
+
+1. Analyze content for alignment with learning objectives
+2. Identify where each objective is addressed
+3. Suggest new objectives for uncovered content
+4. Evaluate the quality and coverage of objectives
+5. Ensure objectives follow the ABCD format (Audience, Behavior, Condition, Degree)
+
+Objective quality criteria:
+- Specific and measurable
+- Uses action verbs from Bloom's taxonomy
+- Describes observable outcomes
+- Appropriate complexity for audience
+- Aligned with assessment methods
+
+Map content to objectives with precision and suggest improvements."#.to_string(),
+        }
+    }
+
+    pub async fn map(&self, request: &ObjectiveMappingRequest) -> Result<ObjectiveMappingResult, ContentError> {
+        let prompt = self.build_mapping_prompt(request);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.3)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| ContentError::ModelError { message: e.to_string() })?;
+
+        self.parse_mapping_response(&response.content)
+    }
+
+    fn build_mapping_prompt(&self, request: &ObjectiveMappingRequest) -> String {
+        let objectives: String = request.existing_objectives.iter()
+            .map(|o| format!("- [{}] {} ({})", o.id.0, o.description, format!("{:?}", o.bloom_level)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            r#"Analyze the following content and map it to learning objectives.
+
+## Content
+{}
+
+## Existing Learning Objectives
+{}
+
+## Task
+1. Map content segments to existing objectives
+2. {} new objectives for uncovered content
+3. Analyze overall coverage
+
+## Output Format (JSON)
+{{
+  "mappings": [
+    {{
+      "objective_id": "<existing objective id>",
+      "content_segments": [
+        {{"start_offset": <start>, "end_offset": <end>, "text_excerpt": "<excerpt>"}}
+      ],
+      "alignment_score": <0.0-1.0>,
+      "evidence": "<why this content addresses this objective>"
+    }}
+  ],
+  "suggested_objectives": [
+    {{
+      "description": "<ABCD format objective>",
+      "bloom_level": "remember|understand|apply|analyze|evaluate|create",
+      "rationale": "<why this objective is needed>",
+      "verb": "<action verb used>",
+      "measurable": true/false
+    }}
+  ],
+  "coverage": {{
+    "coverage_percent": <percent of objectives covered>,
+    "uncovered_objectives": ["<objective_id>"],
+    "unmapped_content_percent": <percent of content not mapped>,
+    "bloom_distribution": {{
+      "remember": <percent>,
+      "understand": <percent>,
+      "apply": <percent>,
+      "analyze": <percent>,
+      "evaluate": <percent>,
+      "create": <percent>
+    }}
+  }}
+}}"#,
+            request.content,
+            objectives,
+            if request.generate_new { "Suggest" } else { "Do not suggest" }
+        )
+    }
+
+    fn parse_mapping_response(&self, response: &str) -> Result<ObjectiveMappingResult, ContentError> {
+        let result: MappingResponseJson = parse_json(response)
+            .map_err(|e| ContentError::ParseError { message: e.to_string() })?;
+
+        Ok(ObjectiveMappingResult {
+            mappings: result.mappings.into_iter().map(|m| ObjectiveMapping {
+                objective_id: LearningObjectiveId(m.objective_id),
+                content_segments: m.content_segments.into_iter().map(|s| ContentSegment {
+                    start_offset: s.start_offset,
+                    end_offset: s.end_offset,
+                    text_excerpt: s.text_excerpt,
+                }).collect(),
+                alignment_score: m.alignment_score,
+                evidence: m.evidence,
+            }).collect(),
+            suggested_objectives: result.suggested_objectives.into_iter().map(|o| SuggestedObjective {
+                description: o.description,
+                bloom_level: self.parse_bloom(&o.bloom_level),
+                rationale: o.rationale,
+                verb: o.verb,
+                measurable: o.measurable,
+            }).collect(),
+            coverage: CoverageAnalysis {
+                coverage_percent: result.coverage.coverage_percent,
+                uncovered_objectives: result.coverage.uncovered_objectives.iter()
+                    .map(|id| LearningObjectiveId(id.clone()))
+                    .collect(),
+                unmapped_content_percent: result.coverage.unmapped_content_percent,
+                bloom_distribution: result.coverage.bloom_distribution.into_iter()
+                    .map(|(k, v)| (self.parse_bloom(&k), v))
+                    .collect(),
+            },
+        })
+    }
+
+    fn parse_bloom(&self, s: &str) -> BloomLevel {
+        match s {
+            "remember" => BloomLevel::Remember,
+            "understand" => BloomLevel::Understand,
+            "apply" => BloomLevel::Apply,
+            "analyze" => BloomLevel::Analyze,
+            "evaluate" => BloomLevel::Evaluate,
+            "create" => BloomLevel::Create,
+            _ => BloomLevel::Understand,
+        }
+    }
+}
+
+/// Content Summarizer Specialist
+pub struct ContentSummarizer {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl ContentSummarizer {
+    pub fn new(config: ModelConfig) -> Self {
+        ContentSummarizer {
+            config,
+            system_prompt: r#"You are an expert at creating educational summaries. Your role is to:
+
+1. Distill content to its essential points
+2. Preserve key concepts and relationships
+3. Adapt summaries for the target audience
+4. Highlight important terms and definitions
+5. Create different summary formats as needed
+
+Summary principles:
+- Accuracy over brevity
+- Preserve logical relationships
+- Use clear, accessible language
+- Highlight actionable insights
+- Include key terminology
+
+Create summaries that help learners review and retain information."#.to_string(),
+        }
+    }
+
+    pub async fn summarize(&self, request: &SummarizationRequest) -> Result<GeneratedSummary, ContentError> {
+        let prompt = self.build_summary_prompt(request);
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(0.3)
+            .with_max_tokens(self.config.max_tokens);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| ContentError::ModelError { message: e.to_string() })?;
+
+        self.parse_summary_response(&response.content, &request.content)
+    }
+
+    fn build_summary_prompt(&self, request: &SummarizationRequest) -> String {
+        let summary_type = match &request.summary_type {
+            SummaryType::Executive => "Executive summary (high-level overview)",
+            SummaryType::KeyPoints => "Bullet point key takeaways",
+            SummaryType::Abstract => "Academic abstract format",
+            SummaryType::Tldr => "TLDR (very brief summary)",
+            SummaryType::StudyGuide => "Study guide format with review questions",
+            SummaryType::LectureNotes => "Lecture notes format",
+        };
+
+        let length_spec = match &request.target_length {
+            LengthTarget::Words(w) => format!("{} words", w),
+            LengthTarget::Percentage(p) => format!("{}% of original length", (p * 100.0) as i32),
+            LengthTarget::Sentences(s) => format!("{} sentences", s),
+            LengthTarget::Paragraphs(p) => format!("{} paragraphs", p),
+        };
+
+        let focus = if request.focus_areas.is_empty() {
+            "all key concepts".to_string()
+        } else {
+            request.focus_areas.join(", ")
+        };
+
+        format!(
+            r#"Create a summary of the following content.
+
+## Content
+{}
+
+## Summary Parameters
+- Type: {}
+- Target Length: {}
+- Audience Level: {:?}
+- Focus Areas: {}
+- Language: {}
+
+## Output Format (JSON)
+{{
+  "summary": "<the summary text>",
+  "key_points": ["<key point 1>", "<key point 2>"],
+  "key_terms": [
+    {{"term": "<term>", "definition": "<definition>", "context": "<optional context>", "related_terms": []}}
+  ],
+  "word_count": <word count of summary>
+}}"#,
+            request.content,
+            summary_type,
+            length_spec,
+            request.audience_level,
+            focus,
+            request.language
+        )
+    }
+
+    fn parse_summary_response(&self, response: &str, original: &str) -> Result<GeneratedSummary, ContentError> {
+        let result: SummaryResponseJson = parse_json(response)
+            .map_err(|e| ContentError::ParseError { message: e.to_string() })?;
+
+        let original_words = original.split_whitespace().count();
+        let summary_words = result.word_count as usize;
+
+        Ok(GeneratedSummary {
+            summary: result.summary,
+            key_points: result.key_points,
+            key_terms: result.key_terms.into_iter().map(|t| VocabularyTerm {
+                term: t.term,
+                definition: t.definition,
+                context: t.context,
+                related_terms: t.related_terms,
+            }).collect(),
+            word_count: result.word_count,
+            compression_ratio: summary_words as f64 / original_words.max(1) as f64,
+        })
+    }
+}
+
+/// Transcript Generator Specialist
+pub struct TranscriptGenerator {
+    config: TranscriptionConfig,
+}
+
+impl TranscriptGenerator {
+    pub fn new(config: TranscriptionConfig) -> Self {
+        TranscriptGenerator { config }
+    }
+
+    pub async fn transcribe(&self, request: &TranscriptionRequest) -> Result<GeneratedTranscript, ContentError> {
+        // Get audio data
+        let audio_data = self.load_audio(&request.media_source).await?;
+
+        // Call transcription API
+        let raw_transcript = self.call_transcription_api(&audio_data, &request.language).await?;
+
+        // Process and structure the transcript
+        let segments = self.parse_segments(&raw_transcript.segments);
+
+        // Generate chapters if requested
+        let chapters = if request.generate_chapters {
+            Some(self.generate_chapters(&segments).await?)
+        } else {
+            None
+        };
+
+        // Extract speakers if diarization enabled
+        let speakers = if request.speaker_diarization {
+            Some(self.extract_speakers(&segments))
+        } else {
+            None
+        };
+
+        Ok(GeneratedTranscript {
+            text: raw_transcript.text,
+            segments,
+            language: raw_transcript.language,
+            duration: raw_transcript.duration,
+            chapters,
+            speakers,
+            confidence: raw_transcript.confidence,
+        })
+    }
+
+    async fn load_audio(&self, source: &MediaSource) -> Result<Vec<u8>, ContentError> {
+        match source {
+            MediaSource::Url(url) => {
+                // Download audio from URL
+                http::get(url)
+                    .send()
+                    .await
+                    .map_err(|e| ContentError::MediaError { message: e.to_string() })?
+                    .bytes()
+                    .await
+                    .map_err(|e| ContentError::MediaError { message: e.to_string() })
+            },
+            MediaSource::File { path, .. } => {
+                std::fs::read(path)
+                    .map_err(|e| ContentError::MediaError { message: e.to_string() })
+            },
+            MediaSource::Bytes { data, .. } => {
+                Ok(data.clone())
+            },
+        }
+    }
+
+    async fn call_transcription_api(&self, audio: &Vec<u8>, language: &Option<String>) -> Result<RawTranscript, ContentError> {
+        let model = TranscriptionModel::new(&self.config.model_id);
+
+        let mut request = model.transcribe(audio);
+
+        if let Some(lang) = language {
+            request = request.with_language(lang);
+        }
+
+        request.send()
+            .await
+            .map_err(|e| ContentError::TranscriptionError { message: e.to_string() })
+    }
+
+    fn parse_segments(&self, raw: &List<RawSegment>) -> List<TranscriptSegment> {
+        raw.iter().enumerate().map(|(i, seg)| TranscriptSegment {
+            id: i as i32,
+            start_time: seg.start,
+            end_time: seg.end,
+            text: seg.text.clone(),
+            speaker_id: seg.speaker.clone(),
+            confidence: seg.confidence,
+        }).collect()
+    }
+
+    async fn generate_chapters(&self, segments: &List<TranscriptSegment>) -> Result<List<TranscriptChapter>, ContentError> {
+        // Use AI to identify topic changes and generate chapters
+        let full_text: String = segments.iter()
+            .map(|s| format!("[{:.1}s] {}", s.start_time, s.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Would call AI model to generate chapters
+        // Simplified placeholder
+        Ok(vec![])
+    }
+
+    fn extract_speakers(&self, segments: &List<TranscriptSegment>) -> List<Speaker> {
+        let mut speaker_times: Map<String, f64> = Map::new();
+
+        for seg in segments {
+            if let Some(speaker_id) = &seg.speaker_id {
+                let duration = seg.end_time - seg.start_time;
+                *speaker_times.entry(speaker_id.clone()).or_insert(0.0) += duration;
+            }
+        }
+
+        speaker_times.into_iter().enumerate().map(|(i, (id, time))| Speaker {
+            id: id.clone(),
+            label: format!("Speaker {}", i + 1),
+            total_speaking_time: time,
+        }).collect()
+    }
+}
+
+// =============================================================================
+// Content Hive Actor
+// =============================================================================
+
+/// Main Content Hive actor
+pub actor ContentHive {
+    var config: ContentHiveConfig = ContentHiveConfig::default()
+    var question_generator: QuizQuestionGenerator
+    var lesson_creator: LessonContentCreator
+    var rubric_builder: AssessmentRubricBuilder
+    var objective_mapper: LearningObjectiveMapper
+    var summarizer: ContentSummarizer
+    var transcriber: TranscriptGenerator
+
+    var content_cache: Map<String, Dynamic> = Map::new()
+    var metrics: ContentMetrics = ContentMetrics::default()
+    var is_running: bool = false
+
+    pub fn new() -> Self {
+        let config = ContentHiveConfig::default();
+
+        ContentHive {
+            config: config.clone(),
+            question_generator: QuizQuestionGenerator::new(config.default_model.clone()),
+            lesson_creator: LessonContentCreator::new(config.creative_model.clone()),
+            rubric_builder: AssessmentRubricBuilder::new(config.default_model.clone()),
+            objective_mapper: LearningObjectiveMapper::new(config.default_model.clone(), config.embedding_model.clone()),
+            summarizer: ContentSummarizer::new(config.default_model.clone()),
+            transcriber: TranscriptGenerator::new(config.transcription_model.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// Start the content hive
+    pub receive Start() -> Result<(), ContentError> {
+        if self.is_running {
+            return Err(ContentError::AlreadyRunning);
+        }
+
+        self.is_running = true;
+        println!("[ContentHive] Started");
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Stop the content hive
+    pub receive Stop() {
+        self.is_running = false;
+        println!("[ContentHive] Stopped");
+        checkpoint();
+    }
+
+    /// Generate quiz questions
+    pub receive GenerateQuestions(request: QuestionGenerationRequest) -> Result<List<GeneratedQuestion>, ContentError> {
+        let questions = self.question_generator.generate(&request).await?;
+
+        self.metrics.questions_generated += questions.len() as i64;
+
+        checkpoint();
+        Ok(questions)
+    }
+
+    /// Create lesson content
+    pub receive CreateLesson(request: LessonContentRequest) -> Result<GeneratedLesson, ContentError> {
+        let lesson = self.lesson_creator.create(&request).await?;
+
+        self.metrics.lessons_created += 1;
+
+        checkpoint();
+        Ok(lesson)
+    }
+
+    /// Build assessment rubric
+    pub receive BuildRubric(request: RubricGenerationRequest) -> Result<GeneratedRubric, ContentError> {
+        let rubric = self.rubric_builder.build(&request).await?;
+
+        self.metrics.rubrics_built += 1;
+
+        checkpoint();
+        Ok(rubric)
+    }
+
+    /// Map learning objectives
+    pub receive MapObjectives(request: ObjectiveMappingRequest) -> Result<ObjectiveMappingResult, ContentError> {
+        let result = self.objective_mapper.map(&request).await?;
+
+        self.metrics.objective_mappings += 1;
+
+        checkpoint();
+        Ok(result)
+    }
+
+    /// Summarize content
+    pub receive SummarizeContent(request: SummarizationRequest) -> Result<GeneratedSummary, ContentError> {
+        let summary = self.summarizer.summarize(&request).await?;
+
+        self.metrics.summaries_generated += 1;
+
+        checkpoint();
+        Ok(summary)
+    }
+
+    /// Generate transcript
+    pub receive GenerateTranscript(request: TranscriptionRequest) -> Result<GeneratedTranscript, ContentError> {
+        let transcript = self.transcriber.transcribe(&request).await?;
+
+        self.metrics.transcripts_generated += 1;
+
+        checkpoint();
+        Ok(transcript)
+    }
+
+    /// Get metrics
+    pub receive GetMetrics() -> ContentMetrics {
+        self.metrics.clone()
+    }
+
+    /// Clear cache
+    pub receive ClearCache() {
+        self.content_cache.clear();
+        checkpoint();
+    }
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+#[derive(Clone, Default)]
+pub struct ContentMetrics {
+    pub questions_generated: i64,
+    pub lessons_created: i64,
+    pub rubrics_built: i64,
+    pub objective_mappings: i64,
+    pub summaries_generated: i64,
+    pub transcripts_generated: i64,
+    pub cache_hits: i64,
+    pub cache_misses: i64,
+}
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+pub enum ContentError {
+    AlreadyRunning,
+    NotRunning,
+    ModelError { message: String },
+    ParseError { message: String },
+    MediaError { message: String },
+    TranscriptionError { message: String },
+    InvalidRequest { message: String },
+}
+
+// =============================================================================
+// JSON Helper Types
+// =============================================================================
+
+struct QuestionJson {
+    question_type: String,
+    text: String,
+    stem: Option<String>,
+    points: f32,
+    difficulty: String,
+    bloom_level: String,
+    options: List<OptionJson>,
+    correct_answer: Option<String>,
+    feedback: Option<FeedbackJsonInner>,
+    explanation: String,
+    mapped_objectives: List<String>,
+    rationale: String,
+    distractor_analysis: Option<List<DistractorJson>>,
+}
+
+struct OptionJson {
+    id: String,
+    text: String,
+    is_correct: bool,
+}
+
+struct FeedbackJsonInner {
+    correct: String,
+    incorrect: String,
+}
+
+struct DistractorJson {
+    option_id: String,
+    why_plausible: String,
+    why_wrong: String,
+    misconception: Option<String>,
+}
+
+struct LessonJson {
+    title: String,
+    introduction: SectionJson,
+    sections: List<SectionJson>,
+    conclusion: SectionJson,
+    key_takeaways: List<String>,
+    vocabulary: List<VocabularyJson>,
+    activities: List<ActivityJson>,
+    suggested_assessments: List<AssessmentSuggestionJson>,
+    estimated_duration: i32,
+    metadata: MetadataJson,
+}
+
+struct SectionJson {
+    title: String,
+    content: String,
+    duration: i32,
+    objectives_addressed: List<String>,
+    media_suggestions: List<MediaSuggestionJson>,
+    instructor_notes: Option<String>,
+}
+
+struct VocabularyJson {
+    term: String,
+    definition: String,
+    context: Option<String>,
+    related_terms: List<String>,
+}
+
+struct ActivityJson {
+    id: String,
+    title: String,
+    description: String,
+    activity_type: String,
+    instructions: String,
+    duration: i32,
+    materials_needed: List<String>,
+    objectives_addressed: List<String>,
+}
+
+struct AssessmentSuggestionJson {
+    assessment_type: String,
+    description: String,
+    objectives_assessed: List<String>,
+    suggested_questions: i32,
+}
+
+struct MediaSuggestionJson {
+    media_type: String,
+    description: String,
+    purpose: String,
+}
+
+struct MetadataJson {
+    bloom_levels_covered: List<String>,
+    prerequisite_knowledge: List<String>,
+    difficulty_level: String,
+}
+
+struct RubricResponseJson {
+    rubric: RubricJson,
+    calibration_examples: List<CalibrationExampleJson>,
+    usage_guidance: String,
+}
+
+struct RubricJson {
+    id: String,
+    title: String,
+    description: String,
+    total_points: f32,
+    criteria: List<CriterionJson>,
+}
+
+struct CriterionJson {
+    id: String,
+    name: String,
+    description: String,
+    max_points: f32,
+    position: i32,
+    learning_objectives: List<String>,
+    levels: List<LevelJson>,
+}
+
+struct LevelJson {
+    id: String,
+    name: String,
+    description: String,
+    points: f32,
+    position: i32,
+}
+
+struct CalibrationExampleJson {
+    criterion_id: String,
+    level_id: String,
+    example_work: String,
+    explanation: String,
+}
+
+struct MappingResponseJson {
+    mappings: List<MappingJson>,
+    suggested_objectives: List<SuggestedObjectiveJson>,
+    coverage: CoverageJson,
+}
+
+struct MappingJson {
+    objective_id: String,
+    content_segments: List<SegmentJson>,
+    alignment_score: f64,
+    evidence: String,
+}
+
+struct SegmentJson {
+    start_offset: i32,
+    end_offset: i32,
+    text_excerpt: String,
+}
+
+struct SuggestedObjectiveJson {
+    description: String,
+    bloom_level: String,
+    rationale: String,
+    verb: String,
+    measurable: bool,
+}
+
+struct CoverageJson {
+    coverage_percent: f64,
+    uncovered_objectives: List<String>,
+    unmapped_content_percent: f64,
+    bloom_distribution: Map<String, f64>,
+}
+
+struct SummaryResponseJson {
+    summary: String,
+    key_points: List<String>,
+    key_terms: List<VocabularyJson>,
+    word_count: i32,
+}
+
+struct RawTranscript {
+    text: String,
+    segments: List<RawSegment>,
+    language: String,
+    duration: f64,
+    confidence: f64,
+}
+
+struct RawSegment {
+    start: f64,
+    end: f64,
+    text: String,
+    speaker: Option<String>,
+    confidence: f64,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn parse_json<T>(json_str: &str) -> Result<T, String> {
+    std::json::parse(json_str)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_content_hive_creation() {
+        let hive = ContentHive::new();
+        assert!(!hive.is_running);
+    }
+
+    #[test]
+    fn test_difficulty_distribution_default() {
+        let dist = DifficultyDistribution::default();
+        let total = dist.novice_percent + dist.beginner_percent + dist.intermediate_percent +
+                   dist.advanced_percent + dist.expert_percent;
+        assert!((total - 1.0).abs() < 0.01);
+    }
+}

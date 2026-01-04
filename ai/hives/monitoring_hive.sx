@@ -1,0 +1,1146 @@
+/// Intelligo LMS - Monitoring Hive
+///
+/// Handles real-time monitoring of learning systems, AI performance,
+/// anomaly detection, alerting, and system health tracking.
+
+module intelligo::ai::hives::monitoring
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock, Mutex}
+use std::time::{DateTime, Duration, Instant}
+
+// =============================================================================
+// MONITORING HIVE
+// =============================================================================
+
+/// Actor that manages monitoring and observability of the LMS
+pub actor MonitoringHive {
+    metrics_store: Arc<MetricsStore>,
+    alert_manager: Arc<RwLock<AlertManager>>,
+    anomaly_detector: Arc<AnomalyDetector>,
+    dashboards: Arc<RwLock<Map<String, Dashboard>>>,
+    config: MonitoringConfig
+}
+
+/// Configuration for monitoring
+pub type MonitoringConfig {
+    retention_period: Duration,
+    aggregation_intervals: List<Duration>,
+    alert_cooldown: Duration,
+    anomaly_sensitivity: f64,
+    sampling_rate: f64
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> MonitoringConfig {
+        MonitoringConfig {
+            retention_period: Duration::from_secs(86400 * 7), // 7 days
+            aggregation_intervals: vec![
+                Duration::from_secs(60),      // 1 minute
+                Duration::from_secs(300),     // 5 minutes
+                Duration::from_secs(3600),    // 1 hour
+                Duration::from_secs(86400),   // 1 day
+            ],
+            alert_cooldown: Duration::from_secs(300),
+            anomaly_sensitivity: 2.0, // Standard deviations
+            sampling_rate: 1.0        // 100% sampling
+        }
+    }
+}
+
+impl MonitoringHive {
+    pub fn new() -> MonitoringHive {
+        MonitoringHive::with_config(MonitoringConfig::default())
+    }
+
+    pub fn with_config(config: MonitoringConfig) -> MonitoringHive {
+        MonitoringHive {
+            metrics_store: Arc::new(MetricsStore::new(&config)),
+            alert_manager: Arc::new(RwLock::new(AlertManager::new(&config))),
+            anomaly_detector: Arc::new(AnomalyDetector::new(config.anomaly_sensitivity)),
+            dashboards: Arc::new(RwLock::new(Map::new())),
+            config
+        }
+    }
+
+    // =========================================================================
+    // METRICS COLLECTION
+    // =========================================================================
+
+    /// Record a metric value
+    pub async fn record_metric(&self, metric: MetricPoint) -> Result<(), String> {
+        // Apply sampling
+        if rand_f64() > self.config.sampling_rate {
+            return Ok(());
+        }
+
+        // Store metric
+        self.metrics_store.record(metric.clone());
+
+        // Check for anomalies
+        if let Some(anomaly) = self.anomaly_detector.check(&metric) {
+            self.handle_anomaly(anomaly).await?;
+        }
+
+        // Check alert conditions
+        self.check_alert_conditions(&metric).await?;
+
+        Ok(())
+    }
+
+    /// Record a counter increment
+    pub async fn increment_counter(&self, name: &str, value: f64, tags: Map<String, String>) {
+        let metric = MetricPoint {
+            name: name.to_string(),
+            metric_type: MetricType::Counter,
+            value,
+            tags,
+            timestamp: DateTime::now()
+        };
+        let _ = self.record_metric(metric).await;
+    }
+
+    /// Record a gauge value
+    pub async fn record_gauge(&self, name: &str, value: f64, tags: Map<String, String>) {
+        let metric = MetricPoint {
+            name: name.to_string(),
+            metric_type: MetricType::Gauge,
+            value,
+            tags,
+            timestamp: DateTime::now()
+        };
+        let _ = self.record_metric(metric).await;
+    }
+
+    /// Record a histogram observation
+    pub async fn observe_histogram(&self, name: &str, value: f64, tags: Map<String, String>) {
+        let metric = MetricPoint {
+            name: name.to_string(),
+            metric_type: MetricType::Histogram,
+            value,
+            tags,
+            timestamp: DateTime::now()
+        };
+        let _ = self.record_metric(metric).await;
+    }
+
+    /// Record a timing measurement
+    pub async fn record_timing(&self, name: &str, duration: Duration, tags: Map<String, String>) {
+        let metric = MetricPoint {
+            name: name.to_string(),
+            metric_type: MetricType::Timer,
+            value: duration.as_secs_f64() * 1000.0, // Convert to ms
+            tags,
+            timestamp: DateTime::now()
+        };
+        let _ = self.record_metric(metric).await;
+    }
+
+    // =========================================================================
+    // LEARNING METRICS
+    // =========================================================================
+
+    /// Record learner activity
+    pub async fn track_learner_activity(&self, event: LearnerActivityEvent) {
+        let mut tags = Map::new();
+        tags.insert("tenant_id".to_string(), event.tenant_id.clone());
+        tags.insert("course_id".to_string(), event.course_id.clone());
+        tags.insert("activity_type".to_string(), event.activity_type.to_string());
+
+        // Active learners
+        self.increment_counter("learner.activity", 1.0, tags.clone()).await;
+
+        // Time spent
+        if let Some(duration) = event.duration {
+            self.observe_histogram("learner.time_spent", duration.as_secs_f64(), tags.clone()).await;
+        }
+
+        // Progress update
+        if let Some(progress) = event.progress {
+            tags.insert("learner_id".to_string(), event.learner_id.clone());
+            self.record_gauge("learner.progress", progress, tags).await;
+        }
+    }
+
+    /// Record assessment result
+    pub async fn track_assessment(&self, result: AssessmentResultEvent) {
+        let mut tags = Map::new();
+        tags.insert("tenant_id".to_string(), result.tenant_id.clone());
+        tags.insert("course_id".to_string(), result.course_id.clone());
+        tags.insert("assessment_id".to_string(), result.assessment_id.clone());
+
+        // Score distribution
+        if let Some(score) = result.score {
+            self.observe_histogram("assessment.score", score, tags.clone()).await;
+        }
+
+        // Pass/fail rate
+        let passed = if result.passed { 1.0 } else { 0.0 };
+        self.increment_counter("assessment.completed", 1.0, tags.clone()).await;
+        self.increment_counter("assessment.passed", passed, tags.clone()).await;
+
+        // Time to complete
+        if let Some(duration) = result.duration {
+            self.observe_histogram("assessment.duration", duration.as_secs_f64(), tags).await;
+        }
+    }
+
+    /// Track AI hive performance
+    pub async fn track_ai_hive(&self, hive_name: &str, operation: &str, result: AiOperationResult) {
+        let mut tags = Map::new();
+        tags.insert("hive".to_string(), hive_name.to_string());
+        tags.insert("operation".to_string(), operation.to_string());
+
+        // Latency
+        self.observe_histogram("ai.latency", result.latency.as_secs_f64() * 1000.0, tags.clone()).await;
+
+        // Token usage
+        if let Some(tokens) = result.tokens_used {
+            self.increment_counter("ai.tokens", tokens as f64, tags.clone()).await;
+        }
+
+        // Success/failure
+        if result.success {
+            self.increment_counter("ai.success", 1.0, tags.clone()).await;
+        } else {
+            self.increment_counter("ai.failure", 1.0, tags.clone()).await;
+        }
+
+        // Confidence score
+        if let Some(confidence) = result.confidence {
+            self.observe_histogram("ai.confidence", confidence, tags).await;
+        }
+    }
+
+    /// Track SCORM/xAPI compliance
+    pub async fn track_compliance(&self, event: ComplianceEvent) {
+        let mut tags = Map::new();
+        tags.insert("standard".to_string(), event.standard.clone());
+        tags.insert("operation".to_string(), event.operation.clone());
+
+        self.increment_counter("compliance.operations", 1.0, tags.clone()).await;
+
+        if event.success {
+            self.increment_counter("compliance.success", 1.0, tags.clone()).await;
+        } else {
+            self.increment_counter("compliance.failure", 1.0, tags.clone()).await;
+            if let Some(ref error) = event.error {
+                tags.insert("error_type".to_string(), error.clone());
+                self.increment_counter("compliance.errors", 1.0, tags).await;
+            }
+        }
+    }
+
+    // =========================================================================
+    // SYSTEM HEALTH
+    // =========================================================================
+
+    /// Get system health summary
+    pub async fn get_health_summary(&self) -> SystemHealthSummary {
+        let now = DateTime::now();
+        let last_hour = now - Duration::from_secs(3600);
+
+        // Collect key metrics
+        let error_rate = self.metrics_store.get_rate("error.count", &last_hour, &now);
+        let request_rate = self.metrics_store.get_rate("request.count", &last_hour, &now);
+        let avg_latency = self.metrics_store.get_average("request.latency", &last_hour, &now);
+        let active_learners = self.metrics_store.get_count_distinct("learner.activity", "learner_id", &last_hour, &now);
+
+        // AI health
+        let ai_success_rate = {
+            let successes = self.metrics_store.get_sum("ai.success", &last_hour, &now);
+            let failures = self.metrics_store.get_sum("ai.failure", &last_hour, &now);
+            if successes + failures > 0.0 {
+                successes / (successes + failures)
+            } else {
+                1.0
+            }
+        };
+
+        // Determine status
+        let status = if error_rate > 0.1 || ai_success_rate < 0.8 {
+            HealthStatus::Degraded
+        } else if error_rate > 0.01 {
+            HealthStatus::Warning
+        } else {
+            HealthStatus::Healthy
+        };
+
+        // Get active alerts
+        let active_alerts = self.alert_manager.read().unwrap().get_active_alerts();
+
+        SystemHealthSummary {
+            status,
+            timestamp: now,
+            metrics: HealthMetrics {
+                error_rate,
+                request_rate,
+                avg_latency_ms: avg_latency,
+                active_learners: active_learners as i32,
+                ai_success_rate
+            },
+            active_alerts: active_alerts.len() as i32,
+            recent_anomalies: self.anomaly_detector.get_recent_anomalies(10)
+        }
+    }
+
+    /// Get component health
+    pub async fn get_component_health(&self, component: &str) -> ComponentHealth {
+        let now = DateTime::now();
+        let last_5min = now - Duration::from_secs(300);
+
+        let mut tags = Map::new();
+        tags.insert("component".to_string(), component.to_string());
+
+        let error_count = self.metrics_store.get_sum_with_tags("error.count", &tags, &last_5min, &now);
+        let request_count = self.metrics_store.get_sum_with_tags("request.count", &tags, &last_5min, &now);
+        let avg_latency = self.metrics_store.get_average_with_tags("request.latency", &tags, &last_5min, &now);
+
+        let status = if error_count > 0.0 && request_count > 0.0 && error_count / request_count > 0.1 {
+            HealthStatus::Degraded
+        } else if error_count > 0.0 {
+            HealthStatus::Warning
+        } else {
+            HealthStatus::Healthy
+        };
+
+        ComponentHealth {
+            component: component.to_string(),
+            status,
+            error_rate: if request_count > 0.0 { error_count / request_count } else { 0.0 },
+            avg_latency_ms: avg_latency,
+            last_check: now
+        }
+    }
+
+    // =========================================================================
+    // ALERTING
+    // =========================================================================
+
+    /// Configure an alert rule
+    pub async fn configure_alert(&mut self, rule: AlertRule) -> Result<(), String> {
+        self.alert_manager.write().unwrap().add_rule(rule);
+        Ok(())
+    }
+
+    /// Check alert conditions
+    async fn check_alert_conditions(&self, metric: &MetricPoint) -> Result<(), String> {
+        let alerts = self.alert_manager.read().unwrap().check(metric, &self.metrics_store);
+
+        for alert in alerts {
+            self.fire_alert(alert).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn fire_alert(&self, alert: Alert) -> Result<(), String> {
+        self.alert_manager.write().unwrap().record_alert(alert.clone());
+
+        // In production, send to notification channels
+        println!("[ALERT] {} - {} (severity: {:?})", alert.rule_name, alert.message, alert.severity);
+
+        Ok(())
+    }
+
+    /// Acknowledge an alert
+    pub async fn acknowledge_alert(&mut self, alert_id: &str, by: &str) -> Result<(), String> {
+        self.alert_manager.write().unwrap().acknowledge(alert_id, by);
+        Ok(())
+    }
+
+    /// Resolve an alert
+    pub async fn resolve_alert(&mut self, alert_id: &str, by: &str, resolution: &str) -> Result<(), String> {
+        self.alert_manager.write().unwrap().resolve(alert_id, by, resolution);
+        Ok(())
+    }
+
+    // =========================================================================
+    // ANOMALY DETECTION
+    // =========================================================================
+
+    async fn handle_anomaly(&self, anomaly: Anomaly) -> Result<(), String> {
+        self.anomaly_detector.record(anomaly.clone());
+
+        // Create alert for severe anomalies
+        if anomaly.severity >= AnomalySeverity::High {
+            let alert = Alert {
+                id: generate_id("alert"),
+                rule_name: "anomaly_detection".to_string(),
+                severity: match anomaly.severity {
+                    AnomalySeverity::Critical => AlertSeverity::Critical,
+                    AnomalySeverity::High => AlertSeverity::High,
+                    _ => AlertSeverity::Medium
+                },
+                message: anomaly.description.clone(),
+                metric_name: anomaly.metric_name.clone(),
+                value: anomaly.value,
+                threshold: anomaly.expected_value,
+                tags: anomaly.tags.clone(),
+                fired_at: DateTime::now(),
+                acknowledged_at: None,
+                resolved_at: None
+            };
+
+            self.fire_alert(alert).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Train anomaly detector with historical data
+    pub async fn train_anomaly_detector(&mut self, metric_name: &str, training_period: Duration) {
+        let now = DateTime::now();
+        let start = now - training_period;
+        let data = self.metrics_store.get_series(metric_name, &start, &now);
+        self.anomaly_detector.train(metric_name, data);
+    }
+
+    // =========================================================================
+    // DASHBOARDS
+    // =========================================================================
+
+    /// Create a dashboard
+    pub async fn create_dashboard(&mut self, dashboard: Dashboard) -> Result<(), String> {
+        self.dashboards.write().unwrap().insert(dashboard.id.clone(), dashboard);
+        Ok(())
+    }
+
+    /// Get dashboard data
+    pub async fn get_dashboard_data(&self, dashboard_id: &str, time_range: TimeRange) -> Result<DashboardData, String> {
+        let dashboards = self.dashboards.read().unwrap();
+        let dashboard = dashboards.get(dashboard_id)
+            .ok_or("Dashboard not found")?;
+
+        let mut panels = vec![];
+
+        for panel in &dashboard.panels {
+            let data = match panel.panel_type {
+                PanelType::LineChart | PanelType::AreaChart => {
+                    let series = self.metrics_store.get_series(&panel.metric, &time_range.start, &time_range.end);
+                    PanelData::TimeSeries(series)
+                }
+                PanelType::Gauge => {
+                    let value = self.metrics_store.get_latest(&panel.metric);
+                    PanelData::SingleValue(value)
+                }
+                PanelType::Counter => {
+                    let sum = self.metrics_store.get_sum(&panel.metric, &time_range.start, &time_range.end);
+                    PanelData::SingleValue(sum)
+                }
+                PanelType::Table => {
+                    let rows = self.metrics_store.get_breakdown(&panel.metric, &panel.group_by, &time_range.start, &time_range.end);
+                    PanelData::Table(rows)
+                }
+                PanelType::Heatmap => {
+                    let data = self.metrics_store.get_heatmap(&panel.metric, &time_range.start, &time_range.end);
+                    PanelData::Heatmap(data)
+                }
+            };
+
+            panels.push(PanelResult {
+                panel_id: panel.id.clone(),
+                title: panel.title.clone(),
+                data
+            });
+        }
+
+        Ok(DashboardData {
+            dashboard_id: dashboard_id.to_string(),
+            time_range,
+            panels,
+            generated_at: DateTime::now()
+        })
+    }
+
+    // =========================================================================
+    // QUERIES
+    // =========================================================================
+
+    /// Query metrics
+    pub async fn query(&self, query: MetricQuery) -> QueryResult {
+        let data = match query.aggregation {
+            Aggregation::Sum => {
+                let value = self.metrics_store.get_sum_with_tags(&query.metric, &query.tags, &query.start, &query.end);
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+            Aggregation::Avg => {
+                let value = self.metrics_store.get_average_with_tags(&query.metric, &query.tags, &query.start, &query.end);
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+            Aggregation::Max => {
+                let value = self.metrics_store.get_max_with_tags(&query.metric, &query.tags, &query.start, &query.end);
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+            Aggregation::Min => {
+                let value = self.metrics_store.get_min_with_tags(&query.metric, &query.tags, &query.start, &query.end);
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+            Aggregation::Count => {
+                let value = self.metrics_store.get_count_with_tags(&query.metric, &query.tags, &query.start, &query.end) as f64;
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+            Aggregation::Percentile(p) => {
+                let value = self.metrics_store.get_percentile(&query.metric, p, &query.start, &query.end);
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+            Aggregation::Rate => {
+                let value = self.metrics_store.get_rate(&query.metric, &query.start, &query.end);
+                vec![DataPoint { timestamp: query.end, value }]
+            }
+        };
+
+        QueryResult {
+            metric: query.metric,
+            data,
+            aggregation: query.aggregation
+        }
+    }
+}
+
+// =============================================================================
+// METRICS STORE
+// =============================================================================
+
+/// In-memory metrics store with retention
+pub type MetricsStore {
+    metrics: Arc<RwLock<Map<String, List<MetricPoint>>>>,
+    retention: Duration
+}
+
+impl MetricsStore {
+    pub fn new(config: &MonitoringConfig) -> MetricsStore {
+        MetricsStore {
+            metrics: Arc::new(RwLock::new(Map::new())),
+            retention: config.retention_period
+        }
+    }
+
+    pub fn record(&self, point: MetricPoint) {
+        let mut metrics = self.metrics.write().unwrap();
+        metrics.entry(point.name.clone())
+            .or_insert_with(Vec::new)
+            .push(point);
+    }
+
+    pub fn get_series(&self, metric: &str, start: &DateTime, end: &DateTime) -> List<DataPoint> {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .map(|points| {
+                points.iter()
+                    .filter(|p| p.timestamp >= *start && p.timestamp <= *end)
+                    .map(|p| DataPoint { timestamp: p.timestamp, value: p.value })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_sum(&self, metric: &str, start: &DateTime, end: &DateTime) -> f64 {
+        self.get_series(metric, start, end).iter().map(|p| p.value).sum()
+    }
+
+    pub fn get_sum_with_tags(&self, metric: &str, tags: &Map<String, String>, start: &DateTime, end: &DateTime) -> f64 {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .map(|points| {
+                points.iter()
+                    .filter(|p| {
+                        p.timestamp >= *start && p.timestamp <= *end &&
+                        tags.iter().all(|(k, v)| p.tags.get(k) == Some(v))
+                    })
+                    .map(|p| p.value)
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
+    pub fn get_average(&self, metric: &str, start: &DateTime, end: &DateTime) -> f64 {
+        let series = self.get_series(metric, start, end);
+        if series.is_empty() {
+            return 0.0;
+        }
+        series.iter().map(|p| p.value).sum::<f64>() / series.len() as f64
+    }
+
+    pub fn get_average_with_tags(&self, metric: &str, tags: &Map<String, String>, start: &DateTime, end: &DateTime) -> f64 {
+        let sum = self.get_sum_with_tags(metric, tags, start, end);
+        let count = self.get_count_with_tags(metric, tags, start, end);
+        if count == 0 { 0.0 } else { sum / count as f64 }
+    }
+
+    pub fn get_max_with_tags(&self, metric: &str, tags: &Map<String, String>, start: &DateTime, end: &DateTime) -> f64 {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .map(|points| {
+                points.iter()
+                    .filter(|p| {
+                        p.timestamp >= *start && p.timestamp <= *end &&
+                        tags.iter().all(|(k, v)| p.tags.get(k) == Some(v))
+                    })
+                    .map(|p| p.value)
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
+            .unwrap_or(0.0)
+    }
+
+    pub fn get_min_with_tags(&self, metric: &str, tags: &Map<String, String>, start: &DateTime, end: &DateTime) -> f64 {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .map(|points| {
+                points.iter()
+                    .filter(|p| {
+                        p.timestamp >= *start && p.timestamp <= *end &&
+                        tags.iter().all(|(k, v)| p.tags.get(k) == Some(v))
+                    })
+                    .map(|p| p.value)
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .unwrap_or(0.0)
+    }
+
+    pub fn get_count_with_tags(&self, metric: &str, tags: &Map<String, String>, start: &DateTime, end: &DateTime) -> i32 {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .map(|points| {
+                points.iter()
+                    .filter(|p| {
+                        p.timestamp >= *start && p.timestamp <= *end &&
+                        tags.iter().all(|(k, v)| p.tags.get(k) == Some(v))
+                    })
+                    .count() as i32
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn get_rate(&self, metric: &str, start: &DateTime, end: &DateTime) -> f64 {
+        let sum = self.get_sum(metric, start, end);
+        let duration = (*end - *start).as_secs_f64();
+        if duration > 0.0 { sum / duration } else { 0.0 }
+    }
+
+    pub fn get_percentile(&self, metric: &str, percentile: f64, start: &DateTime, end: &DateTime) -> f64 {
+        let mut values: Vec<f64> = self.get_series(metric, start, end)
+            .iter()
+            .map(|p| p.value)
+            .collect();
+
+        if values.is_empty() {
+            return 0.0;
+        }
+
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let index = ((percentile / 100.0) * (values.len() - 1) as f64) as usize;
+        values[index]
+    }
+
+    pub fn get_latest(&self, metric: &str) -> f64 {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .and_then(|points| points.last())
+            .map(|p| p.value)
+            .unwrap_or(0.0)
+    }
+
+    pub fn get_count_distinct(&self, metric: &str, tag: &str, start: &DateTime, end: &DateTime) -> usize {
+        self.metrics.read().unwrap()
+            .get(metric)
+            .map(|points| {
+                let values: std::collections::HashSet<_> = points.iter()
+                    .filter(|p| p.timestamp >= *start && p.timestamp <= *end)
+                    .filter_map(|p| p.tags.get(tag))
+                    .collect();
+                values.len()
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn get_breakdown(&self, metric: &str, group_by: &Option<String>, start: &DateTime, end: &DateTime) -> List<TableRow> {
+        // Simplified implementation
+        vec![]
+    }
+
+    pub fn get_heatmap(&self, metric: &str, start: &DateTime, end: &DateTime) -> List<HeatmapCell> {
+        // Simplified implementation
+        vec![]
+    }
+}
+
+// =============================================================================
+// ALERT MANAGER
+// =============================================================================
+
+pub type AlertManager {
+    rules: List<AlertRule>,
+    alerts: List<Alert>,
+    cooldowns: Map<String, DateTime>,
+    config: MonitoringConfig
+}
+
+impl AlertManager {
+    pub fn new(config: &MonitoringConfig) -> AlertManager {
+        AlertManager {
+            rules: vec![],
+            alerts: vec![],
+            cooldowns: Map::new(),
+            config: config.clone()
+        }
+    }
+
+    pub fn add_rule(&mut self, rule: AlertRule) {
+        self.rules.push(rule);
+    }
+
+    pub fn check(&self, metric: &MetricPoint, store: &MetricsStore) -> List<Alert> {
+        let mut fired_alerts = vec![];
+
+        for rule in &self.rules {
+            if rule.metric_name != metric.name {
+                continue;
+            }
+
+            // Check cooldown
+            if let Some(last_fired) = self.cooldowns.get(&rule.id) {
+                if DateTime::now() - *last_fired < self.config.alert_cooldown {
+                    continue;
+                }
+            }
+
+            // Evaluate condition
+            let should_fire = match &rule.condition {
+                AlertCondition::GreaterThan(threshold) => metric.value > *threshold,
+                AlertCondition::LessThan(threshold) => metric.value < *threshold,
+                AlertCondition::Equal(value) => (metric.value - value).abs() < 0.001,
+                AlertCondition::RateOfChange(threshold) => {
+                    // Would need to calculate rate of change from store
+                    false
+                }
+            };
+
+            if should_fire {
+                fired_alerts.push(Alert {
+                    id: generate_id("alert"),
+                    rule_name: rule.name.clone(),
+                    severity: rule.severity.clone(),
+                    message: rule.message.clone(),
+                    metric_name: metric.name.clone(),
+                    value: metric.value,
+                    threshold: match &rule.condition {
+                        AlertCondition::GreaterThan(t) | AlertCondition::LessThan(t) => *t,
+                        AlertCondition::Equal(v) => *v,
+                        AlertCondition::RateOfChange(t) => *t
+                    },
+                    tags: metric.tags.clone(),
+                    fired_at: DateTime::now(),
+                    acknowledged_at: None,
+                    resolved_at: None
+                });
+            }
+        }
+
+        fired_alerts
+    }
+
+    pub fn record_alert(&mut self, alert: Alert) {
+        self.cooldowns.insert(alert.rule_name.clone(), DateTime::now());
+        self.alerts.push(alert);
+    }
+
+    pub fn get_active_alerts(&self) -> List<Alert> {
+        self.alerts.iter()
+            .filter(|a| a.resolved_at.is_none())
+            .cloned()
+            .collect()
+    }
+
+    pub fn acknowledge(&mut self, alert_id: &str, by: &str) {
+        if let Some(alert) = self.alerts.iter_mut().find(|a| a.id == alert_id) {
+            alert.acknowledged_at = Some(DateTime::now());
+        }
+    }
+
+    pub fn resolve(&mut self, alert_id: &str, by: &str, resolution: &str) {
+        if let Some(alert) = self.alerts.iter_mut().find(|a| a.id == alert_id) {
+            alert.resolved_at = Some(DateTime::now());
+        }
+    }
+}
+
+// =============================================================================
+// ANOMALY DETECTOR
+// =============================================================================
+
+pub type AnomalyDetector {
+    models: Arc<RwLock<Map<String, AnomalyModel>>>,
+    anomalies: Arc<Mutex<List<Anomaly>>>,
+    sensitivity: f64
+}
+
+pub type AnomalyModel {
+    metric_name: String,
+    mean: f64,
+    std_dev: f64,
+    sample_count: i32
+}
+
+impl AnomalyDetector {
+    pub fn new(sensitivity: f64) -> AnomalyDetector {
+        AnomalyDetector {
+            models: Arc::new(RwLock::new(Map::new())),
+            anomalies: Arc::new(Mutex::new(vec![])),
+            sensitivity
+        }
+    }
+
+    pub fn check(&self, metric: &MetricPoint) -> Option<Anomaly> {
+        let models = self.models.read().unwrap();
+        let model = models.get(&metric.name)?;
+
+        let z_score = (metric.value - model.mean) / model.std_dev;
+
+        if z_score.abs() > self.sensitivity {
+            let severity = if z_score.abs() > 4.0 {
+                AnomalySeverity::Critical
+            } else if z_score.abs() > 3.0 {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Medium
+            };
+
+            Some(Anomaly {
+                id: generate_id("anomaly"),
+                metric_name: metric.name.clone(),
+                value: metric.value,
+                expected_value: model.mean,
+                deviation: z_score,
+                severity,
+                description: format!(
+                    "Metric {} has unusual value {:.2} (expected ~{:.2}, {:.1} std devs away)",
+                    metric.name, metric.value, model.mean, z_score
+                ),
+                tags: metric.tags.clone(),
+                detected_at: DateTime::now()
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn train(&self, metric_name: &str, data: List<DataPoint>) {
+        if data.is_empty() {
+            return;
+        }
+
+        let values: Vec<f64> = data.iter().map(|d| d.value).collect();
+        let n = values.len() as f64;
+        let mean = values.iter().sum::<f64>() / n;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        let std_dev = variance.sqrt();
+
+        self.models.write().unwrap().insert(metric_name.to_string(), AnomalyModel {
+            metric_name: metric_name.to_string(),
+            mean,
+            std_dev: std_dev.max(0.001), // Prevent division by zero
+            sample_count: data.len() as i32
+        });
+    }
+
+    pub fn record(&self, anomaly: Anomaly) {
+        self.anomalies.lock().unwrap().push(anomaly);
+    }
+
+    pub fn get_recent_anomalies(&self, limit: usize) -> List<Anomaly> {
+        let anomalies = self.anomalies.lock().unwrap();
+        anomalies.iter().rev().take(limit).cloned().collect()
+    }
+}
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+#[derive(Clone)]
+pub type MetricPoint {
+    name: String,
+    metric_type: MetricType,
+    value: f64,
+    tags: Map<String, String>,
+    timestamp: DateTime
+}
+
+#[derive(Clone)]
+pub enum MetricType {
+    Counter,
+    Gauge,
+    Histogram,
+    Timer
+}
+
+#[derive(Clone)]
+pub type DataPoint {
+    timestamp: DateTime,
+    value: f64
+}
+
+#[derive(Clone)]
+pub type AlertRule {
+    id: String,
+    name: String,
+    metric_name: String,
+    condition: AlertCondition,
+    severity: AlertSeverity,
+    message: String,
+    enabled: bool
+}
+
+#[derive(Clone)]
+pub enum AlertCondition {
+    GreaterThan(f64),
+    LessThan(f64),
+    Equal(f64),
+    RateOfChange(f64)
+}
+
+#[derive(Clone, Debug)]
+pub enum AlertSeverity {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+#[derive(Clone)]
+pub type Alert {
+    id: String,
+    rule_name: String,
+    severity: AlertSeverity,
+    message: String,
+    metric_name: String,
+    value: f64,
+    threshold: f64,
+    tags: Map<String, String>,
+    fired_at: DateTime,
+    acknowledged_at: Option<DateTime>,
+    resolved_at: Option<DateTime>
+}
+
+#[derive(Clone)]
+pub type Anomaly {
+    id: String,
+    metric_name: String,
+    value: f64,
+    expected_value: f64,
+    deviation: f64,
+    severity: AnomalySeverity,
+    description: String,
+    tags: Map<String, String>,
+    detected_at: DateTime
+}
+
+#[derive(Clone, PartialEq, PartialOrd)]
+pub enum AnomalySeverity {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+#[derive(Clone)]
+pub enum HealthStatus {
+    Healthy,
+    Warning,
+    Degraded,
+    Critical
+}
+
+pub type SystemHealthSummary {
+    status: HealthStatus,
+    timestamp: DateTime,
+    metrics: HealthMetrics,
+    active_alerts: i32,
+    recent_anomalies: List<Anomaly>
+}
+
+pub type HealthMetrics {
+    error_rate: f64,
+    request_rate: f64,
+    avg_latency_ms: f64,
+    active_learners: i32,
+    ai_success_rate: f64
+}
+
+pub type ComponentHealth {
+    component: String,
+    status: HealthStatus,
+    error_rate: f64,
+    avg_latency_ms: f64,
+    last_check: DateTime
+}
+
+// Event types
+pub type LearnerActivityEvent {
+    tenant_id: String,
+    learner_id: String,
+    course_id: String,
+    activity_type: ActivityType,
+    duration: Option<Duration>,
+    progress: Option<f64>,
+    timestamp: DateTime
+}
+
+pub enum ActivityType {
+    View,
+    Complete,
+    Quiz,
+    Video,
+    Download,
+    Interaction
+}
+
+impl std::fmt::Display for ActivityType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ActivityType::View => write!(f, "view"),
+            ActivityType::Complete => write!(f, "complete"),
+            ActivityType::Quiz => write!(f, "quiz"),
+            ActivityType::Video => write!(f, "video"),
+            ActivityType::Download => write!(f, "download"),
+            ActivityType::Interaction => write!(f, "interaction")
+        }
+    }
+}
+
+pub type AssessmentResultEvent {
+    tenant_id: String,
+    course_id: String,
+    assessment_id: String,
+    learner_id: String,
+    score: Option<f64>,
+    passed: bool,
+    duration: Option<Duration>,
+    timestamp: DateTime
+}
+
+pub type AiOperationResult {
+    success: bool,
+    latency: Duration,
+    tokens_used: Option<i32>,
+    confidence: Option<f64>,
+    error: Option<String>
+}
+
+pub type ComplianceEvent {
+    standard: String,
+    operation: String,
+    success: bool,
+    error: Option<String>,
+    timestamp: DateTime
+}
+
+// Dashboard types
+pub type Dashboard {
+    id: String,
+    name: String,
+    description: Option<String>,
+    panels: List<Panel>,
+    refresh_interval: Option<Duration>
+}
+
+pub type Panel {
+    id: String,
+    title: String,
+    panel_type: PanelType,
+    metric: String,
+    group_by: Option<String>,
+    aggregation: Option<Aggregation>
+}
+
+pub enum PanelType {
+    LineChart,
+    AreaChart,
+    Gauge,
+    Counter,
+    Table,
+    Heatmap
+}
+
+pub type TimeRange {
+    start: DateTime,
+    end: DateTime
+}
+
+pub type DashboardData {
+    dashboard_id: String,
+    time_range: TimeRange,
+    panels: List<PanelResult>,
+    generated_at: DateTime
+}
+
+pub type PanelResult {
+    panel_id: String,
+    title: String,
+    data: PanelData
+}
+
+pub enum PanelData {
+    TimeSeries(List<DataPoint>),
+    SingleValue(f64),
+    Table(List<TableRow>),
+    Heatmap(List<HeatmapCell>)
+}
+
+pub type TableRow {
+    values: Map<String, String>
+}
+
+pub type HeatmapCell {
+    x: i32,
+    y: i32,
+    value: f64
+}
+
+// Query types
+pub type MetricQuery {
+    metric: String,
+    tags: Map<String, String>,
+    start: DateTime,
+    end: DateTime,
+    aggregation: Aggregation
+}
+
+#[derive(Clone)]
+pub enum Aggregation {
+    Sum,
+    Avg,
+    Max,
+    Min,
+    Count,
+    Percentile(f64),
+    Rate
+}
+
+pub type QueryResult {
+    metric: String,
+    data: List<DataPoint>,
+    aggregation: Aggregation
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id(prefix: &str) -> String {
+    use std::time::SystemTime;
+    format!("{}_{:x}", prefix, SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}
+
+fn rand_f64() -> f64 {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    (nanos % 1000) as f64 / 1000.0
+}

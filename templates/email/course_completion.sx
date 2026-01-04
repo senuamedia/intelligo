@@ -1,0 +1,273 @@
+// Course Completion Email Template for Intelligo LMS
+// Sent when a user completes a course
+
+module intelligo::templates::email::course_completion
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Course completion email template ID
+pub const TEMPLATE_ID: &str = "email.course_completion";
+
+/// Create the course completion email template configuration
+pub fn get_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Course Completion".to_string(),
+        description: Some("Sent when a user completes a course".to_string()),
+        category: "learning".to_string(),
+
+        subject: Some("Congratulations! You've completed {{course_name}}".to_string()),
+        body_html: COMPLETION_HTML.to_string(),
+        body_text: Some(COMPLETION_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "course_name".to_string(),
+            "organization_name".to_string(),
+            "completion_date".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "course_image_url".to_string(),
+            "final_score".to_string(),
+            "time_spent".to_string(),
+            "certificate_url".to_string(),
+            "certificate_id".to_string(),
+            "next_course_name".to_string(),
+            "next_course_url".to_string(),
+            "achievements".to_string(),
+            "share_url".to_string(),
+            "linkedin_add_url".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Build context for course completion email
+pub fn build_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    course_name: String,
+    course_image_url: Option<String>,
+    completion_date: String,
+    organization_name: String,
+    final_score: Option<f64>,
+    time_spent: Option<String>,
+    certificate_url: Option<String>,
+    certificate_id: Option<String>,
+    next_course_name: Option<String>,
+    next_course_url: Option<String>,
+    achievements: Option<Vec<String>>,
+    share_url: Option<String>,
+    linkedin_add_url: Option<String>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name)
+        .set_string("course_name", course_name)
+        .set_string("completion_date", completion_date)
+        .set_string("organization_name", organization_name)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(first_name) = user_first_name {
+        ctx = ctx.set_string("user_first_name", first_name);
+    }
+
+    if let Some(image_url) = course_image_url {
+        ctx = ctx.set_string("course_image_url", image_url);
+    }
+
+    if let Some(score) = final_score {
+        ctx = ctx.set_number("final_score", score);
+        ctx = ctx.set_bool("has_score", true);
+    }
+
+    if let Some(time) = time_spent {
+        ctx = ctx.set_string("time_spent", time);
+    }
+
+    if let Some(cert_url) = certificate_url {
+        ctx = ctx.set_string("certificate_url", cert_url);
+        ctx = ctx.set_bool("has_certificate", true);
+    }
+
+    if let Some(cert_id) = certificate_id {
+        ctx = ctx.set_string("certificate_id", cert_id);
+    }
+
+    if let Some(next_name) = next_course_name {
+        ctx = ctx.set_string("next_course_name", next_name);
+        ctx = ctx.set_bool("has_next_course", true);
+    }
+
+    if let Some(next_url) = next_course_url {
+        ctx = ctx.set_string("next_course_url", next_url);
+    }
+
+    if let Some(ach) = achievements {
+        if !ach.is_empty() {
+            let ach_values: Vec<ContextValue> = ach.into_iter()
+                .map(|a| ContextValue::String(a))
+                .collect();
+            ctx = ctx.set_list("achievements", ach_values);
+            ctx = ctx.set_bool("has_achievements", true);
+        }
+    }
+
+    if let Some(share) = share_url {
+        ctx = ctx.set_string("share_url", share);
+        ctx = ctx.set_bool("can_share", true);
+    }
+
+    if let Some(linkedin) = linkedin_add_url {
+        ctx = ctx.set_string("linkedin_add_url", linkedin);
+    }
+
+    ctx
+}
+
+const COMPLETION_HTML: &str = r#"
+<div style="text-align: center; margin-bottom: 30px;">
+    <div style="font-size: 64px; margin-bottom: 10px;">🎉</div>
+    <h1 style="color: #28a745; margin: 0;">Congratulations!</h1>
+</div>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+<p>You've successfully completed <strong>{{course_name}}</strong>! This is a fantastic achievement, and we're proud of your dedication to learning.</p>
+
+<div style="background-color: #f8f9fa; border-radius: 8px; overflow: hidden; margin: 20px 0;">
+    {{#if course_image_url}}
+    <img src="{{course_image_url}}" alt="{{course_name}}" style="width: 100%; max-height: 150px; object-fit: cover;">
+    {{/if}}
+    <div style="padding: 20px;">
+        <h2 style="margin-top: 0; color: #28a745;">{{course_name}}</h2>
+
+        <table style="width: 100%; margin: 15px 0;">
+            <tr>
+                <td style="padding: 5px 0;"><strong>Completed On:</strong></td>
+                <td style="padding: 5px 0;">{{completion_date}}</td>
+            </tr>
+            {{#if has_score}}
+            <tr>
+                <td style="padding: 5px 0;"><strong>Final Score:</strong></td>
+                <td style="padding: 5px 0;">{{final_score}}%</td>
+            </tr>
+            {{/if}}
+            {{#if time_spent}}
+            <tr>
+                <td style="padding: 5px 0;"><strong>Time Invested:</strong></td>
+                <td style="padding: 5px 0;">{{time_spent}}</td>
+            </tr>
+            {{/if}}
+        </table>
+    </div>
+</div>
+
+{{#if has_achievements}}
+<div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 10px 0;"><strong>🏆 Achievements Unlocked:</strong></p>
+    <ul style="margin: 0; padding-left: 20px;">
+        {{#each achievements}}
+        <li>{{this}}</li>
+        {{/each}}
+    </ul>
+</div>
+{{/if}}
+
+{{#if has_certificate}}
+<div style="background-color: #d4edda; border: 1px solid #28a745; border-radius: 4px; padding: 20px; margin: 20px 0; text-align: center;">
+    <p style="margin: 0 0 10px 0; font-size: 18px;"><strong>📜 Your Certificate is Ready!</strong></p>
+    {{#if certificate_id}}
+    <p style="margin: 0 0 15px 0; color: #666;">Certificate ID: {{certificate_id}}</p>
+    {{/if}}
+    <a href="{{certificate_url}}" class="button" style="background-color: #28a745;">View & Download Certificate</a>
+</div>
+{{/if}}
+
+{{#if can_share}}
+<div style="text-align: center; margin: 20px 0;">
+    <p><strong>Share your achievement:</strong></p>
+    <p>
+        <a href="{{share_url}}" style="margin: 0 10px;">Share</a>
+        {{#if linkedin_add_url}}
+        | <a href="{{linkedin_add_url}}" style="margin: 0 10px;">Add to LinkedIn</a>
+        {{/if}}
+    </p>
+</div>
+{{/if}}
+
+{{#if has_next_course}}
+<div style="background-color: #e7f3ff; border: 1px solid #0066cc; border-radius: 4px; padding: 20px; margin: 20px 0;">
+    <h3 style="margin-top: 0;">Continue Your Learning Journey</h3>
+    <p>Ready for your next challenge? We recommend:</p>
+    <p style="font-size: 18px;"><strong>{{next_course_name}}</strong></p>
+    <p style="text-align: center;">
+        <a href="{{next_course_url}}" class="button">Start Next Course</a>
+    </p>
+</div>
+{{/if}}
+
+<p>Thank you for learning with us. Keep up the great work!</p>
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+"#;
+
+const COMPLETION_TEXT: &str = r#"
+🎉 CONGRATULATIONS! 🎉
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+You've successfully completed {{course_name}}! This is a fantastic achievement, and we're proud of your dedication to learning.
+
+COURSE DETAILS
+--------------
+Course: {{course_name}}
+Completed On: {{completion_date}}
+{{#if has_score}}Final Score: {{final_score}}%{{/if}}
+{{#if time_spent}}Time Invested: {{time_spent}}{{/if}}
+
+{{#if has_achievements}}
+🏆 ACHIEVEMENTS UNLOCKED
+{{#each achievements}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+{{#if has_certificate}}
+📜 YOUR CERTIFICATE IS READY!
+{{#if certificate_id}}Certificate ID: {{certificate_id}}{{/if}}
+View & Download: {{certificate_url}}
+{{/if}}
+
+{{#if can_share}}
+SHARE YOUR ACHIEVEMENT
+Share: {{share_url}}
+{{#if linkedin_add_url}}Add to LinkedIn: {{linkedin_add_url}}{{/if}}
+{{/if}}
+
+{{#if has_next_course}}
+CONTINUE YOUR LEARNING JOURNEY
+Ready for your next challenge? We recommend:
+{{next_course_name}}
+Start now: {{next_course_url}}
+{{/if}}
+
+Thank you for learning with us. Keep up the great work!
+
+Best regards,
+The {{organization_name}} Team
+"#;

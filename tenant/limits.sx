@@ -1,0 +1,972 @@
+/// Intelligo LMS - Tenant Limits
+///
+/// Resource limits, quotas, and enforcement for multi-tenant deployments.
+/// Provides configurable limits per tier with soft and hard enforcement.
+
+module intelligo::tenant::limits
+
+use intelligo::tenant::core::*
+use intelligo::tenant::billing::*
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// LIMIT DEFINITIONS
+// =============================================================================
+
+/// Complete limit configuration for a tenant
+type TenantLimits {
+    /// Tenant ID
+    tenant_id: TenantId,
+
+    /// Source of limits (plan-based or custom)
+    source: LimitSource,
+
+    /// User limits
+    user_limits: UserLimits,
+
+    /// Content limits
+    content_limits: ContentLimits,
+
+    /// Storage limits
+    storage_limits: StorageLimits,
+
+    /// API limits
+    api_limits: ApiLimits,
+
+    /// Feature limits
+    feature_limits: FeatureLimits,
+
+    /// Integration limits
+    integration_limits: IntegrationLimits,
+
+    /// Custom limits
+    custom_limits: Map<String, LimitValue>,
+
+    /// Enforcement mode
+    enforcement: EnforcementMode,
+
+    /// Grace period after limit exceeded
+    grace_period: Duration,
+
+    /// Last updated
+    updated_at: DateTime
+}
+
+impl TenantLimits {
+    /// Create default limits for tier
+    fn for_tier(tenant_id: TenantId, tier: &SubscriptionTier) -> TenantLimits {
+        TenantLimits {
+            tenant_id,
+            source: LimitSource::Plan { tier: tier.clone() },
+            user_limits: UserLimits::for_tier(tier),
+            content_limits: ContentLimits::for_tier(tier),
+            storage_limits: StorageLimits::for_tier(tier),
+            api_limits: ApiLimits::for_tier(tier),
+            feature_limits: FeatureLimits::for_tier(tier),
+            integration_limits: IntegrationLimits::for_tier(tier),
+            custom_limits: Map::new(),
+            enforcement: EnforcementMode::Soft,
+            grace_period: Duration::days(7),
+            updated_at: DateTime::now()
+        }
+    }
+}
+
+/// Source of limit configuration
+enum LimitSource {
+    /// Limits derived from subscription plan
+    Plan { tier: SubscriptionTier },
+    /// Custom limits set for tenant
+    Custom,
+    /// Hybrid (plan base with custom overrides)
+    Hybrid { tier: SubscriptionTier }
+}
+
+/// Enforcement mode
+enum EnforcementMode {
+    /// Warn but don't block (grace period)
+    Soft,
+    /// Block new resources when limit reached
+    Hard,
+    /// Block and notify
+    Strict,
+    /// No enforcement (monitoring only)
+    Monitor
+}
+
+/// Generic limit value
+enum LimitValue {
+    /// Numeric limit
+    Numeric { value: i64, unit: String },
+    /// Boolean limit (enabled/disabled)
+    Boolean { enabled: Bool },
+    /// Rate limit
+    Rate { count: i64, period: Duration },
+    /// Unlimited
+    Unlimited
+}
+
+impl LimitValue {
+    fn is_exceeded(&self, current: i64) -> Bool {
+        match self {
+            LimitValue::Numeric { value, .. } => current >= *value,
+            LimitValue::Boolean { enabled } => !enabled,
+            LimitValue::Rate { count, .. } => current >= *count,
+            LimitValue::Unlimited => false
+        }
+    }
+
+    fn remaining(&self, current: i64) -> i64 {
+        match self {
+            LimitValue::Numeric { value, .. } => (*value - current).max(0),
+            LimitValue::Boolean { enabled } => if *enabled { i64::MAX } else { 0 },
+            LimitValue::Rate { count, .. } => (*count - current).max(0),
+            LimitValue::Unlimited => i64::MAX
+        }
+    }
+}
+
+// =============================================================================
+// USER LIMITS
+// =============================================================================
+
+/// User-related limits
+type UserLimits {
+    /// Maximum total users
+    max_total_users: LimitValue,
+
+    /// Maximum active users (logged in within period)
+    max_active_users: LimitValue,
+
+    /// Maximum admin users
+    max_admin_users: LimitValue,
+
+    /// Maximum instructor users
+    max_instructors: LimitValue,
+
+    /// Maximum concurrent sessions per user
+    max_concurrent_sessions: LimitValue,
+
+    /// Session timeout
+    session_timeout: Duration,
+
+    /// Allow SSO
+    allow_sso: Bool,
+
+    /// Allow bulk import
+    allow_bulk_import: Bool,
+
+    /// Max bulk import size
+    max_bulk_import_size: i32
+}
+
+impl UserLimits {
+    fn for_tier(tier: &SubscriptionTier) -> UserLimits {
+        match tier {
+            SubscriptionTier::Free => UserLimits {
+                max_total_users: LimitValue::Numeric { value: 25, unit: "users".to_string() },
+                max_active_users: LimitValue::Numeric { value: 25, unit: "users".to_string() },
+                max_admin_users: LimitValue::Numeric { value: 2, unit: "users".to_string() },
+                max_instructors: LimitValue::Numeric { value: 3, unit: "users".to_string() },
+                max_concurrent_sessions: LimitValue::Numeric { value: 1, unit: "sessions".to_string() },
+                session_timeout: Duration::hours(24),
+                allow_sso: false,
+                allow_bulk_import: false,
+                max_bulk_import_size: 0
+            },
+            SubscriptionTier::Starter => UserLimits {
+                max_total_users: LimitValue::Numeric { value: 100, unit: "users".to_string() },
+                max_active_users: LimitValue::Numeric { value: 100, unit: "users".to_string() },
+                max_admin_users: LimitValue::Numeric { value: 5, unit: "users".to_string() },
+                max_instructors: LimitValue::Numeric { value: 10, unit: "users".to_string() },
+                max_concurrent_sessions: LimitValue::Numeric { value: 2, unit: "sessions".to_string() },
+                session_timeout: Duration::hours(48),
+                allow_sso: false,
+                allow_bulk_import: true,
+                max_bulk_import_size: 100
+            },
+            SubscriptionTier::Professional => UserLimits {
+                max_total_users: LimitValue::Numeric { value: 500, unit: "users".to_string() },
+                max_active_users: LimitValue::Numeric { value: 500, unit: "users".to_string() },
+                max_admin_users: LimitValue::Numeric { value: 10, unit: "users".to_string() },
+                max_instructors: LimitValue::Numeric { value: 50, unit: "users".to_string() },
+                max_concurrent_sessions: LimitValue::Numeric { value: 3, unit: "sessions".to_string() },
+                session_timeout: Duration::hours(72),
+                allow_sso: true,
+                allow_bulk_import: true,
+                max_bulk_import_size: 500
+            },
+            SubscriptionTier::Business => UserLimits {
+                max_total_users: LimitValue::Numeric { value: 2000, unit: "users".to_string() },
+                max_active_users: LimitValue::Numeric { value: 2000, unit: "users".to_string() },
+                max_admin_users: LimitValue::Numeric { value: 25, unit: "users".to_string() },
+                max_instructors: LimitValue::Numeric { value: 200, unit: "users".to_string() },
+                max_concurrent_sessions: LimitValue::Numeric { value: 5, unit: "sessions".to_string() },
+                session_timeout: Duration::days(7),
+                allow_sso: true,
+                allow_bulk_import: true,
+                max_bulk_import_size: 2000
+            },
+            SubscriptionTier::Enterprise | SubscriptionTier::Custom { .. } => UserLimits {
+                max_total_users: LimitValue::Unlimited,
+                max_active_users: LimitValue::Unlimited,
+                max_admin_users: LimitValue::Unlimited,
+                max_instructors: LimitValue::Unlimited,
+                max_concurrent_sessions: LimitValue::Unlimited,
+                session_timeout: Duration::days(30),
+                allow_sso: true,
+                allow_bulk_import: true,
+                max_bulk_import_size: 10000
+            }
+        }
+    }
+}
+
+// =============================================================================
+// CONTENT LIMITS
+// =============================================================================
+
+/// Content-related limits
+type ContentLimits {
+    /// Maximum courses
+    max_courses: LimitValue,
+
+    /// Maximum published courses
+    max_published_courses: LimitValue,
+
+    /// Maximum modules per course
+    max_modules_per_course: LimitValue,
+
+    /// Maximum lessons per module
+    max_lessons_per_module: LimitValue,
+
+    /// Maximum assessments
+    max_assessments: LimitValue,
+
+    /// Maximum questions per assessment
+    max_questions_per_assessment: LimitValue,
+
+    /// Maximum question banks
+    max_question_banks: LimitValue,
+
+    /// Maximum learning paths
+    max_learning_paths: LimitValue,
+
+    /// Maximum certificates
+    max_certificates: LimitValue,
+
+    /// Allow SCORM import
+    allow_scorm: Bool,
+
+    /// Allow xAPI
+    allow_xapi: Bool
+}
+
+impl ContentLimits {
+    fn for_tier(tier: &SubscriptionTier) -> ContentLimits {
+        match tier {
+            SubscriptionTier::Free => ContentLimits {
+                max_courses: LimitValue::Numeric { value: 3, unit: "courses".to_string() },
+                max_published_courses: LimitValue::Numeric { value: 2, unit: "courses".to_string() },
+                max_modules_per_course: LimitValue::Numeric { value: 5, unit: "modules".to_string() },
+                max_lessons_per_module: LimitValue::Numeric { value: 10, unit: "lessons".to_string() },
+                max_assessments: LimitValue::Numeric { value: 5, unit: "assessments".to_string() },
+                max_questions_per_assessment: LimitValue::Numeric { value: 25, unit: "questions".to_string() },
+                max_question_banks: LimitValue::Numeric { value: 1, unit: "banks".to_string() },
+                max_learning_paths: LimitValue::Numeric { value: 0, unit: "paths".to_string() },
+                max_certificates: LimitValue::Numeric { value: 1, unit: "templates".to_string() },
+                allow_scorm: false,
+                allow_xapi: false
+            },
+            SubscriptionTier::Starter => ContentLimits {
+                max_courses: LimitValue::Numeric { value: 15, unit: "courses".to_string() },
+                max_published_courses: LimitValue::Numeric { value: 10, unit: "courses".to_string() },
+                max_modules_per_course: LimitValue::Numeric { value: 10, unit: "modules".to_string() },
+                max_lessons_per_module: LimitValue::Numeric { value: 20, unit: "lessons".to_string() },
+                max_assessments: LimitValue::Numeric { value: 25, unit: "assessments".to_string() },
+                max_questions_per_assessment: LimitValue::Numeric { value: 50, unit: "questions".to_string() },
+                max_question_banks: LimitValue::Numeric { value: 5, unit: "banks".to_string() },
+                max_learning_paths: LimitValue::Numeric { value: 3, unit: "paths".to_string() },
+                max_certificates: LimitValue::Numeric { value: 5, unit: "templates".to_string() },
+                allow_scorm: false,
+                allow_xapi: false
+            },
+            SubscriptionTier::Professional => ContentLimits {
+                max_courses: LimitValue::Numeric { value: 50, unit: "courses".to_string() },
+                max_published_courses: LimitValue::Numeric { value: 50, unit: "courses".to_string() },
+                max_modules_per_course: LimitValue::Numeric { value: 25, unit: "modules".to_string() },
+                max_lessons_per_module: LimitValue::Numeric { value: 50, unit: "lessons".to_string() },
+                max_assessments: LimitValue::Numeric { value: 100, unit: "assessments".to_string() },
+                max_questions_per_assessment: LimitValue::Numeric { value: 100, unit: "questions".to_string() },
+                max_question_banks: LimitValue::Numeric { value: 25, unit: "banks".to_string() },
+                max_learning_paths: LimitValue::Numeric { value: 15, unit: "paths".to_string() },
+                max_certificates: LimitValue::Numeric { value: 20, unit: "templates".to_string() },
+                allow_scorm: true,
+                allow_xapi: true
+            },
+            SubscriptionTier::Business => ContentLimits {
+                max_courses: LimitValue::Numeric { value: 200, unit: "courses".to_string() },
+                max_published_courses: LimitValue::Numeric { value: 200, unit: "courses".to_string() },
+                max_modules_per_course: LimitValue::Numeric { value: 50, unit: "modules".to_string() },
+                max_lessons_per_module: LimitValue::Numeric { value: 100, unit: "lessons".to_string() },
+                max_assessments: LimitValue::Numeric { value: 500, unit: "assessments".to_string() },
+                max_questions_per_assessment: LimitValue::Numeric { value: 200, unit: "questions".to_string() },
+                max_question_banks: LimitValue::Numeric { value: 100, unit: "banks".to_string() },
+                max_learning_paths: LimitValue::Numeric { value: 50, unit: "paths".to_string() },
+                max_certificates: LimitValue::Unlimited,
+                allow_scorm: true,
+                allow_xapi: true
+            },
+            SubscriptionTier::Enterprise | SubscriptionTier::Custom { .. } => ContentLimits {
+                max_courses: LimitValue::Unlimited,
+                max_published_courses: LimitValue::Unlimited,
+                max_modules_per_course: LimitValue::Unlimited,
+                max_lessons_per_module: LimitValue::Unlimited,
+                max_assessments: LimitValue::Unlimited,
+                max_questions_per_assessment: LimitValue::Unlimited,
+                max_question_banks: LimitValue::Unlimited,
+                max_learning_paths: LimitValue::Unlimited,
+                max_certificates: LimitValue::Unlimited,
+                allow_scorm: true,
+                allow_xapi: true
+            }
+        }
+    }
+}
+
+// =============================================================================
+// STORAGE LIMITS
+// =============================================================================
+
+/// Storage-related limits
+type StorageLimits {
+    /// Total storage quota (bytes)
+    total_storage_bytes: LimitValue,
+
+    /// Maximum file size (bytes)
+    max_file_size_bytes: LimitValue,
+
+    /// Maximum video storage (bytes)
+    max_video_storage_bytes: LimitValue,
+
+    /// Allowed file types
+    allowed_file_types: Set<String>,
+
+    /// Maximum video duration per file (seconds)
+    max_video_duration_seconds: i32,
+
+    /// Enable CDN
+    cdn_enabled: Bool,
+
+    /// Bandwidth limit per month (bytes)
+    monthly_bandwidth_bytes: LimitValue
+}
+
+impl StorageLimits {
+    fn for_tier(tier: &SubscriptionTier) -> StorageLimits {
+        let gb = 1024 * 1024 * 1024i64;
+        let mb = 1024 * 1024i64;
+
+        let standard_file_types = Set::from([
+            "pdf".to_string(), "doc".to_string(), "docx".to_string(),
+            "ppt".to_string(), "pptx".to_string(), "xls".to_string(),
+            "xlsx".to_string(), "txt".to_string(), "jpg".to_string(),
+            "jpeg".to_string(), "png".to_string(), "gif".to_string(),
+            "mp4".to_string(), "mp3".to_string(), "zip".to_string()
+        ]);
+
+        match tier {
+            SubscriptionTier::Free => StorageLimits {
+                total_storage_bytes: LimitValue::Numeric { value: 1 * gb, unit: "bytes".to_string() },
+                max_file_size_bytes: LimitValue::Numeric { value: 50 * mb, unit: "bytes".to_string() },
+                max_video_storage_bytes: LimitValue::Numeric { value: 500 * mb, unit: "bytes".to_string() },
+                allowed_file_types: standard_file_types,
+                max_video_duration_seconds: 600, // 10 minutes
+                cdn_enabled: false,
+                monthly_bandwidth_bytes: LimitValue::Numeric { value: 5 * gb, unit: "bytes".to_string() }
+            },
+            SubscriptionTier::Starter => StorageLimits {
+                total_storage_bytes: LimitValue::Numeric { value: 10 * gb, unit: "bytes".to_string() },
+                max_file_size_bytes: LimitValue::Numeric { value: 200 * mb, unit: "bytes".to_string() },
+                max_video_storage_bytes: LimitValue::Numeric { value: 5 * gb, unit: "bytes".to_string() },
+                allowed_file_types: standard_file_types,
+                max_video_duration_seconds: 1800, // 30 minutes
+                cdn_enabled: true,
+                monthly_bandwidth_bytes: LimitValue::Numeric { value: 50 * gb, unit: "bytes".to_string() }
+            },
+            SubscriptionTier::Professional => StorageLimits {
+                total_storage_bytes: LimitValue::Numeric { value: 100 * gb, unit: "bytes".to_string() },
+                max_file_size_bytes: LimitValue::Numeric { value: 500 * mb, unit: "bytes".to_string() },
+                max_video_storage_bytes: LimitValue::Numeric { value: 50 * gb, unit: "bytes".to_string() },
+                allowed_file_types: standard_file_types,
+                max_video_duration_seconds: 3600, // 60 minutes
+                cdn_enabled: true,
+                monthly_bandwidth_bytes: LimitValue::Numeric { value: 500 * gb, unit: "bytes".to_string() }
+            },
+            SubscriptionTier::Business => StorageLimits {
+                total_storage_bytes: LimitValue::Numeric { value: 500 * gb, unit: "bytes".to_string() },
+                max_file_size_bytes: LimitValue::Numeric { value: 2 * gb, unit: "bytes".to_string() },
+                max_video_storage_bytes: LimitValue::Numeric { value: 250 * gb, unit: "bytes".to_string() },
+                allowed_file_types: standard_file_types,
+                max_video_duration_seconds: 7200, // 2 hours
+                cdn_enabled: true,
+                monthly_bandwidth_bytes: LimitValue::Numeric { value: 2000 * gb, unit: "bytes".to_string() }
+            },
+            SubscriptionTier::Enterprise | SubscriptionTier::Custom { .. } => StorageLimits {
+                total_storage_bytes: LimitValue::Unlimited,
+                max_file_size_bytes: LimitValue::Numeric { value: 10 * gb, unit: "bytes".to_string() },
+                max_video_storage_bytes: LimitValue::Unlimited,
+                allowed_file_types: standard_file_types,
+                max_video_duration_seconds: 14400, // 4 hours
+                cdn_enabled: true,
+                monthly_bandwidth_bytes: LimitValue::Unlimited
+            }
+        }
+    }
+}
+
+// =============================================================================
+// API LIMITS
+// =============================================================================
+
+/// API and rate limits
+type ApiLimits {
+    /// API access enabled
+    api_enabled: Bool,
+
+    /// Requests per minute
+    requests_per_minute: LimitValue,
+
+    /// Requests per hour
+    requests_per_hour: LimitValue,
+
+    /// Requests per day
+    requests_per_day: LimitValue,
+
+    /// Concurrent requests
+    concurrent_requests: LimitValue,
+
+    /// Webhook endpoints
+    max_webhooks: LimitValue,
+
+    /// API keys
+    max_api_keys: LimitValue
+}
+
+impl ApiLimits {
+    fn for_tier(tier: &SubscriptionTier) -> ApiLimits {
+        match tier {
+            SubscriptionTier::Free => ApiLimits {
+                api_enabled: false,
+                requests_per_minute: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                requests_per_hour: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                requests_per_day: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                concurrent_requests: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                max_webhooks: LimitValue::Numeric { value: 0, unit: "webhooks".to_string() },
+                max_api_keys: LimitValue::Numeric { value: 0, unit: "keys".to_string() }
+            },
+            SubscriptionTier::Starter => ApiLimits {
+                api_enabled: false,
+                requests_per_minute: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                requests_per_hour: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                requests_per_day: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                concurrent_requests: LimitValue::Numeric { value: 0, unit: "requests".to_string() },
+                max_webhooks: LimitValue::Numeric { value: 0, unit: "webhooks".to_string() },
+                max_api_keys: LimitValue::Numeric { value: 0, unit: "keys".to_string() }
+            },
+            SubscriptionTier::Professional => ApiLimits {
+                api_enabled: true,
+                requests_per_minute: LimitValue::Numeric { value: 60, unit: "requests".to_string() },
+                requests_per_hour: LimitValue::Numeric { value: 1000, unit: "requests".to_string() },
+                requests_per_day: LimitValue::Numeric { value: 10000, unit: "requests".to_string() },
+                concurrent_requests: LimitValue::Numeric { value: 5, unit: "requests".to_string() },
+                max_webhooks: LimitValue::Numeric { value: 5, unit: "webhooks".to_string() },
+                max_api_keys: LimitValue::Numeric { value: 3, unit: "keys".to_string() }
+            },
+            SubscriptionTier::Business => ApiLimits {
+                api_enabled: true,
+                requests_per_minute: LimitValue::Numeric { value: 300, unit: "requests".to_string() },
+                requests_per_hour: LimitValue::Numeric { value: 5000, unit: "requests".to_string() },
+                requests_per_day: LimitValue::Numeric { value: 50000, unit: "requests".to_string() },
+                concurrent_requests: LimitValue::Numeric { value: 20, unit: "requests".to_string() },
+                max_webhooks: LimitValue::Numeric { value: 25, unit: "webhooks".to_string() },
+                max_api_keys: LimitValue::Numeric { value: 10, unit: "keys".to_string() }
+            },
+            SubscriptionTier::Enterprise | SubscriptionTier::Custom { .. } => ApiLimits {
+                api_enabled: true,
+                requests_per_minute: LimitValue::Numeric { value: 1000, unit: "requests".to_string() },
+                requests_per_hour: LimitValue::Numeric { value: 20000, unit: "requests".to_string() },
+                requests_per_day: LimitValue::Unlimited,
+                concurrent_requests: LimitValue::Numeric { value: 100, unit: "requests".to_string() },
+                max_webhooks: LimitValue::Unlimited,
+                max_api_keys: LimitValue::Unlimited
+            }
+        }
+    }
+}
+
+// =============================================================================
+// FEATURE LIMITS
+// =============================================================================
+
+/// Feature availability limits
+type FeatureLimits {
+    /// AI features
+    ai_tutor_enabled: Bool,
+    ai_grading_enabled: Bool,
+    ai_content_generation_enabled: Bool,
+    ai_tokens_per_month: LimitValue,
+
+    /// Gamification
+    gamification_enabled: Bool,
+    leaderboards_enabled: Bool,
+    badges_enabled: Bool,
+
+    /// Communication
+    discussion_forums_enabled: Bool,
+    live_sessions_enabled: Bool,
+    max_live_session_participants: LimitValue,
+
+    /// Reporting
+    basic_reports_enabled: Bool,
+    advanced_analytics_enabled: Bool,
+    custom_reports_enabled: Bool,
+    report_exports_enabled: Bool,
+
+    /// Branding
+    custom_branding_enabled: Bool,
+    white_label_enabled: Bool,
+    custom_domain_enabled: Bool
+}
+
+impl FeatureLimits {
+    fn for_tier(tier: &SubscriptionTier) -> FeatureLimits {
+        match tier {
+            SubscriptionTier::Free => FeatureLimits {
+                ai_tutor_enabled: false,
+                ai_grading_enabled: false,
+                ai_content_generation_enabled: false,
+                ai_tokens_per_month: LimitValue::Numeric { value: 0, unit: "tokens".to_string() },
+                gamification_enabled: false,
+                leaderboards_enabled: false,
+                badges_enabled: false,
+                discussion_forums_enabled: true,
+                live_sessions_enabled: false,
+                max_live_session_participants: LimitValue::Numeric { value: 0, unit: "participants".to_string() },
+                basic_reports_enabled: true,
+                advanced_analytics_enabled: false,
+                custom_reports_enabled: false,
+                report_exports_enabled: false,
+                custom_branding_enabled: false,
+                white_label_enabled: false,
+                custom_domain_enabled: false
+            },
+            SubscriptionTier::Starter => FeatureLimits {
+                ai_tutor_enabled: false,
+                ai_grading_enabled: false,
+                ai_content_generation_enabled: false,
+                ai_tokens_per_month: LimitValue::Numeric { value: 0, unit: "tokens".to_string() },
+                gamification_enabled: true,
+                leaderboards_enabled: true,
+                badges_enabled: true,
+                discussion_forums_enabled: true,
+                live_sessions_enabled: false,
+                max_live_session_participants: LimitValue::Numeric { value: 0, unit: "participants".to_string() },
+                basic_reports_enabled: true,
+                advanced_analytics_enabled: false,
+                custom_reports_enabled: false,
+                report_exports_enabled: true,
+                custom_branding_enabled: true,
+                white_label_enabled: false,
+                custom_domain_enabled: false
+            },
+            SubscriptionTier::Professional => FeatureLimits {
+                ai_tutor_enabled: false,
+                ai_grading_enabled: false,
+                ai_content_generation_enabled: false,
+                ai_tokens_per_month: LimitValue::Numeric { value: 0, unit: "tokens".to_string() },
+                gamification_enabled: true,
+                leaderboards_enabled: true,
+                badges_enabled: true,
+                discussion_forums_enabled: true,
+                live_sessions_enabled: true,
+                max_live_session_participants: LimitValue::Numeric { value: 50, unit: "participants".to_string() },
+                basic_reports_enabled: true,
+                advanced_analytics_enabled: true,
+                custom_reports_enabled: false,
+                report_exports_enabled: true,
+                custom_branding_enabled: true,
+                white_label_enabled: false,
+                custom_domain_enabled: true
+            },
+            SubscriptionTier::Business => FeatureLimits {
+                ai_tutor_enabled: true,
+                ai_grading_enabled: true,
+                ai_content_generation_enabled: true,
+                ai_tokens_per_month: LimitValue::Numeric { value: 100000, unit: "tokens".to_string() },
+                gamification_enabled: true,
+                leaderboards_enabled: true,
+                badges_enabled: true,
+                discussion_forums_enabled: true,
+                live_sessions_enabled: true,
+                max_live_session_participants: LimitValue::Numeric { value: 200, unit: "participants".to_string() },
+                basic_reports_enabled: true,
+                advanced_analytics_enabled: true,
+                custom_reports_enabled: true,
+                report_exports_enabled: true,
+                custom_branding_enabled: true,
+                white_label_enabled: false,
+                custom_domain_enabled: true
+            },
+            SubscriptionTier::Enterprise | SubscriptionTier::Custom { .. } => FeatureLimits {
+                ai_tutor_enabled: true,
+                ai_grading_enabled: true,
+                ai_content_generation_enabled: true,
+                ai_tokens_per_month: LimitValue::Unlimited,
+                gamification_enabled: true,
+                leaderboards_enabled: true,
+                badges_enabled: true,
+                discussion_forums_enabled: true,
+                live_sessions_enabled: true,
+                max_live_session_participants: LimitValue::Unlimited,
+                basic_reports_enabled: true,
+                advanced_analytics_enabled: true,
+                custom_reports_enabled: true,
+                report_exports_enabled: true,
+                custom_branding_enabled: true,
+                white_label_enabled: true,
+                custom_domain_enabled: true
+            }
+        }
+    }
+}
+
+// =============================================================================
+// INTEGRATION LIMITS
+// =============================================================================
+
+/// Integration-related limits
+type IntegrationLimits {
+    /// SSO integrations
+    max_sso_providers: LimitValue,
+
+    /// LTI connections
+    max_lti_connections: LimitValue,
+
+    /// Calendar integrations
+    calendar_sync_enabled: Bool,
+
+    /// HRIS integrations
+    hris_sync_enabled: Bool,
+
+    /// Custom integrations
+    max_custom_integrations: LimitValue
+}
+
+impl IntegrationLimits {
+    fn for_tier(tier: &SubscriptionTier) -> IntegrationLimits {
+        match tier {
+            SubscriptionTier::Free | SubscriptionTier::Starter => IntegrationLimits {
+                max_sso_providers: LimitValue::Numeric { value: 0, unit: "providers".to_string() },
+                max_lti_connections: LimitValue::Numeric { value: 0, unit: "connections".to_string() },
+                calendar_sync_enabled: false,
+                hris_sync_enabled: false,
+                max_custom_integrations: LimitValue::Numeric { value: 0, unit: "integrations".to_string() }
+            },
+            SubscriptionTier::Professional => IntegrationLimits {
+                max_sso_providers: LimitValue::Numeric { value: 1, unit: "providers".to_string() },
+                max_lti_connections: LimitValue::Numeric { value: 3, unit: "connections".to_string() },
+                calendar_sync_enabled: true,
+                hris_sync_enabled: false,
+                max_custom_integrations: LimitValue::Numeric { value: 0, unit: "integrations".to_string() }
+            },
+            SubscriptionTier::Business => IntegrationLimits {
+                max_sso_providers: LimitValue::Numeric { value: 3, unit: "providers".to_string() },
+                max_lti_connections: LimitValue::Numeric { value: 10, unit: "connections".to_string() },
+                calendar_sync_enabled: true,
+                hris_sync_enabled: true,
+                max_custom_integrations: LimitValue::Numeric { value: 5, unit: "integrations".to_string() }
+            },
+            SubscriptionTier::Enterprise | SubscriptionTier::Custom { .. } => IntegrationLimits {
+                max_sso_providers: LimitValue::Unlimited,
+                max_lti_connections: LimitValue::Unlimited,
+                calendar_sync_enabled: true,
+                hris_sync_enabled: true,
+                max_custom_integrations: LimitValue::Unlimited
+            }
+        }
+    }
+}
+
+// =============================================================================
+// LIMIT CHECKER
+// =============================================================================
+
+/// Result of limit check
+type LimitCheckResult {
+    allowed: Bool,
+    limit_name: String,
+    current_value: i64,
+    limit_value: LimitValue,
+    remaining: i64,
+    warning: Option<String>,
+    enforcement_action: Option<EnforcementAction>
+}
+
+/// Enforcement action to take
+enum EnforcementAction {
+    None,
+    Warn,
+    Block,
+    BlockAndNotify,
+    Throttle { delay_ms: i64 }
+}
+
+/// Limit checker actor
+actor LimitChecker {
+    var tenant_limits: Map<TenantId, TenantLimits> = Map::new()
+    var current_usage: Map<TenantId, Map<String, i64>> = Map::new()
+    var rate_windows: Map<(TenantId, String), RateWindow> = Map::new()
+
+    fn new() -> Self {
+        LimitChecker::default()
+    }
+
+    /// Register limits for tenant
+    receive RegisterLimits(limits: TenantLimits) {
+        self.tenant_limits.insert(limits.tenant_id.clone(), limits);
+        checkpoint();
+    }
+
+    /// Check if action is allowed
+    receive CheckLimit(tenant_id: TenantId, limit_name: String, increment: i64) -> LimitCheckResult {
+        let limits = match self.tenant_limits.get(&tenant_id) {
+            Some(l) => l,
+            None => {
+                return LimitCheckResult {
+                    allowed: true,
+                    limit_name,
+                    current_value: 0,
+                    limit_value: LimitValue::Unlimited,
+                    remaining: i64::MAX,
+                    warning: None,
+                    enforcement_action: None
+                };
+            }
+        };
+
+        let current = self.get_current_value(&tenant_id, &limit_name);
+        let limit_value = self.get_limit_value(limits, &limit_name);
+        let new_value = current + increment;
+
+        let is_exceeded = limit_value.is_exceeded(new_value);
+        let remaining = limit_value.remaining(new_value);
+
+        let (allowed, action, warning) = match (&limits.enforcement, is_exceeded) {
+            (EnforcementMode::Monitor, _) => (true, None, if is_exceeded { Some("Limit exceeded (monitoring)".to_string()) } else { None }),
+            (EnforcementMode::Soft, true) => (true, Some(EnforcementAction::Warn), Some("Limit exceeded - grace period active".to_string())),
+            (EnforcementMode::Hard, true) => (false, Some(EnforcementAction::Block), Some("Limit exceeded".to_string())),
+            (EnforcementMode::Strict, true) => (false, Some(EnforcementAction::BlockAndNotify), Some("Limit exceeded - action blocked".to_string())),
+            (_, false) => {
+                // Check for warning thresholds
+                let percentage_used = if let LimitValue::Numeric { value, .. } = &limit_value {
+                    (new_value as f64 / *value as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                let warning = if percentage_used >= 90.0 {
+                    Some("Critical: Approaching limit (>90%)".to_string())
+                } else if percentage_used >= 75.0 {
+                    Some("Warning: Approaching limit (>75%)".to_string())
+                } else {
+                    None
+                };
+
+                (true, None, warning)
+            }
+        };
+
+        LimitCheckResult {
+            allowed,
+            limit_name,
+            current_value: new_value,
+            limit_value,
+            remaining,
+            warning,
+            enforcement_action: action
+        }
+    }
+
+    /// Record usage
+    receive RecordUsage(tenant_id: TenantId, metric: String, value: i64) {
+        let usage = self.current_usage.entry(tenant_id).or_insert(Map::new());
+        *usage.entry(metric).or_insert(0) += value;
+        checkpoint();
+    }
+
+    /// Set usage (for absolute values like storage)
+    receive SetUsage(tenant_id: TenantId, metric: String, value: i64) {
+        let usage = self.current_usage.entry(tenant_id).or_insert(Map::new());
+        usage.insert(metric, value);
+        checkpoint();
+    }
+
+    /// Check rate limit
+    receive CheckRateLimit(tenant_id: TenantId, limit_name: String) -> LimitCheckResult {
+        let limits = match self.tenant_limits.get(&tenant_id) {
+            Some(l) => l,
+            None => {
+                return LimitCheckResult {
+                    allowed: true,
+                    limit_name,
+                    current_value: 0,
+                    limit_value: LimitValue::Unlimited,
+                    remaining: i64::MAX,
+                    warning: None,
+                    enforcement_action: None
+                };
+            }
+        };
+
+        let limit_value = self.get_limit_value(limits, &limit_name);
+
+        let window_key = (tenant_id.clone(), limit_name.clone());
+        let now = DateTime::now();
+
+        let window = self.rate_windows.entry(window_key).or_insert(RateWindow {
+            start: now,
+            count: 0
+        });
+
+        // Get window duration from limit
+        let window_duration = match &limit_value {
+            LimitValue::Rate { period, .. } => period.clone(),
+            _ => Duration::minutes(1)
+        };
+
+        // Reset window if expired
+        if now - window.start >= window_duration {
+            window.start = now;
+            window.count = 0;
+        }
+
+        window.count += 1;
+
+        let is_exceeded = limit_value.is_exceeded(window.count);
+        let remaining = limit_value.remaining(window.count);
+
+        let (allowed, action) = if is_exceeded {
+            match &limits.enforcement {
+                EnforcementMode::Monitor => (true, None),
+                EnforcementMode::Soft => (true, Some(EnforcementAction::Warn)),
+                EnforcementMode::Hard => (false, Some(EnforcementAction::Throttle { delay_ms: 1000 })),
+                EnforcementMode::Strict => (false, Some(EnforcementAction::Block)),
+            }
+        } else {
+            (true, None)
+        };
+
+        checkpoint();
+
+        LimitCheckResult {
+            allowed,
+            limit_name,
+            current_value: window.count,
+            limit_value,
+            remaining,
+            warning: if is_exceeded { Some("Rate limit exceeded".to_string()) } else { None },
+            enforcement_action: action
+        }
+    }
+
+    /// Get current usage summary
+    receive GetUsageSummary(tenant_id: TenantId) -> Map<String, i64> {
+        self.current_usage.get(&tenant_id).cloned().unwrap_or_default()
+    }
+
+    /// Reset usage for new period
+    receive ResetPeriodUsage(tenant_id: TenantId) {
+        if let Some(usage) = self.current_usage.get_mut(&tenant_id) {
+            // Keep absolute metrics (storage, users), reset periodic ones
+            let to_reset = vec!["api_calls", "ai_tokens", "bandwidth", "emails_sent"];
+            for metric in to_reset {
+                usage.remove(metric);
+            }
+        }
+
+        // Clear rate windows
+        self.rate_windows.retain(|(tid, _), _| tid != &tenant_id);
+
+        checkpoint();
+    }
+
+    // Internal methods
+
+    fn get_current_value(&self, tenant_id: &TenantId, metric: &str) -> i64 {
+        self.current_usage.get(tenant_id)
+            .and_then(|u| u.get(metric))
+            .cloned()
+            .unwrap_or(0)
+    }
+
+    fn get_limit_value(&self, limits: &TenantLimits, name: &str) -> LimitValue {
+        match name {
+            "users" | "max_total_users" => limits.user_limits.max_total_users.clone(),
+            "active_users" => limits.user_limits.max_active_users.clone(),
+            "courses" => limits.content_limits.max_courses.clone(),
+            "storage" => limits.storage_limits.total_storage_bytes.clone(),
+            "api_per_minute" => limits.api_limits.requests_per_minute.clone(),
+            "api_per_hour" => limits.api_limits.requests_per_hour.clone(),
+            "api_per_day" => limits.api_limits.requests_per_day.clone(),
+            "ai_tokens" => limits.feature_limits.ai_tokens_per_month.clone(),
+            _ => {
+                limits.custom_limits.get(name)
+                    .cloned()
+                    .unwrap_or(LimitValue::Unlimited)
+            }
+        }
+    }
+}
+
+/// Rate limiting window
+type RateWindow {
+    start: DateTime,
+    count: i64
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_limit_value_exceeded() {
+        let limit = LimitValue::Numeric { value: 100, unit: "items".to_string() };
+        assert!(!limit.is_exceeded(50));
+        assert!(limit.is_exceeded(100));
+        assert!(limit.is_exceeded(150));
+    }
+
+    #[test]
+    fn test_limit_remaining() {
+        let limit = LimitValue::Numeric { value: 100, unit: "items".to_string() };
+        assert_eq!(limit.remaining(50), 50);
+        assert_eq!(limit.remaining(100), 0);
+        assert_eq!(limit.remaining(150), 0);
+    }
+
+    #[test]
+    fn test_tier_limits() {
+        let free_limits = UserLimits::for_tier(&SubscriptionTier::Free);
+        let enterprise_limits = UserLimits::for_tier(&SubscriptionTier::Enterprise);
+
+        assert!(!free_limits.allow_sso);
+        assert!(enterprise_limits.allow_sso);
+    }
+}

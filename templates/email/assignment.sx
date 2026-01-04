@@ -1,0 +1,465 @@
+// Assignment Email Templates for Intelligo LMS
+// Notifications for assignment submissions and grading
+
+module intelligo::templates::email::assignment
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Assignment submission confirmation template ID
+pub const SUBMISSION_TEMPLATE_ID: &str = "email.assignment_submitted";
+
+/// Assignment graded notification template ID
+pub const GRADED_TEMPLATE_ID: &str = "email.assignment_graded";
+
+/// Create the assignment submission confirmation template configuration
+pub fn get_submission_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: SUBMISSION_TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Assignment Submitted".to_string(),
+        description: Some("Confirmation sent when a user submits an assignment".to_string()),
+        category: "assessment".to_string(),
+
+        subject: Some("Assignment Submitted: {{assignment_name}}".to_string()),
+        body_html: SUBMISSION_HTML.to_string(),
+        body_text: Some(SUBMISSION_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "assignment_name".to_string(),
+            "course_name".to_string(),
+            "organization_name".to_string(),
+            "submission_date".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "submission_id".to_string(),
+            "due_date".to_string(),
+            "submitted_on_time".to_string(),
+            "file_name".to_string(),
+            "assignment_url".to_string(),
+            "estimated_review_time".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Create the assignment graded notification template configuration
+pub fn get_graded_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: GRADED_TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Assignment Graded".to_string(),
+        description: Some("Sent when an assignment has been graded".to_string()),
+        category: "assessment".to_string(),
+
+        subject: Some("Your Assignment Has Been Graded: {{assignment_name}}".to_string()),
+        body_html: GRADED_HTML.to_string(),
+        body_text: Some(GRADED_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "assignment_name".to_string(),
+            "course_name".to_string(),
+            "organization_name".to_string(),
+            "grade".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "max_grade".to_string(),
+            "percentage".to_string(),
+            "letter_grade".to_string(),
+            "graded_by".to_string(),
+            "feedback".to_string(),
+            "rubric_scores".to_string(),
+            "assignment_url".to_string(),
+            "resubmit_allowed".to_string(),
+            "resubmit_deadline".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Build context for assignment submission email
+pub fn build_submission_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    assignment_name: String,
+    course_name: String,
+    organization_name: String,
+    submission_date: String,
+    submission_id: Option<String>,
+    due_date: Option<String>,
+    submitted_on_time: Option<bool>,
+    file_name: Option<String>,
+    assignment_url: Option<String>,
+    estimated_review_time: Option<String>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name)
+        .set_string("assignment_name", assignment_name)
+        .set_string("course_name", course_name)
+        .set_string("organization_name", organization_name)
+        .set_string("submission_date", submission_date)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(first_name) = user_first_name {
+        ctx = ctx.set_string("user_first_name", first_name);
+    }
+
+    if let Some(id) = submission_id {
+        ctx = ctx.set_string("submission_id", id);
+    }
+
+    if let Some(due) = due_date {
+        ctx = ctx.set_string("due_date", due);
+        ctx = ctx.set_bool("has_due_date", true);
+    }
+
+    if let Some(on_time) = submitted_on_time {
+        ctx = ctx.set_bool("submitted_on_time", on_time);
+    }
+
+    if let Some(file) = file_name {
+        ctx = ctx.set_string("file_name", file);
+        ctx = ctx.set_bool("has_file", true);
+    }
+
+    if let Some(url) = assignment_url {
+        ctx = ctx.set_string("assignment_url", url);
+    }
+
+    if let Some(review_time) = estimated_review_time {
+        ctx = ctx.set_string("estimated_review_time", review_time);
+    }
+
+    ctx
+}
+
+/// Build context for assignment graded email
+pub fn build_graded_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    assignment_name: String,
+    course_name: String,
+    organization_name: String,
+    grade: String,
+    max_grade: Option<String>,
+    percentage: Option<f64>,
+    letter_grade: Option<String>,
+    graded_by: Option<String>,
+    feedback: Option<String>,
+    rubric_scores: Option<Vec<RubricScore>>,
+    assignment_url: Option<String>,
+    resubmit_allowed: Option<bool>,
+    resubmit_deadline: Option<String>
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name)
+        .set_string("assignment_name", assignment_name)
+        .set_string("course_name", course_name)
+        .set_string("organization_name", organization_name)
+        .set_string("grade", grade)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(first_name) = user_first_name {
+        ctx = ctx.set_string("user_first_name", first_name);
+    }
+
+    if let Some(max) = max_grade {
+        ctx = ctx.set_string("max_grade", max);
+        ctx = ctx.set_bool("has_max_grade", true);
+    }
+
+    if let Some(pct) = percentage {
+        ctx = ctx.set_number("percentage", pct);
+    }
+
+    if let Some(letter) = letter_grade {
+        ctx = ctx.set_string("letter_grade", letter);
+        ctx = ctx.set_bool("has_letter_grade", true);
+    }
+
+    if let Some(grader) = graded_by {
+        ctx = ctx.set_string("graded_by", grader);
+    }
+
+    if let Some(fb) = feedback {
+        ctx = ctx.set_string("feedback", fb);
+        ctx = ctx.set_bool("has_feedback", true);
+    }
+
+    if let Some(rubric) = rubric_scores {
+        if !rubric.is_empty() {
+            let rubric_values: Vec<ContextValue> = rubric.into_iter()
+                .map(|r| {
+                    let mut obj = HashMap::new();
+                    obj.insert("criterion".to_string(), ContextValue::String(r.criterion));
+                    obj.insert("score".to_string(), ContextValue::String(r.score));
+                    obj.insert("max_score".to_string(), ContextValue::String(r.max_score));
+                    if let Some(comment) = r.comment {
+                        obj.insert("comment".to_string(), ContextValue::String(comment));
+                    }
+                    ContextValue::Object(obj)
+                })
+                .collect();
+            ctx = ctx.set_list("rubric_scores", rubric_values);
+            ctx = ctx.set_bool("has_rubric", true);
+        }
+    }
+
+    if let Some(url) = assignment_url {
+        ctx = ctx.set_string("assignment_url", url);
+    }
+
+    if let Some(resubmit) = resubmit_allowed {
+        ctx = ctx.set_bool("resubmit_allowed", resubmit);
+        if resubmit {
+            if let Some(deadline) = resubmit_deadline {
+                ctx = ctx.set_string("resubmit_deadline", deadline);
+            }
+        }
+    }
+
+    ctx
+}
+
+/// Rubric score for graded assignments
+pub type RubricScore {
+    criterion: String,
+    score: String,
+    max_score: String,
+    comment: Option<String>,
+}
+
+const SUBMISSION_HTML: &str = r#"
+<h1>Assignment Submitted</h1>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+<p>Your assignment has been successfully submitted. Here are the details:</p>
+
+<div style="background-color: #d4edda; border: 1px solid #28a745; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0; font-size: 18px;"><strong>✓ Submission Confirmed</strong></p>
+</div>
+
+<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Assignment:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{assignment_name}}</td>
+    </tr>
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Course:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{course_name}}</td>
+    </tr>
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Submitted:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{submission_date}}</td>
+    </tr>
+    {{#if has_due_date}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Due Date:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">
+            {{due_date}}
+            {{#if submitted_on_time}}
+            <span style="color: #28a745; margin-left: 10px;">✓ On Time</span>
+            {{else}}
+            <span style="color: #dc3545; margin-left: 10px;">⚠ Late</span>
+            {{/if}}
+        </td>
+    </tr>
+    {{/if}}
+    {{#if submission_id}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Submission ID:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><code>{{submission_id}}</code></td>
+    </tr>
+    {{/if}}
+    {{#if has_file}}
+    <tr>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>File:</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #eee;">{{file_name}}</td>
+    </tr>
+    {{/if}}
+</table>
+
+{{#if estimated_review_time}}
+<p>Estimated review time: <strong>{{estimated_review_time}}</strong></p>
+{{/if}}
+
+<p>You'll receive another email once your assignment has been graded.</p>
+
+{{#if assignment_url}}
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{assignment_url}}" class="button">View Submission</a>
+</p>
+{{/if}}
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+"#;
+
+const SUBMISSION_TEXT: &str = r#"
+ASSIGNMENT SUBMITTED
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+Your assignment has been successfully submitted. Here are the details:
+
+✓ SUBMISSION CONFIRMED
+
+Assignment: {{assignment_name}}
+Course: {{course_name}}
+Submitted: {{submission_date}}
+{{#if has_due_date}}
+Due Date: {{due_date}} {{#if submitted_on_time}}(On Time){{else}}(Late){{/if}}
+{{/if}}
+{{#if submission_id}}Submission ID: {{submission_id}}{{/if}}
+{{#if has_file}}File: {{file_name}}{{/if}}
+
+{{#if estimated_review_time}}
+Estimated review time: {{estimated_review_time}}
+{{/if}}
+
+You'll receive another email once your assignment has been graded.
+
+{{#if assignment_url}}
+View Submission: {{assignment_url}}
+{{/if}}
+
+Best regards,
+The {{organization_name}} Team
+"#;
+
+const GRADED_HTML: &str = r#"
+<h1>Assignment Graded</h1>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+<p>Your assignment for <strong>{{course_name}}</strong> has been graded.</p>
+
+<div style="background-color: #f8f9fa; border-radius: 8px; padding: 25px; margin: 20px 0; text-align: center;">
+    <h2 style="margin: 0 0 10px 0;">{{assignment_name}}</h2>
+    <div style="font-size: 48px; font-weight: bold; color: #0066cc; margin: 15px 0;">
+        {{grade}}{{#if has_max_grade}} / {{max_grade}}{{/if}}
+    </div>
+    {{#if has_letter_grade}}
+    <div style="font-size: 24px; color: #666;">Grade: {{letter_grade}}</div>
+    {{/if}}
+    {{#if percentage}}
+    <div style="font-size: 18px; color: #666;">{{percentage}}%</div>
+    {{/if}}
+</div>
+
+{{#if graded_by}}
+<p style="color: #666;">Graded by: {{graded_by}}</p>
+{{/if}}
+
+{{#if has_feedback}}
+<div style="background-color: #e7f3ff; border-left: 4px solid #0066cc; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0 0 10px 0;"><strong>Instructor Feedback:</strong></p>
+    <p style="margin: 0; white-space: pre-wrap;">{{feedback}}</p>
+</div>
+{{/if}}
+
+{{#if has_rubric}}
+<h3>Rubric Breakdown</h3>
+<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr style="background-color: #f5f5f5;">
+        <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Criterion</th>
+        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Score</th>
+        <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Comments</th>
+    </tr>
+    {{#each rubric_scores}}
+    <tr>
+        <td style="padding: 10px; border: 1px solid #ddd;">{{criterion}}</td>
+        <td style="padding: 10px; text-align: center; border: 1px solid #ddd;">{{score}} / {{max_score}}</td>
+        <td style="padding: 10px; border: 1px solid #ddd;">{{#if comment}}{{comment}}{{else}}-{{/if}}</td>
+    </tr>
+    {{/each}}
+</table>
+{{/if}}
+
+{{#if resubmit_allowed}}
+<div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin: 20px 0;">
+    <p style="margin: 0;"><strong>Resubmission Available</strong></p>
+    <p style="margin: 10px 0 0 0;">You may resubmit this assignment to improve your grade.
+    {{#if resubmit_deadline}}Deadline: {{resubmit_deadline}}{{/if}}</p>
+</div>
+{{/if}}
+
+{{#if assignment_url}}
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{assignment_url}}" class="button">View Full Details</a>
+</p>
+{{/if}}
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+"#;
+
+const GRADED_TEXT: &str = r#"
+ASSIGNMENT GRADED
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+Your assignment for {{course_name}} has been graded.
+
+{{assignment_name}}
+-----------------
+Grade: {{grade}}{{#if has_max_grade}} / {{max_grade}}{{/if}}
+{{#if has_letter_grade}}Letter Grade: {{letter_grade}}{{/if}}
+{{#if percentage}}Percentage: {{percentage}}%{{/if}}
+
+{{#if graded_by}}Graded by: {{graded_by}}{{/if}}
+
+{{#if has_feedback}}
+INSTRUCTOR FEEDBACK
+-------------------
+{{feedback}}
+{{/if}}
+
+{{#if has_rubric}}
+RUBRIC BREAKDOWN
+{{#each rubric_scores}}
+{{criterion}}: {{score}} / {{max_score}}
+{{#if comment}}  Comment: {{comment}}{{/if}}
+{{/each}}
+{{/if}}
+
+{{#if resubmit_allowed}}
+RESUBMISSION AVAILABLE
+You may resubmit this assignment to improve your grade.
+{{#if resubmit_deadline}}Deadline: {{resubmit_deadline}}{{/if}}
+{{/if}}
+
+{{#if assignment_url}}
+View Full Details: {{assignment_url}}
+{{/if}}
+
+Best regards,
+The {{organization_name}} Team
+"#;

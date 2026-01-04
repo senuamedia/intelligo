@@ -1,0 +1,543 @@
+// Video Provider Core - Trait and abstractions for video integrations
+// Defines the interface for all video provider implementations
+
+module intelligo::integrations::video::core
+
+use intelligo::integrations::video::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::http::Client as HttpClient
+
+/// Video Provider trait - interface for all video implementations
+pub trait VideoProvider {
+    /// Get provider configuration
+    fn get_config(self) -> VideoConfig
+
+    /// Test connection to the video service
+    async fn test_connection(self) -> Result<VideoConnectionTest, VideoError>
+
+    /// Check if provider can handle a given URL
+    fn can_handle_url(self, url: &str) -> bool
+
+    /// Extract video ID from URL
+    fn extract_video_id(self, url: &str) -> Result<String, VideoError>
+
+    /// Get video metadata
+    async fn get_video(self, video_id: String) -> Result<Video, VideoError>
+
+    /// List videos (if supported)
+    async fn list_videos(self, options: VideoListOptions) -> Result<VideoList, VideoError>
+
+    /// Search videos (if supported)
+    async fn search_videos(self, query: String, options: VideoListOptions) -> Result<VideoList, VideoError>
+
+    /// Get embed code for a video
+    async fn get_embed(self, video_id: String, options: VideoEmbedOptions) -> Result<VideoEmbed, VideoError>
+
+    /// Get video player script URL (for JS-based players)
+    fn get_player_script(self) -> Option<String>
+
+    /// Get analytics for a video (if supported)
+    async fn get_analytics(self, video_id: String) -> Result<VideoAnalytics, VideoError>
+
+    /// Get captions/subtitles for a video
+    async fn get_captions(self, video_id: String) -> Result<Vec<VideoCaption>, VideoError>
+
+    /// Upload a video (if supported)
+    async fn upload_video(self, upload: VideoUpload) -> Result<Video, VideoError>
+
+    /// Delete a video (if supported)
+    async fn delete_video(self, video_id: String) -> Result<(), VideoError>
+
+    /// Get supported capabilities
+    fn get_capabilities(self) -> Vec<VideoCapability>
+}
+
+/// Video connection test result
+pub type VideoConnectionTest {
+    success: bool,
+    message: String,
+    latency_ms: u64,
+    account_name: Option<String>,
+    quota_remaining: Option<u64>,
+}
+
+/// Video list options
+pub type VideoListOptions {
+    limit: u32,
+    offset: u32,
+    sort_by: VideoSortField,
+    sort_order: SortOrder,
+    filter_status: Option<VideoStatus>,
+    filter_privacy: Option<VideoPrivacy>,
+    folder_id: Option<String>,
+    playlist_id: Option<String>,
+}
+
+impl VideoListOptions {
+    pub fn default() -> Self {
+        VideoListOptions {
+            limit: 25,
+            offset: 0,
+            sort_by: VideoSortField::CreatedAt,
+            sort_order: SortOrder::Descending,
+            filter_status: None,
+            filter_privacy: None,
+            folder_id: None,
+            playlist_id: None,
+        }
+    }
+}
+
+/// Video sort fields
+pub enum VideoSortField {
+    Title,
+    CreatedAt,
+    Duration,
+    Views,
+}
+
+/// Sort order
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+/// Video list result
+pub type VideoList {
+    videos: Vec<Video>,
+    total: u32,
+    offset: u32,
+    limit: u32,
+    has_more: bool,
+}
+
+/// Video caption/subtitle
+pub type VideoCaption {
+    id: String,
+    language: String,
+    language_name: String,
+    is_auto_generated: bool,
+    format: CaptionFormat,
+    url: Option<String>,
+    content: Option<String>,
+}
+
+/// Caption formats
+pub enum CaptionFormat {
+    Vtt,
+    Srt,
+    Ttml,
+    Sbv,
+}
+
+/// Video upload request
+pub type VideoUpload {
+    title: String,
+    description: Option<String>,
+    file_path: Option<String>,
+    file_url: Option<String>,
+    file_data: Option<Vec<u8>>,
+    content_type: String,
+    privacy: VideoPrivacy,
+    tags: Vec<String>,
+    folder_id: Option<String>,
+    custom_fields: HashMap<String, String>,
+    notify_on_complete: bool,
+}
+
+/// Video capabilities
+pub enum VideoCapability {
+    Embed,
+    Upload,
+    Delete,
+    Analytics,
+    Captions,
+    Chapters,
+    Playlists,
+    Privacy,
+    CustomThumbnail,
+    LiveStreaming,
+    PasswordProtection,
+    DomainRestriction,
+}
+
+/// Base video client for HTTP-based providers
+pub actor BaseVideoClient {
+    base_url: String,
+    api_key: Option<String>,
+    access_token: Option<String>,
+    http_client: HttpClient,
+
+    pub fn new(base_url: String) -> Self {
+        BaseVideoClient {
+            base_url: base_url,
+            api_key: None,
+            access_token: None,
+            http_client: HttpClient::new(),
+        }
+    }
+
+    pub fn with_api_key(mut self, api_key: String) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    pub fn with_access_token(mut self, token: String) -> Self {
+        self.access_token = Some(token);
+        self
+    }
+
+    /// Make authenticated GET request
+    pub async fn get(self, path: &str) -> Result<std::json::JsonValue, VideoError> {
+        let url = format!("{}{}", self.base_url, path);
+
+        let mut request = self.http_client.get(&url);
+
+        if let Some(ref token) = self.access_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        } else if let Some(ref key) = self.api_key {
+            request = request.header("Authorization", format!("api_key {}", key));
+        }
+
+        let response = request
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make authenticated POST request
+    pub async fn post(
+        self,
+        path: &str,
+        body: std::json::JsonValue
+    ) -> Result<std::json::JsonValue, VideoError> {
+        let url = format!("{}{}", self.base_url, path);
+
+        let mut request = self.http_client.post(&url);
+
+        if let Some(ref token) = self.access_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        } else if let Some(ref key) = self.api_key {
+            request = request.header("Authorization", format!("api_key {}", key));
+        }
+
+        let response = request
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make authenticated DELETE request
+    pub async fn delete(self, path: &str) -> Result<(), VideoError> {
+        let url = format!("{}{}", self.base_url, path);
+
+        let mut request = self.http_client.delete(&url);
+
+        if let Some(ref token) = self.access_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        } else if let Some(ref key) = self.api_key {
+            request = request.header("Authorization", format!("api_key {}", key));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(VideoError::ApiError { status: status, message: body });
+        }
+
+        Ok(())
+    }
+
+    /// Handle HTTP response
+    async fn handle_response(
+        self,
+        response: std::http::Response
+    ) -> Result<std::json::JsonValue, VideoError> {
+        let status = response.status().as_u16();
+
+        if status == 401 || status == 403 {
+            return Err(VideoError::AuthenticationError {
+                message: "Authentication failed".to_string()
+            });
+        }
+
+        if status == 404 {
+            return Err(VideoError::VideoNotFound {
+                video_id: "unknown".to_string()
+            });
+        }
+
+        if status == 429 {
+            let retry_after = response.headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|s| Duration::seconds(s as i64));
+
+            return Err(VideoError::RateLimitError { retry_after: retry_after });
+        }
+
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(VideoError::ApiError {
+                status: status,
+                message: body
+            });
+        }
+
+        response.json().await
+            .map_err(|e| VideoError::NetworkError { message: e.to_string() })
+    }
+}
+
+/// OEmbed response parser
+pub type OEmbedResponse {
+    html: String,
+    title: Option<String>,
+    author_name: Option<String>,
+    author_url: Option<String>,
+    provider_name: String,
+    provider_url: String,
+    thumbnail_url: Option<String>,
+    thumbnail_width: Option<u32>,
+    thumbnail_height: Option<u32>,
+    width: u32,
+    height: u32,
+    duration: Option<u64>,
+}
+
+impl OEmbedResponse {
+    pub fn from_json(json: &std::json::JsonValue) -> Option<Self> {
+        Some(OEmbedResponse {
+            html: json["html"].as_str()?.to_string(),
+            title: json["title"].as_str().map(|s| s.to_string()),
+            author_name: json["author_name"].as_str().map(|s| s.to_string()),
+            author_url: json["author_url"].as_str().map(|s| s.to_string()),
+            provider_name: json["provider_name"].as_str()?.to_string(),
+            provider_url: json["provider_url"].as_str()?.to_string(),
+            thumbnail_url: json["thumbnail_url"].as_str().map(|s| s.to_string()),
+            thumbnail_width: json["thumbnail_width"].as_u64().map(|n| n as u32),
+            thumbnail_height: json["thumbnail_height"].as_u64().map(|n| n as u32),
+            width: json["width"].as_u64()? as u32,
+            height: json["height"].as_u64()? as u32,
+            duration: json["duration"].as_u64(),
+        })
+    }
+}
+
+/// Fetch OEmbed data from a URL
+pub async fn fetch_oembed(
+    oembed_url: String,
+    video_url: String,
+    max_width: Option<u32>,
+    max_height: Option<u32>
+) -> Result<OEmbedResponse, VideoError> {
+    let client = HttpClient::new();
+
+    let mut url = format!("{}?url={}", oembed_url, url_encode(&video_url));
+
+    if let Some(w) = max_width {
+        url = format!("{}&maxwidth={}", url, w);
+    }
+    if let Some(h) = max_height {
+        url = format!("{}&maxheight={}", url, h);
+    }
+
+    url = format!("{}&format=json", url);
+
+    let response = client.get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+    if !response.status().is_success() {
+        return Err(VideoError::EmbedError {
+            message: format!("OEmbed request failed: {}", response.status())
+        });
+    }
+
+    let json: std::json::JsonValue = response.json().await
+        .map_err(|e| VideoError::NetworkError { message: e.to_string() })?;
+
+    OEmbedResponse::from_json(&json).ok_or(
+        VideoError::EmbedError {
+            message: "Invalid OEmbed response".to_string()
+        }
+    )
+}
+
+/// URL encode helper
+fn url_encode(s: &str) -> String {
+    s.chars().map(|c| {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        }
+    }).collect()
+}
+
+/// Video player tracking script generator
+pub fn generate_tracking_script(
+    video_id: String,
+    user_id: Uuid,
+    tracking_endpoint: String,
+    provider_type: VideoProviderType
+) -> String {
+    format!(r#"
+(function() {{
+    var videoId = '{}';
+    var userId = '{}';
+    var trackingEndpoint = '{}';
+    var providerType = '{}';
+
+    var lastPosition = 0;
+    var totalWatched = 0;
+    var startTime = null;
+
+    function sendEvent(eventType, position, duration) {{
+        var data = {{
+            event_type: eventType,
+            video_id: videoId,
+            user_id: userId,
+            timestamp: new Date().toISOString(),
+            position: position,
+            duration: duration,
+            percent_complete: duration > 0 ? (position / duration) * 100 : 0,
+            playback_rate: 1.0,
+            provider: providerType
+        }};
+
+        fetch(trackingEndpoint, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(data)
+        }}).catch(function(e) {{ console.error('Tracking error:', e); }});
+    }}
+
+    function onPlay(position, duration) {{
+        startTime = Date.now();
+        sendEvent('play', position, duration);
+    }}
+
+    function onPause(position, duration) {{
+        if (startTime) {{
+            totalWatched += (Date.now() - startTime) / 1000;
+            startTime = null;
+        }}
+        sendEvent('pause', position, duration);
+    }}
+
+    function onProgress(position, duration) {{
+        if (position - lastPosition > 5) {{
+            sendEvent('progress', position, duration);
+            lastPosition = position;
+        }}
+    }}
+
+    function onComplete(duration) {{
+        sendEvent('complete', duration, duration);
+    }}
+
+    function onSeek(position, duration) {{
+        sendEvent('seek', position, duration);
+        lastPosition = position;
+    }}
+
+    // Export for player integration
+    window.IntelligoVideoTracking = window.IntelligoVideoTracking || {{}};
+    window.IntelligoVideoTracking['{}'] = {{
+        onPlay: onPlay,
+        onPause: onPause,
+        onProgress: onProgress,
+        onComplete: onComplete,
+        onSeek: onSeek
+    }};
+}})();
+"#, video_id, user_id, tracking_endpoint, provider_type.to_string(), video_id)
+}
+
+/// Responsive embed wrapper generator
+pub fn generate_responsive_wrapper(
+    embed_html: String,
+    aspect_ratio: f64
+) -> String {
+    let padding_percent = (1.0 / aspect_ratio) * 100.0;
+
+    format!(r#"
+<div class="intelligo-video-wrapper" style="position: relative; padding-bottom: {:.2}%; height: 0; overflow: hidden;">
+    <div style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;">
+        {}
+    </div>
+</div>
+"#, padding_percent, embed_html)
+}
+
+/// Parse duration from various formats
+pub fn parse_duration(s: &str) -> Option<Duration> {
+    // Try ISO 8601 duration (PT1H30M45S)
+    if s.starts_with("PT") {
+        return parse_iso8601_duration(s);
+    }
+
+    // Try HH:MM:SS or MM:SS format
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        2 => {
+            let minutes = parts[0].parse::<u64>().ok()?;
+            let seconds = parts[1].parse::<u64>().ok()?;
+            Some(Duration::seconds((minutes * 60 + seconds) as i64))
+        },
+        3 => {
+            let hours = parts[0].parse::<u64>().ok()?;
+            let minutes = parts[1].parse::<u64>().ok()?;
+            let seconds = parts[2].parse::<u64>().ok()?;
+            Some(Duration::seconds((hours * 3600 + minutes * 60 + seconds) as i64))
+        },
+        _ => {
+            // Try as plain seconds
+            let seconds = s.parse::<u64>().ok()?;
+            Some(Duration::seconds(seconds as i64))
+        }
+    }
+}
+
+fn parse_iso8601_duration(s: &str) -> Option<Duration> {
+    let s = s.strip_prefix("PT")?;
+
+    let mut total_seconds: i64 = 0;
+    let mut current_num = String::new();
+
+    for c in s.chars() {
+        if c.is_numeric() {
+            current_num.push(c);
+        } else {
+            let num: i64 = current_num.parse().ok()?;
+            current_num.clear();
+
+            match c {
+                'H' => total_seconds += num * 3600,
+                'M' => total_seconds += num * 60,
+                'S' => total_seconds += num,
+                _ => {}
+            }
+        }
+    }
+
+    Some(Duration::seconds(total_seconds))
+}

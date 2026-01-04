@@ -1,0 +1,825 @@
+/// Intelligo LMS - Webhook System
+///
+/// Event-driven webhook delivery for external integrations.
+
+module intelligo::core::webhooks
+
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Webhook Manager
+// ============================================================================
+
+/// Central webhook management service
+pub actor WebhookManager {
+    tenant_id: String,
+    webhooks: Map<String, Webhook>,
+    event_subscriptions: Map<String, Vec<String>>,
+    delivery_queue: MessageQueue<WebhookDelivery>,
+    retry_policy: RetryPolicy,
+    signer: WebhookSigner,
+
+    pub fn new(tenant_id: &str) -> Self {
+        WebhookManager {
+            tenant_id: tenant_id.to_string(),
+            webhooks: Map::new(),
+            event_subscriptions: Map::new(),
+            delivery_queue: MessageQueue::new("webhook_delivery"),
+            retry_policy: RetryPolicy::default(),
+            signer: WebhookSigner::new()
+        }
+    }
+
+    // ========================================================================
+    // Webhook CRUD
+    // ========================================================================
+
+    /// Create a new webhook
+    pub fn create(mut self, request: CreateWebhookRequest) -> Result<Webhook, WebhookError> {
+        // Validate URL
+        self.validate_url(&request.url)?;
+
+        // Validate events
+        for event in &request.events {
+            if !self.is_valid_event(event) {
+                return Err(WebhookError::InvalidEvent(event.clone()));
+            }
+        }
+
+        let webhook = Webhook {
+            id: Uuid::new_v4().to_string(),
+            tenant_id: self.tenant_id.clone(),
+            name: request.name,
+            description: request.description,
+            url: request.url,
+            secret: self.generate_secret(),
+            events: request.events.clone(),
+            headers: request.headers.unwrap_or_default(),
+            enabled: true,
+            version: WebhookVersion::V1,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            last_triggered_at: None,
+            failure_count: 0,
+            status: WebhookStatus::Active
+        };
+
+        // Register event subscriptions
+        for event in &request.events {
+            let subs = self.event_subscriptions.entry(event.clone()).or_insert(vec![]);
+            subs.push(webhook.id.clone());
+        }
+
+        self.webhooks.insert(webhook.id.clone(), webhook.clone());
+
+        Ok(webhook)
+    }
+
+    /// Update a webhook
+    pub fn update(mut self, webhook_id: &str, request: UpdateWebhookRequest) -> Result<Webhook, WebhookError> {
+        let mut webhook = self.get(webhook_id)?;
+
+        if let Some(name) = request.name {
+            webhook.name = name;
+        }
+
+        if let Some(description) = request.description {
+            webhook.description = Some(description);
+        }
+
+        if let Some(url) = request.url {
+            self.validate_url(&url)?;
+            webhook.url = url;
+        }
+
+        if let Some(events) = request.events {
+            // Validate new events
+            for event in &events {
+                if !self.is_valid_event(event) {
+                    return Err(WebhookError::InvalidEvent(event.clone()));
+                }
+            }
+
+            // Update subscriptions
+            self.update_subscriptions(webhook_id, &webhook.events, &events);
+            webhook.events = events;
+        }
+
+        if let Some(headers) = request.headers {
+            webhook.headers = headers;
+        }
+
+        if let Some(enabled) = request.enabled {
+            webhook.enabled = enabled;
+            webhook.status = if enabled { WebhookStatus::Active } else { WebhookStatus::Disabled };
+        }
+
+        webhook.updated_at = DateTime::now();
+
+        self.webhooks.insert(webhook_id.to_string(), webhook.clone());
+
+        Ok(webhook)
+    }
+
+    /// Delete a webhook
+    pub fn delete(mut self, webhook_id: &str) -> Result<(), WebhookError> {
+        let webhook = self.get(webhook_id)?;
+
+        // Remove from subscriptions
+        for event in &webhook.events {
+            if let Some(subs) = self.event_subscriptions.get_mut(event) {
+                subs.retain(|id| id != webhook_id);
+            }
+        }
+
+        self.webhooks.remove(webhook_id);
+
+        Ok(())
+    }
+
+    /// Get a webhook
+    pub fn get(self, webhook_id: &str) -> Result<Webhook, WebhookError> {
+        self.webhooks.get(webhook_id)
+            .ok_or_else(|| WebhookError::NotFound(webhook_id.to_string()))
+            .cloned()
+    }
+
+    /// List webhooks
+    pub fn list(self) -> Vec<Webhook> {
+        self.webhooks.values().cloned().collect()
+    }
+
+    /// Regenerate webhook secret
+    pub fn regenerate_secret(mut self, webhook_id: &str) -> Result<String, WebhookError> {
+        let mut webhook = self.get(webhook_id)?;
+
+        webhook.secret = self.generate_secret();
+        webhook.updated_at = DateTime::now();
+
+        self.webhooks.insert(webhook_id.to_string(), webhook.clone());
+
+        Ok(webhook.secret)
+    }
+
+    // ========================================================================
+    // Event Triggering
+    // ========================================================================
+
+    /// Trigger webhooks for an event
+    pub fn trigger(mut self, event: WebhookEvent) -> Result<Vec<WebhookDelivery>, WebhookError> {
+        let webhook_ids = match self.event_subscriptions.get(&event.event_type) {
+            Some(ids) => ids.clone(),
+            None => return Ok(vec![])
+        };
+
+        let mut deliveries = vec![];
+
+        for webhook_id in webhook_ids {
+            let webhook = match self.webhooks.get(&webhook_id) {
+                Some(w) if w.enabled => w.clone(),
+                _ => continue
+            };
+
+            let delivery = self.create_delivery(&webhook, &event);
+            deliveries.push(delivery.clone());
+
+            // Queue for delivery
+            self.delivery_queue.enqueue(delivery);
+        }
+
+        Ok(deliveries)
+    }
+
+    /// Create a delivery record
+    fn create_delivery(self, webhook: &Webhook, event: &WebhookEvent) -> WebhookDelivery {
+        let payload = self.build_payload(webhook, event);
+        let signature = self.signer.sign(&payload, &webhook.secret);
+
+        WebhookDelivery {
+            id: Uuid::new_v4().to_string(),
+            webhook_id: webhook.id.clone(),
+            event_type: event.event_type.clone(),
+            event_id: event.id.clone(),
+            url: webhook.url.clone(),
+            payload,
+            signature,
+            headers: webhook.headers.clone(),
+            status: DeliveryStatus::Pending,
+            attempts: 0,
+            max_attempts: self.retry_policy.max_attempts,
+            next_attempt_at: Some(DateTime::now()),
+            created_at: DateTime::now(),
+            delivered_at: None,
+            response_code: None,
+            response_body: None,
+            error: None
+        }
+    }
+
+    /// Build webhook payload
+    fn build_payload(self, webhook: &Webhook, event: &WebhookEvent) -> String {
+        let payload = WebhookPayload {
+            id: event.id.clone(),
+            event_type: event.event_type.clone(),
+            created_at: event.created_at,
+            data: event.data.clone(),
+            webhook_id: webhook.id.clone(),
+            version: webhook.version.clone()
+        };
+
+        // Serialize to JSON
+        serde_json::to_string(&payload).unwrap_or_default()
+    }
+
+    // ========================================================================
+    // Delivery Processing
+    // ========================================================================
+
+    /// Process pending deliveries
+    pub fn process_deliveries(mut self) -> Result<DeliveryResults, WebhookError> {
+        let mut results = DeliveryResults::new();
+
+        while let Some(mut delivery) = self.delivery_queue.dequeue() {
+            if delivery.next_attempt_at.map(|t| t > DateTime::now()).unwrap_or(false) {
+                // Not ready yet, re-queue
+                self.delivery_queue.enqueue(delivery);
+                continue;
+            }
+
+            delivery.attempts += 1;
+
+            match self.deliver(&delivery) {
+                Ok(response) => {
+                    delivery.status = DeliveryStatus::Delivered;
+                    delivery.delivered_at = Some(DateTime::now());
+                    delivery.response_code = Some(response.status_code);
+                    delivery.response_body = Some(response.body);
+
+                    // Update webhook success
+                    self.record_success(&delivery.webhook_id);
+
+                    results.add_success(delivery.id.clone());
+                }
+                Err(e) => {
+                    if delivery.attempts >= delivery.max_attempts {
+                        delivery.status = DeliveryStatus::Failed;
+                        delivery.error = Some(e.to_string());
+
+                        // Update webhook failure
+                        self.record_failure(&delivery.webhook_id);
+
+                        results.add_failure(delivery.id.clone(), e.to_string());
+                    } else {
+                        // Schedule retry
+                        delivery.status = DeliveryStatus::Retrying;
+                        delivery.next_attempt_at = Some(self.calculate_next_attempt(&delivery));
+
+                        self.delivery_queue.enqueue(delivery.clone());
+
+                        results.add_retry(delivery.id.clone());
+                    }
+                }
+            }
+
+            // Save delivery record
+            self.save_delivery(&delivery)?;
+        }
+
+        Ok(results)
+    }
+
+    /// Deliver a webhook
+    fn deliver(self, delivery: &WebhookDelivery) -> Result<HttpResponse, WebhookError> {
+        let mut headers = delivery.headers.clone();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("X-Webhook-Signature".to_string(), delivery.signature.clone());
+        headers.insert("X-Webhook-ID".to_string(), delivery.webhook_id.clone());
+        headers.insert("X-Delivery-ID".to_string(), delivery.id.clone());
+        headers.insert("X-Event-Type".to_string(), delivery.event_type.clone());
+
+        // Make HTTP request
+        let response = http::post(&delivery.url)
+            .headers(headers)
+            .body(&delivery.payload)
+            .timeout(Duration::from_secs(30))
+            .send()?;
+
+        if response.status_code >= 200 && response.status_code < 300 {
+            Ok(response)
+        } else {
+            Err(WebhookError::DeliveryFailed(
+                format!("HTTP {}: {}", response.status_code, response.body)
+            ))
+        }
+    }
+
+    /// Calculate next retry attempt time
+    fn calculate_next_attempt(self, delivery: &WebhookDelivery) -> DateTime {
+        let delay = self.retry_policy.calculate_delay(delivery.attempts);
+        DateTime::now() + delay
+    }
+
+    /// Record successful delivery
+    fn record_success(mut self, webhook_id: &str) {
+        if let Some(webhook) = self.webhooks.get_mut(webhook_id) {
+            webhook.last_triggered_at = Some(DateTime::now());
+            webhook.failure_count = 0;
+            webhook.status = WebhookStatus::Active;
+        }
+    }
+
+    /// Record failed delivery
+    fn record_failure(mut self, webhook_id: &str) {
+        if let Some(webhook) = self.webhooks.get_mut(webhook_id) {
+            webhook.failure_count += 1;
+
+            // Disable after too many failures
+            if webhook.failure_count >= 10 {
+                webhook.enabled = false;
+                webhook.status = WebhookStatus::Suspended;
+            }
+        }
+    }
+
+    // ========================================================================
+    // Delivery History
+    // ========================================================================
+
+    /// Get delivery history for a webhook
+    pub fn get_deliveries(self, webhook_id: &str, query: DeliveryQuery) -> Result<PagedResult<WebhookDelivery>, WebhookError> {
+        // Would query delivery history from database
+        Ok(PagedResult {
+            items: vec![],
+            total: 0,
+            page: query.page.unwrap_or(1),
+            page_size: query.page_size.unwrap_or(20),
+            has_more: false,
+        })
+    }
+
+    /// Get a specific delivery
+    pub fn get_delivery(self, delivery_id: &str) -> Result<WebhookDelivery, WebhookError> {
+        // Would query from database
+        Err(WebhookError::NotFound(format!("Delivery not found: {}", delivery_id)))
+    }
+
+    /// Retry a failed delivery
+    pub fn retry_delivery(mut self, delivery_id: &str) -> Result<WebhookDelivery, WebhookError> {
+        let mut delivery = self.get_delivery(delivery_id)?;
+
+        if delivery.status != DeliveryStatus::Failed {
+            return Err(WebhookError::InvalidState("Delivery is not in failed state".to_string()));
+        }
+
+        delivery.status = DeliveryStatus::Pending;
+        delivery.attempts = 0;
+        delivery.next_attempt_at = Some(DateTime::now());
+        delivery.error = None;
+
+        self.delivery_queue.enqueue(delivery.clone());
+
+        Ok(delivery)
+    }
+
+    // ========================================================================
+    // Event Catalog
+    // ========================================================================
+
+    /// Get available events
+    pub fn get_event_catalog(self) -> Vec<WebhookEventDefinition> {
+        vec![
+            // Course events
+            WebhookEventDefinition::new("course.created", "Course was created"),
+            WebhookEventDefinition::new("course.updated", "Course was updated"),
+            WebhookEventDefinition::new("course.published", "Course was published"),
+            WebhookEventDefinition::new("course.unpublished", "Course was unpublished"),
+            WebhookEventDefinition::new("course.deleted", "Course was deleted"),
+
+            // Enrollment events
+            WebhookEventDefinition::new("enrollment.created", "User enrolled in course"),
+            WebhookEventDefinition::new("enrollment.activated", "Enrollment was activated"),
+            WebhookEventDefinition::new("enrollment.completed", "User completed course"),
+            WebhookEventDefinition::new("enrollment.expired", "Enrollment expired"),
+            WebhookEventDefinition::new("enrollment.withdrawn", "User withdrew from course"),
+
+            // User events
+            WebhookEventDefinition::new("user.created", "User was created"),
+            WebhookEventDefinition::new("user.updated", "User was updated"),
+            WebhookEventDefinition::new("user.deleted", "User was deleted"),
+            WebhookEventDefinition::new("user.login", "User logged in"),
+            WebhookEventDefinition::new("user.logout", "User logged out"),
+
+            // Assessment events
+            WebhookEventDefinition::new("assessment.submitted", "Assessment was submitted"),
+            WebhookEventDefinition::new("assessment.graded", "Assessment was graded"),
+            WebhookEventDefinition::new("assessment.passed", "User passed assessment"),
+            WebhookEventDefinition::new("assessment.failed", "User failed assessment"),
+
+            // Certificate events
+            WebhookEventDefinition::new("certificate.issued", "Certificate was issued"),
+            WebhookEventDefinition::new("certificate.revoked", "Certificate was revoked"),
+
+            // Compliance events
+            WebhookEventDefinition::new("compliance.due", "Compliance training due"),
+            WebhookEventDefinition::new("compliance.overdue", "Compliance training overdue"),
+            WebhookEventDefinition::new("compliance.completed", "Compliance training completed"),
+
+            // xAPI events
+            WebhookEventDefinition::new("xapi.statement", "xAPI statement recorded"),
+
+            // SCORM events
+            WebhookEventDefinition::new("scorm.launched", "SCORM content launched"),
+            WebhookEventDefinition::new("scorm.completed", "SCORM content completed")
+        ]
+    }
+
+    fn is_valid_event(self, event: &str) -> bool {
+        self.get_event_catalog().iter().any(|e| e.event_type == event)
+    }
+
+    // ========================================================================
+    // Testing
+    // ========================================================================
+
+    /// Test a webhook with a sample event
+    pub fn test(self, webhook_id: &str) -> Result<WebhookTestResult, WebhookError> {
+        let webhook = self.get(webhook_id)?;
+
+        let test_event = WebhookEvent {
+            id: Uuid::new_v4().to_string(),
+            event_type: "webhook.test".to_string(),
+            data: {
+                let mut m = Map::new();
+                m.insert("message".to_string(), Value::String("This is a test webhook".to_string()));
+                m
+            },
+            created_at: DateTime::now()
+        };
+
+        let delivery = self.create_delivery(&webhook, &test_event);
+
+        match self.deliver(&delivery) {
+            Ok(response) => Ok(WebhookTestResult {
+                success: true,
+                status_code: Some(response.status_code),
+                response_body: Some(response.body),
+                error: None,
+                duration_ms: 0 // Would measure actual duration
+            }),
+            Err(e) => Ok(WebhookTestResult {
+                success: false,
+                status_code: None,
+                response_body: None,
+                error: Some(e.to_string()),
+                duration_ms: 0
+            })
+        }
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn validate_url(self, url: &str) -> Result<(), WebhookError> {
+        if !url.starts_with("https://") {
+            return Err(WebhookError::ValidationError("URL must use HTTPS".to_string()));
+        }
+
+        // Additional URL validation
+        Ok(())
+    }
+
+    fn generate_secret(self) -> String {
+        // Generate secure random secret
+        Uuid::new_v4().to_string().replace("-", "")
+    }
+
+    fn update_subscriptions(mut self, webhook_id: &str, old_events: &[String], new_events: &[String]) {
+        // Remove old subscriptions
+        for event in old_events {
+            if !new_events.contains(event) {
+                if let Some(subs) = self.event_subscriptions.get_mut(event) {
+                    subs.retain(|id| id != webhook_id);
+                }
+            }
+        }
+
+        // Add new subscriptions
+        for event in new_events {
+            if !old_events.contains(event) {
+                let subs = self.event_subscriptions.entry(event.clone()).or_insert(vec![]);
+                subs.push(webhook_id.to_string());
+            }
+        }
+    }
+
+    fn save_delivery(self, delivery: &WebhookDelivery) -> Result<(), WebhookError> {
+        // Would persist to database
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Webhook Signer
+// ============================================================================
+
+/// Signs webhook payloads for verification
+pub type WebhookSigner = type {}
+
+impl WebhookSigner {
+    pub fn new() -> Self { WebhookSigner {} }
+
+    /// Sign a payload with HMAC-SHA256
+    pub fn sign(self, payload: &str, secret: &str) -> String {
+        // HMAC-SHA256 signature
+        let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
+        format!("sha256={}", hex::encode(signature))
+    }
+
+    /// Verify a signature
+    pub fn verify(self, payload: &str, secret: &str, signature: &str) -> bool {
+        let expected = self.sign(payload, secret);
+        constant_time_eq(expected.as_bytes(), signature.as_bytes())
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Webhook entity
+pub type Webhook = type {
+    id: String,
+    tenant_id: String,
+    name: String,
+    description: Option<String>,
+    url: String,
+    secret: String,
+    events: Vec<String>,
+    headers: Map<String, String>,
+    enabled: bool,
+    version: WebhookVersion,
+    created_at: DateTime,
+    updated_at: DateTime,
+    last_triggered_at: Option<DateTime>,
+    failure_count: i32,
+    status: WebhookStatus
+}
+
+/// Webhook version
+pub enum WebhookVersion {
+    V1
+}
+
+/// Webhook status
+pub enum WebhookStatus {
+    Active,
+    Disabled,
+    Suspended
+}
+
+/// Create webhook request
+pub type CreateWebhookRequest = type {
+    name: String,
+    description: Option<String>,
+    url: String,
+    events: Vec<String>,
+    headers: Option<Map<String, String>>
+}
+
+/// Update webhook request
+pub type UpdateWebhookRequest = type {
+    name: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    events: Option<Vec<String>>,
+    headers: Option<Map<String, String>>,
+    enabled: Option<bool>
+}
+
+/// Webhook event
+pub type WebhookEvent = type {
+    id: String,
+    event_type: String,
+    data: Map<String, Value>,
+    created_at: DateTime
+}
+
+/// Webhook payload
+pub type WebhookPayload = type {
+    id: String,
+    event_type: String,
+    created_at: DateTime,
+    data: Map<String, Value>,
+    webhook_id: String,
+    version: WebhookVersion
+}
+
+/// Webhook delivery
+pub type WebhookDelivery = type {
+    id: String,
+    webhook_id: String,
+    event_type: String,
+    event_id: String,
+    url: String,
+    payload: String,
+    signature: String,
+    headers: Map<String, String>,
+    status: DeliveryStatus,
+    attempts: i32,
+    max_attempts: i32,
+    next_attempt_at: Option<DateTime>,
+    created_at: DateTime,
+    delivered_at: Option<DateTime>,
+    response_code: Option<i32>,
+    response_body: Option<String>,
+    error: Option<String>
+}
+
+/// Delivery status
+pub enum DeliveryStatus {
+    Pending,
+    Delivering,
+    Delivered,
+    Retrying,
+    Failed
+}
+
+/// Delivery query
+pub type DeliveryQuery = type {
+    status: Option<DeliveryStatus>,
+    event_type: Option<String>,
+    from: Option<DateTime>,
+    to: Option<DateTime>,
+    page: Option<i32>,
+    page_size: Option<i32>
+}
+
+/// Delivery results
+pub type DeliveryResults = type {
+    successful: Vec<String>,
+    failed: Vec<(String, String)>,
+    retrying: Vec<String>
+}
+
+impl DeliveryResults {
+    pub fn new() -> Self {
+        DeliveryResults { successful: vec![], failed: vec![], retrying: vec![] }
+    }
+
+    pub fn add_success(mut self, id: String) { self.successful.push(id); }
+    pub fn add_failure(mut self, id: String, error: String) { self.failed.push((id, error)); }
+    pub fn add_retry(mut self, id: String) { self.retrying.push(id); }
+}
+
+/// Retry policy
+pub type RetryPolicy = type {
+    max_attempts: i32,
+    initial_delay: Duration,
+    max_delay: Duration,
+    multiplier: f64
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_attempts: 5,
+            initial_delay: Duration::from_secs(60),
+            max_delay: Duration::from_secs(3600),
+            multiplier: 2.0
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn calculate_delay(self, attempt: i32) -> Duration {
+        let delay_secs = self.initial_delay.as_secs() as f64 * self.multiplier.powi(attempt - 1);
+        let clamped = delay_secs.min(self.max_delay.as_secs() as f64);
+        Duration::from_secs(clamped as u64)
+    }
+}
+
+/// Webhook event definition
+pub type WebhookEventDefinition = type {
+    event_type: String,
+    description: String,
+    schema: Option<Value>
+}
+
+impl WebhookEventDefinition {
+    pub fn new(event_type: &str, description: &str) -> Self {
+        WebhookEventDefinition {
+            event_type: event_type.to_string(),
+            description: description.to_string(),
+            schema: None
+        }
+    }
+}
+
+/// Webhook test result
+pub type WebhookTestResult = type {
+    success: bool,
+    status_code: Option<i32>,
+    response_body: Option<String>,
+    error: Option<String>,
+    duration_ms: i64
+}
+
+/// HTTP response
+pub type HttpResponse = type {
+    status_code: i32,
+    headers: Map<String, String>,
+    body: String
+}
+
+/// Paged result
+pub type PagedResult<T> = type {
+    items: Vec<T>,
+    total: i64,
+    page: i32,
+    page_size: i32
+}
+
+/// Webhook error
+pub enum WebhookError {
+    NotFound(String),
+    ValidationError(String),
+    InvalidEvent(String),
+    InvalidState(String),
+    DeliveryFailed(String),
+    HttpError(String)
+}
+
+impl WebhookError {
+    pub fn to_string(self) -> String {
+        match self {
+            WebhookError::NotFound(id) => format!("Webhook not found: {}", id),
+            WebhookError::ValidationError(msg) => msg,
+            WebhookError::InvalidEvent(event) => format!("Invalid event type: {}", event),
+            WebhookError::InvalidState(msg) => msg,
+            WebhookError::DeliveryFailed(msg) => format!("Delivery failed: {}", msg),
+            WebhookError::HttpError(msg) => format!("HTTP error: {}", msg)
+        }
+    }
+}
+
+// Crypto utilities
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // HMAC-SHA256 implementation using std::crypto
+    std::crypto::hmac_sha256(key, data)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for i in 0..a.len() {
+        result |= a[i] ^ b[i];
+    }
+    result == 0
+}
+
+mod hex {
+    pub fn encode(data: Vec<u8>) -> String {
+        data.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<String>>()
+            .join("")
+    }
+}
+
+mod http {
+    use super::*;
+
+    pub fn post(url: &str) -> HttpRequestBuilder { HttpRequestBuilder::new(url) }
+
+    pub type HttpRequestBuilder = type { url: String, headers: Map<String, String>, body: Option<String>, timeout_duration: Option<Duration> }
+
+    impl HttpRequestBuilder {
+        pub fn new(url: &str) -> Self {
+            HttpRequestBuilder { url: url.to_string(), headers: Map::new(), body: None, timeout_duration: None }
+        }
+
+        pub fn headers(mut self, headers: Map<String, String>) -> Self {
+            self.headers = headers;
+            self
+        }
+
+        pub fn body(mut self, body: &str) -> Self {
+            self.body = Some(body.to_string());
+            self
+        }
+
+        pub fn timeout(mut self, duration: Duration) -> Self {
+            self.timeout_duration = Some(duration);
+            self
+        }
+
+        pub fn send(self) -> Result<HttpResponse, WebhookError> {
+            // HTTP client implementation would go here
+            Err(WebhookError::HttpError("HTTP client not yet implemented".to_string()))
+        }
+    }
+}

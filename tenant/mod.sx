@@ -1,0 +1,24 @@
+/// Intelligo LMS - Tenant Module
+///
+/// Multi-tenancy system providing complete tenant isolation, management,
+/// branding customization, billing integration, and resource limits.
+
+module intelligo::tenant
+
+// Re-export all tenant submodules
+pub use intelligo::tenant::core::*
+pub use intelligo::tenant::management::*
+pub use intelligo::tenant::isolation::*
+pub use intelligo::tenant::branding::*
+pub use intelligo::tenant::billing::*
+pub use intelligo::tenant::limits::*
+
+/// Initialize tenant system
+pub fn init() {
+    println!("[Tenant] Initializing multi-tenancy system")
+}
+
+/// Get the tenant module version
+pub fn version() -> String {
+    "1.0.0".to_string()
+}

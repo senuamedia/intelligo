@@ -1,0 +1,1084 @@
+/// Intelligo LMS - Enrollment Entity
+///
+/// Enrollments represent the relationship between students and courses.
+/// They track enrollment status, roles, progress, accommodations, and certificates.
+
+module intelligo::entities::enrollment
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// ENROLLMENT ENTITY
+// =============================================================================
+
+/// An enrollment represents a user's participation in a course
+type Enrollment {
+    /// Unique identifier
+    id: EnrollmentId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Bundle type (student_enrollment, instructor_enrollment, ta_enrollment, etc.)
+    bundle: String,
+
+    /// Course enrolled in
+    course_id: CourseId,
+
+    /// User enrolled
+    user_id: UserId,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    /// Section (if course has sections)
+    section_id: Option<SectionId>,
+
+    // =========================================================================
+    // Role & Status
+    // =========================================================================
+
+    /// Role in the course
+    role: CourseRole,
+
+    /// Enrollment status
+    status: EnrollmentStatus,
+
+    /// Source of enrollment
+    source: EnrollmentSource,
+
+    // =========================================================================
+    // Dates
+    // =========================================================================
+
+    /// When enrollment was created
+    enrolled_at: DateTime,
+
+    /// When enrollment starts (for delayed start)
+    start_date: Option<DateTime>,
+
+    /// When enrollment ends/expires
+    end_date: Option<DateTime>,
+
+    /// When enrollment was completed
+    completed_at: Option<DateTime>,
+
+    /// Last activity in course
+    last_activity_at: Option<DateTime>,
+
+    // =========================================================================
+    // Progress Caching
+    // =========================================================================
+
+    /// Cached progress data
+    progress: EnrollmentProgress,
+
+    /// Current module
+    current_module_id: Option<ModuleId>,
+
+    /// Current lesson
+    current_lesson_id: Option<LessonId>,
+
+    // =========================================================================
+    // Grading
+    // =========================================================================
+
+    /// Current grade (cached)
+    current_grade: Option<f32>,
+
+    /// Current letter grade (cached)
+    current_letter_grade: Option<String>,
+
+    /// Whether currently passing
+    is_passing: Bool,
+
+    /// Grade book entry ID
+    gradebook_entry_id: Option<String>,
+
+    // =========================================================================
+    // Accommodations
+    // =========================================================================
+
+    /// Student accommodations
+    accommodations: Option<Accommodations>,
+
+    // =========================================================================
+    // Engagement
+    // =========================================================================
+
+    /// Total time spent in course (seconds)
+    total_time_seconds: i64,
+
+    /// Login count
+    login_count: i32,
+
+    /// Engagement score (0-100)
+    engagement_score: Option<f32>,
+
+    /// Risk level (early warning)
+    risk_level: RiskLevel,
+
+    /// Risk factors identified
+    risk_factors: List<RiskFactor>,
+
+    // =========================================================================
+    // Certificate
+    // =========================================================================
+
+    /// Certificate issued
+    certificate: Option<CertificateInfo>,
+
+    // =========================================================================
+    // Metadata
+    // =========================================================================
+
+    /// External ID (from SIS)
+    external_id: Option<String>,
+
+    /// LTI context
+    lti_context: Option<LtiEnrollmentContext>,
+
+    /// Additional metadata
+    metadata: Map<String, Dynamic>,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+// =============================================================================
+// ENROLLMENT PROGRESS
+// =============================================================================
+
+/// Cached progress data for an enrollment
+type EnrollmentProgress {
+    /// Overall completion percentage
+    overall_percentage: f32,
+
+    /// Module progress
+    module_progress: Map<ModuleId, ModuleProgress>,
+
+    /// Lesson completion count
+    lessons_completed: i32,
+
+    /// Total lessons in course
+    total_lessons: i32,
+
+    /// Assessments completed count
+    assessments_completed: i32,
+
+    /// Total assessments in course
+    total_assessments: i32,
+
+    /// Assignments submitted count
+    assignments_submitted: i32,
+
+    /// Total assignments
+    total_assignments: i32,
+
+    /// Required items completed
+    required_completed: i32,
+
+    /// Total required items
+    total_required: i32,
+
+    /// SCORM completion status (if SCORM course)
+    scorm_status: Option<ScormCompletionStatus>,
+
+    /// xAPI statements count
+    xapi_statements: i32,
+
+    /// Competencies mastered
+    competencies_mastered: List<CompetencyId>,
+
+    /// Badges earned
+    badges_earned: List<BadgeId>,
+
+    /// Skills developed
+    skills_acquired: List<SkillProgress>,
+
+    /// Last progress update
+    last_updated: DateTime
+}
+
+/// Progress for a single module
+type ModuleProgress {
+    module_id: ModuleId,
+    percentage: f32,
+    is_completed: Bool,
+    completed_at: Option<DateTime>,
+    lessons_completed: i32,
+    total_lessons: i32,
+    assessments_completed: i32,
+    total_assessments: i32,
+    time_spent_seconds: i64
+}
+
+/// Progress on a skill
+type SkillProgress {
+    skill_id: SkillId,
+    skill_name: String,
+    level: SkillLevel,
+    progress_percentage: f32,
+    evidence_count: i32
+}
+
+// =============================================================================
+// ACCOMMODATIONS
+// =============================================================================
+
+/// Student accommodations for accessibility and special needs
+type Accommodations {
+    /// Unique identifier
+    id: String,
+
+    /// Extra time on assessments
+    extra_time: Option<ExtraTime>,
+
+    /// Extended deadlines
+    extended_deadlines: Option<ExtendedDeadlines>,
+
+    /// Alternative formats
+    alternative_formats: List<AlternativeFormat>,
+
+    /// Assistive technology allowed
+    assistive_technology: List<AssistiveTechnology>,
+
+    /// Reduced distraction environment
+    reduced_distraction: Bool,
+
+    /// Breaks allowed
+    breaks: Option<BreakAccommodation>,
+
+    /// Reader/scribe allowed
+    reader_scribe: Bool,
+
+    /// Separate testing location
+    separate_location: Bool,
+
+    /// Notes/attachments about accommodations
+    notes: Option<String>,
+
+    /// Documentation reference
+    documentation_id: Option<MediaId>,
+
+    /// Approved by
+    approved_by: UserId,
+
+    /// Approved at
+    approved_at: DateTime,
+
+    /// Valid until
+    valid_until: Option<DateTime>,
+
+    /// Accommodation source
+    source: AccommodationSource
+}
+
+/// Extra time accommodation
+type ExtraTime {
+    /// Time multiplier (e.g., 1.5 = 50% extra time)
+    multiplier: f32,
+
+    /// Or fixed extra minutes
+    fixed_minutes: Option<i32>,
+
+    /// Applies to
+    applies_to: ExtraTimeScope
+}
+
+/// What extra time applies to
+enum ExtraTimeScope {
+    /// All timed assessments
+    AllAssessments,
+    /// Only exams
+    ExamsOnly,
+    /// Only quizzes
+    QuizzesOnly,
+    /// Specific assessments
+    Specific { assessment_ids: List<AssessmentId> }
+}
+
+/// Extended deadline accommodation
+type ExtendedDeadlines {
+    /// Extra days for all assignments
+    extra_days: i32,
+
+    /// Or percentage extension
+    percentage_extension: Option<f32>,
+
+    /// Require prior approval for each
+    require_approval: Bool
+}
+
+/// Alternative format accommodation
+enum AlternativeFormat {
+    /// Large print
+    LargePrint { font_size: i32 },
+    /// Audio version
+    Audio,
+    /// Braille
+    Braille,
+    /// Electronic text
+    ElectronicText,
+    /// Simplified language
+    SimplifiedLanguage,
+    /// Translation
+    Translation { language: String },
+    /// Other format
+    Other { description: String }
+}
+
+/// Assistive technology accommodation
+enum AssistiveTechnology {
+    ScreenReader,
+    SpeechToText,
+    TextToSpeech,
+    Magnification,
+    Calculator,
+    DictionaryThesaurus,
+    SpellChecker,
+    GrammarChecker,
+    Other { name: String }
+}
+
+/// Break accommodation
+type BreakAccommodation {
+    /// Break frequency (minutes between breaks)
+    frequency_minutes: i32,
+
+    /// Break duration (minutes)
+    duration_minutes: i32,
+
+    /// Stop timer during breaks
+    stop_timer: Bool
+}
+
+/// Source of accommodation
+enum AccommodationSource {
+    /// Disability services office
+    DisabilityServices,
+    /// IEP (Individualized Education Program)
+    Iep,
+    /// 504 Plan
+    Section504,
+    /// Instructor granted
+    Instructor,
+    /// Temporary medical
+    Medical,
+    /// Other
+    Other { source: String }
+}
+
+// =============================================================================
+// CERTIFICATE
+// =============================================================================
+
+/// Certificate information
+type CertificateInfo {
+    /// Certificate ID
+    certificate_id: CertificateId,
+
+    /// Certificate UUID
+    uuid: String,
+
+    /// Certificate template used
+    template_id: String,
+
+    /// When issued
+    issued_at: DateTime,
+
+    /// Issued by
+    issued_by: Option<UserId>,
+
+    /// Certificate URL
+    certificate_url: String,
+
+    /// Verification URL
+    verification_url: String,
+
+    /// Verification code
+    verification_code: String,
+
+    /// Final grade at time of issue
+    final_grade: f32,
+
+    /// Final letter grade
+    final_letter_grade: Option<String>,
+
+    /// Completion date
+    completion_date: DateTime,
+
+    /// Certificate type
+    certificate_type: CertificateType,
+
+    /// Credentials earned
+    credentials: List<Credential>,
+
+    /// Expiry date (for certifications)
+    expires_at: Option<DateTime>,
+
+    /// Whether certificate is valid
+    is_valid: Bool,
+
+    /// Revocation info (if revoked)
+    revocation: Option<CertificateRevocation>,
+
+    /// Blockchain verification (if applicable)
+    blockchain_tx: Option<String>
+}
+
+/// Type of certificate
+enum CertificateType {
+    /// Course completion certificate
+    Completion,
+    /// Certificate with grade
+    Achievement,
+    /// Professional certification
+    Certification,
+    /// Badge/micro-credential
+    Badge,
+    /// Continuing education units
+    Ceu,
+    /// Degree/diploma
+    Degree
+}
+
+/// A credential earned
+type Credential {
+    credential_type: String,
+    name: String,
+    issuer: String,
+    external_id: Option<String>,
+    metadata: Map<String, Dynamic>
+}
+
+/// Certificate revocation info
+type CertificateRevocation {
+    revoked_at: DateTime,
+    revoked_by: UserId,
+    reason: String
+}
+
+// =============================================================================
+// RISK FACTORS
+// =============================================================================
+
+/// A risk factor for early warning system
+type RiskFactor {
+    /// Factor type
+    factor_type: RiskFactorType,
+
+    /// Severity
+    severity: RiskLevel,
+
+    /// Description
+    description: String,
+
+    /// When detected
+    detected_at: DateTime,
+
+    /// Value/metric
+    value: Option<f32>,
+
+    /// Threshold that was crossed
+    threshold: Option<f32>,
+
+    /// Recommended intervention
+    recommended_intervention: Option<String>
+}
+
+/// Types of risk factors
+enum RiskFactorType {
+    /// Low engagement
+    LowEngagement,
+    /// Declining grades
+    DecliningGrades,
+    /// Missed assignments
+    MissedAssignments,
+    /// Inactivity
+    Inactivity,
+    /// Failed assessments
+    FailedAssessments,
+    /// Low participation
+    LowParticipation,
+    /// At-risk of not completing
+    AtRiskCompletion,
+    /// Custom factor
+    Custom { name: String }
+}
+
+// =============================================================================
+// LTI CONTEXT
+// =============================================================================
+
+/// LTI enrollment context
+type LtiEnrollmentContext {
+    /// LTI consumer key
+    consumer_key: String,
+
+    /// LTI user ID
+    lti_user_id: String,
+
+    /// LTI context ID
+    context_id: String,
+
+    /// LTI resource link ID
+    resource_link_id: Option<String>,
+
+    /// LTI roles
+    lti_roles: List<String>,
+
+    /// Launch URL
+    launch_url: Option<String>,
+
+    /// Last LTI launch
+    last_launch: DateTime
+}
+
+// =============================================================================
+// ENROLLMENT ACTIONS
+// =============================================================================
+
+/// Enrollment state transition
+type EnrollmentTransition {
+    from_status: EnrollmentStatus,
+    to_status: EnrollmentStatus,
+    transitioned_at: DateTime,
+    transitioned_by: Option<UserId>,
+    reason: Option<String>
+}
+
+/// Enrollment activity log entry
+type EnrollmentActivity {
+    id: String,
+    activity_type: ActivityType,
+    timestamp: DateTime,
+    details: Map<String, Dynamic>,
+    ip_address: Option<String>,
+    user_agent: Option<String>
+}
+
+/// Type of enrollment activity
+enum ActivityType {
+    /// Logged in
+    Login,
+    /// Logged out
+    Logout,
+    /// Viewed content
+    ContentView,
+    /// Started assessment
+    AssessmentStart,
+    /// Submitted assessment
+    AssessmentSubmit,
+    /// Downloaded resource
+    ResourceDownload,
+    /// Posted in discussion
+    DiscussionPost,
+    /// Received grade
+    GradeReceived,
+    /// Certificate issued
+    CertificateIssued,
+    /// Custom activity
+    Custom { name: String }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating an enrollment
+type CreateEnrollmentInput {
+    course_id: CourseId,
+    user_id: UserId,
+    role: CourseRole,
+    section_id: Option<SectionId>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    source: EnrollmentSource,
+    external_id: Option<String>,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Input for updating an enrollment
+type UpdateEnrollmentInput {
+    role: Option<CourseRole>,
+    status: Option<EnrollmentStatus>,
+    section_id: Option<SectionId>,
+    start_date: Option<DateTime>,
+    end_date: Option<DateTime>,
+    accommodations: Option<Accommodations>,
+    metadata: Option<Map<String, Dynamic>>
+}
+
+/// Input for bulk enrollment
+type BulkEnrollInput {
+    course_id: CourseId,
+    enrollments: List<EnrollmentRecord>,
+    send_notifications: Bool
+}
+
+/// Individual enrollment record for bulk
+type EnrollmentRecord {
+    user_id: UserId,
+    role: CourseRole,
+    section_id: Option<SectionId>,
+    external_id: Option<String>
+}
+
+/// Input for withdrawing enrollment
+type WithdrawInput {
+    enrollment_id: EnrollmentId,
+    reason: Option<String>,
+    refund_eligible: Bool,
+    keep_progress: Bool
+}
+
+// =============================================================================
+// FILTER TYPES
+// =============================================================================
+
+/// Filter options for enrollment queries
+type EnrollmentFilter {
+    tenant_id: Option<TenantId>,
+    course_id: Option<CourseId>,
+    user_id: Option<UserId>,
+    section_id: Option<SectionId>,
+    role: Option<CourseRole>,
+    status: Option<EnrollmentStatus>,
+    source: Option<EnrollmentSource>,
+    enrolled_date_range: Option<DateRange>,
+    is_at_risk: Option<Bool>,
+    has_certificate: Option<Bool>,
+    search: Option<String>
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Enrollment {
+    /// Create a new enrollment
+    fn new(
+        bundle: String,
+        course_id: CourseId,
+        user_id: UserId,
+        tenant_id: TenantId,
+        role: CourseRole,
+        source: EnrollmentSource
+    ) -> Enrollment {
+        let now = DateTime::now();
+        Enrollment {
+            id: generate_enrollment_id(),
+            uuid: generate_uuid(),
+            bundle,
+            course_id,
+            user_id,
+            tenant_id,
+            section_id: None,
+            role,
+            status: EnrollmentStatus::Active,
+            source,
+            enrolled_at: now,
+            start_date: None,
+            end_date: None,
+            completed_at: None,
+            last_activity_at: Some(now),
+            progress: EnrollmentProgress::default(),
+            current_module_id: None,
+            current_lesson_id: None,
+            current_grade: None,
+            current_letter_grade: None,
+            is_passing: false,
+            gradebook_entry_id: None,
+            accommodations: None,
+            total_time_seconds: 0,
+            login_count: 0,
+            engagement_score: None,
+            risk_level: RiskLevel::None,
+            risk_factors: vec![],
+            certificate: None,
+            external_id: None,
+            lti_context: None,
+            metadata: Map::new(),
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Check if enrollment is active
+    fn is_active(&self) -> Bool {
+        if self.status != EnrollmentStatus::Active {
+            return false
+        }
+
+        let now = DateTime::now();
+
+        if let Some(start) = &self.start_date {
+            if now < *start {
+                return false
+            }
+        }
+
+        if let Some(end) = &self.end_date {
+            if now > *end {
+                return false
+            }
+        }
+
+        true
+    }
+
+    /// Check if student role
+    fn is_student(&self) -> Bool {
+        matches!(self.role, CourseRole::Student | CourseRole::Auditor)
+    }
+
+    /// Check if instructor/staff role
+    fn is_instructor(&self) -> Bool {
+        matches!(self.role, CourseRole::Teacher | CourseRole::TeachingAssistant | CourseRole::Grader)
+    }
+
+    /// Check if can grade
+    fn can_grade(&self) -> Bool {
+        matches!(self.role, CourseRole::Teacher | CourseRole::TeachingAssistant | CourseRole::Grader)
+    }
+
+    /// Check if can edit content
+    fn can_edit_content(&self) -> Bool {
+        matches!(self.role, CourseRole::Teacher | CourseRole::Designer)
+    }
+
+    /// Update activity timestamp
+    fn record_activity(&mut self) {
+        self.last_activity_at = Some(DateTime::now());
+        self.updated_at = DateTime::now();
+    }
+
+    /// Increment login count
+    fn record_login(&mut self) {
+        self.login_count += 1;
+        self.record_activity();
+    }
+
+    /// Add time spent
+    fn add_time(&mut self, seconds: i64) {
+        self.total_time_seconds += seconds;
+        self.record_activity();
+    }
+
+    /// Update progress
+    fn update_progress(&mut self, progress: EnrollmentProgress) {
+        self.progress = progress;
+        self.updated_at = DateTime::now();
+    }
+
+    /// Complete enrollment
+    fn complete(&mut self) {
+        self.status = EnrollmentStatus::Completed;
+        self.completed_at = Some(DateTime::now());
+        self.progress.overall_percentage = 100.0;
+    }
+
+    /// Withdraw enrollment
+    fn withdraw(&mut self, reason: Option<String>) {
+        self.status = EnrollmentStatus::Withdrawn;
+        self.updated_at = DateTime::now();
+        if let Some(r) = reason {
+            self.metadata.insert("withdrawal_reason".to_string(), Dynamic::String(r));
+        }
+    }
+
+    /// Check if at risk
+    fn is_at_risk(&self) -> Bool {
+        matches!(self.risk_level, RiskLevel::Medium | RiskLevel::High | RiskLevel::Critical)
+    }
+
+    /// Get extra time multiplier
+    fn get_extra_time_multiplier(&self) -> f32 {
+        self.accommodations.as_ref()
+            .and_then(|a| a.extra_time.as_ref())
+            .map(|e| e.multiplier)
+            .unwrap_or(1.0)
+    }
+
+    /// Check if has accommodation
+    fn has_accommodations(&self) -> Bool {
+        self.accommodations.is_some()
+    }
+
+    /// Issue certificate
+    fn issue_certificate(&mut self, certificate: CertificateInfo) {
+        self.certificate = Some(certificate);
+        self.updated_at = DateTime::now();
+    }
+
+    /// Calculate days since last activity
+    fn days_inactive(&self) -> i32 {
+        if let Some(last) = &self.last_activity_at {
+            let duration = DateTime::now() - *last;
+            return duration.as_days() as i32
+        }
+        0
+    }
+}
+
+impl EnrollmentProgress {
+    fn default() -> EnrollmentProgress {
+        EnrollmentProgress {
+            overall_percentage: 0.0,
+            module_progress: Map::new(),
+            lessons_completed: 0,
+            total_lessons: 0,
+            assessments_completed: 0,
+            total_assessments: 0,
+            assignments_submitted: 0,
+            total_assignments: 0,
+            required_completed: 0,
+            total_required: 0,
+            scorm_status: None,
+            xapi_statements: 0,
+            competencies_mastered: vec![],
+            badges_earned: vec![],
+            skills_acquired: vec![],
+            last_updated: DateTime::now()
+        }
+    }
+
+    /// Recalculate overall percentage
+    fn recalculate(&mut self) {
+        if self.total_required > 0 {
+            self.overall_percentage = (self.required_completed as f32 / self.total_required as f32) * 100.0;
+        } else if self.total_lessons > 0 {
+            self.overall_percentage = (self.lessons_completed as f32 / self.total_lessons as f32) * 100.0;
+        }
+        self.last_updated = DateTime::now();
+    }
+
+    /// Check if completed
+    fn is_completed(&self) -> Bool {
+        self.overall_percentage >= 100.0
+    }
+
+    /// Get module completion percentage
+    fn module_percentage(&self, module_id: &ModuleId) -> f32 {
+        self.module_progress.get(module_id)
+            .map(|p| p.percentage)
+            .unwrap_or(0.0)
+    }
+}
+
+impl Accommodations {
+    /// Create new accommodations
+    fn new(approved_by: UserId) -> Accommodations {
+        Accommodations {
+            id: generate_uuid(),
+            extra_time: None,
+            extended_deadlines: None,
+            alternative_formats: vec![],
+            assistive_technology: vec![],
+            reduced_distraction: false,
+            breaks: None,
+            reader_scribe: false,
+            separate_location: false,
+            notes: None,
+            documentation_id: None,
+            approved_by,
+            approved_at: DateTime::now(),
+            valid_until: None,
+            source: AccommodationSource::DisabilityServices
+        }
+    }
+
+    /// Add extra time
+    fn with_extra_time(&mut self, multiplier: f32, scope: ExtraTimeScope) {
+        self.extra_time = Some(ExtraTime {
+            multiplier,
+            fixed_minutes: None,
+            applies_to: scope
+        });
+    }
+
+    /// Add extended deadlines
+    fn with_extended_deadlines(&mut self, extra_days: i32) {
+        self.extended_deadlines = Some(ExtendedDeadlines {
+            extra_days,
+            percentage_extension: None,
+            require_approval: false
+        });
+    }
+
+    /// Check if valid
+    fn is_valid(&self) -> Bool {
+        if let Some(valid_until) = &self.valid_until {
+            return DateTime::now() <= *valid_until
+        }
+        true
+    }
+
+    /// Calculate adjusted time limit
+    fn adjust_time_limit(&self, original: Duration) -> Duration {
+        if let Some(extra) = &self.extra_time {
+            return original * extra.multiplier
+        }
+        original
+    }
+
+    /// Calculate adjusted due date
+    fn adjust_due_date(&self, original: DateTime) -> DateTime {
+        if let Some(extended) = &self.extended_deadlines {
+            return original + Duration::days(extended.extra_days as i64)
+        }
+        original
+    }
+}
+
+impl CertificateInfo {
+    /// Create a new certificate
+    fn new(
+        template_id: String,
+        final_grade: f32,
+        final_letter_grade: Option<String>
+    ) -> CertificateInfo {
+        let now = DateTime::now();
+        let uuid = generate_uuid();
+        let verification_code = generate_verification_code();
+
+        CertificateInfo {
+            certificate_id: format!("cert_{}", uuid),
+            uuid: uuid.clone(),
+            template_id,
+            issued_at: now,
+            issued_by: None,
+            certificate_url: format!("/certificates/{}", uuid),
+            verification_url: format!("/verify/{}", verification_code),
+            verification_code,
+            final_grade,
+            final_letter_grade,
+            completion_date: now,
+            certificate_type: CertificateType::Completion,
+            credentials: vec![],
+            expires_at: None,
+            is_valid: true,
+            revocation: None,
+            blockchain_tx: None
+        }
+    }
+
+    /// Revoke certificate
+    fn revoke(&mut self, revoked_by: UserId, reason: String) {
+        self.is_valid = false;
+        self.revocation = Some(CertificateRevocation {
+            revoked_at: DateTime::now(),
+            revoked_by,
+            reason
+        });
+    }
+
+    /// Check if expired
+    fn is_expired(&self) -> Bool {
+        if let Some(expires) = &self.expires_at {
+            return DateTime::now() > *expires
+        }
+        false
+    }
+}
+
+/// Generate a verification code
+fn generate_verification_code() -> String {
+    // Generate a short alphanumeric code
+    let chars: Vec<char> = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect();
+    let mut code = String::new();
+    for _ in 0..8 {
+        let idx = (std::random::random::<u8>() as usize) % chars.len();
+        code.push(chars[idx]);
+    }
+    code
+}
+
+impl ModuleProgress {
+    /// Create new module progress
+    fn new(module_id: ModuleId, total_lessons: i32, total_assessments: i32) -> ModuleProgress {
+        ModuleProgress {
+            module_id,
+            percentage: 0.0,
+            is_completed: false,
+            completed_at: None,
+            lessons_completed: 0,
+            total_lessons,
+            assessments_completed: 0,
+            total_assessments,
+            time_spent_seconds: 0
+        }
+    }
+
+    /// Mark lesson completed
+    fn complete_lesson(&mut self) {
+        self.lessons_completed += 1;
+        self.recalculate();
+    }
+
+    /// Mark assessment completed
+    fn complete_assessment(&mut self) {
+        self.assessments_completed += 1;
+        self.recalculate();
+    }
+
+    /// Recalculate percentage
+    fn recalculate(&mut self) {
+        let total = self.total_lessons + self.total_assessments;
+        let completed = self.lessons_completed + self.assessments_completed;
+
+        if total > 0 {
+            self.percentage = (completed as f32 / total as f32) * 100.0;
+        }
+
+        if self.percentage >= 100.0 {
+            self.is_completed = true;
+            self.completed_at = Some(DateTime::now());
+        }
+    }
+}
+
+// =============================================================================
+// ENROLLMENT SUMMARY TYPES
+// =============================================================================
+
+/// Summary of enrollment for lists/reports
+type EnrollmentSummary {
+    enrollment_id: EnrollmentId,
+    user_id: UserId,
+    user_name: String,
+    user_email: String,
+    role: CourseRole,
+    status: EnrollmentStatus,
+    progress_percentage: f32,
+    current_grade: Option<f32>,
+    letter_grade: Option<String>,
+    last_activity_at: Option<DateTime>,
+    risk_level: RiskLevel,
+    has_certificate: Bool
+}
+
+/// Course enrollment statistics
+type EnrollmentStats {
+    course_id: CourseId,
+    total_enrolled: i32,
+    active_count: i32,
+    completed_count: i32,
+    withdrawn_count: i32,
+    students_count: i32,
+    instructors_count: i32,
+    average_progress: f32,
+    average_grade: Option<f32>,
+    at_risk_count: i32,
+    certificates_issued: i32
+}

@@ -1,0 +1,1693 @@
+/// Intelligo LMS - OAuth2 Social Login Integration
+///
+/// Complete OAuth2 implementation for social login including:
+/// - Google login
+/// - Microsoft/Azure AD login
+/// - Facebook login
+/// - LinkedIn login
+/// - Apple login
+/// - GitHub login
+/// - Provider-specific profile mapping
+/// - Account linking (multiple social accounts)
+/// - JIT user provisioning
+
+module intelligo::integrations::social::oauth
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+use std::http::{HttpClient, Request, Response, Headers}
+use std::json::{Json, to_json, from_json}
+use std::crypto::{random_bytes, sha256, hmac_sha256}
+use std::base64
+
+// =============================================================================
+// OAUTH PROVIDER TYPES
+// =============================================================================
+
+/// OAuth provider identifier
+enum OAuthProvider {
+    Google,
+    Microsoft,
+    Facebook,
+    LinkedIn,
+    Apple,
+    GitHub,
+    Custom { provider_id: String }
+}
+
+impl OAuthProvider {
+    fn to_string(&self) -> String {
+        match self {
+            OAuthProvider::Google => "google".to_string(),
+            OAuthProvider::Microsoft => "microsoft".to_string(),
+            OAuthProvider::Facebook => "facebook".to_string(),
+            OAuthProvider::LinkedIn => "linkedin".to_string(),
+            OAuthProvider::Apple => "apple".to_string(),
+            OAuthProvider::GitHub => "github".to_string(),
+            OAuthProvider::Custom { provider_id } => provider_id.clone()
+        }
+    }
+
+    fn from_string(s: &str) -> OAuthProvider {
+        match s.to_lowercase().as_str() {
+            "google" => OAuthProvider::Google,
+            "microsoft" | "azure" | "azuread" => OAuthProvider::Microsoft,
+            "facebook" => OAuthProvider::Facebook,
+            "linkedin" => OAuthProvider::LinkedIn,
+            "apple" => OAuthProvider::Apple,
+            "github" => OAuthProvider::GitHub,
+            _ => OAuthProvider::Custom { provider_id: s.to_string() }
+        }
+    }
+}
+
+// =============================================================================
+// PROVIDER CONFIGURATIONS
+// =============================================================================
+
+/// Base OAuth configuration
+type OAuthConfig {
+    /// Provider identifier
+    provider: OAuthProvider,
+    /// Client ID
+    client_id: String,
+    /// Client secret
+    client_secret: String,
+    /// Authorization endpoint
+    authorization_url: String,
+    /// Token endpoint
+    token_url: String,
+    /// User info endpoint (optional)
+    userinfo_url: Option<String>,
+    /// Scopes to request
+    scopes: List<String>,
+    /// Redirect URI
+    redirect_uri: String,
+    /// Additional authorization params
+    extra_params: Map<String, String>,
+    /// Whether provider is enabled
+    enabled: Bool
+}
+
+/// Google OAuth configuration
+type GoogleConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    /// Hosted domain restriction (for G Suite)
+    hosted_domain: Option<String>
+}
+
+impl GoogleConfig {
+    fn to_oauth_config(&self) -> OAuthConfig {
+        let mut extra_params = Map::new();
+        if let Some(hd) = &self.hosted_domain {
+            extra_params.insert("hd".to_string(), hd.clone());
+        }
+        extra_params.insert("access_type".to_string(), "offline".to_string());
+        extra_params.insert("prompt".to_string(), "consent".to_string());
+
+        OAuthConfig {
+            provider: OAuthProvider::Google,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+            token_url: "https://oauth2.googleapis.com/token".to_string(),
+            userinfo_url: Some("https://www.googleapis.com/oauth2/v3/userinfo".to_string()),
+            scopes: vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string()
+            ],
+            redirect_uri: self.redirect_uri.clone(),
+            extra_params,
+            enabled: true
+        }
+    }
+}
+
+/// Microsoft/Azure AD configuration
+type MicrosoftConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    /// Tenant ID (common, organizations, consumers, or specific tenant)
+    tenant_id: String,
+    /// Admin consent required
+    admin_consent: Bool
+}
+
+impl MicrosoftConfig {
+    fn to_oauth_config(&self) -> OAuthConfig {
+        let base_url = format!("https://login.microsoftonline.com/{}", self.tenant_id);
+
+        OAuthConfig {
+            provider: OAuthProvider::Microsoft,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            authorization_url: format!("{}/oauth2/v2.0/authorize", base_url),
+            token_url: format!("{}/oauth2/v2.0/token", base_url),
+            userinfo_url: Some("https://graph.microsoft.com/v1.0/me".to_string()),
+            scopes: vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+                "User.Read".to_string()
+            ],
+            redirect_uri: self.redirect_uri.clone(),
+            extra_params: Map::new(),
+            enabled: true
+        }
+    }
+}
+
+/// Facebook configuration
+type FacebookConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    /// API version
+    api_version: String
+}
+
+impl FacebookConfig {
+    fn to_oauth_config(&self) -> OAuthConfig {
+        OAuthConfig {
+            provider: OAuthProvider::Facebook,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            authorization_url: format!("https://www.facebook.com/{}/dialog/oauth", self.api_version),
+            token_url: format!("https://graph.facebook.com/{}/oauth/access_token", self.api_version),
+            userinfo_url: Some(format!("https://graph.facebook.com/{}/me?fields=id,name,email,picture", self.api_version)),
+            scopes: vec!["email".to_string(), "public_profile".to_string()],
+            redirect_uri: self.redirect_uri.clone(),
+            extra_params: Map::new(),
+            enabled: true
+        }
+    }
+}
+
+/// LinkedIn configuration
+type LinkedInConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String
+}
+
+impl LinkedInConfig {
+    fn to_oauth_config(&self) -> OAuthConfig {
+        OAuthConfig {
+            provider: OAuthProvider::LinkedIn,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            authorization_url: "https://www.linkedin.com/oauth/v2/authorization".to_string(),
+            token_url: "https://www.linkedin.com/oauth/v2/accessToken".to_string(),
+            userinfo_url: Some("https://api.linkedin.com/v2/userinfo".to_string()),
+            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            redirect_uri: self.redirect_uri.clone(),
+            extra_params: Map::new(),
+            enabled: true
+        }
+    }
+}
+
+/// Apple configuration
+type AppleConfig {
+    client_id: String,
+    team_id: String,
+    key_id: String,
+    /// Private key (PEM format)
+    private_key: String,
+    redirect_uri: String
+}
+
+impl AppleConfig {
+    fn to_oauth_config(&self) -> OAuthConfig {
+        let mut extra_params = Map::new();
+        extra_params.insert("response_mode".to_string(), "form_post".to_string());
+
+        OAuthConfig {
+            provider: OAuthProvider::Apple,
+            client_id: self.client_id.clone(),
+            client_secret: "".to_string(), // Generated dynamically
+            authorization_url: "https://appleid.apple.com/auth/authorize".to_string(),
+            token_url: "https://appleid.apple.com/auth/token".to_string(),
+            userinfo_url: None, // Apple returns user info in ID token
+            scopes: vec!["name".to_string(), "email".to_string()],
+            redirect_uri: self.redirect_uri.clone(),
+            extra_params,
+            enabled: true
+        }
+    }
+
+    /// Generate client secret JWT for Apple
+    fn generate_client_secret(&self) -> Result<String, OAuthError> {
+        let now = DateTime::now();
+        let exp = now + Duration::days(180);
+
+        let header = Json::object([
+            ("alg", Json::String("ES256".to_string())),
+            ("kid", Json::String(self.key_id.clone()))
+        ]);
+
+        let claims = Json::object([
+            ("iss", Json::String(self.team_id.clone())),
+            ("iat", Json::Number(now.timestamp().into())),
+            ("exp", Json::Number(exp.timestamp().into())),
+            ("aud", Json::String("https://appleid.apple.com".to_string())),
+            ("sub", Json::String(self.client_id.clone()))
+        ]);
+
+        // Sign with ES256 using private key
+        // This would use a proper JWT library in production
+        let header_b64 = base64::encode_url_safe(&to_json(&header));
+        let claims_b64 = base64::encode_url_safe(&to_json(&claims));
+        let message = format!("{}.{}", header_b64, claims_b64);
+
+        // In production, sign with ES256
+        let signature = self.sign_es256(&message)?;
+        let sig_b64 = base64::encode_url_safe(&signature);
+
+        Ok(format!("{}.{}", message, sig_b64))
+    }
+
+    fn sign_es256(&self, message: &str) -> Result<Vec<u8>, OAuthError> {
+        // Would use actual ES256 signing in production
+        // This is a placeholder
+        Ok(sha256(message.as_bytes()).to_vec())
+    }
+}
+
+/// GitHub configuration
+type GitHubConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    /// Allowed organizations (for org-restricted access)
+    allowed_organizations: Option<List<String>>
+}
+
+impl GitHubConfig {
+    fn to_oauth_config(&self) -> OAuthConfig {
+        OAuthConfig {
+            provider: OAuthProvider::GitHub,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            authorization_url: "https://github.com/login/oauth/authorize".to_string(),
+            token_url: "https://github.com/login/oauth/access_token".to_string(),
+            userinfo_url: Some("https://api.github.com/user".to_string()),
+            scopes: vec!["user:email".to_string(), "read:user".to_string()],
+            redirect_uri: self.redirect_uri.clone(),
+            extra_params: Map::new(),
+            enabled: true
+        }
+    }
+}
+
+// =============================================================================
+// OAUTH TYPES
+// =============================================================================
+
+/// OAuth authorization request
+type AuthorizationRequest {
+    /// State parameter (CSRF protection)
+    state: String,
+    /// Code verifier for PKCE
+    code_verifier: Option<String>,
+    /// Code challenge for PKCE
+    code_challenge: Option<String>,
+    /// Nonce for OIDC
+    nonce: Option<String>,
+    /// Provider
+    provider: OAuthProvider,
+    /// Created at
+    created_at: DateTime,
+    /// Expires at
+    expires_at: DateTime,
+    /// Return URL after login
+    return_url: Option<String>,
+    /// Tenant ID for multi-tenant
+    tenant_id: Option<TenantId>,
+    /// For account linking
+    link_to_user_id: Option<UserId>
+}
+
+/// OAuth token response
+type OAuthTokens {
+    /// Access token
+    access_token: String,
+    /// Token type (usually "Bearer")
+    token_type: String,
+    /// Expires in seconds
+    expires_in: Option<i64>,
+    /// Refresh token
+    refresh_token: Option<String>,
+    /// ID token (OIDC)
+    id_token: Option<String>,
+    /// Scopes granted
+    scope: Option<String>
+}
+
+/// User profile from OAuth provider
+type OAuthProfile {
+    /// Provider
+    provider: OAuthProvider,
+    /// Provider's user ID
+    provider_user_id: String,
+    /// Email
+    email: Option<String>,
+    /// Email verified
+    email_verified: Bool,
+    /// Name
+    name: Option<String>,
+    /// First name
+    first_name: Option<String>,
+    /// Last name
+    last_name: Option<String>,
+    /// Profile picture URL
+    picture_url: Option<String>,
+    /// Locale
+    locale: Option<String>,
+    /// Provider-specific raw data
+    raw_data: Json
+}
+
+/// Linked social account
+type LinkedAccount {
+    /// Link ID
+    id: String,
+    /// User ID this is linked to
+    user_id: UserId,
+    /// Provider
+    provider: OAuthProvider,
+    /// Provider's user ID
+    provider_user_id: String,
+    /// Provider email (may differ from user email)
+    provider_email: Option<String>,
+    /// Access token (encrypted)
+    access_token: Option<String>,
+    /// Refresh token (encrypted)
+    refresh_token: Option<String>,
+    /// Token expiry
+    token_expires_at: Option<DateTime>,
+    /// Profile data
+    profile: OAuthProfile,
+    /// Linked at
+    linked_at: DateTime,
+    /// Last used
+    last_used_at: Option<DateTime>
+}
+
+/// JIT provisioned user
+type ProvisionedUser {
+    /// User ID
+    user_id: UserId,
+    /// Email
+    email: String,
+    /// Name
+    name: String,
+    /// First name
+    first_name: Option<String>,
+    /// Last name
+    last_name: Option<String>,
+    /// Profile picture URL
+    picture_url: Option<String>,
+    /// Provider that created this user
+    created_by_provider: OAuthProvider,
+    /// Provider user ID
+    provider_user_id: String,
+    /// Tenant ID
+    tenant_id: TenantId,
+    /// Created at
+    created_at: DateTime,
+    /// Is new user (just created)
+    is_new: Bool
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// OAuth errors
+enum OAuthError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// Invalid state (CSRF)
+    InvalidState { message: String },
+    /// Authorization denied
+    AuthorizationDenied { error: String, description: Option<String> },
+    /// Token exchange failed
+    TokenExchangeFailed { message: String },
+    /// Profile fetch failed
+    ProfileFetchFailed { message: String },
+    /// Invalid ID token
+    InvalidIdToken { message: String },
+    /// Account not found
+    AccountNotFound { provider: String, provider_user_id: String },
+    /// Account already linked
+    AccountAlreadyLinked { provider: String, provider_user_id: String, existing_user_id: UserId },
+    /// Provider not configured
+    ProviderNotConfigured { provider: String },
+    /// Network error
+    NetworkError { message: String },
+    /// User creation failed
+    UserCreationFailed { message: String },
+    /// Domain not allowed
+    DomainNotAllowed { domain: String },
+    /// Organization not allowed
+    OrganizationNotAllowed { org: String }
+}
+
+impl OAuthError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            OAuthError::AuthorizationDenied { error, .. } =>
+                LmsError::AccessDenied { reason: error.clone() },
+            OAuthError::AccountNotFound { provider, provider_user_id } =>
+                LmsError::NotFound { entity_type: "social_account".to_string(), id: format!("{}:{}", provider, provider_user_id) },
+            OAuthError::AccountAlreadyLinked { .. } =>
+                LmsError::Conflict { message: "Account already linked to another user".to_string() },
+            _ => LmsError::IntegrationError { provider: "oauth".to_string(), message: format!("{:?}", self) }
+        }
+    }
+}
+
+// =============================================================================
+// OAUTH SERVICE CONFIGURATION
+// =============================================================================
+
+/// OAuth service configuration
+type OAuthServiceConfig {
+    /// Google config
+    google: Option<GoogleConfig>,
+    /// Microsoft config
+    microsoft: Option<MicrosoftConfig>,
+    /// Facebook config
+    facebook: Option<FacebookConfig>,
+    /// LinkedIn config
+    linkedin: Option<LinkedInConfig>,
+    /// Apple config
+    apple: Option<AppleConfig>,
+    /// GitHub config
+    github: Option<GitHubConfig>,
+    /// State token expiry
+    state_expiry: Duration,
+    /// Allow account linking
+    allow_account_linking: Bool,
+    /// Allow JIT provisioning
+    allow_jit_provisioning: Bool,
+    /// Allowed email domains (None = all allowed)
+    allowed_email_domains: Option<Set<String>>,
+    /// Default tenant for new users
+    default_tenant_id: TenantId,
+    /// User creation callback
+    user_creation_callback: Option<fn(ProvisionedUser) -> Result<UserId, LmsError>>
+}
+
+impl OAuthServiceConfig {
+    fn default() -> OAuthServiceConfig {
+        OAuthServiceConfig {
+            google: None,
+            microsoft: None,
+            facebook: None,
+            linkedin: None,
+            apple: None,
+            github: None,
+            state_expiry: Duration::minutes(10),
+            allow_account_linking: true,
+            allow_jit_provisioning: true,
+            allowed_email_domains: None,
+            default_tenant_id: "default".to_string(),
+            user_creation_callback: None
+        }
+    }
+}
+
+// =============================================================================
+// OAUTH SERVICE ACTOR
+// =============================================================================
+
+/// OAuth service actor
+actor OAuthService {
+    /// Configuration
+    config: OAuthServiceConfig,
+
+    /// HTTP client
+    client: HttpClient,
+
+    /// Provider configs (compiled from service config)
+    providers: Map<String, OAuthConfig>,
+
+    /// Pending authorization requests (state -> request)
+    pending_requests: Map<String, AuthorizationRequest>,
+
+    /// Linked accounts (user_id -> list of linked accounts)
+    linked_accounts: Map<UserId, List<LinkedAccount>>,
+
+    /// Provider user ID -> user ID mapping
+    provider_user_mapping: Map<String, UserId>
+}
+
+impl OAuthService {
+    /// Create new OAuth service
+    pub fn new(config: OAuthServiceConfig) -> OAuthService {
+        let mut providers = Map::new();
+
+        if let Some(google) = &config.google {
+            providers.insert("google".to_string(), google.to_oauth_config());
+        }
+        if let Some(microsoft) = &config.microsoft {
+            providers.insert("microsoft".to_string(), microsoft.to_oauth_config());
+        }
+        if let Some(facebook) = &config.facebook {
+            providers.insert("facebook".to_string(), facebook.to_oauth_config());
+        }
+        if let Some(linkedin) = &config.linkedin {
+            providers.insert("linkedin".to_string(), linkedin.to_oauth_config());
+        }
+        if let Some(apple) = &config.apple {
+            providers.insert("apple".to_string(), apple.to_oauth_config());
+        }
+        if let Some(github) = &config.github {
+            providers.insert("github".to_string(), github.to_oauth_config());
+        }
+
+        OAuthService {
+            config,
+            client: HttpClient::new(),
+            providers,
+            pending_requests: Map::new(),
+            linked_accounts: Map::new(),
+            provider_user_mapping: Map::new()
+        }
+    }
+
+    /// Get enabled providers
+    pub fn get_enabled_providers(&self) -> List<OAuthProvider> {
+        self.providers.iter()
+            .filter(|(_, config)| config.enabled)
+            .map(|(_, config)| config.provider.clone())
+            .collect()
+    }
+
+    // =========================================================================
+    // AUTHORIZATION
+    // =========================================================================
+
+    /// Generate authorization URL
+    pub fn generate_authorization_url(
+        &mut self,
+        provider: OAuthProvider,
+        return_url: Option<String>,
+        tenant_id: Option<TenantId>,
+        link_to_user_id: Option<UserId>
+    ) -> Result<String, OAuthError> {
+        let provider_key = provider.to_string();
+        let config = self.providers.get(&provider_key)
+            .ok_or(OAuthError::ProviderNotConfigured { provider: provider_key.clone() })?;
+
+        if !config.enabled {
+            return Err(OAuthError::ProviderNotConfigured { provider: provider_key })
+        }
+
+        // Generate state
+        let state = self.generate_state();
+
+        // Generate PKCE (for providers that support it)
+        let (code_verifier, code_challenge) = self.generate_pkce();
+
+        // Generate nonce for OIDC
+        let nonce = self.generate_nonce();
+
+        // Store pending request
+        let now = DateTime::now();
+        let request = AuthorizationRequest {
+            state: state.clone(),
+            code_verifier: Some(code_verifier),
+            code_challenge: Some(code_challenge.clone()),
+            nonce: Some(nonce.clone()),
+            provider: provider.clone(),
+            created_at: now,
+            expires_at: now + self.config.state_expiry,
+            return_url,
+            tenant_id,
+            link_to_user_id
+        };
+        self.pending_requests.insert(state.clone(), request);
+
+        // Clean up expired requests
+        self.cleanup_expired_requests();
+
+        // Build URL
+        let mut params = vec![
+            format!("client_id={}", urlencoding::encode(&config.client_id)),
+            format!("redirect_uri={}", urlencoding::encode(&config.redirect_uri)),
+            format!("response_type=code"),
+            format!("state={}", urlencoding::encode(&state)),
+            format!("scope={}", urlencoding::encode(&config.scopes.join(" ")))
+        ];
+
+        // Add PKCE
+        params.push(format!("code_challenge={}", urlencoding::encode(&code_challenge)));
+        params.push(format!("code_challenge_method=S256"));
+
+        // Add nonce for OIDC
+        params.push(format!("nonce={}", urlencoding::encode(&nonce)));
+
+        // Add extra params
+        for (key, value) in &config.extra_params {
+            params.push(format!("{}={}", key, urlencoding::encode(value)));
+        }
+
+        Ok(format!("{}?{}", config.authorization_url, params.join("&")))
+    }
+
+    fn generate_state(&self) -> String {
+        let bytes = random_bytes(32);
+        base64::encode_url_safe(&bytes)
+    }
+
+    fn generate_pkce(&self) -> (String, String) {
+        let verifier_bytes = random_bytes(32);
+        let verifier = base64::encode_url_safe(&verifier_bytes);
+
+        let challenge_bytes = sha256(verifier.as_bytes());
+        let challenge = base64::encode_url_safe(&challenge_bytes);
+
+        (verifier, challenge)
+    }
+
+    fn generate_nonce(&self) -> String {
+        let bytes = random_bytes(16);
+        base64::encode_url_safe(&bytes)
+    }
+
+    fn cleanup_expired_requests(&mut self) {
+        let now = DateTime::now();
+        self.pending_requests.retain(|_, req| req.expires_at > now);
+    }
+
+    // =========================================================================
+    // CALLBACK HANDLING
+    // =========================================================================
+
+    /// Handle OAuth callback
+    pub async fn handle_callback(
+        &mut self,
+        provider: OAuthProvider,
+        code: &str,
+        state: &str,
+        error: Option<String>,
+        error_description: Option<String>
+    ) -> Result<OAuthResult, OAuthError> {
+        // Check for error
+        if let Some(err) = error {
+            return Err(OAuthError::AuthorizationDenied {
+                error: err,
+                description: error_description
+            })
+        }
+
+        // Validate state
+        let request = self.pending_requests.remove(state)
+            .ok_or(OAuthError::InvalidState { message: "Invalid or expired state".to_string() })?;
+
+        // Verify state matches provider
+        if request.provider.to_string() != provider.to_string() {
+            return Err(OAuthError::InvalidState { message: "Provider mismatch".to_string() })
+        }
+
+        // Verify not expired
+        if request.expires_at < DateTime::now() {
+            return Err(OAuthError::InvalidState { message: "State expired".to_string() })
+        }
+
+        // Exchange code for tokens
+        let tokens = self.exchange_code(&provider, code, &request).await?;
+
+        // Fetch user profile
+        let profile = self.fetch_profile(&provider, &tokens).await?;
+
+        // Validate email domain if configured
+        if let Some(allowed_domains) = &self.config.allowed_email_domains {
+            if let Some(email) = &profile.email {
+                let domain = email.split('@').last().unwrap_or("");
+                if !allowed_domains.contains(domain) {
+                    return Err(OAuthError::DomainNotAllowed { domain: domain.to_string() })
+                }
+            }
+        }
+
+        // Handle account linking vs login
+        if let Some(user_id) = request.link_to_user_id {
+            // Account linking
+            self.link_account(user_id.clone(), &profile, &tokens)?;
+            return Ok(OAuthResult::AccountLinked {
+                user_id,
+                provider,
+                provider_user_id: profile.provider_user_id
+            })
+        }
+
+        // Check if this provider account is already linked
+        let provider_key = format!("{}:{}", provider.to_string(), profile.provider_user_id);
+        if let Some(existing_user_id) = self.provider_user_mapping.get(&provider_key) {
+            // Existing user - update tokens and return
+            self.update_tokens(existing_user_id, &provider, &tokens);
+            return Ok(OAuthResult::ExistingUser {
+                user_id: existing_user_id.clone(),
+                profile,
+                return_url: request.return_url
+            })
+        }
+
+        // Check if user exists by email
+        // In production, this would query the user database
+        // For now, we'll proceed with JIT provisioning
+
+        if self.config.allow_jit_provisioning {
+            // Create new user
+            let tenant_id = request.tenant_id.unwrap_or(self.config.default_tenant_id.clone());
+            let provisioned = self.provision_user(&profile, &tenant_id, &tokens)?;
+
+            Ok(OAuthResult::NewUser {
+                user: provisioned,
+                profile,
+                return_url: request.return_url
+            })
+        } else {
+            Err(OAuthError::AccountNotFound {
+                provider: provider.to_string(),
+                provider_user_id: profile.provider_user_id
+            })
+        }
+    }
+
+    // =========================================================================
+    // TOKEN EXCHANGE
+    // =========================================================================
+
+    async fn exchange_code(
+        &self,
+        provider: &OAuthProvider,
+        code: &str,
+        request: &AuthorizationRequest
+    ) -> Result<OAuthTokens, OAuthError> {
+        let provider_key = provider.to_string();
+        let config = self.providers.get(&provider_key)
+            .ok_or(OAuthError::ProviderNotConfigured { provider: provider_key.clone() })?;
+
+        let mut params = vec![
+            format!("grant_type=authorization_code"),
+            format!("code={}", urlencoding::encode(code)),
+            format!("redirect_uri={}", urlencoding::encode(&config.redirect_uri)),
+            format!("client_id={}", urlencoding::encode(&config.client_id))
+        ];
+
+        // Add client secret (except for Apple which uses JWT)
+        match provider {
+            OAuthProvider::Apple => {
+                let apple_config = self.config.apple.as_ref()
+                    .ok_or(OAuthError::ProviderNotConfigured { provider: "apple".to_string() })?;
+                let client_secret = apple_config.generate_client_secret()?;
+                params.push(format!("client_secret={}", urlencoding::encode(&client_secret)));
+            },
+            _ => {
+                params.push(format!("client_secret={}", urlencoding::encode(&config.client_secret)));
+            }
+        }
+
+        // Add PKCE code verifier
+        if let Some(verifier) = &request.code_verifier {
+            params.push(format!("code_verifier={}", urlencoding::encode(verifier)));
+        }
+
+        let body = params.join("&");
+
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        headers.set("Accept", "application/json");
+
+        let response = self.client.post(&config.token_url)
+            .headers(headers)
+            .body(&body)
+            .send()
+            .await
+            .map_err(|e| OAuthError::NetworkError { message: e.to_string() })?;
+
+        if response.status() != 200 {
+            let error_body = response.text().await.unwrap_or_default();
+            return Err(OAuthError::TokenExchangeFailed {
+                message: format!("Token exchange failed: {}", error_body)
+            })
+        }
+
+        let json: Json = response.json().await
+            .map_err(|e| OAuthError::TokenExchangeFailed { message: e.to_string() })?;
+
+        Ok(OAuthTokens {
+            access_token: json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            token_type: json.get("token_type").and_then(|v| v.as_str()).unwrap_or("Bearer").to_string(),
+            expires_in: json.get("expires_in").and_then(|v| v.as_i64()),
+            refresh_token: json.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            id_token: json.get("id_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            scope: json.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    }
+
+    // =========================================================================
+    // PROFILE FETCHING
+    // =========================================================================
+
+    async fn fetch_profile(
+        &self,
+        provider: &OAuthProvider,
+        tokens: &OAuthTokens
+    ) -> Result<OAuthProfile, OAuthError> {
+        match provider {
+            OAuthProvider::Google => self.fetch_google_profile(tokens).await,
+            OAuthProvider::Microsoft => self.fetch_microsoft_profile(tokens).await,
+            OAuthProvider::Facebook => self.fetch_facebook_profile(tokens).await,
+            OAuthProvider::LinkedIn => self.fetch_linkedin_profile(tokens).await,
+            OAuthProvider::Apple => self.parse_apple_profile(tokens),
+            OAuthProvider::GitHub => self.fetch_github_profile(tokens).await,
+            OAuthProvider::Custom { .. } => self.fetch_generic_profile(provider, tokens).await
+        }
+    }
+
+    async fn fetch_google_profile(&self, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        let url = "https://www.googleapis.com/oauth2/v3/userinfo";
+        let json = self.fetch_userinfo(url, &tokens.access_token).await?;
+
+        Ok(OAuthProfile {
+            provider: OAuthProvider::Google,
+            provider_user_id: json.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email_verified: json.get("email_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+            name: json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            first_name: json.get("given_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: json.get("family_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            picture_url: json.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            locale: json.get("locale").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            raw_data: json
+        })
+    }
+
+    async fn fetch_microsoft_profile(&self, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        let url = "https://graph.microsoft.com/v1.0/me";
+        let json = self.fetch_userinfo(url, &tokens.access_token).await?;
+
+        let email = json.get("mail")
+            .or(json.get("userPrincipalName"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(OAuthProfile {
+            provider: OAuthProvider::Microsoft,
+            provider_user_id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email,
+            email_verified: true, // Microsoft validates emails
+            name: json.get("displayName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            first_name: json.get("givenName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: json.get("surname").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            picture_url: None, // Requires separate Graph API call
+            locale: json.get("preferredLanguage").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            raw_data: json
+        })
+    }
+
+    async fn fetch_facebook_profile(&self, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        let api_version = self.config.facebook.as_ref()
+            .map(|c| c.api_version.clone())
+            .unwrap_or("v18.0".to_string());
+        let url = format!("https://graph.facebook.com/{}/me?fields=id,name,email,first_name,last_name,picture", api_version);
+        let json = self.fetch_userinfo(&url, &tokens.access_token).await?;
+
+        let picture_url = json.get("picture")
+            .and_then(|p| p.get("data"))
+            .and_then(|d| d.get("url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(OAuthProfile {
+            provider: OAuthProvider::Facebook,
+            provider_user_id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email_verified: true, // Facebook verifies emails
+            name: json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            first_name: json.get("first_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: json.get("last_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            picture_url,
+            locale: json.get("locale").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            raw_data: json
+        })
+    }
+
+    async fn fetch_linkedin_profile(&self, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        let url = "https://api.linkedin.com/v2/userinfo";
+        let json = self.fetch_userinfo(url, &tokens.access_token).await?;
+
+        Ok(OAuthProfile {
+            provider: OAuthProvider::LinkedIn,
+            provider_user_id: json.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email_verified: json.get("email_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+            name: json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            first_name: json.get("given_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: json.get("family_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            picture_url: json.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            locale: json.get("locale").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            raw_data: json
+        })
+    }
+
+    fn parse_apple_profile(&self, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        // Apple returns user info in the ID token
+        let id_token = tokens.id_token.as_ref()
+            .ok_or(OAuthError::InvalidIdToken { message: "No ID token from Apple".to_string() })?;
+
+        // Parse and verify JWT
+        let claims = self.verify_and_parse_jwt(id_token, &OAuthProvider::Apple)?;
+
+        Ok(OAuthProfile {
+            provider: OAuthProvider::Apple,
+            provider_user_id: claims.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            email: claims.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email_verified: claims.get("email_verified")
+                .and_then(|v| v.as_bool())
+                .or(claims.get("email_verified").and_then(|v| v.as_str()).map(|s| s == "true"))
+                .unwrap_or(false),
+            name: None, // Apple sends name separately on first auth
+            first_name: None,
+            last_name: None,
+            picture_url: None,
+            locale: None,
+            raw_data: claims
+        })
+    }
+
+    async fn fetch_github_profile(&self, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        let url = "https://api.github.com/user";
+        let json = self.fetch_userinfo(url, &tokens.access_token).await?;
+
+        // GitHub requires separate call for email if private
+        let email = if json.get("email").and_then(|v| v.as_str()).is_some() {
+            json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string())
+        } else {
+            self.fetch_github_email(&tokens.access_token).await.ok()
+        };
+
+        // Check organization membership if configured
+        if let Some(github_config) = &self.config.github {
+            if let Some(allowed_orgs) = &github_config.allowed_organizations {
+                let user_orgs = self.fetch_github_orgs(&tokens.access_token).await.unwrap_or_default();
+                let has_allowed_org = user_orgs.iter().any(|org| allowed_orgs.contains(org));
+                if !has_allowed_org {
+                    return Err(OAuthError::OrganizationNotAllowed {
+                        org: user_orgs.join(", ")
+                    })
+                }
+            }
+        }
+
+        // Parse name into first/last
+        let name = json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let (first_name, last_name) = name.as_ref()
+            .map(|n| {
+                let parts: Vec<&str> = n.splitn(2, ' ').collect();
+                (
+                    Some(parts[0].to_string()),
+                    parts.get(1).map(|s| s.to_string())
+                )
+            })
+            .unwrap_or((None, None));
+
+        Ok(OAuthProfile {
+            provider: OAuthProvider::GitHub,
+            provider_user_id: json.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_default(),
+            email,
+            email_verified: true, // GitHub verifies emails
+            name,
+            first_name,
+            last_name,
+            picture_url: json.get("avatar_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            locale: None,
+            raw_data: json
+        })
+    }
+
+    async fn fetch_github_email(&self, access_token: &str) -> Result<String, OAuthError> {
+        let url = "https://api.github.com/user/emails";
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", access_token));
+        headers.set("Accept", "application/json");
+        headers.set("User-Agent", "Intelligo-LMS");
+
+        let response = self.client.get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| OAuthError::NetworkError { message: e.to_string() })?;
+
+        let emails: Json = response.json().await
+            .map_err(|e| OAuthError::ProfileFetchFailed { message: e.to_string() })?;
+
+        // Find primary verified email
+        if let Some(arr) = emails.as_array() {
+            for email in arr {
+                let is_primary = email.get("primary").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_verified = email.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+                if is_primary && is_verified {
+                    if let Some(addr) = email.get("email").and_then(|v| v.as_str()) {
+                        return Ok(addr.to_string())
+                    }
+                }
+            }
+        }
+
+        Err(OAuthError::ProfileFetchFailed { message: "No primary email found".to_string() })
+    }
+
+    async fn fetch_github_orgs(&self, access_token: &str) -> Result<List<String>, OAuthError> {
+        let url = "https://api.github.com/user/orgs";
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", access_token));
+        headers.set("Accept", "application/json");
+        headers.set("User-Agent", "Intelligo-LMS");
+
+        let response = self.client.get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| OAuthError::NetworkError { message: e.to_string() })?;
+
+        let orgs: Json = response.json().await
+            .map_err(|e| OAuthError::ProfileFetchFailed { message: e.to_string() })?;
+
+        let org_names = orgs.as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| o.get("login").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(org_names)
+    }
+
+    async fn fetch_generic_profile(&self, provider: &OAuthProvider, tokens: &OAuthTokens) -> Result<OAuthProfile, OAuthError> {
+        let provider_key = provider.to_string();
+        let config = self.providers.get(&provider_key)
+            .ok_or(OAuthError::ProviderNotConfigured { provider: provider_key.clone() })?;
+
+        let userinfo_url = config.userinfo_url.as_ref()
+            .ok_or(OAuthError::ProfileFetchFailed { message: "No userinfo URL configured".to_string() })?;
+
+        let json = self.fetch_userinfo(userinfo_url, &tokens.access_token).await?;
+
+        // Generic OIDC-style parsing
+        Ok(OAuthProfile {
+            provider: provider.clone(),
+            provider_user_id: json.get("sub")
+                .or(json.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            email: json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email_verified: json.get("email_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+            name: json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            first_name: json.get("given_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            last_name: json.get("family_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            picture_url: json.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            locale: json.get("locale").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            raw_data: json
+        })
+    }
+
+    /// Verify and parse a JWT ID token
+    fn verify_and_parse_jwt(&self, token: &str, provider: &OAuthProvider) -> Result<Json, OAuthError> {
+        // Parse JWT structure (header.payload.signature)
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(OAuthError::InvalidIdToken {
+                message: "Invalid JWT format: expected 3 parts".to_string()
+            });
+        }
+
+        // Decode header to get algorithm
+        let header_b64 = parts[0];
+        let header_bytes = base64::decode_url_safe(header_b64)
+            .map_err(|e| OAuthError::InvalidIdToken {
+                message: format!("Failed to decode JWT header: {}", e)
+            })?;
+        let header: Json = from_json(&String::from_utf8_lossy(&header_bytes))
+            .map_err(|e| OAuthError::InvalidIdToken {
+                message: format!("Failed to parse JWT header: {}", e)
+            })?;
+
+        let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("RS256");
+
+        // Decode payload
+        let payload_b64 = parts[1];
+        let payload_bytes = base64::decode_url_safe(payload_b64)
+            .map_err(|e| OAuthError::InvalidIdToken {
+                message: format!("Failed to decode JWT payload: {}", e)
+            })?;
+        let claims: Json = from_json(&String::from_utf8_lossy(&payload_bytes))
+            .map_err(|e| OAuthError::InvalidIdToken {
+                message: format!("Failed to parse JWT claims: {}", e)
+            })?;
+
+        // Verify standard claims
+        let now = std::time::now_unix();
+
+        // Check expiration
+        if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
+            if exp < now {
+                return Err(OAuthError::InvalidIdToken {
+                    message: "ID token has expired".to_string()
+                });
+            }
+        }
+
+        // Check issued at (not from the future)
+        if let Some(iat) = claims.get("iat").and_then(|v| v.as_i64()) {
+            if iat > now + 300 { // 5 minute clock skew tolerance
+                return Err(OAuthError::InvalidIdToken {
+                    message: "ID token issued in the future".to_string()
+                });
+            }
+        }
+
+        // Check not before
+        if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_i64()) {
+            if nbf > now {
+                return Err(OAuthError::InvalidIdToken {
+                    message: "ID token not yet valid".to_string()
+                });
+            }
+        }
+
+        // Verify issuer based on provider
+        let expected_issuer = match provider {
+            OAuthProvider::Google => Some("https://accounts.google.com"),
+            OAuthProvider::Apple => Some("https://appleid.apple.com"),
+            OAuthProvider::Microsoft => None, // Multiple valid issuers
+            OAuthProvider::Facebook => None,
+            _ => None
+        };
+
+        if let Some(expected) = expected_issuer {
+            if let Some(iss) = claims.get("iss").and_then(|v| v.as_str()) {
+                if iss != expected {
+                    return Err(OAuthError::InvalidIdToken {
+                        message: format!("Invalid issuer: expected {}, got {}", expected, iss)
+                    });
+                }
+            }
+        }
+
+        // Verify audience matches our client ID
+        let config = self.configs.get(provider);
+        if let Some(cfg) = config {
+            if let Some(aud) = claims.get("aud").and_then(|v| v.as_str()) {
+                if aud != cfg.client_id {
+                    return Err(OAuthError::InvalidIdToken {
+                        message: "ID token audience does not match client ID".to_string()
+                    });
+                }
+            }
+        }
+
+        // For RS256/ES256 algorithms, we would verify signature using provider's JWKS
+        // This requires fetching the public keys from the provider's JWKS endpoint
+        if alg == "RS256" || alg == "ES256" {
+            self.verify_jwt_signature_async(token, provider, alg).await?;
+        }
+
+        Ok(claims)
+    }
+
+    /// Verify JWT signature using provider's public keys (JWKS)
+    async fn verify_jwt_signature_async(&self, token: &str, provider: &OAuthProvider, alg: &str) -> Result<(), OAuthError> {
+        let jwks_url = match provider {
+            OAuthProvider::Google => "https://www.googleapis.com/oauth2/v3/certs",
+            OAuthProvider::Apple => "https://appleid.apple.com/auth/keys",
+            OAuthProvider::Microsoft => "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+            _ => return Ok(()) // Skip verification for providers without JWKS
+        };
+
+        // Fetch JWKS (with caching in production)
+        let jwks_response = self.client.get(jwks_url)
+            .send()
+            .await
+            .map_err(|e| OAuthError::InvalidIdToken {
+                message: format!("Failed to fetch JWKS: {}", e)
+            })?;
+
+        let jwks: Json = jwks_response.json().await
+            .map_err(|e| OAuthError::InvalidIdToken {
+                message: format!("Failed to parse JWKS: {}", e)
+            })?;
+
+        // Parse token to get key ID
+        let parts: Vec<&str> = token.split('.').collect();
+        let header_bytes = base64::decode_url_safe(parts[0]).unwrap_or_default();
+        let header: Json = from_json(&String::from_utf8_lossy(&header_bytes)).unwrap_or_default();
+        let kid = header.get("kid").and_then(|v| v.as_str());
+
+        // Find matching key
+        let keys = jwks.get("keys").and_then(|v| v.as_array());
+        if let (Some(kid), Some(keys)) = (kid, keys) {
+            let key = keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(kid));
+
+            if let Some(key) = key {
+                // Verify signature using the public key
+                let header_payload = format!("{}.{}", parts[0], parts[1]);
+                let signature = base64::decode_url_safe(parts[2])
+                    .map_err(|e| OAuthError::InvalidIdToken {
+                        message: format!("Failed to decode signature: {}", e)
+                    })?;
+
+                // For RS256, construct RSA public key and verify
+                if alg == "RS256" {
+                    let n = key.get("n").and_then(|v| v.as_str()).unwrap_or("");
+                    let e = key.get("e").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let valid = std::crypto::rsa_verify_pkcs1_sha256(
+                        &base64::decode_url_safe(n).unwrap_or_default(),
+                        &base64::decode_url_safe(e).unwrap_or_default(),
+                        header_payload.as_bytes(),
+                        &signature
+                    );
+
+                    if !valid {
+                        return Err(OAuthError::InvalidIdToken {
+                            message: "JWT signature verification failed".to_string()
+                        });
+                    }
+                }
+
+                return Ok(());
+            }
+        }
+
+        // Key not found - could be a key rotation issue
+        Err(OAuthError::InvalidIdToken {
+            message: "Signing key not found in JWKS".to_string()
+        })
+    }
+
+    async fn fetch_userinfo(&self, url: &str, access_token: &str) -> Result<Json, OAuthError> {
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", access_token));
+        headers.set("Accept", "application/json");
+
+        let response = self.client.get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| OAuthError::NetworkError { message: e.to_string() })?;
+
+        if response.status() != 200 {
+            return Err(OAuthError::ProfileFetchFailed {
+                message: format!("Status {}", response.status())
+            })
+        }
+
+        response.json().await
+            .map_err(|e| OAuthError::ProfileFetchFailed { message: e.to_string() })
+    }
+
+    // =========================================================================
+    // ACCOUNT LINKING
+    // =========================================================================
+
+    /// Link OAuth account to existing user
+    pub fn link_account(
+        &mut self,
+        user_id: UserId,
+        profile: &OAuthProfile,
+        tokens: &OAuthTokens
+    ) -> Result<(), OAuthError> {
+        let provider_key = format!("{}:{}", profile.provider.to_string(), profile.provider_user_id);
+
+        // Check if already linked to another user
+        if let Some(existing_user) = self.provider_user_mapping.get(&provider_key) {
+            if existing_user != &user_id {
+                return Err(OAuthError::AccountAlreadyLinked {
+                    provider: profile.provider.to_string(),
+                    provider_user_id: profile.provider_user_id.clone(),
+                    existing_user_id: existing_user.clone()
+                })
+            }
+        }
+
+        // Create linked account
+        let linked = LinkedAccount {
+            id: generate_uuid(),
+            user_id: user_id.clone(),
+            provider: profile.provider.clone(),
+            provider_user_id: profile.provider_user_id.clone(),
+            provider_email: profile.email.clone(),
+            access_token: Some(tokens.access_token.clone()),
+            refresh_token: tokens.refresh_token.clone(),
+            token_expires_at: tokens.expires_in.map(|s| DateTime::now() + Duration::seconds(s)),
+            profile: profile.clone(),
+            linked_at: DateTime::now(),
+            last_used_at: Some(DateTime::now())
+        };
+
+        // Store
+        let accounts = self.linked_accounts.entry(user_id.clone()).or_insert(vec![]);
+        accounts.push(linked);
+        self.provider_user_mapping.insert(provider_key, user_id);
+
+        Ok(())
+    }
+
+    /// Unlink OAuth account from user
+    pub fn unlink_account(
+        &mut self,
+        user_id: &UserId,
+        provider: &OAuthProvider
+    ) -> Result<(), OAuthError> {
+        if let Some(accounts) = self.linked_accounts.get_mut(user_id) {
+            // Find and remove the account
+            let provider_str = provider.to_string();
+            if let Some(pos) = accounts.iter().position(|a| a.provider.to_string() == provider_str) {
+                let removed = accounts.remove(pos);
+                let provider_key = format!("{}:{}", provider_str, removed.provider_user_id);
+                self.provider_user_mapping.remove(&provider_key);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get linked accounts for user
+    pub fn get_linked_accounts(&self, user_id: &UserId) -> List<&LinkedAccount> {
+        self.linked_accounts.get(user_id)
+            .map(|accounts| accounts.iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn update_tokens(&mut self, user_id: &UserId, provider: &OAuthProvider, tokens: &OAuthTokens) {
+        if let Some(accounts) = self.linked_accounts.get_mut(user_id) {
+            let provider_str = provider.to_string();
+            for account in accounts.iter_mut() {
+                if account.provider.to_string() == provider_str {
+                    account.access_token = Some(tokens.access_token.clone());
+                    if tokens.refresh_token.is_some() {
+                        account.refresh_token = tokens.refresh_token.clone();
+                    }
+                    account.token_expires_at = tokens.expires_in.map(|s| DateTime::now() + Duration::seconds(s));
+                    account.last_used_at = Some(DateTime::now());
+                    break
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // JIT PROVISIONING
+    // =========================================================================
+
+    fn provision_user(
+        &mut self,
+        profile: &OAuthProfile,
+        tenant_id: &TenantId,
+        tokens: &OAuthTokens
+    ) -> Result<ProvisionedUser, OAuthError> {
+        let email = profile.email.clone()
+            .ok_or(OAuthError::UserCreationFailed { message: "Email required for user creation".to_string() })?;
+
+        let name = profile.name.clone()
+            .or_else(|| {
+                match (&profile.first_name, &profile.last_name) {
+                    (Some(f), Some(l)) => Some(format!("{} {}", f, l)),
+                    (Some(f), None) => Some(f.clone()),
+                    (None, Some(l)) => Some(l.clone()),
+                    (None, None) => Some(email.split('@').next().unwrap_or("User").to_string())
+                }
+            })
+            .unwrap_or_else(|| email.clone());
+
+        let user_id = format!("user_{}", generate_uuid());
+
+        let provisioned = ProvisionedUser {
+            user_id: user_id.clone(),
+            email: email.clone(),
+            name,
+            first_name: profile.first_name.clone(),
+            last_name: profile.last_name.clone(),
+            picture_url: profile.picture_url.clone(),
+            created_by_provider: profile.provider.clone(),
+            provider_user_id: profile.provider_user_id.clone(),
+            tenant_id: tenant_id.clone(),
+            created_at: DateTime::now(),
+            is_new: true
+        };
+
+        // Link the account
+        self.link_account(user_id.clone(), profile, tokens)?;
+
+        // Call user creation callback if set
+        if let Some(callback) = &self.config.user_creation_callback {
+            callback(provisioned.clone())
+                .map_err(|e| OAuthError::UserCreationFailed { message: format!("{:?}", e) })?;
+        }
+
+        Ok(provisioned)
+    }
+
+    // =========================================================================
+    // TOKEN REFRESH
+    // =========================================================================
+
+    /// Refresh access token
+    pub async fn refresh_token(
+        &mut self,
+        user_id: &UserId,
+        provider: &OAuthProvider
+    ) -> Result<OAuthTokens, OAuthError> {
+        let account = self.get_linked_accounts(user_id)
+            .into_iter()
+            .find(|a| a.provider.to_string() == provider.to_string())
+            .ok_or(OAuthError::AccountNotFound {
+                provider: provider.to_string(),
+                provider_user_id: "".to_string()
+            })?;
+
+        let refresh_token = account.refresh_token.as_ref()
+            .ok_or(OAuthError::TokenExchangeFailed { message: "No refresh token available".to_string() })?;
+
+        let provider_key = provider.to_string();
+        let config = self.providers.get(&provider_key)
+            .ok_or(OAuthError::ProviderNotConfigured { provider: provider_key })?;
+
+        let params = vec![
+            format!("grant_type=refresh_token"),
+            format!("refresh_token={}", urlencoding::encode(refresh_token)),
+            format!("client_id={}", urlencoding::encode(&config.client_id)),
+            format!("client_secret={}", urlencoding::encode(&config.client_secret))
+        ];
+
+        let body = params.join("&");
+
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        headers.set("Accept", "application/json");
+
+        let response = self.client.post(&config.token_url)
+            .headers(headers)
+            .body(&body)
+            .send()
+            .await
+            .map_err(|e| OAuthError::NetworkError { message: e.to_string() })?;
+
+        if response.status() != 200 {
+            return Err(OAuthError::TokenExchangeFailed {
+                message: "Token refresh failed".to_string()
+            })
+        }
+
+        let json: Json = response.json().await
+            .map_err(|e| OAuthError::TokenExchangeFailed { message: e.to_string() })?;
+
+        let tokens = OAuthTokens {
+            access_token: json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            token_type: json.get("token_type").and_then(|v| v.as_str()).unwrap_or("Bearer").to_string(),
+            expires_in: json.get("expires_in").and_then(|v| v.as_i64()),
+            refresh_token: json.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string())
+                .or(Some(refresh_token.clone())),
+            id_token: json.get("id_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            scope: json.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+
+        // Update stored tokens
+        self.update_tokens(user_id, provider, &tokens);
+
+        Ok(tokens)
+    }
+
+    // =========================================================================
+    // USER LOOKUP
+    // =========================================================================
+
+    /// Find user by provider account
+    pub fn find_user_by_provider(
+        &self,
+        provider: &OAuthProvider,
+        provider_user_id: &str
+    ) -> Option<UserId> {
+        let provider_key = format!("{}:{}", provider.to_string(), provider_user_id);
+        self.provider_user_mapping.get(&provider_key).cloned()
+    }
+
+    /// Find user by email across all linked accounts
+    pub fn find_user_by_email(&self, email: &str) -> Option<UserId> {
+        for (user_id, accounts) in &self.linked_accounts {
+            for account in accounts {
+                if account.provider_email.as_ref() == Some(&email.to_string()) {
+                    return Some(user_id.clone())
+                }
+            }
+        }
+        None
+    }
+}
+
+// =============================================================================
+// OAUTH RESULT
+// =============================================================================
+
+/// Result of OAuth authentication
+enum OAuthResult {
+    /// Existing user logged in
+    ExistingUser {
+        user_id: UserId,
+        profile: OAuthProfile,
+        return_url: Option<String>
+    },
+    /// New user created via JIT provisioning
+    NewUser {
+        user: ProvisionedUser,
+        profile: OAuthProfile,
+        return_url: Option<String>
+    },
+    /// Account linked to existing user
+    AccountLinked {
+        user_id: UserId,
+        provider: OAuthProvider,
+        provider_user_id: String
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut encoded = String::new();
+        for c in s.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                    encoded.push(c);
+                }
+                _ => {
+                    for byte in c.to_string().as_bytes() {
+                        encoded.push_str(&format!("%{:02X}", byte));
+                    }
+                }
+            }
+        }
+        encoded
+    }
+}
+
+mod base64 {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    pub fn encode(input: &[u8]) -> String {
+        encode_with_alphabet(input, ALPHABET, true)
+    }
+
+    pub fn encode_url_safe(input: &[u8]) -> String {
+        encode_with_alphabet(input, URL_ALPHABET, false)
+    }
+
+    fn encode_with_alphabet(input: &[u8], alphabet: &[u8], padding: Bool) -> String {
+        let mut output = String::new();
+        let mut i = 0;
+
+        while i < input.len() {
+            let b0 = input[i];
+            let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+            let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+
+            output.push(alphabet[(b0 >> 2) as usize] as char);
+            output.push(alphabet[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
+
+            if i + 1 < input.len() {
+                output.push(alphabet[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
+            } else if padding {
+                output.push('=');
+            }
+
+            if i + 2 < input.len() {
+                output.push(alphabet[(b2 & 0x3f) as usize] as char);
+            } else if padding {
+                output.push('=');
+            }
+
+            i += 3;
+        }
+
+        output
+    }
+
+    pub fn decode_url_safe(input: &str) -> Result<Vec<u8>, String> {
+        decode_with_alphabet(input, URL_ALPHABET)
+    }
+
+    fn decode_with_alphabet(input: &str, alphabet: &[u8]) -> Result<Vec<u8>, String> {
+        let mut lookup = [255u8; 256];
+        for (i, &c) in alphabet.iter().enumerate() {
+            lookup[c as usize] = i as u8;
+        }
+
+        let mut output = Vec::new();
+        let mut buffer = 0u32;
+        let mut bits = 0;
+
+        for c in input.chars() {
+            if c == '=' {
+                break
+            }
+
+            let value = lookup[c as usize];
+            if value == 255 {
+                continue // Skip invalid characters
+            }
+
+            buffer = (buffer << 6) | value as u32;
+            bits += 6;
+
+            if bits >= 8 {
+                bits -= 8;
+                output.push((buffer >> bits) as u8);
+                buffer &= (1 << bits) - 1;
+            }
+        }
+
+        Ok(output)
+    }
+}

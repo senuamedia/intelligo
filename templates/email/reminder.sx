@@ -1,0 +1,372 @@
+// Reminder Email Templates for Intelligo LMS
+// Various reminder notifications for deadlines and activities
+
+module intelligo::templates::email::reminder
+
+use intelligo::templates::*
+use intelligo::core::types::*
+
+/// Reminder email template ID
+pub const TEMPLATE_ID: &str = "email.reminder";
+
+/// Create the reminder email template configuration
+pub fn get_template_config() -> TemplateConfig {
+    TemplateConfig {
+        template_id: TEMPLATE_ID.to_string(),
+        template_type: TemplateType::Email,
+        name: "Learning Reminder".to_string(),
+        description: Some("Reminders for deadlines, incomplete courses, and activity".to_string()),
+        category: "notification".to_string(),
+
+        subject: Some("{{reminder_subject}}".to_string()),
+        body_html: REMINDER_HTML.to_string(),
+        body_text: Some(REMINDER_TEXT.to_string()),
+
+        default_locale: "en".to_string(),
+        available_locales: vec!["en".to_string(), "es".to_string(), "fr".to_string()],
+
+        enabled: true,
+        track_opens: true,
+        track_clicks: true,
+
+        required_variables: vec![
+            "user_name".to_string(),
+            "organization_name".to_string(),
+            "reminder_type".to_string(),
+            "reminder_subject".to_string(),
+        ],
+        optional_variables: vec![
+            "user_first_name".to_string(),
+            "course_name".to_string(),
+            "course_url".to_string(),
+            "assignment_name".to_string(),
+            "assignment_url".to_string(),
+            "due_date".to_string(),
+            "time_remaining".to_string(),
+            "progress_percent".to_string(),
+            "last_activity_date".to_string(),
+            "days_inactive".to_string(),
+            "action_url".to_string(),
+            "action_text".to_string(),
+            "items".to_string(),
+        ],
+
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// Reminder types
+pub enum ReminderType {
+    AssignmentDue,
+    CourseDue,
+    IncompleteCouser,
+    Inactivity,
+    UpcomingDeadline,
+    WeeklyDigest,
+}
+
+impl ReminderType {
+    pub fn to_string(self) -> String {
+        match self {
+            ReminderType::AssignmentDue => "assignment_due".to_string(),
+            ReminderType::CourseDue => "course_due".to_string(),
+            ReminderType::IncompleteCouser => "incomplete_course".to_string(),
+            ReminderType::Inactivity => "inactivity".to_string(),
+            ReminderType::UpcomingDeadline => "upcoming_deadline".to_string(),
+            ReminderType::WeeklyDigest => "weekly_digest".to_string(),
+        }
+    }
+}
+
+/// Build context for assignment due reminder
+pub fn build_assignment_due_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    organization_name: String,
+    assignment_name: String,
+    course_name: String,
+    due_date: String,
+    time_remaining: String,
+    assignment_url: String
+) -> TemplateContext {
+    TemplateContext::new()
+        .set_string("user_name", user_name.clone())
+        .set_string("user_first_name", user_first_name.unwrap_or(user_name))
+        .set_string("organization_name", organization_name)
+        .set_string("reminder_type", ReminderType::AssignmentDue.to_string())
+        .set_string("reminder_subject", format!("Reminder: {} is due soon", assignment_name))
+        .set_string("assignment_name", assignment_name)
+        .set_string("course_name", course_name)
+        .set_string("due_date", due_date)
+        .set_string("time_remaining", time_remaining)
+        .set_string("assignment_url", assignment_url.clone())
+        .set_string("action_url", assignment_url)
+        .set_string("action_text", "View Assignment".to_string())
+        .set_bool("is_assignment_reminder", true)
+        .set_string("year", DateTime::now().year().to_string())
+}
+
+/// Build context for course deadline reminder
+pub fn build_course_due_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    organization_name: String,
+    course_name: String,
+    due_date: String,
+    time_remaining: String,
+    progress_percent: f64,
+    course_url: String
+) -> TemplateContext {
+    TemplateContext::new()
+        .set_string("user_name", user_name.clone())
+        .set_string("user_first_name", user_first_name.unwrap_or(user_name))
+        .set_string("organization_name", organization_name)
+        .set_string("reminder_type", ReminderType::CourseDue.to_string())
+        .set_string("reminder_subject", format!("Reminder: {} deadline approaching", course_name))
+        .set_string("course_name", course_name)
+        .set_string("due_date", due_date)
+        .set_string("time_remaining", time_remaining)
+        .set_number("progress_percent", progress_percent)
+        .set_string("course_url", course_url.clone())
+        .set_string("action_url", course_url)
+        .set_string("action_text", "Continue Course".to_string())
+        .set_bool("is_course_reminder", true)
+        .set_bool("has_progress", true)
+        .set_string("year", DateTime::now().year().to_string())
+}
+
+/// Build context for inactivity reminder
+pub fn build_inactivity_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    organization_name: String,
+    last_activity_date: String,
+    days_inactive: u32,
+    course_name: Option<String>,
+    course_url: Option<String>,
+    action_url: String
+) -> TemplateContext {
+    let mut ctx = TemplateContext::new()
+        .set_string("user_name", user_name.clone())
+        .set_string("user_first_name", user_first_name.unwrap_or(user_name))
+        .set_string("organization_name", organization_name)
+        .set_string("reminder_type", ReminderType::Inactivity.to_string())
+        .set_string("reminder_subject", "We miss you! Continue your learning journey".to_string())
+        .set_string("last_activity_date", last_activity_date)
+        .set_number("days_inactive", days_inactive as f64)
+        .set_string("action_url", action_url)
+        .set_string("action_text", "Resume Learning".to_string())
+        .set_bool("is_inactivity_reminder", true)
+        .set_string("year", DateTime::now().year().to_string());
+
+    if let Some(course) = course_name {
+        ctx = ctx.set_string("course_name", course);
+        ctx = ctx.set_bool("has_course", true);
+    }
+
+    if let Some(url) = course_url {
+        ctx = ctx.set_string("course_url", url);
+    }
+
+    ctx
+}
+
+/// Reminder item for digest emails
+pub type ReminderItem {
+    item_type: String,
+    title: String,
+    due_date: Option<String>,
+    url: String,
+    progress_percent: Option<f64>,
+}
+
+/// Build context for weekly digest
+pub fn build_weekly_digest_context(
+    user_name: String,
+    user_first_name: Option<String>,
+    organization_name: String,
+    items: Vec<ReminderItem>,
+    dashboard_url: String
+) -> TemplateContext {
+    let item_values: Vec<ContextValue> = items.into_iter()
+        .map(|item| {
+            let mut obj = HashMap::new();
+            obj.insert("item_type".to_string(), ContextValue::String(item.item_type));
+            obj.insert("title".to_string(), ContextValue::String(item.title));
+            obj.insert("url".to_string(), ContextValue::String(item.url));
+            if let Some(due) = item.due_date {
+                obj.insert("due_date".to_string(), ContextValue::String(due));
+            }
+            if let Some(progress) = item.progress_percent {
+                obj.insert("progress_percent".to_string(), ContextValue::Number(progress));
+            }
+            ContextValue::Object(obj)
+        })
+        .collect();
+
+    TemplateContext::new()
+        .set_string("user_name", user_name.clone())
+        .set_string("user_first_name", user_first_name.unwrap_or(user_name))
+        .set_string("organization_name", organization_name)
+        .set_string("reminder_type", ReminderType::WeeklyDigest.to_string())
+        .set_string("reminder_subject", "Your Weekly Learning Summary".to_string())
+        .set_list("items", item_values)
+        .set_bool("is_digest", true)
+        .set_bool("has_items", true)
+        .set_string("action_url", dashboard_url)
+        .set_string("action_text", "Go to Dashboard".to_string())
+        .set_string("year", DateTime::now().year().to_string())
+}
+
+const REMINDER_HTML: &str = r#"
+<h1>
+    {{#if is_assignment_reminder}}📝 Assignment Reminder{{/if}}
+    {{#if is_course_reminder}}📚 Course Deadline Reminder{{/if}}
+    {{#if is_inactivity_reminder}}👋 We Miss You!{{/if}}
+    {{#if is_digest}}📊 Your Weekly Summary{{/if}}
+</h1>
+
+<p>Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},</p>
+
+{{#if is_assignment_reminder}}
+<p>This is a friendly reminder that your assignment is due soon:</p>
+
+<div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 20px; margin: 20px 0;">
+    <h2 style="margin: 0 0 10px 0;">{{assignment_name}}</h2>
+    <p style="margin: 0 0 5px 0;"><strong>Course:</strong> {{course_name}}</p>
+    <p style="margin: 0 0 5px 0;"><strong>Due:</strong> {{due_date}}</p>
+    <p style="margin: 0; color: #856404;"><strong>Time Remaining:</strong> {{time_remaining}}</p>
+</div>
+{{/if}}
+
+{{#if is_course_reminder}}
+<p>Your course deadline is approaching. Don't forget to complete your coursework!</p>
+
+<div style="background-color: #e7f3ff; border: 1px solid #0066cc; border-radius: 4px; padding: 20px; margin: 20px 0;">
+    <h2 style="margin: 0 0 10px 0;">{{course_name}}</h2>
+    <p style="margin: 0 0 5px 0;"><strong>Deadline:</strong> {{due_date}}</p>
+    <p style="margin: 0 0 5px 0;"><strong>Time Remaining:</strong> {{time_remaining}}</p>
+    {{#if has_progress}}
+    <p style="margin: 10px 0 0 0;"><strong>Your Progress:</strong></p>
+    <div style="background-color: #ddd; border-radius: 10px; height: 20px; margin-top: 5px;">
+        <div style="background-color: #28a745; border-radius: 10px; height: 20px; width: {{progress_percent}}%; min-width: 20px; text-align: center; color: white; font-size: 12px; line-height: 20px;">
+            {{progress_percent}}%
+        </div>
+    </div>
+    {{/if}}
+</div>
+{{/if}}
+
+{{#if is_inactivity_reminder}}
+<p>It's been a while since we've seen you! Your learning journey is waiting for you to continue.</p>
+
+<div style="background-color: #f8f9fa; border-radius: 4px; padding: 20px; margin: 20px 0;">
+    <p style="margin: 0 0 10px 0;">Last activity: <strong>{{last_activity_date}}</strong> ({{days_inactive}} days ago)</p>
+    {{#if has_course}}
+    <p style="margin: 0;">You were working on: <strong>{{course_name}}</strong></p>
+    {{/if}}
+</div>
+
+<p>Even just 15 minutes of learning each day can make a big difference!</p>
+{{/if}}
+
+{{#if is_digest}}
+<p>Here's your weekly learning summary:</p>
+
+{{#if has_items}}
+<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    <tr style="background-color: #f5f5f5;">
+        <th style="padding: 12px; text-align: left; border-bottom: 2px solid #ddd;">Item</th>
+        <th style="padding: 12px; text-align: left; border-bottom: 2px solid #ddd;">Due Date</th>
+        <th style="padding: 12px; text-align: center; border-bottom: 2px solid #ddd;">Progress</th>
+    </tr>
+    {{#each items}}
+    <tr>
+        <td style="padding: 12px; border-bottom: 1px solid #eee;">
+            <a href="{{url}}">{{title}}</a>
+            <span style="color: #666; font-size: 12px;">({{item_type}})</span>
+        </td>
+        <td style="padding: 12px; border-bottom: 1px solid #eee;">{{#if due_date}}{{due_date}}{{else}}-{{/if}}</td>
+        <td style="padding: 12px; border-bottom: 1px solid #eee; text-align: center;">
+            {{#if progress_percent}}{{progress_percent}}%{{else}}-{{/if}}
+        </td>
+    </tr>
+    {{/each}}
+</table>
+{{/if}}
+{{/if}}
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{action_url}}" class="button">{{action_text}}</a>
+</p>
+
+<p>
+    Best regards,<br>
+    The {{organization_name}} Team
+</p>
+
+<hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+
+<p style="font-size: 12px; color: #666; text-align: center;">
+    You're receiving this email because you have active courses or assignments in {{organization_name}}.
+</p>
+"#;
+
+const REMINDER_TEXT: &str = r#"
+{{#if is_assignment_reminder}}📝 ASSIGNMENT REMINDER{{/if}}
+{{#if is_course_reminder}}📚 COURSE DEADLINE REMINDER{{/if}}
+{{#if is_inactivity_reminder}}👋 WE MISS YOU!{{/if}}
+{{#if is_digest}}📊 YOUR WEEKLY SUMMARY{{/if}}
+
+Hi {{#if user_first_name}}{{user_first_name}}{{else}}{{user_name}}{{/if}},
+
+{{#if is_assignment_reminder}}
+This is a friendly reminder that your assignment is due soon:
+
+Assignment: {{assignment_name}}
+Course: {{course_name}}
+Due: {{due_date}}
+Time Remaining: {{time_remaining}}
+{{/if}}
+
+{{#if is_course_reminder}}
+Your course deadline is approaching. Don't forget to complete your coursework!
+
+Course: {{course_name}}
+Deadline: {{due_date}}
+Time Remaining: {{time_remaining}}
+{{#if has_progress}}Your Progress: {{progress_percent}}%{{/if}}
+{{/if}}
+
+{{#if is_inactivity_reminder}}
+It's been a while since we've seen you! Your learning journey is waiting for you to continue.
+
+Last activity: {{last_activity_date}} ({{days_inactive}} days ago)
+{{#if has_course}}You were working on: {{course_name}}{{/if}}
+
+Even just 15 minutes of learning each day can make a big difference!
+{{/if}}
+
+{{#if is_digest}}
+Here's your weekly learning summary:
+
+{{#if has_items}}
+{{#each items}}
+- {{title}} ({{item_type}})
+  {{#if due_date}}Due: {{due_date}}{{/if}}
+  {{#if progress_percent}}Progress: {{progress_percent}}%{{/if}}
+  Link: {{url}}
+
+{{/each}}
+{{/if}}
+{{/if}}
+
+{{action_text}}: {{action_url}}
+
+Best regards,
+The {{organization_name}} Team
+
+---
+You're receiving this email because you have active courses or assignments in {{organization_name}}.
+"#;

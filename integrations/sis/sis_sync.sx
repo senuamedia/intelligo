@@ -1,0 +1,958 @@
+// SIS Sync Engine for Intelligo LMS
+// Handles background sync jobs, conflict resolution, and data reconciliation
+
+module intelligo::integrations::sis::sis_sync
+
+use intelligo::integrations::sis::*
+use intelligo::core::types::*
+use std::collections::{HashMap, HashSet}
+use std::time::{DateTime, Duration}
+use std::sync::{Mutex, RwLock}
+use std::uuid::Uuid
+
+/// Sync Manager - orchestrates the sync process
+pub actor SyncManager {
+    provider: Box<dyn SisProvider>,
+    user_service: Box<dyn SisUserService>,
+    course_service: Box<dyn SisCourseService>,
+    enrollment_service: Box<dyn SisEnrollmentService>,
+    conflict_resolver: ConflictResolver,
+    progress_tracker: SyncProgressTracker,
+
+    pub fn new(
+        provider: Box<dyn SisProvider>,
+        user_service: Box<dyn SisUserService>,
+        course_service: Box<dyn SisCourseService>,
+        enrollment_service: Box<dyn SisEnrollmentService>
+    ) -> Self {
+        SyncManager {
+            provider: provider,
+            user_service: user_service,
+            course_service: course_service,
+            enrollment_service: enrollment_service,
+            conflict_resolver: ConflictResolver::new(),
+            progress_tracker: SyncProgressTracker::new(),
+        }
+    }
+
+    /// Run a full or incremental sync
+    pub async fn run_sync(mut self, options: SyncOptions) -> Result<SisSyncResult, SisError> {
+        let config = self.provider.get_config();
+        let mut result = SisSyncResult::new(config.provider_id.clone());
+
+        self.progress_tracker.start_sync();
+
+        // Determine sync type
+        if options.full_sync || !self.provider.supports_delta_sync() {
+            self.run_full_sync(&mut result, &options).await?;
+        } else if let Some(since) = options.since {
+            self.run_delta_sync(&mut result, since, &options).await?;
+        } else {
+            // Use last sync time from config
+            if let Some(last_sync) = config.last_sync {
+                self.run_delta_sync(&mut result, last_sync, &options).await?;
+            } else {
+                self.run_full_sync(&mut result, &options).await?;
+            }
+        }
+
+        result.completed_at = DateTime::now();
+        self.progress_tracker.complete_sync(&result);
+
+        Ok(result)
+    }
+
+    /// Run a full sync
+    async fn run_full_sync(
+        mut self,
+        result: &mut SisSyncResult,
+        options: &SyncOptions
+    ) -> Result<(), SisError> {
+        let fetch_options = FetchOptions::default().include_inactive();
+
+        // Phase 1: Sync users
+        if options.sync_users {
+            self.progress_tracker.set_phase("users");
+            self.sync_users_full(result, &fetch_options, options.dry_run).await?;
+        }
+
+        // Phase 2: Sync courses
+        if options.sync_courses {
+            self.progress_tracker.set_phase("courses");
+            self.sync_courses_full(result, &fetch_options, options.dry_run).await?;
+        }
+
+        // Phase 3: Sync enrollments
+        if options.sync_enrollments {
+            self.progress_tracker.set_phase("enrollments");
+            self.sync_enrollments_full(result, &fetch_options, options.dry_run).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Run a delta/incremental sync
+    async fn run_delta_sync(
+        mut self,
+        result: &mut SisSyncResult,
+        since: DateTime,
+        options: &SyncOptions
+    ) -> Result<(), SisError> {
+        let mut entity_types = Vec::new();
+
+        if options.sync_users {
+            entity_types.push(SisEntityType::User);
+        }
+        if options.sync_courses {
+            entity_types.push(SisEntityType::Course);
+            entity_types.push(SisEntityType::Class);
+        }
+        if options.sync_enrollments {
+            entity_types.push(SisEntityType::Enrollment);
+        }
+
+        let delta = self.provider.fetch_deltas(since, entity_types).await?;
+
+        // Process user deltas
+        if options.sync_users {
+            self.progress_tracker.set_phase("users");
+            for delta_item in delta.users {
+                self.process_user_delta(result, delta_item, options.dry_run).await?;
+            }
+        }
+
+        // Process course deltas
+        if options.sync_courses {
+            self.progress_tracker.set_phase("courses");
+            for delta_item in delta.courses {
+                self.process_course_delta(result, delta_item, options.dry_run).await?;
+            }
+            for delta_item in delta.classes {
+                self.process_class_delta(result, delta_item, options.dry_run).await?;
+            }
+        }
+
+        // Process enrollment deltas
+        if options.sync_enrollments {
+            self.progress_tracker.set_phase("enrollments");
+            for delta_item in delta.enrollments {
+                self.process_enrollment_delta(result, delta_item, options.dry_run).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Full sync of users
+    async fn sync_users_full(
+        mut self,
+        result: &mut SisSyncResult,
+        options: &FetchOptions,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        let config = self.provider.get_config();
+
+        // Fetch all users from SIS
+        let sis_users = self.provider.fetch_users(options.clone()).await?;
+        result.users_processed = sis_users.len() as u32;
+
+        // Get all existing source IDs from LMS
+        let existing_source_ids: HashSet<String> = self.user_service.get_all_source_ids()
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut processed_source_ids = HashSet::new();
+
+        for sis_user in sis_users {
+            processed_source_ids.insert(sis_user.source_id.clone());
+            self.progress_tracker.increment_processed();
+
+            match self.sync_user(sis_user, dry_run).await {
+                Ok(SyncAction::Created) => result.users_created += 1,
+                Ok(SyncAction::Updated) => result.users_updated += 1,
+                Ok(SyncAction::Skipped) => {},
+                Ok(SyncAction::Deleted) => result.users_deactivated += 1,
+                Err(e) => {
+                    result.users_errors += 1;
+                    result.errors.push(SisSyncError {
+                        entity_type: "user".to_string(),
+                        entity_id: "unknown".to_string(),
+                        error_code: "SYNC_ERROR".to_string(),
+                        message: e.to_string(),
+                        details: None,
+                    });
+                }
+            }
+        }
+
+        // Deactivate users not in SIS (if configured)
+        if config.deactivate_missing_users {
+            for source_id in existing_source_ids.difference(&processed_source_ids) {
+                if !dry_run {
+                    if let Ok(Some(user_id)) = self.user_service.find_by_source_id(source_id.clone()).await {
+                        if let Err(e) = self.user_service.deactivate_user(user_id).await {
+                            result.errors.push(SisSyncError {
+                                entity_type: "user".to_string(),
+                                entity_id: source_id.clone(),
+                                error_code: "DEACTIVATE_ERROR".to_string(),
+                                message: e.to_string(),
+                                details: None,
+                            });
+                        } else {
+                            result.users_deactivated += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sync a single user
+    async fn sync_user(
+        mut self,
+        sis_user: SisUser,
+        dry_run: bool
+    ) -> Result<SyncAction, SisError> {
+        let config = self.provider.get_config();
+
+        // Skip inactive users unless they already exist
+        match sis_user.status {
+            SisUserStatus::ToBeDeleted | SisUserStatus::Inactive => {
+                if let Ok(Some(user_id)) = self.user_service.find_by_source_id(sis_user.source_id.clone()).await {
+                    if !dry_run {
+                        self.user_service.deactivate_user(user_id).await?;
+                    }
+                    return Ok(SyncAction::Deleted);
+                }
+                return Ok(SyncAction::Skipped);
+            },
+            _ => {}
+        }
+
+        // Check if user exists by source ID
+        if let Ok(Some(user_id)) = self.user_service.find_by_source_id(sis_user.source_id.clone()).await {
+            // Update existing user
+            if !dry_run {
+                self.user_service.update_user(user_id, sis_user).await?;
+            }
+            return Ok(SyncAction::Updated);
+        }
+
+        // Check if user exists by email
+        if let Ok(Some(user_id)) = self.user_service.find_by_email(sis_user.email.clone()).await {
+            // Conflict: email exists but different source ID
+            let resolution = self.conflict_resolver.resolve_user_conflict(
+                ConflictType::DuplicateEmail { email: sis_user.email.clone() }
+            );
+
+            match resolution {
+                ConflictResolution::Update => {
+                    if !dry_run {
+                        self.user_service.update_user(user_id, sis_user).await?;
+                    }
+                    return Ok(SyncAction::Updated);
+                },
+                ConflictResolution::Skip => return Ok(SyncAction::Skipped),
+                ConflictResolution::CreateNew => {
+                    // Fall through to create
+                }
+            }
+        }
+
+        // Create new user if auto-provision is enabled
+        if config.create_missing_users {
+            if !dry_run {
+                self.user_service.create_user(sis_user).await?;
+            }
+            return Ok(SyncAction::Created);
+        }
+
+        Ok(SyncAction::Skipped)
+    }
+
+    /// Process a user delta item
+    async fn process_user_delta(
+        mut self,
+        result: &mut SisSyncResult,
+        delta: SisDeltaItem<SisUser>,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        result.users_processed += 1;
+
+        match delta.operation {
+            DeltaOperation::Delete => {
+                if let Ok(Some(user_id)) = self.user_service
+                    .find_by_source_id(delta.entity.source_id.clone()).await {
+                    if !dry_run {
+                        self.user_service.deactivate_user(user_id).await?;
+                    }
+                    result.users_deactivated += 1;
+                }
+            },
+            DeltaOperation::Create | DeltaOperation::Update => {
+                match self.sync_user(delta.entity, dry_run).await? {
+                    SyncAction::Created => result.users_created += 1,
+                    SyncAction::Updated => result.users_updated += 1,
+                    SyncAction::Deleted => result.users_deactivated += 1,
+                    SyncAction::Skipped => {},
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Full sync of courses
+    async fn sync_courses_full(
+        mut self,
+        result: &mut SisSyncResult,
+        options: &FetchOptions,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        let config = self.provider.get_config();
+
+        // Fetch all courses from SIS
+        let sis_courses = self.provider.fetch_courses(options.clone()).await?;
+        result.courses_processed = sis_courses.len() as u32;
+
+        let existing_source_ids: HashSet<String> = self.course_service.get_all_source_ids()
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut processed_source_ids = HashSet::new();
+
+        for sis_course in sis_courses {
+            processed_source_ids.insert(sis_course.source_id.clone());
+            self.progress_tracker.increment_processed();
+
+            match self.sync_course(sis_course, dry_run).await {
+                Ok(SyncAction::Created) => result.courses_created += 1,
+                Ok(SyncAction::Updated) => result.courses_updated += 1,
+                Ok(SyncAction::Skipped) => {},
+                Ok(SyncAction::Deleted) => result.courses_archived += 1,
+                Err(e) => {
+                    result.courses_errors += 1;
+                    result.errors.push(SisSyncError {
+                        entity_type: "course".to_string(),
+                        entity_id: "unknown".to_string(),
+                        error_code: "SYNC_ERROR".to_string(),
+                        message: e.to_string(),
+                        details: None,
+                    });
+                }
+            }
+        }
+
+        // Archive courses not in SIS
+        if config.archive_missing_courses {
+            for source_id in existing_source_ids.difference(&processed_source_ids) {
+                if !dry_run {
+                    if let Ok(Some(course_id)) = self.course_service.find_by_source_id(source_id.clone()).await {
+                        if let Err(e) = self.course_service.archive_course(course_id).await {
+                            result.errors.push(SisSyncError {
+                                entity_type: "course".to_string(),
+                                entity_id: source_id.clone(),
+                                error_code: "ARCHIVE_ERROR".to_string(),
+                                message: e.to_string(),
+                                details: None,
+                            });
+                        } else {
+                            result.courses_archived += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sync a single course
+    async fn sync_course(
+        mut self,
+        sis_course: SisCourse,
+        dry_run: bool
+    ) -> Result<SyncAction, SisError> {
+        let config = self.provider.get_config();
+
+        // Handle deleted/inactive courses
+        match sis_course.status {
+            SisCourseStatus::ToBeDeleted | SisCourseStatus::Inactive => {
+                if let Ok(Some(course_id)) = self.course_service.find_by_source_id(sis_course.source_id.clone()).await {
+                    if !dry_run {
+                        self.course_service.archive_course(course_id).await?;
+                    }
+                    return Ok(SyncAction::Deleted);
+                }
+                return Ok(SyncAction::Skipped);
+            },
+            _ => {}
+        }
+
+        // Check if course exists
+        if let Ok(Some(course_id)) = self.course_service.find_by_source_id(sis_course.source_id.clone()).await {
+            if !dry_run {
+                self.course_service.update_course(course_id, sis_course).await?;
+            }
+            return Ok(SyncAction::Updated);
+        }
+
+        // Create new course if configured
+        if config.create_missing_courses {
+            if !dry_run {
+                self.course_service.create_course(sis_course).await?;
+            }
+            return Ok(SyncAction::Created);
+        }
+
+        Ok(SyncAction::Skipped)
+    }
+
+    /// Process a course delta
+    async fn process_course_delta(
+        mut self,
+        result: &mut SisSyncResult,
+        delta: SisDeltaItem<SisCourse>,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        result.courses_processed += 1;
+
+        match delta.operation {
+            DeltaOperation::Delete => {
+                if let Ok(Some(course_id)) = self.course_service
+                    .find_by_source_id(delta.entity.source_id.clone()).await {
+                    if !dry_run {
+                        self.course_service.archive_course(course_id).await?;
+                    }
+                    result.courses_archived += 1;
+                }
+            },
+            DeltaOperation::Create | DeltaOperation::Update => {
+                match self.sync_course(delta.entity, dry_run).await? {
+                    SyncAction::Created => result.courses_created += 1,
+                    SyncAction::Updated => result.courses_updated += 1,
+                    SyncAction::Deleted => result.courses_archived += 1,
+                    SyncAction::Skipped => {},
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a class delta (treated as course)
+    async fn process_class_delta(
+        mut self,
+        result: &mut SisSyncResult,
+        delta: SisDeltaItem<SisClass>,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        // Convert class to course for sync
+        let sis_course = SisCourse {
+            source_id: delta.entity.source_id,
+            code: delta.entity.code.unwrap_or_default(),
+            name: delta.entity.name,
+            description: None,
+            term_ids: delta.entity.term_ids,
+            status: delta.entity.status,
+            subject_codes: Vec::new(),
+            grade_levels: Vec::new(),
+            metadata: delta.entity.metadata,
+        };
+
+        let course_delta = SisDeltaItem {
+            operation: delta.operation,
+            entity: sis_course,
+            modified_at: delta.modified_at,
+        };
+
+        self.process_course_delta(result, course_delta, dry_run).await
+    }
+
+    /// Full sync of enrollments
+    async fn sync_enrollments_full(
+        mut self,
+        result: &mut SisSyncResult,
+        options: &FetchOptions,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        // Fetch all enrollments from SIS
+        let sis_enrollments = self.provider.fetch_enrollments(options.clone()).await?;
+        result.enrollments_processed = sis_enrollments.len() as u32;
+
+        // Group enrollments by class for efficient processing
+        let mut enrollments_by_class: HashMap<String, Vec<SisEnrollment>> = HashMap::new();
+        for enrollment in sis_enrollments {
+            enrollments_by_class
+                .entry(enrollment.class_id.clone())
+                .or_insert_with(Vec::new)
+                .push(enrollment);
+        }
+
+        // Process each class's enrollments
+        for (class_id, enrollments) in enrollments_by_class {
+            self.sync_class_enrollments(&class_id, enrollments, result, dry_run).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Sync enrollments for a specific class
+    async fn sync_class_enrollments(
+        mut self,
+        class_id: &str,
+        sis_enrollments: Vec<SisEnrollment>,
+        result: &mut SisSyncResult,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        // Find the course in LMS
+        let course_id = match self.course_service.find_by_source_id(class_id.to_string()).await? {
+            Some(id) => id,
+            None => {
+                result.warnings.push(format!("Course not found for class: {}", class_id));
+                return Ok(());
+            }
+        };
+
+        // Get existing enrollments
+        let existing_enrollments = self.enrollment_service.get_enrollments_for_course(course_id).await?;
+        let mut processed_users = HashSet::new();
+
+        for sis_enrollment in sis_enrollments {
+            self.progress_tracker.increment_processed();
+            processed_users.insert(sis_enrollment.user_id.clone());
+
+            match self.sync_enrollment(sis_enrollment, course_id, dry_run).await {
+                Ok(SyncAction::Created) => result.enrollments_created += 1,
+                Ok(SyncAction::Updated) => result.enrollments_updated += 1,
+                Ok(SyncAction::Deleted) => result.enrollments_removed += 1,
+                Ok(SyncAction::Skipped) => {},
+                Err(e) => {
+                    result.enrollments_errors += 1;
+                    result.errors.push(SisSyncError {
+                        entity_type: "enrollment".to_string(),
+                        entity_id: class_id.to_string(),
+                        error_code: "SYNC_ERROR".to_string(),
+                        message: e.to_string(),
+                        details: None,
+                    });
+                }
+            }
+        }
+
+        // Note: We don't automatically remove enrollments not in SIS
+        // as they may have been added manually in the LMS
+
+        Ok(())
+    }
+
+    /// Sync a single enrollment
+    async fn sync_enrollment(
+        mut self,
+        sis_enrollment: SisEnrollment,
+        course_id: Uuid,
+        dry_run: bool
+    ) -> Result<SyncAction, SisError> {
+        // Find the user in LMS
+        let user_id = match self.user_service.find_by_source_id(sis_enrollment.user_id.clone()).await? {
+            Some(id) => id,
+            None => {
+                // User not found, skip this enrollment
+                return Ok(SyncAction::Skipped);
+            }
+        };
+
+        // Handle deleted/inactive enrollments
+        match sis_enrollment.status {
+            SisEnrollmentStatus::ToBeDeleted | SisEnrollmentStatus::Inactive => {
+                if let Ok(Some(enrollment_id)) = self.enrollment_service
+                    .find_enrollment(user_id, course_id).await {
+                    if !dry_run {
+                        self.enrollment_service.remove_enrollment(enrollment_id).await?;
+                    }
+                    return Ok(SyncAction::Deleted);
+                }
+                return Ok(SyncAction::Skipped);
+            },
+            _ => {}
+        }
+
+        // Check if enrollment exists
+        if let Ok(Some(enrollment_id)) = self.enrollment_service.find_enrollment(user_id, course_id).await {
+            if !dry_run {
+                self.enrollment_service.update_enrollment(enrollment_id, sis_enrollment).await?;
+            }
+            return Ok(SyncAction::Updated);
+        }
+
+        // Create new enrollment
+        if !dry_run {
+            self.enrollment_service.create_enrollment(sis_enrollment).await?;
+        }
+
+        Ok(SyncAction::Created)
+    }
+
+    /// Process an enrollment delta
+    async fn process_enrollment_delta(
+        mut self,
+        result: &mut SisSyncResult,
+        delta: SisDeltaItem<SisEnrollment>,
+        dry_run: bool
+    ) -> Result<(), SisError> {
+        result.enrollments_processed += 1;
+
+        // Find course ID
+        let course_id = match self.course_service
+            .find_by_source_id(delta.entity.class_id.clone()).await? {
+            Some(id) => id,
+            None => {
+                result.warnings.push(format!("Course not found: {}", delta.entity.class_id));
+                return Ok(());
+            }
+        };
+
+        match delta.operation {
+            DeltaOperation::Delete => {
+                if let Ok(Some(user_id)) = self.user_service
+                    .find_by_source_id(delta.entity.user_id.clone()).await {
+                    if let Ok(Some(enrollment_id)) = self.enrollment_service
+                        .find_enrollment(user_id, course_id).await {
+                        if !dry_run {
+                            self.enrollment_service.remove_enrollment(enrollment_id).await?;
+                        }
+                        result.enrollments_removed += 1;
+                    }
+                }
+            },
+            DeltaOperation::Create | DeltaOperation::Update => {
+                match self.sync_enrollment(delta.entity, course_id, dry_run).await? {
+                    SyncAction::Created => result.enrollments_created += 1,
+                    SyncAction::Updated => result.enrollments_updated += 1,
+                    SyncAction::Deleted => result.enrollments_removed += 1,
+                    SyncAction::Skipped => {},
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get current sync progress
+    pub fn get_progress(self) -> SyncProgress {
+        self.progress_tracker.get_progress()
+    }
+}
+
+/// Sync action result
+pub enum SyncAction {
+    Created,
+    Updated,
+    Deleted,
+    Skipped,
+}
+
+/// Conflict types
+pub enum ConflictType {
+    DuplicateEmail { email: String },
+    DuplicateSourceId { source_id: String },
+    DataMismatch { field: String, sis_value: String, lms_value: String },
+}
+
+/// Conflict resolution strategies
+pub enum ConflictResolution {
+    Update,
+    Skip,
+    CreateNew,
+}
+
+/// Conflict Resolver
+pub actor ConflictResolver {
+    default_strategy: ConflictResolutionStrategy,
+    custom_rules: Vec<ConflictRule>,
+
+    pub fn new() -> Self {
+        ConflictResolver {
+            default_strategy: ConflictResolutionStrategy::SisWins,
+            custom_rules: Vec::new(),
+        }
+    }
+
+    pub fn with_strategy(mut self, strategy: ConflictResolutionStrategy) -> Self {
+        self.default_strategy = strategy;
+        self
+    }
+
+    pub fn add_rule(mut self, rule: ConflictRule) {
+        self.custom_rules.push(rule);
+    }
+
+    pub fn resolve_user_conflict(self, conflict: ConflictType) -> ConflictResolution {
+        // Check custom rules first
+        for rule in &self.custom_rules {
+            if rule.matches(&conflict) {
+                return rule.resolution.clone();
+            }
+        }
+
+        // Apply default strategy
+        match self.default_strategy {
+            ConflictResolutionStrategy::SisWins => ConflictResolution::Update,
+            ConflictResolutionStrategy::LmsWins => ConflictResolution::Skip,
+            ConflictResolutionStrategy::AskUser => ConflictResolution::Skip, // In automated sync, skip
+            ConflictResolutionStrategy::MostRecent => ConflictResolution::Update, // SIS data is newer
+        }
+    }
+}
+
+/// Conflict resolution strategy
+pub enum ConflictResolutionStrategy {
+    SisWins,
+    LmsWins,
+    AskUser,
+    MostRecent,
+}
+
+/// Conflict rule
+pub type ConflictRule {
+    conflict_type: String,
+    condition: Option<String>,
+    resolution: ConflictResolution,
+}
+
+impl ConflictRule {
+    pub fn matches(self, conflict: &ConflictType) -> bool {
+        match conflict {
+            ConflictType::DuplicateEmail { .. } =>
+                self.conflict_type == "duplicate_email",
+            ConflictType::DuplicateSourceId { .. } =>
+                self.conflict_type == "duplicate_source_id",
+            ConflictType::DataMismatch { field, .. } =>
+                self.conflict_type == "data_mismatch" &&
+                self.condition.as_ref().map(|c| c == field).unwrap_or(true),
+        }
+    }
+}
+
+/// Sync progress tracking
+pub type SyncProgress {
+    phase: String,
+    total_items: u32,
+    processed_items: u32,
+    errors: u32,
+    started_at: DateTime,
+    estimated_completion: Option<DateTime>,
+    items_per_second: f64,
+}
+
+/// Progress tracker actor
+pub actor SyncProgressTracker {
+    current_phase: String,
+    total_items: u32,
+    processed_items: u32,
+    errors: u32,
+    started_at: Option<DateTime>,
+    phase_started_at: Option<DateTime>,
+    is_running: bool,
+
+    pub fn new() -> Self {
+        SyncProgressTracker {
+            current_phase: "idle".to_string(),
+            total_items: 0,
+            processed_items: 0,
+            errors: 0,
+            started_at: None,
+            phase_started_at: None,
+            is_running: false,
+        }
+    }
+
+    pub fn start_sync(mut self) {
+        self.started_at = Some(DateTime::now());
+        self.is_running = true;
+        self.processed_items = 0;
+        self.errors = 0;
+    }
+
+    pub fn set_phase(mut self, phase: &str) {
+        self.current_phase = phase.to_string();
+        self.phase_started_at = Some(DateTime::now());
+    }
+
+    pub fn set_total(mut self, total: u32) {
+        self.total_items = total;
+    }
+
+    pub fn increment_processed(mut self) {
+        self.processed_items += 1;
+    }
+
+    pub fn increment_errors(mut self) {
+        self.errors += 1;
+    }
+
+    pub fn complete_sync(mut self, result: &SisSyncResult) {
+        self.is_running = false;
+        self.current_phase = "completed".to_string();
+    }
+
+    pub fn get_progress(self) -> SyncProgress {
+        let elapsed = self.started_at
+            .map(|s| (DateTime::now() - s).as_secs_f64())
+            .unwrap_or(0.0);
+
+        let items_per_second = if elapsed > 0.0 {
+            self.processed_items as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        let remaining = self.total_items.saturating_sub(self.processed_items);
+        let estimated_completion = if items_per_second > 0.0 && remaining > 0 {
+            let remaining_secs = remaining as f64 / items_per_second;
+            Some(DateTime::now() + Duration::seconds(remaining_secs as i64))
+        } else {
+            None
+        };
+
+        SyncProgress {
+            phase: self.current_phase.clone(),
+            total_items: self.total_items,
+            processed_items: self.processed_items,
+            errors: self.errors,
+            started_at: self.started_at.unwrap_or(DateTime::now()),
+            estimated_completion: estimated_completion,
+            items_per_second: items_per_second,
+        }
+    }
+}
+
+/// Sync job scheduler
+pub actor SyncScheduler {
+    jobs: HashMap<String, ScheduledSyncJob>,
+    running_jobs: HashSet<String>,
+
+    pub fn new() -> Self {
+        SyncScheduler {
+            jobs: HashMap::new(),
+            running_jobs: HashSet::new(),
+        }
+    }
+
+    /// Schedule a sync job
+    pub fn schedule(mut self, job: ScheduledSyncJob) {
+        self.jobs.insert(job.provider_id.clone(), job);
+    }
+
+    /// Unschedule a job
+    pub fn unschedule(mut self, provider_id: String) {
+        self.jobs.remove(&provider_id);
+    }
+
+    /// Get jobs due to run
+    pub fn get_due_jobs(self) -> Vec<ScheduledSyncJob> {
+        let now = DateTime::now();
+
+        self.jobs.values()
+            .filter(|job| {
+                job.enabled &&
+                !self.running_jobs.contains(&job.provider_id) &&
+                job.next_run.map(|nr| nr <= now).unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Mark job as running
+    pub fn start_job(mut self, provider_id: String) {
+        self.running_jobs.insert(provider_id);
+    }
+
+    /// Mark job as complete and schedule next run
+    pub fn complete_job(mut self, provider_id: String, success: bool) {
+        self.running_jobs.remove(&provider_id);
+
+        if let Some(job) = self.jobs.get_mut(&provider_id) {
+            job.last_run = Some(DateTime::now());
+            job.last_success = Some(success);
+            job.next_run = Some(DateTime::now() + job.interval);
+        }
+    }
+
+    /// Check if a job is running
+    pub fn is_running(self, provider_id: &str) -> bool {
+        self.running_jobs.contains(provider_id)
+    }
+}
+
+/// Scheduled sync job
+pub type ScheduledSyncJob {
+    provider_id: String,
+    enabled: bool,
+    interval: Duration,
+    next_run: Option<DateTime>,
+    last_run: Option<DateTime>,
+    last_success: Option<bool>,
+    options: SyncOptions,
+    retry_on_failure: bool,
+    max_retries: u32,
+    current_retries: u32,
+}
+
+impl ScheduledSyncJob {
+    pub fn new(provider_id: String, interval: Duration) -> Self {
+        ScheduledSyncJob {
+            provider_id: provider_id,
+            enabled: true,
+            interval: interval,
+            next_run: Some(DateTime::now()),
+            last_run: None,
+            last_success: None,
+            options: SyncOptions::full(),
+            retry_on_failure: true,
+            max_retries: 3,
+            current_retries: 0,
+        }
+    }
+
+    pub fn with_options(mut self, options: SyncOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// Sync history entry
+pub type SyncHistoryEntry {
+    id: Uuid,
+    provider_id: String,
+    started_at: DateTime,
+    completed_at: Option<DateTime>,
+    status: SyncHistoryStatus,
+    result: Option<SisSyncResult>,
+    triggered_by: String,
+}
+
+/// Sync history status
+pub enum SyncHistoryStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Sync history store trait
+pub trait SyncHistoryStore {
+    async fn record_start(self, provider_id: String, triggered_by: String) -> Result<Uuid, SisError>
+    async fn record_complete(self, id: Uuid, result: SisSyncResult) -> Result<(), SisError>
+    async fn record_failure(self, id: Uuid, error: String) -> Result<(), SisError>
+    async fn get_history(
+        self,
+        provider_id: String,
+        limit: u32
+    ) -> Result<Vec<SyncHistoryEntry>, SisError>
+    async fn get_last_successful(self, provider_id: String) -> Result<Option<SyncHistoryEntry>, SisError>
+}

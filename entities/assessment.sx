@@ -1,0 +1,1343 @@
+/// Intelligo LMS - Assessment Entity
+///
+/// Assessments are evaluation instruments within a course.
+/// They include quizzes, exams, assignments, discussions, projects, and peer reviews.
+/// Assessments contain questions, rubrics, and timing/proctoring configurations.
+
+module intelligo::entities::assessment
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// ASSESSMENT ENTITY
+// =============================================================================
+
+/// An assessment is an evaluation instrument within a course
+type Assessment {
+    /// Unique identifier
+    id: AssessmentId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Bundle type (quiz, exam, assignment, discussion, project, peer_review)
+    bundle: String,
+
+    /// Parent module
+    module_id: ModuleId,
+
+    /// Parent course
+    course_id: CourseId,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    // =========================================================================
+    // Core Fields
+    // =========================================================================
+
+    /// Assessment title
+    title: String,
+
+    /// Assessment description (rich text)
+    description: String,
+
+    /// Instructions for students
+    instructions: Option<String>,
+
+    // =========================================================================
+    // Assessment Type
+    // =========================================================================
+
+    /// Type of assessment
+    assessment_type: AssessmentType,
+
+    /// Grading type
+    grading_type: GradingType,
+
+    // =========================================================================
+    // Points & Scoring
+    // =========================================================================
+
+    /// Total points possible
+    total_points: f32,
+
+    /// Weight in course grade (percentage)
+    weight: Option<f32>,
+
+    /// Passing score (percentage)
+    passing_score: Option<f32>,
+
+    /// Grade category (e.g., "Quizzes", "Exams")
+    grade_category: Option<String>,
+
+    // =========================================================================
+    // Questions
+    // =========================================================================
+
+    /// Questions in this assessment (ordered)
+    questions: List<Question>,
+
+    /// Question banks to pull from (for randomization)
+    question_bank_refs: List<QuestionBankRef>,
+
+    /// Whether to randomize question order
+    randomize_questions: Bool,
+
+    /// Whether to randomize answer options
+    randomize_options: Bool,
+
+    /// Number of questions to show (if less than total available)
+    question_count: Option<i32>,
+
+    // =========================================================================
+    // Rubric
+    // =========================================================================
+
+    /// Rubric for grading (for essays, assignments, etc.)
+    rubric: Option<Rubric>,
+
+    // =========================================================================
+    // Timing
+    // =========================================================================
+
+    /// Timing settings
+    timing: TimingSettings,
+
+    // =========================================================================
+    // Attempts
+    // =========================================================================
+
+    /// Number of attempts allowed (None = unlimited)
+    max_attempts: Option<i32>,
+
+    /// How to score multiple attempts
+    attempt_scoring: AttemptScoring,
+
+    /// Minimum time between attempts
+    attempt_cooldown: Option<Duration>,
+
+    // =========================================================================
+    // Display & Feedback
+    // =========================================================================
+
+    /// When to show correct answers
+    show_answers: ShowAnswersPolicy,
+
+    /// When to show feedback
+    show_feedback: ShowFeedbackPolicy,
+
+    /// Show score immediately after submission
+    show_score_immediately: Bool,
+
+    /// Show one question at a time
+    one_question_at_a_time: Bool,
+
+    /// Lock questions after answering (prevent going back)
+    lock_after_answer: Bool,
+
+    // =========================================================================
+    // Proctoring
+    // =========================================================================
+
+    /// Proctoring configuration
+    proctoring: Option<ProctoringConfig>,
+
+    // =========================================================================
+    // AI Grading
+    // =========================================================================
+
+    /// AI grading configuration
+    ai_grading: Option<AiGradingConfig>,
+
+    // =========================================================================
+    // Access Control
+    // =========================================================================
+
+    /// Require access code to start
+    access_code: Option<String>,
+
+    /// IP address restrictions
+    ip_restrictions: List<String>,
+
+    /// Browser lockdown required
+    require_lockdown_browser: Bool,
+
+    // =========================================================================
+    // Learning Objectives
+    // =========================================================================
+
+    /// Learning objectives assessed
+    learning_objectives: List<LearningObjectiveId>,
+
+    /// Competencies assessed
+    competencies: List<CompetencyId>,
+
+    // =========================================================================
+    // Status
+    // =========================================================================
+
+    /// Assessment status
+    status: EntityStatus,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime,
+
+    /// When published
+    published_at: Option<DateTime>
+}
+
+// =============================================================================
+// QUESTION ENTITY
+// =============================================================================
+
+/// A question within an assessment
+type Question {
+    /// Unique identifier
+    id: String,
+
+    /// Question type
+    question_type: QuestionType,
+
+    /// Question text (rich text)
+    text: String,
+
+    /// Question prompt/stem
+    stem: Option<String>,
+
+    /// Points for this question
+    points: f32,
+
+    /// Position in assessment (0-indexed)
+    position: i32,
+
+    /// Whether this question is required
+    is_required: Bool,
+
+    // =========================================================================
+    // Question Content
+    // =========================================================================
+
+    /// Answer options (for multiple choice, matching, etc.)
+    options: List<QuestionOption>,
+
+    /// Correct answers
+    correct_answers: List<CorrectAnswer>,
+
+    /// Matching pairs (for matching questions)
+    matching_pairs: Option<List<MatchingPair>>,
+
+    /// Items to order (for ordering questions)
+    ordering_items: Option<List<OrderingItem>>,
+
+    /// Numeric answer configuration
+    numeric_config: Option<NumericConfig>,
+
+    /// Fill in blank configuration
+    fill_blank_config: Option<FillBlankConfig>,
+
+    /// File upload configuration
+    file_upload_config: Option<FileUploadConfig>,
+
+    // =========================================================================
+    // Media
+    // =========================================================================
+
+    /// Attached images
+    images: List<MediaId>,
+
+    /// Attached audio
+    audio: Option<MediaId>,
+
+    /// Attached video
+    video: Option<MediaId>,
+
+    // =========================================================================
+    // Feedback
+    // =========================================================================
+
+    /// General feedback (shown after answering)
+    general_feedback: Option<String>,
+
+    /// Feedback for correct answer
+    correct_feedback: Option<String>,
+
+    /// Feedback for incorrect answer
+    incorrect_feedback: Option<String>,
+
+    /// Option-specific feedback
+    option_feedback: Map<String, String>,
+
+    // =========================================================================
+    // Hints
+    // =========================================================================
+
+    /// Hints available to students
+    hints: List<QuestionHint>,
+
+    /// Penalty for using hints (percentage of points)
+    hint_penalty: f32,
+
+    // =========================================================================
+    // Metadata
+    // =========================================================================
+
+    /// Difficulty level
+    difficulty: SkillLevel,
+
+    /// Bloom's taxonomy level
+    bloom_level: BloomLevel,
+
+    /// Tags for categorization
+    tags: List<String>,
+
+    /// Learning objectives this question assesses
+    learning_objectives: List<LearningObjectiveId>,
+
+    /// Source question bank (if from a bank)
+    source_bank_id: Option<QuestionBankId>,
+
+    /// Explanation for answer (shown after grading)
+    explanation: Option<String>
+}
+
+/// An option in a multiple choice or similar question
+type QuestionOption {
+    /// Unique identifier
+    id: String,
+
+    /// Option text
+    text: String,
+
+    /// Position in list
+    position: i32,
+
+    /// Whether this option is correct
+    is_correct: Bool,
+
+    /// Partial credit (0.0-1.0, None = full or nothing)
+    partial_credit: Option<f32>,
+
+    /// Attached media
+    media_id: Option<MediaId>
+}
+
+/// A correct answer specification
+type CorrectAnswer {
+    /// Answer value (text, number, or option ID)
+    value: String,
+
+    /// Whether matching is case-sensitive
+    case_sensitive: Bool,
+
+    /// Allow partial matching
+    partial_match: Bool,
+
+    /// Regular expression for matching
+    regex: Option<String>,
+
+    /// Tolerance for numeric answers
+    tolerance: Option<f32>
+}
+
+/// A matching pair for matching questions
+type MatchingPair {
+    /// Left side (premise)
+    premise_id: String,
+    premise_text: String,
+
+    /// Right side (response)
+    response_id: String,
+    response_text: String
+}
+
+/// An item for ordering questions
+type OrderingItem {
+    /// Unique identifier
+    id: String,
+
+    /// Item text
+    text: String,
+
+    /// Correct position (0-indexed)
+    correct_position: i32
+}
+
+/// Configuration for numeric questions
+type NumericConfig {
+    /// Expected answer
+    expected_value: f64,
+
+    /// Tolerance (absolute)
+    tolerance: Option<f64>,
+
+    /// Tolerance (percentage)
+    tolerance_percent: Option<f32>,
+
+    /// Required precision (decimal places)
+    precision: Option<i32>,
+
+    /// Units label
+    units: Option<String>,
+
+    /// Require units in answer
+    require_units: Bool
+}
+
+/// Configuration for fill-in-the-blank questions
+type FillBlankConfig {
+    /// Text with blanks marked (e.g., "The {blank1} is {blank2}")
+    template: String,
+
+    /// Blank definitions
+    blanks: List<BlankDefinition>
+}
+
+/// Definition of a blank in fill-in-the-blank
+type BlankDefinition {
+    /// Blank identifier
+    id: String,
+
+    /// Accepted answers
+    accepted_answers: List<String>,
+
+    /// Case sensitive matching
+    case_sensitive: Bool,
+
+    /// Points for this blank
+    points: f32
+}
+
+/// Configuration for file upload questions
+type FileUploadConfig {
+    /// Allowed file types (extensions)
+    allowed_types: List<String>,
+
+    /// Maximum file size in bytes
+    max_file_size: i64,
+
+    /// Maximum number of files
+    max_files: i32,
+
+    /// Require specific filename pattern
+    filename_pattern: Option<String>
+}
+
+/// A hint for a question
+type QuestionHint {
+    /// Hint text
+    text: String,
+
+    /// Order of this hint (shown progressively)
+    order: i32,
+
+    /// Points penalty for viewing this hint
+    penalty_points: f32
+}
+
+// =============================================================================
+// QUESTION BANK
+// =============================================================================
+
+/// A reusable collection of questions
+type QuestionBank {
+    /// Unique identifier
+    id: QuestionBankId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    /// Bank title
+    title: String,
+
+    /// Bank description
+    description: Option<String>,
+
+    /// Questions in this bank
+    questions: List<Question>,
+
+    /// Categories/folders within the bank
+    categories: List<QuestionCategory>,
+
+    /// Courses that can access this bank
+    shared_with_courses: List<CourseId>,
+
+    /// Whether this bank is global (tenant-wide)
+    is_global: Bool,
+
+    /// Creator
+    created_by: UserId,
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+/// A category within a question bank
+type QuestionCategory {
+    id: String,
+    name: String,
+    description: Option<String>,
+    parent_id: Option<String>,
+    question_ids: List<String>
+}
+
+/// Reference to questions from a bank
+type QuestionBankRef {
+    /// Bank ID
+    bank_id: QuestionBankId,
+
+    /// Number of questions to pull
+    count: i32,
+
+    /// Filter by category
+    category_id: Option<String>,
+
+    /// Filter by difficulty
+    difficulty: Option<SkillLevel>,
+
+    /// Filter by tags
+    tags: List<String>,
+
+    /// Points per question from this bank
+    points_per_question: f32
+}
+
+// =============================================================================
+// RUBRIC ENTITY
+// =============================================================================
+
+/// A rubric for grading assessments
+type Rubric {
+    /// Unique identifier
+    id: RubricId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Rubric title
+    title: String,
+
+    /// Rubric description
+    description: Option<String>,
+
+    /// Criteria in this rubric
+    criteria: List<RubricCriterion>,
+
+    /// Total points possible
+    total_points: f32,
+
+    /// Whether to use ranges or specific levels
+    use_ranges: Bool,
+
+    /// Whether this rubric is reusable
+    is_reusable: Bool,
+
+    /// Courses this rubric is shared with
+    shared_with_courses: List<CourseId>,
+
+    /// Creator
+    created_by: UserId,
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+/// A criterion in a rubric
+type RubricCriterion {
+    /// Unique identifier
+    id: String,
+
+    /// Criterion name
+    name: String,
+
+    /// Criterion description
+    description: Option<String>,
+
+    /// Maximum points for this criterion
+    max_points: f32,
+
+    /// Position in rubric
+    position: i32,
+
+    /// Performance levels for this criterion
+    levels: List<RubricLevel>,
+
+    /// Learning objectives this criterion assesses
+    learning_objectives: List<LearningObjectiveId>
+}
+
+/// A performance level within a rubric criterion
+type RubricLevel {
+    /// Unique identifier
+    id: String,
+
+    /// Level name (e.g., "Excellent", "Proficient", "Developing")
+    name: String,
+
+    /// Level description
+    description: String,
+
+    /// Points for this level
+    points: f32,
+
+    /// Minimum points (if using ranges)
+    min_points: Option<f32>,
+
+    /// Maximum points (if using ranges)
+    max_points: Option<f32>,
+
+    /// Position (order) of this level
+    position: i32
+}
+
+// =============================================================================
+// TIMING SETTINGS
+// =============================================================================
+
+/// Timing configuration for an assessment
+type TimingSettings {
+    /// Time limit for the entire assessment
+    time_limit: Option<Duration>,
+
+    /// Due date
+    due_date: Option<DateTime>,
+
+    /// Available from date
+    available_from: Option<DateTime>,
+
+    /// Available until date
+    available_until: Option<DateTime>,
+
+    /// Grace period after due date
+    grace_period: Option<Duration>,
+
+    /// Time limit per question (for timed per-question mode)
+    time_per_question: Option<Duration>,
+
+    /// Whether to show timer
+    show_timer: Bool,
+
+    /// Warning when time is almost up (minutes before)
+    time_warning_minutes: Option<i32>,
+
+    /// Auto-submit when time expires
+    auto_submit_on_timeout: Bool
+}
+
+// =============================================================================
+// PROCTORING CONFIGURATION
+// =============================================================================
+
+/// Configuration for proctored assessments
+type ProctoringConfig {
+    /// Proctoring enabled
+    enabled: Bool,
+
+    /// Proctoring provider
+    provider: ProctoringProvider,
+
+    /// Record webcam
+    record_webcam: Bool,
+
+    /// Record screen
+    record_screen: Bool,
+
+    /// Record audio
+    record_audio: Bool,
+
+    /// Detect faces
+    face_detection: Bool,
+
+    /// Detect multiple faces
+    multi_face_detection: Bool,
+
+    /// Detect phone usage
+    phone_detection: Bool,
+
+    /// Detect tab switching
+    tab_switch_detection: Bool,
+
+    /// Detect copy/paste
+    copy_paste_detection: Bool,
+
+    /// Maximum tab switches allowed
+    max_tab_switches: Option<i32>,
+
+    /// Flag for review vs auto-fail
+    flag_only: Bool,
+
+    /// ID verification required
+    id_verification: Bool,
+
+    /// Room scan required before start
+    room_scan: Bool,
+
+    /// Custom rules
+    custom_rules: List<ProctoringRule>
+}
+
+/// Proctoring service provider
+enum ProctoringProvider {
+    /// Built-in proctoring
+    Builtin,
+    /// Proctorio integration
+    Proctorio,
+    /// Respondus LockDown Browser
+    Respondus,
+    /// ExamSoft
+    ExamSoft,
+    /// Honorlock
+    Honorlock,
+    /// ProctorU
+    ProctorU,
+    /// Custom provider
+    Custom { name: String, config: Map<String, Dynamic> }
+}
+
+/// A custom proctoring rule
+type ProctoringRule {
+    name: String,
+    description: String,
+    severity: RiskLevel,
+    auto_flag: Bool
+}
+
+// =============================================================================
+// AI GRADING CONFIGURATION
+// =============================================================================
+
+/// Configuration for AI-assisted grading
+type AiGradingConfig {
+    /// AI grading enabled
+    enabled: Bool,
+
+    /// Model to use for grading
+    model: String,
+
+    /// Question types to auto-grade
+    auto_grade_types: List<QuestionType>,
+
+    /// Minimum confidence threshold for auto-grading
+    confidence_threshold: f32,
+
+    /// Use rubric for AI grading
+    use_rubric: Bool,
+
+    /// Provide AI-generated feedback
+    generate_feedback: Bool,
+
+    /// Require human review for low confidence
+    require_review_below_confidence: Bool,
+
+    /// Custom grading prompt additions
+    custom_instructions: Option<String>,
+
+    /// Grading criteria keywords
+    grading_criteria: List<String>,
+
+    /// Example good answers for reference
+    example_answers: List<ExampleAnswer>
+}
+
+/// An example answer for AI grading reference
+type ExampleAnswer {
+    /// The answer text
+    answer: String,
+
+    /// The score this answer should receive
+    score: f32,
+
+    /// Explanation of the score
+    explanation: String
+}
+
+// =============================================================================
+// BUNDLE DEFINITIONS
+// =============================================================================
+
+/// Bundle-specific fields for quizzes
+type QuizBundle {
+    /// Show results page
+    show_results_page: Bool,
+
+    /// Allow review after completion
+    allow_review: Bool,
+
+    /// Study mode available (practice without grading)
+    study_mode_available: Bool
+}
+
+/// Bundle-specific fields for exams
+type ExamBundle {
+    /// Proctoring required
+    proctoring_required: Bool,
+
+    /// Exam window (specific dates/times)
+    exam_window: Option<ExamWindow>,
+
+    /// Makeup policy
+    makeup_policy: Option<String>
+}
+
+/// Exam availability window
+type ExamWindow {
+    start: DateTime,
+    end: DateTime,
+    time_zone: String
+}
+
+/// Bundle-specific fields for assignments
+type AssignmentBundle {
+    /// Submission types allowed
+    submission_types: List<SubmissionType>,
+
+    /// Allow multiple files
+    allow_multiple_files: Bool,
+
+    /// Maximum file size
+    max_file_size: Option<i64>,
+
+    /// Allowed file types
+    allowed_file_types: List<String>,
+
+    /// Peer review enabled
+    peer_review_enabled: Bool,
+
+    /// Number of peer reviews required
+    peer_reviews_required: Option<i32>,
+
+    /// Group assignment
+    group_assignment: Bool,
+
+    /// Group size range
+    group_size: Option<GroupSize>
+}
+
+/// Group size configuration
+type GroupSize {
+    min: i32,
+    max: i32
+}
+
+/// Bundle-specific fields for discussions
+type DiscussionBundle {
+    /// Initial post required before viewing others
+    require_initial_post: Bool,
+
+    /// Minimum word count for posts
+    min_word_count: Option<i32>,
+
+    /// Required replies to peers
+    required_replies: i32,
+
+    /// Allow attachments
+    allow_attachments: Bool,
+
+    /// Allow editing after post
+    allow_editing: Bool,
+
+    /// Time window for editing
+    edit_window: Option<Duration>,
+
+    /// Threading style
+    threading: ThreadingStyle,
+
+    /// Moderation enabled
+    moderation_enabled: Bool
+}
+
+/// Discussion threading style
+enum ThreadingStyle {
+    /// Flat list
+    Flat,
+    /// Nested threads
+    Threaded,
+    /// Q&A format
+    QuestionAnswer
+}
+
+/// Bundle-specific fields for projects
+type ProjectBundle {
+    /// Milestones/phases
+    milestones: List<ProjectMilestone>,
+
+    /// Team project
+    is_team_project: Bool,
+
+    /// Team size
+    team_size: Option<GroupSize>,
+
+    /// Require project proposal
+    require_proposal: Bool,
+
+    /// Progress check-ins
+    check_ins: List<ProjectCheckIn>
+}
+
+/// A project milestone
+type ProjectMilestone {
+    id: String,
+    title: String,
+    description: Option<String>,
+    due_date: DateTime,
+    weight: f32,
+    deliverables: List<String>
+}
+
+/// A project check-in
+type ProjectCheckIn {
+    id: String,
+    title: String,
+    date: DateTime,
+    required: Bool,
+    format: CheckInFormat
+}
+
+/// Format for project check-ins
+enum CheckInFormat {
+    Written,
+    Video,
+    Meeting,
+    Presentation
+}
+
+/// Bundle-specific fields for peer review
+type PeerReviewBundle {
+    /// Number of reviews each student gives
+    reviews_per_student: i32,
+
+    /// Anonymous reviews
+    anonymous: Bool,
+
+    /// Rubric for peer review
+    peer_rubric: Option<Rubric>,
+
+    /// Weight of peer grades in final grade
+    peer_grade_weight: f32,
+
+    /// Instructor moderation
+    instructor_moderation: Bool,
+
+    /// Assignment deadline
+    assignment_deadline: DateTime,
+
+    /// Review deadline
+    review_deadline: DateTime,
+
+    /// Calibration enabled (practice reviews)
+    calibration_enabled: Bool,
+
+    /// Number of calibration reviews
+    calibration_count: i32
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating an assessment
+type CreateAssessmentInput {
+    bundle: String,
+    module_id: ModuleId,
+    course_id: CourseId,
+    title: String,
+    description: String,
+    instructions: Option<String>,
+    assessment_type: AssessmentType,
+    grading_type: GradingType,
+    total_points: f32,
+    weight: Option<f32>,
+    passing_score: Option<f32>,
+    grade_category: Option<String>,
+    timing: Option<TimingSettings>,
+    max_attempts: Option<i32>,
+    attempt_scoring: Option<AttemptScoring>
+}
+
+/// Input for updating an assessment
+type UpdateAssessmentInput {
+    title: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
+    total_points: Option<f32>,
+    weight: Option<f32>,
+    passing_score: Option<f32>,
+    grade_category: Option<String>,
+    questions: Option<List<Question>>,
+    randomize_questions: Option<Bool>,
+    randomize_options: Option<Bool>,
+    question_count: Option<i32>,
+    rubric: Option<Rubric>,
+    timing: Option<TimingSettings>,
+    max_attempts: Option<i32>,
+    attempt_scoring: Option<AttemptScoring>,
+    show_answers: Option<ShowAnswersPolicy>,
+    show_feedback: Option<ShowFeedbackPolicy>,
+    show_score_immediately: Option<Bool>,
+    one_question_at_a_time: Option<Bool>,
+    lock_after_answer: Option<Bool>,
+    proctoring: Option<ProctoringConfig>,
+    ai_grading: Option<AiGradingConfig>,
+    access_code: Option<String>,
+    require_lockdown_browser: Option<Bool>,
+    learning_objectives: Option<List<LearningObjectiveId>>,
+    competencies: Option<List<CompetencyId>>,
+    status: Option<EntityStatus>
+}
+
+/// Input for adding a question
+type AddQuestionInput {
+    question_type: QuestionType,
+    text: String,
+    stem: Option<String>,
+    points: f32,
+    position: Option<i32>,
+    options: List<QuestionOption>,
+    correct_answers: List<CorrectAnswer>,
+    general_feedback: Option<String>,
+    correct_feedback: Option<String>,
+    incorrect_feedback: Option<String>,
+    hints: List<QuestionHint>,
+    difficulty: Option<SkillLevel>,
+    bloom_level: Option<BloomLevel>,
+    tags: List<String>
+}
+
+// =============================================================================
+// FILTER TYPES
+// =============================================================================
+
+/// Filter options for assessment queries
+type AssessmentFilter {
+    tenant_id: Option<TenantId>,
+    course_id: Option<CourseId>,
+    module_id: Option<ModuleId>,
+    assessment_type: Option<AssessmentType>,
+    status: Option<EntityStatus>,
+    grade_category: Option<String>,
+    has_due_date: Option<Bool>,
+    due_date_range: Option<DateRange>,
+    search: Option<String>
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Assessment {
+    /// Create a new assessment with defaults
+    fn new(
+        bundle: String,
+        module_id: ModuleId,
+        course_id: CourseId,
+        tenant_id: TenantId,
+        title: String,
+        description: String,
+        assessment_type: AssessmentType,
+        total_points: f32
+    ) -> Assessment {
+        let now = DateTime::now();
+        Assessment {
+            id: generate_assessment_id(),
+            uuid: generate_uuid(),
+            bundle,
+            module_id,
+            course_id,
+            tenant_id,
+            title,
+            description,
+            instructions: None,
+            assessment_type,
+            grading_type: GradingType::Points,
+            total_points,
+            weight: None,
+            passing_score: None,
+            grade_category: None,
+            questions: vec![],
+            question_bank_refs: vec![],
+            randomize_questions: false,
+            randomize_options: false,
+            question_count: None,
+            rubric: None,
+            timing: TimingSettings::default(),
+            max_attempts: Some(1),
+            attempt_scoring: AttemptScoring::Highest,
+            attempt_cooldown: None,
+            show_answers: ShowAnswersPolicy::AfterSubmission,
+            show_feedback: ShowFeedbackPolicy::AfterSubmission,
+            show_score_immediately: true,
+            one_question_at_a_time: false,
+            lock_after_answer: false,
+            proctoring: None,
+            ai_grading: None,
+            access_code: None,
+            ip_restrictions: vec![],
+            require_lockdown_browser: false,
+            learning_objectives: vec![],
+            competencies: vec![],
+            status: EntityStatus::Draft,
+            created_at: now,
+            updated_at: now,
+            published_at: None
+        }
+    }
+
+    /// Check if assessment is available now
+    fn is_available(&self) -> Bool {
+        if self.status != EntityStatus::Published {
+            return false
+        }
+
+        let now = DateTime::now();
+
+        if let Some(from) = &self.timing.available_from {
+            if now < *from {
+                return false
+            }
+        }
+
+        if let Some(until) = &self.timing.available_until {
+            if now > *until {
+                return false
+            }
+        }
+
+        true
+    }
+
+    /// Check if assessment is past due
+    fn is_past_due(&self) -> Bool {
+        if let Some(due) = &self.timing.due_date {
+            return DateTime::now() > *due
+        }
+        false
+    }
+
+    /// Check if still within grace period
+    fn is_in_grace_period(&self) -> Bool {
+        if let (Some(due), Some(grace)) = (&self.timing.due_date, &self.timing.grace_period) {
+            let now = DateTime::now();
+            let grace_end = *due + *grace;
+            return now > *due && now <= grace_end
+        }
+        false
+    }
+
+    /// Get total question count
+    fn question_count(&self) -> i32 {
+        self.questions.len() as i32
+    }
+
+    /// Check if this is a timed assessment
+    fn is_timed(&self) -> Bool {
+        self.timing.time_limit.is_some()
+    }
+
+    /// Check if proctoring is enabled
+    fn is_proctored(&self) -> Bool {
+        self.proctoring.as_ref().map(|p| p.enabled).unwrap_or(false)
+    }
+
+    /// Check if AI grading is enabled
+    fn has_ai_grading(&self) -> Bool {
+        self.ai_grading.as_ref().map(|a| a.enabled).unwrap_or(false)
+    }
+}
+
+impl Question {
+    /// Create a new question with defaults
+    fn new(
+        question_type: QuestionType,
+        text: String,
+        points: f32,
+        position: i32
+    ) -> Question {
+        Question {
+            id: generate_uuid(),
+            question_type,
+            text,
+            stem: None,
+            points,
+            position,
+            is_required: true,
+            options: vec![],
+            correct_answers: vec![],
+            matching_pairs: None,
+            ordering_items: None,
+            numeric_config: None,
+            fill_blank_config: None,
+            file_upload_config: None,
+            images: vec![],
+            audio: None,
+            video: None,
+            general_feedback: None,
+            correct_feedback: None,
+            incorrect_feedback: None,
+            option_feedback: Map::new(),
+            hints: vec![],
+            hint_penalty: 0.0,
+            difficulty: SkillLevel::Intermediate,
+            bloom_level: BloomLevel::Understand,
+            tags: vec![],
+            learning_objectives: vec![],
+            source_bank_id: None,
+            explanation: None
+        }
+    }
+
+    /// Check if question is auto-gradable
+    fn is_auto_gradable(&self) -> Bool {
+        match &self.question_type {
+            QuestionType::MultipleChoice { .. } => true,
+            QuestionType::TrueFalse => true,
+            QuestionType::ShortAnswer => true,
+            QuestionType::FillInBlank => true,
+            QuestionType::Matching => true,
+            QuestionType::Ordering => true,
+            QuestionType::Numeric => true,
+            QuestionType::Likert => true,
+            QuestionType::Essay => false,
+            QuestionType::Hotspot => true,
+            QuestionType::FileUpload => false,
+            QuestionType::Custom { .. } => false
+        }
+    }
+}
+
+impl TimingSettings {
+    fn default() -> TimingSettings {
+        TimingSettings {
+            time_limit: None,
+            due_date: None,
+            available_from: None,
+            available_until: None,
+            grace_period: None,
+            time_per_question: None,
+            show_timer: true,
+            time_warning_minutes: Some(5),
+            auto_submit_on_timeout: true
+        }
+    }
+}
+
+impl Rubric {
+    /// Create a new rubric with defaults
+    fn new(title: String, created_by: UserId) -> Rubric {
+        let now = DateTime::now();
+        Rubric {
+            id: generate_uuid(),
+            uuid: generate_uuid(),
+            title,
+            description: None,
+            criteria: vec![],
+            total_points: 0.0,
+            use_ranges: false,
+            is_reusable: false,
+            shared_with_courses: vec![],
+            created_by,
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Calculate total points from criteria
+    fn calculate_total_points(&self) -> f32 {
+        self.criteria.iter().map(|c| c.max_points).sum()
+    }
+}
+
+impl QuestionBank {
+    /// Create a new question bank
+    fn new(title: String, tenant_id: TenantId, created_by: UserId) -> QuestionBank {
+        let now = DateTime::now();
+        QuestionBank {
+            id: generate_uuid(),
+            uuid: generate_uuid(),
+            tenant_id,
+            title,
+            description: None,
+            questions: vec![],
+            categories: vec![],
+            shared_with_courses: vec![],
+            is_global: false,
+            created_by,
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Get question count
+    fn question_count(&self) -> i32 {
+        self.questions.len() as i32
+    }
+
+    /// Get questions by difficulty
+    fn get_by_difficulty(&self, difficulty: SkillLevel) -> List<&Question> {
+        self.questions.iter().filter(|q| q.difficulty == difficulty).collect()
+    }
+
+    /// Get questions by tag
+    fn get_by_tag(&self, tag: &String) -> List<&Question> {
+        self.questions.iter().filter(|q| q.tags.contains(tag)).collect()
+    }
+}
+
+impl ProctoringConfig {
+    fn default() -> ProctoringConfig {
+        ProctoringConfig {
+            enabled: false,
+            provider: ProctoringProvider::Builtin,
+            record_webcam: true,
+            record_screen: true,
+            record_audio: false,
+            face_detection: true,
+            multi_face_detection: true,
+            phone_detection: true,
+            tab_switch_detection: true,
+            copy_paste_detection: true,
+            max_tab_switches: Some(3),
+            flag_only: true,
+            id_verification: false,
+            room_scan: false,
+            custom_rules: vec![]
+        }
+    }
+}
+
+impl AiGradingConfig {
+    fn default() -> AiGradingConfig {
+        AiGradingConfig {
+            enabled: false,
+            model: "claude-sonnet".to_string(),
+            auto_grade_types: vec![
+                QuestionType::ShortAnswer,
+                QuestionType::Essay
+            ],
+            confidence_threshold: 0.85,
+            use_rubric: true,
+            generate_feedback: true,
+            require_review_below_confidence: true,
+            custom_instructions: None,
+            grading_criteria: vec![],
+            example_answers: vec![]
+        }
+    }
+}

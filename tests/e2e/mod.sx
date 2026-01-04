@@ -1,0 +1,8 @@
+/// Intelligo LMS - E2E Tests Module
+///
+/// Exports all end-to-end test suites.
+
+module intelligo::tests::e2e
+
+pub use intelligo::tests::e2e::learner_journey::*
+pub use intelligo::tests::e2e::admin_workflow::*

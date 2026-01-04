@@ -1,0 +1,1683 @@
+/// Intelligo LMS - Slack Integration
+///
+/// Complete Slack integration including:
+/// - Slack API integration
+/// - Workspace/Channel creation
+/// - Bot for notifications
+/// - Slash commands (/grade, /submit, /course)
+/// - Course announcements
+
+module intelligo::integrations::communication::slack
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+use std::http::{HttpClient, Request, Response, Headers}
+use std::json::{Json, to_json, from_json}
+use std::crypto::{hmac_sha256, constant_time_compare}
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+/// Slack configuration
+type SlackConfig {
+    /// Bot token (xoxb-...)
+    bot_token: String,
+    /// Signing secret (for request verification)
+    signing_secret: String,
+    /// App ID
+    app_id: String,
+    /// Client ID (for OAuth)
+    client_id: Option<String>,
+    /// Client secret (for OAuth)
+    client_secret: Option<String>,
+    /// Default channel for notifications
+    default_channel: Option<String>,
+    /// Bot user ID
+    bot_user_id: Option<String>
+}
+
+impl SlackConfig {
+    fn from_env() -> Result<SlackConfig, SlackError> {
+        Ok(SlackConfig {
+            bot_token: std::env::get("SLACK_BOT_TOKEN")
+                .ok_or(SlackError::ConfigurationError { message: "SLACK_BOT_TOKEN not set".to_string() })?,
+            signing_secret: std::env::get("SLACK_SIGNING_SECRET")
+                .ok_or(SlackError::ConfigurationError { message: "SLACK_SIGNING_SECRET not set".to_string() })?,
+            app_id: std::env::get("SLACK_APP_ID").unwrap_or_default(),
+            client_id: std::env::get("SLACK_CLIENT_ID"),
+            client_secret: std::env::get("SLACK_CLIENT_SECRET"),
+            default_channel: std::env::get("SLACK_DEFAULT_CHANNEL"),
+            bot_user_id: std::env::get("SLACK_BOT_USER_ID")
+        })
+    }
+}
+
+// =============================================================================
+// SLACK TYPES
+// =============================================================================
+
+/// Slack channel
+type SlackChannel {
+    id: String,
+    name: String,
+    is_channel: Bool,
+    is_private: Bool,
+    is_archived: Bool,
+    is_member: Bool,
+    topic: Option<ChannelTopic>,
+    purpose: Option<ChannelPurpose>,
+    num_members: Option<i32>,
+    created: i64
+}
+
+/// Channel topic
+type ChannelTopic {
+    value: String,
+    creator: String,
+    last_set: i64
+}
+
+/// Channel purpose
+type ChannelPurpose {
+    value: String,
+    creator: String,
+    last_set: i64
+}
+
+/// Slack user
+type SlackUser {
+    id: String,
+    name: String,
+    real_name: Option<String>,
+    email: Option<String>,
+    is_admin: Bool,
+    is_owner: Bool,
+    is_bot: Bool,
+    profile: Option<UserProfile>
+}
+
+/// User profile
+type UserProfile {
+    display_name: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    email: Option<String>,
+    image_72: Option<String>,
+    image_192: Option<String>
+}
+
+/// Slack message
+type SlackMessage {
+    ts: String,
+    channel: String,
+    text: String,
+    user: Option<String>,
+    bot_id: Option<String>,
+    blocks: Option<List<Block>>,
+    attachments: Option<List<Attachment>>,
+    thread_ts: Option<String>,
+    reply_count: Option<i32>,
+    reactions: Option<List<Reaction>>
+}
+
+/// Reaction
+type Reaction {
+    name: String,
+    count: i32,
+    users: List<String>
+}
+
+/// Block Kit block
+enum Block {
+    Section {
+        block_id: Option<String>,
+        text: TextObject,
+        accessory: Option<BlockElement>,
+        fields: Option<List<TextObject>>
+    },
+    Divider {
+        block_id: Option<String>
+    },
+    Image {
+        block_id: Option<String>,
+        image_url: String,
+        alt_text: String,
+        title: Option<TextObject>
+    },
+    Actions {
+        block_id: Option<String>,
+        elements: List<BlockElement>
+    },
+    Context {
+        block_id: Option<String>,
+        elements: List<ContextElement>
+    },
+    Header {
+        block_id: Option<String>,
+        text: TextObject
+    },
+    Input {
+        block_id: Option<String>,
+        label: TextObject,
+        element: BlockElement,
+        hint: Option<TextObject>,
+        optional: Bool
+    }
+}
+
+/// Text object
+type TextObject {
+    type_: TextType,
+    text: String,
+    emoji: Option<Bool>,
+    verbatim: Option<Bool>
+}
+
+/// Text type
+enum TextType {
+    PlainText,
+    Mrkdwn
+}
+
+impl TextType {
+    fn to_string(&self) -> String {
+        match self {
+            TextType::PlainText => "plain_text".to_string(),
+            TextType::Mrkdwn => "mrkdwn".to_string()
+        }
+    }
+}
+
+/// Block element
+enum BlockElement {
+    Button {
+        action_id: String,
+        text: TextObject,
+        url: Option<String>,
+        value: Option<String>,
+        style: Option<ButtonStyle>
+    },
+    StaticSelect {
+        action_id: String,
+        placeholder: Option<TextObject>,
+        options: List<SelectOption>,
+        initial_option: Option<SelectOption>
+    },
+    MultiStaticSelect {
+        action_id: String,
+        placeholder: Option<TextObject>,
+        options: List<SelectOption>,
+        initial_options: Option<List<SelectOption>>
+    },
+    UsersSelect {
+        action_id: String,
+        placeholder: Option<TextObject>,
+        initial_user: Option<String>
+    },
+    ConversationsSelect {
+        action_id: String,
+        placeholder: Option<TextObject>,
+        initial_conversation: Option<String>
+    },
+    DatePicker {
+        action_id: String,
+        placeholder: Option<TextObject>,
+        initial_date: Option<String>
+    },
+    PlainTextInput {
+        action_id: String,
+        placeholder: Option<TextObject>,
+        initial_value: Option<String>,
+        multiline: Bool
+    },
+    Overflow {
+        action_id: String,
+        options: List<SelectOption>
+    }
+}
+
+/// Button style
+enum ButtonStyle {
+    Primary,
+    Danger
+}
+
+impl ButtonStyle {
+    fn to_string(&self) -> String {
+        match self {
+            ButtonStyle::Primary => "primary".to_string(),
+            ButtonStyle::Danger => "danger".to_string()
+        }
+    }
+}
+
+/// Select option
+type SelectOption {
+    text: TextObject,
+    value: String,
+    description: Option<TextObject>
+}
+
+/// Context element
+enum ContextElement {
+    Text(TextObject),
+    Image { image_url: String, alt_text: String }
+}
+
+/// Legacy attachment (for backwards compatibility)
+type Attachment {
+    color: Option<String>,
+    pretext: Option<String>,
+    author_name: Option<String>,
+    author_icon: Option<String>,
+    title: Option<String>,
+    title_link: Option<String>,
+    text: Option<String>,
+    fields: Option<List<AttachmentField>>,
+    footer: Option<String>,
+    footer_icon: Option<String>,
+    ts: Option<i64>,
+    fallback: Option<String>
+}
+
+/// Attachment field
+type AttachmentField {
+    title: String,
+    value: String,
+    short: Bool
+}
+
+/// Slash command
+type SlashCommand {
+    token: String,
+    team_id: String,
+    team_domain: String,
+    channel_id: String,
+    channel_name: String,
+    user_id: String,
+    user_name: String,
+    command: String,
+    text: String,
+    response_url: String,
+    trigger_id: String
+}
+
+/// Interactive payload (button clicks, etc)
+type InteractionPayload {
+    type_: InteractionType,
+    trigger_id: String,
+    user: InteractionUser,
+    channel: Option<InteractionChannel>,
+    message: Option<SlackMessage>,
+    response_url: String,
+    actions: Option<List<InteractionAction>>
+}
+
+/// Interaction type
+enum InteractionType {
+    BlockActions,
+    MessageAction,
+    ViewSubmission,
+    ViewClosed,
+    Shortcut
+}
+
+/// Interaction user
+type InteractionUser {
+    id: String,
+    username: String,
+    name: String
+}
+
+/// Interaction channel
+type InteractionChannel {
+    id: String,
+    name: String
+}
+
+/// Interaction action
+type InteractionAction {
+    action_id: String,
+    block_id: Option<String>,
+    type_: String,
+    value: Option<String>,
+    selected_option: Option<SelectOption>,
+    selected_user: Option<String>,
+    selected_conversation: Option<String>,
+    selected_date: Option<String>
+}
+
+/// Modal view
+type ModalView {
+    type_: String,
+    callback_id: String,
+    title: TextObject,
+    submit: Option<TextObject>,
+    close: Option<TextObject>,
+    blocks: List<Block>,
+    private_metadata: Option<String>
+}
+
+// =============================================================================
+// ERROR TYPES
+// =============================================================================
+
+/// Slack errors
+enum SlackError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// Authentication error
+    AuthenticationError { message: String },
+    /// API error
+    ApiError { error: String, needed: Option<String> },
+    /// Channel not found
+    ChannelNotFound { channel: String },
+    /// User not found
+    UserNotFound { user: String },
+    /// Rate limit
+    RateLimitError { retry_after: i64 },
+    /// Invalid signature
+    InvalidSignature { message: String },
+    /// Network error
+    NetworkError { message: String }
+}
+
+impl SlackError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            SlackError::ConfigurationError { message } =>
+                LmsError::IntegrationError { provider: "slack".to_string(), message: message.clone() },
+            SlackError::AuthenticationError { message } =>
+                LmsError::AccessDenied { reason: message.clone() },
+            SlackError::ChannelNotFound { channel } =>
+                LmsError::NotFound { entity_type: "slack_channel".to_string(), id: channel.clone() },
+            SlackError::UserNotFound { user } =>
+                LmsError::NotFound { entity_type: "slack_user".to_string(), id: user.clone() },
+            SlackError::RateLimitError { retry_after } =>
+                LmsError::RateLimitExceeded { retry_after: Duration::seconds(*retry_after) },
+            _ => LmsError::IntegrationError { provider: "slack".to_string(), message: format!("{:?}", self) }
+        }
+    }
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating a channel
+type CreateChannelInput {
+    name: String,
+    is_private: Bool,
+    description: Option<String>,
+    /// Course ID for linking
+    course_id: Option<CourseId>
+}
+
+/// Input for posting a message
+type PostMessageInput {
+    channel: String,
+    text: String,
+    blocks: Option<List<Block>>,
+    attachments: Option<List<Attachment>>,
+    thread_ts: Option<String>,
+    reply_broadcast: Bool,
+    unfurl_links: Bool,
+    unfurl_media: Bool
+}
+
+/// Input for updating a message
+type UpdateMessageInput {
+    channel: String,
+    ts: String,
+    text: String,
+    blocks: Option<List<Block>>,
+    attachments: Option<List<Attachment>>
+}
+
+/// Command response
+type CommandResponse {
+    response_type: ResponseType,
+    text: Option<String>,
+    blocks: Option<List<Block>>,
+    attachments: Option<List<Attachment>>,
+    replace_original: Bool,
+    delete_original: Bool
+}
+
+/// Response type
+enum ResponseType {
+    InChannel,
+    Ephemeral
+}
+
+impl ResponseType {
+    fn to_string(&self) -> String {
+        match self {
+            ResponseType::InChannel => "in_channel".to_string(),
+            ResponseType::Ephemeral => "ephemeral".to_string()
+        }
+    }
+}
+
+// =============================================================================
+// SLACK SERVICE ACTOR
+// =============================================================================
+
+/// Slack service actor
+actor SlackService {
+    /// Configuration
+    config: SlackConfig,
+
+    /// HTTP client
+    client: HttpClient,
+
+    /// Channel cache (channel_id -> channel)
+    channels_cache: Map<String, SlackChannel>,
+
+    /// Course to channel mapping
+    course_channels: Map<CourseId, String>,
+
+    /// User cache
+    users_cache: Map<String, SlackUser>,
+
+    /// Email to user ID mapping
+    email_user_mapping: Map<String, String>
+}
+
+impl SlackService {
+    /// Create new Slack service
+    pub fn new(config: SlackConfig) -> SlackService {
+        SlackService {
+            config,
+            client: HttpClient::new(),
+            channels_cache: Map::new(),
+            course_channels: Map::new(),
+            users_cache: Map::new(),
+            email_user_mapping: Map::new()
+        }
+    }
+
+    /// Create from environment
+    pub fn from_env() -> Result<SlackService, SlackError> {
+        let config = SlackConfig::from_env()?;
+        Ok(SlackService::new(config))
+    }
+
+    // =========================================================================
+    // REQUEST VERIFICATION
+    // =========================================================================
+
+    /// Verify Slack request signature
+    pub fn verify_request(
+        &self,
+        timestamp: &str,
+        body: &str,
+        signature: &str
+    ) -> Result<(), SlackError> {
+        // Check timestamp is recent (within 5 minutes)
+        let ts: i64 = timestamp.parse()
+            .map_err(|_| SlackError::InvalidSignature { message: "Invalid timestamp".to_string() })?;
+
+        let now = DateTime::now().timestamp();
+        if (now - ts).abs() > 300 {
+            return Err(SlackError::InvalidSignature { message: "Timestamp too old".to_string() })
+        }
+
+        // Compute expected signature
+        let sig_basestring = format!("v0:{}:{}", timestamp, body);
+        let expected = hmac_sha256(self.config.signing_secret.as_bytes(), sig_basestring.as_bytes());
+        let expected_hex = format!("v0={}", hex::encode(&expected));
+
+        // Compare
+        if !constant_time_compare(signature.as_bytes(), expected_hex.as_bytes()) {
+            return Err(SlackError::InvalidSignature { message: "Signature mismatch".to_string() })
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // HTTP HELPERS
+    // =========================================================================
+
+    async fn api_call(&self, method: &str, body: Option<&Json>) -> Result<Json, SlackError> {
+        let url = format!("https://slack.com/api/{}", method);
+
+        let mut headers = Headers::new();
+        headers.set("Authorization", &format!("Bearer {}", self.config.bot_token));
+        headers.set("Content-Type", "application/json; charset=utf-8");
+
+        let response = if let Some(b) = body {
+            self.client.post(&url)
+                .headers(headers)
+                .body(&to_json(b))
+                .send()
+                .await
+        } else {
+            self.client.get(&url)
+                .headers(headers)
+                .send()
+                .await
+        }.map_err(|e| SlackError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    async fn handle_response(&self, response: Response) -> Result<Json, SlackError> {
+        // Check for rate limiting
+        if response.status() == 429 {
+            let retry_after = response.headers().get("Retry-After")
+                .and_then(|h| h.parse::<i64>().ok())
+                .unwrap_or(60);
+            return Err(SlackError::RateLimitError { retry_after })
+        }
+
+        let json: Json = response.json().await
+            .map_err(|e| SlackError::NetworkError { message: e.to_string() })?;
+
+        // Check for Slack API error
+        let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            let error = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown_error").to_string();
+            let needed = json.get("needed").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            return Err(match error.as_str() {
+                "channel_not_found" => SlackError::ChannelNotFound { channel: "unknown".to_string() },
+                "user_not_found" => SlackError::UserNotFound { user: "unknown".to_string() },
+                "invalid_auth" | "not_authed" => SlackError::AuthenticationError { message: error },
+                "ratelimited" => SlackError::RateLimitError { retry_after: 60 },
+                _ => SlackError::ApiError { error, needed }
+            })
+        }
+
+        Ok(json)
+    }
+
+    // =========================================================================
+    // CHANNEL MANAGEMENT
+    // =========================================================================
+
+    /// Create a channel
+    pub async fn create_channel(&mut self, input: CreateChannelInput) -> Result<SlackChannel, SlackError> {
+        let method = if input.is_private {
+            "conversations.create"
+        } else {
+            "conversations.create"
+        };
+
+        let mut body = Json::object([
+            ("name", Json::String(input.name.clone())),
+            ("is_private", Json::Bool(input.is_private))
+        ]);
+
+        let json = self.api_call(method, Some(&body)).await?;
+        let channel = self.parse_channel(json.get("channel").cloned().unwrap_or(Json::Null))?;
+
+        // Set topic/purpose if description provided
+        if let Some(desc) = input.description {
+            let _ = self.set_channel_topic(&channel.id, &desc).await;
+        }
+
+        // Cache
+        self.channels_cache.insert(channel.id.clone(), channel.clone());
+        if let Some(course_id) = input.course_id {
+            self.course_channels.insert(course_id, channel.id.clone());
+        }
+
+        Ok(channel)
+    }
+
+    /// Get channel by ID
+    pub async fn get_channel(&mut self, channel_id: &str) -> Result<SlackChannel, SlackError> {
+        // Check cache
+        if let Some(channel) = self.channels_cache.get(channel_id) {
+            return Ok(channel.clone())
+        }
+
+        let body = Json::object([
+            ("channel", Json::String(channel_id.to_string()))
+        ]);
+
+        let json = self.api_call("conversations.info", Some(&body)).await?;
+        let channel = self.parse_channel(json.get("channel").cloned().unwrap_or(Json::Null))?;
+
+        self.channels_cache.insert(channel_id.to_string(), channel.clone());
+
+        Ok(channel)
+    }
+
+    /// List channels
+    pub async fn list_channels(&mut self, include_private: Bool) -> Result<List<SlackChannel>, SlackError> {
+        let types = if include_private {
+            "public_channel,private_channel"
+        } else {
+            "public_channel"
+        };
+
+        let body = Json::object([
+            ("types", Json::String(types.to_string())),
+            ("limit", Json::Number(1000.into()))
+        ]);
+
+        let json = self.api_call("conversations.list", Some(&body)).await?;
+
+        let channels = json.get("channels")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|c| self.parse_channel(c.clone()).ok()).collect()
+            })
+            .unwrap_or_default();
+
+        // Update cache
+        for channel in &channels {
+            self.channels_cache.insert(channel.id.clone(), channel.clone());
+        }
+
+        Ok(channels)
+    }
+
+    /// Set channel topic
+    pub async fn set_channel_topic(&self, channel_id: &str, topic: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel_id.to_string())),
+            ("topic", Json::String(topic.to_string()))
+        ]);
+
+        self.api_call("conversations.setTopic", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Set channel purpose
+    pub async fn set_channel_purpose(&self, channel_id: &str, purpose: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel_id.to_string())),
+            ("purpose", Json::String(purpose.to_string()))
+        ]);
+
+        self.api_call("conversations.setPurpose", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Invite user to channel
+    pub async fn invite_to_channel(&self, channel_id: &str, user_id: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel_id.to_string())),
+            ("users", Json::String(user_id.to_string()))
+        ]);
+
+        self.api_call("conversations.invite", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Remove user from channel
+    pub async fn kick_from_channel(&self, channel_id: &str, user_id: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel_id.to_string())),
+            ("user", Json::String(user_id.to_string()))
+        ]);
+
+        self.api_call("conversations.kick", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Archive channel
+    pub async fn archive_channel(&mut self, channel_id: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel_id.to_string()))
+        ]);
+
+        self.api_call("conversations.archive", Some(&body)).await?;
+
+        // Update cache
+        if let Some(channel) = self.channels_cache.get_mut(channel_id) {
+            channel.is_archived = true;
+        }
+
+        Ok(())
+    }
+
+    fn parse_channel(&self, json: Json) -> Result<SlackChannel, SlackError> {
+        Ok(SlackChannel {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            is_channel: json.get("is_channel").and_then(|v| v.as_bool()).unwrap_or(true),
+            is_private: json.get("is_private").and_then(|v| v.as_bool()).unwrap_or(false),
+            is_archived: json.get("is_archived").and_then(|v| v.as_bool()).unwrap_or(false),
+            is_member: json.get("is_member").and_then(|v| v.as_bool()).unwrap_or(false),
+            topic: json.get("topic").map(|t| ChannelTopic {
+                value: t.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                creator: t.get("creator").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                last_set: t.get("last_set").and_then(|v| v.as_i64()).unwrap_or(0)
+            }),
+            purpose: json.get("purpose").map(|p| ChannelPurpose {
+                value: p.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                creator: p.get("creator").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                last_set: p.get("last_set").and_then(|v| v.as_i64()).unwrap_or(0)
+            }),
+            num_members: json.get("num_members").and_then(|v| v.as_i64()).map(|n| n as i32),
+            created: json.get("created").and_then(|v| v.as_i64()).unwrap_or(0)
+        })
+    }
+
+    // =========================================================================
+    // USER MANAGEMENT
+    // =========================================================================
+
+    /// Get user by ID
+    pub async fn get_user(&mut self, user_id: &str) -> Result<SlackUser, SlackError> {
+        // Check cache
+        if let Some(user) = self.users_cache.get(user_id) {
+            return Ok(user.clone())
+        }
+
+        let body = Json::object([
+            ("user", Json::String(user_id.to_string()))
+        ]);
+
+        let json = self.api_call("users.info", Some(&body)).await?;
+        let user = self.parse_user(json.get("user").cloned().unwrap_or(Json::Null))?;
+
+        self.users_cache.insert(user_id.to_string(), user.clone());
+        if let Some(email) = &user.email {
+            self.email_user_mapping.insert(email.clone(), user.id.clone());
+        }
+
+        Ok(user)
+    }
+
+    /// Find user by email
+    pub async fn find_user_by_email(&mut self, email: &str) -> Result<SlackUser, SlackError> {
+        // Check cache
+        if let Some(user_id) = self.email_user_mapping.get(email) {
+            if let Some(user) = self.users_cache.get(user_id) {
+                return Ok(user.clone())
+            }
+        }
+
+        let body = Json::object([
+            ("email", Json::String(email.to_string()))
+        ]);
+
+        let json = self.api_call("users.lookupByEmail", Some(&body)).await?;
+        let user = self.parse_user(json.get("user").cloned().unwrap_or(Json::Null))?;
+
+        self.users_cache.insert(user.id.clone(), user.clone());
+        self.email_user_mapping.insert(email.to_string(), user.id.clone());
+
+        Ok(user)
+    }
+
+    /// List workspace users
+    pub async fn list_users(&mut self, limit: Option<i32>) -> Result<List<SlackUser>, SlackError> {
+        let mut body = Json::object([]);
+        if let Some(l) = limit {
+            body.as_object_mut().map(|obj| {
+                obj.insert("limit".to_string(), Json::Number(l.into()));
+            });
+        }
+
+        let json = self.api_call("users.list", Some(&body)).await?;
+
+        let users = json.get("members")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|u| self.parse_user(u.clone()).ok()).collect()
+            })
+            .unwrap_or_default();
+
+        // Update cache
+        for user in &users {
+            self.users_cache.insert(user.id.clone(), user.clone());
+            if let Some(email) = &user.email {
+                self.email_user_mapping.insert(email.clone(), user.id.clone());
+            }
+        }
+
+        Ok(users)
+    }
+
+    fn parse_user(&self, json: Json) -> Result<SlackUser, SlackError> {
+        let profile = json.get("profile").cloned();
+
+        Ok(SlackUser {
+            id: json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: json.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            real_name: json.get("real_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            email: profile.as_ref()
+                .and_then(|p| p.get("email"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            is_admin: json.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false),
+            is_owner: json.get("is_owner").and_then(|v| v.as_bool()).unwrap_or(false),
+            is_bot: json.get("is_bot").and_then(|v| v.as_bool()).unwrap_or(false),
+            profile: profile.map(|p| UserProfile {
+                display_name: p.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                first_name: p.get("first_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                last_name: p.get("last_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                email: p.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                image_72: p.get("image_72").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                image_192: p.get("image_192").and_then(|v| v.as_str()).map(|s| s.to_string())
+            })
+        })
+    }
+
+    // =========================================================================
+    // MESSAGING
+    // =========================================================================
+
+    /// Post a message
+    pub async fn post_message(&self, input: PostMessageInput) -> Result<SlackMessage, SlackError> {
+        let mut body = Json::object([
+            ("channel", Json::String(input.channel)),
+            ("text", Json::String(input.text)),
+            ("unfurl_links", Json::Bool(input.unfurl_links)),
+            ("unfurl_media", Json::Bool(input.unfurl_media))
+        ]);
+
+        if let Some(blocks) = input.blocks {
+            body.as_object_mut().map(|obj| {
+                obj.insert("blocks".to_string(), self.blocks_to_json(&blocks));
+            });
+        }
+
+        if let Some(attachments) = input.attachments {
+            body.as_object_mut().map(|obj| {
+                obj.insert("attachments".to_string(), self.attachments_to_json(&attachments));
+            });
+        }
+
+        if let Some(thread_ts) = input.thread_ts {
+            body.as_object_mut().map(|obj| {
+                obj.insert("thread_ts".to_string(), Json::String(thread_ts));
+                if input.reply_broadcast {
+                    obj.insert("reply_broadcast".to_string(), Json::Bool(true));
+                }
+            });
+        }
+
+        let json = self.api_call("chat.postMessage", Some(&body)).await?;
+        self.parse_message(json)
+    }
+
+    /// Update a message
+    pub async fn update_message(&self, input: UpdateMessageInput) -> Result<SlackMessage, SlackError> {
+        let mut body = Json::object([
+            ("channel", Json::String(input.channel)),
+            ("ts", Json::String(input.ts)),
+            ("text", Json::String(input.text))
+        ]);
+
+        if let Some(blocks) = input.blocks {
+            body.as_object_mut().map(|obj| {
+                obj.insert("blocks".to_string(), self.blocks_to_json(&blocks));
+            });
+        }
+
+        if let Some(attachments) = input.attachments {
+            body.as_object_mut().map(|obj| {
+                obj.insert("attachments".to_string(), self.attachments_to_json(&attachments));
+            });
+        }
+
+        let json = self.api_call("chat.update", Some(&body)).await?;
+        self.parse_message(json)
+    }
+
+    /// Delete a message
+    pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel.to_string())),
+            ("ts", Json::String(ts.to_string()))
+        ]);
+
+        self.api_call("chat.delete", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Post ephemeral message (only visible to one user)
+    pub async fn post_ephemeral(
+        &self,
+        channel: &str,
+        user: &str,
+        text: &str,
+        blocks: Option<List<Block>>
+    ) -> Result<(), SlackError> {
+        let mut body = Json::object([
+            ("channel", Json::String(channel.to_string())),
+            ("user", Json::String(user.to_string())),
+            ("text", Json::String(text.to_string()))
+        ]);
+
+        if let Some(b) = blocks {
+            body.as_object_mut().map(|obj| {
+                obj.insert("blocks".to_string(), self.blocks_to_json(&b));
+            });
+        }
+
+        self.api_call("chat.postEphemeral", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// React to a message
+    pub async fn add_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("channel", Json::String(channel.to_string())),
+            ("timestamp", Json::String(ts.to_string())),
+            ("name", Json::String(emoji.to_string()))
+        ]);
+
+        self.api_call("reactions.add", Some(&body)).await?;
+        Ok(())
+    }
+
+    fn parse_message(&self, json: Json) -> Result<SlackMessage, SlackError> {
+        Ok(SlackMessage {
+            ts: json.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            channel: json.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            text: json.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            user: json.get("user").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            bot_id: json.get("bot_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            blocks: None, // Parse if needed
+            attachments: None,
+            thread_ts: json.get("thread_ts").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            reply_count: json.get("reply_count").and_then(|v| v.as_i64()).map(|n| n as i32),
+            reactions: None
+        })
+    }
+
+    // =========================================================================
+    // BLOCK KIT HELPERS
+    // =========================================================================
+
+    fn blocks_to_json(&self, blocks: &List<Block>) -> Json {
+        Json::Array(blocks.iter().map(|b| self.block_to_json(b)).collect())
+    }
+
+    fn block_to_json(&self, block: &Block) -> Json {
+        match block {
+            Block::Section { block_id, text, accessory, fields } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("section".to_string())),
+                    ("text", self.text_to_json(text))
+                ]);
+                if let Some(id) = block_id {
+                    obj.as_object_mut().map(|o| o.insert("block_id".to_string(), Json::String(id.clone())));
+                }
+                if let Some(acc) = accessory {
+                    obj.as_object_mut().map(|o| o.insert("accessory".to_string(), self.element_to_json(acc)));
+                }
+                if let Some(f) = fields {
+                    obj.as_object_mut().map(|o| o.insert("fields".to_string(), Json::Array(f.iter().map(|t| self.text_to_json(t)).collect())));
+                }
+                obj
+            },
+            Block::Divider { block_id } => {
+                let mut obj = Json::object([("type", Json::String("divider".to_string()))]);
+                if let Some(id) = block_id {
+                    obj.as_object_mut().map(|o| o.insert("block_id".to_string(), Json::String(id.clone())));
+                }
+                obj
+            },
+            Block::Header { block_id, text } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("header".to_string())),
+                    ("text", self.text_to_json(text))
+                ]);
+                if let Some(id) = block_id {
+                    obj.as_object_mut().map(|o| o.insert("block_id".to_string(), Json::String(id.clone())));
+                }
+                obj
+            },
+            Block::Image { block_id, image_url, alt_text, title } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("image".to_string())),
+                    ("image_url", Json::String(image_url.clone())),
+                    ("alt_text", Json::String(alt_text.clone()))
+                ]);
+                if let Some(id) = block_id {
+                    obj.as_object_mut().map(|o| o.insert("block_id".to_string(), Json::String(id.clone())));
+                }
+                if let Some(t) = title {
+                    obj.as_object_mut().map(|o| o.insert("title".to_string(), self.text_to_json(t)));
+                }
+                obj
+            },
+            Block::Actions { block_id, elements } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("actions".to_string())),
+                    ("elements", Json::Array(elements.iter().map(|e| self.element_to_json(e)).collect()))
+                ]);
+                if let Some(id) = block_id {
+                    obj.as_object_mut().map(|o| o.insert("block_id".to_string(), Json::String(id.clone())));
+                }
+                obj
+            },
+            Block::Context { block_id, elements } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("context".to_string())),
+                    ("elements", Json::Array(elements.iter().map(|e| match e {
+                        ContextElement::Text(t) => self.text_to_json(t),
+                        ContextElement::Image { image_url, alt_text } => Json::object([
+                            ("type", Json::String("image".to_string())),
+                            ("image_url", Json::String(image_url.clone())),
+                            ("alt_text", Json::String(alt_text.clone()))
+                        ])
+                    }).collect()))
+                ]);
+                if let Some(id) = block_id {
+                    obj.as_object_mut().map(|o| o.insert("block_id".to_string(), Json::String(id.clone())));
+                }
+                obj
+            },
+            _ => Json::Null
+        }
+    }
+
+    fn text_to_json(&self, text: &TextObject) -> Json {
+        let mut obj = Json::object([
+            ("type", Json::String(text.type_.to_string())),
+            ("text", Json::String(text.text.clone()))
+        ]);
+        if let Some(emoji) = text.emoji {
+            obj.as_object_mut().map(|o| o.insert("emoji".to_string(), Json::Bool(emoji)));
+        }
+        obj
+    }
+
+    fn element_to_json(&self, element: &BlockElement) -> Json {
+        match element {
+            BlockElement::Button { action_id, text, url, value, style } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("button".to_string())),
+                    ("action_id", Json::String(action_id.clone())),
+                    ("text", self.text_to_json(text))
+                ]);
+                if let Some(u) = url {
+                    obj.as_object_mut().map(|o| o.insert("url".to_string(), Json::String(u.clone())));
+                }
+                if let Some(v) = value {
+                    obj.as_object_mut().map(|o| o.insert("value".to_string(), Json::String(v.clone())));
+                }
+                if let Some(s) = style {
+                    obj.as_object_mut().map(|o| o.insert("style".to_string(), Json::String(s.to_string())));
+                }
+                obj
+            },
+            BlockElement::StaticSelect { action_id, placeholder, options, initial_option } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("static_select".to_string())),
+                    ("action_id", Json::String(action_id.clone())),
+                    ("options", Json::Array(options.iter().map(|o| self.option_to_json(o)).collect()))
+                ]);
+                if let Some(p) = placeholder {
+                    obj.as_object_mut().map(|o| o.insert("placeholder".to_string(), self.text_to_json(p)));
+                }
+                if let Some(i) = initial_option {
+                    obj.as_object_mut().map(|o| o.insert("initial_option".to_string(), self.option_to_json(i)));
+                }
+                obj
+            },
+            BlockElement::DatePicker { action_id, placeholder, initial_date } => {
+                let mut obj = Json::object([
+                    ("type", Json::String("datepicker".to_string())),
+                    ("action_id", Json::String(action_id.clone()))
+                ]);
+                if let Some(p) = placeholder {
+                    obj.as_object_mut().map(|o| o.insert("placeholder".to_string(), self.text_to_json(p)));
+                }
+                if let Some(d) = initial_date {
+                    obj.as_object_mut().map(|o| o.insert("initial_date".to_string(), Json::String(d.clone())));
+                }
+                obj
+            },
+            _ => Json::Null
+        }
+    }
+
+    fn option_to_json(&self, option: &SelectOption) -> Json {
+        let mut obj = Json::object([
+            ("text", self.text_to_json(&option.text)),
+            ("value", Json::String(option.value.clone()))
+        ]);
+        if let Some(desc) = &option.description {
+            obj.as_object_mut().map(|o| o.insert("description".to_string(), self.text_to_json(desc)));
+        }
+        obj
+    }
+
+    fn attachments_to_json(&self, attachments: &List<Attachment>) -> Json {
+        Json::Array(attachments.iter().map(|a| {
+            let mut obj = Json::object([]);
+            if let Some(color) = &a.color {
+                obj.as_object_mut().map(|o| o.insert("color".to_string(), Json::String(color.clone())));
+            }
+            if let Some(pretext) = &a.pretext {
+                obj.as_object_mut().map(|o| o.insert("pretext".to_string(), Json::String(pretext.clone())));
+            }
+            if let Some(title) = &a.title {
+                obj.as_object_mut().map(|o| o.insert("title".to_string(), Json::String(title.clone())));
+            }
+            if let Some(title_link) = &a.title_link {
+                obj.as_object_mut().map(|o| o.insert("title_link".to_string(), Json::String(title_link.clone())));
+            }
+            if let Some(text) = &a.text {
+                obj.as_object_mut().map(|o| o.insert("text".to_string(), Json::String(text.clone())));
+            }
+            if let Some(footer) = &a.footer {
+                obj.as_object_mut().map(|o| o.insert("footer".to_string(), Json::String(footer.clone())));
+            }
+            if let Some(fields) = &a.fields {
+                obj.as_object_mut().map(|o| o.insert("fields".to_string(), Json::Array(
+                    fields.iter().map(|f| Json::object([
+                        ("title", Json::String(f.title.clone())),
+                        ("value", Json::String(f.value.clone())),
+                        ("short", Json::Bool(f.short))
+                    ])).collect()
+                )));
+            }
+            obj
+        }).collect())
+    }
+
+    // =========================================================================
+    // MODALS
+    // =========================================================================
+
+    /// Open a modal
+    pub async fn open_modal(&self, trigger_id: &str, view: &ModalView) -> Result<String, SlackError> {
+        let body = Json::object([
+            ("trigger_id", Json::String(trigger_id.to_string())),
+            ("view", self.view_to_json(view))
+        ]);
+
+        let json = self.api_call("views.open", Some(&body)).await?;
+
+        json.get("view")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or(SlackError::ApiError { error: "no_view_id".to_string(), needed: None })
+    }
+
+    /// Update a modal
+    pub async fn update_modal(&self, view_id: &str, view: &ModalView) -> Result<(), SlackError> {
+        let body = Json::object([
+            ("view_id", Json::String(view_id.to_string())),
+            ("view", self.view_to_json(view))
+        ]);
+
+        self.api_call("views.update", Some(&body)).await?;
+        Ok(())
+    }
+
+    fn view_to_json(&self, view: &ModalView) -> Json {
+        let mut obj = Json::object([
+            ("type", Json::String(view.type_.clone())),
+            ("callback_id", Json::String(view.callback_id.clone())),
+            ("title", self.text_to_json(&view.title)),
+            ("blocks", self.blocks_to_json(&view.blocks))
+        ]);
+
+        if let Some(submit) = &view.submit {
+            obj.as_object_mut().map(|o| o.insert("submit".to_string(), self.text_to_json(submit)));
+        }
+        if let Some(close) = &view.close {
+            obj.as_object_mut().map(|o| o.insert("close".to_string(), self.text_to_json(close)));
+        }
+        if let Some(metadata) = &view.private_metadata {
+            obj.as_object_mut().map(|o| o.insert("private_metadata".to_string(), Json::String(metadata.clone())));
+        }
+
+        obj
+    }
+
+    // =========================================================================
+    // SLASH COMMANDS
+    // =========================================================================
+
+    /// Handle /grade command
+    pub async fn handle_grade_command(
+        &self,
+        command: &SlashCommand,
+        course_name: &str,
+        grades: List<(String, String)> // (assignment, grade)
+    ) -> Result<CommandResponse, SlackError> {
+        let mut fields: Vec<AttachmentField> = grades.iter().map(|(assignment, grade)| {
+            AttachmentField {
+                title: assignment.clone(),
+                value: grade.clone(),
+                short: true
+            }
+        }).collect();
+
+        Ok(CommandResponse {
+            response_type: ResponseType::Ephemeral,
+            text: Some(format!("Your grades for {}", course_name)),
+            blocks: None,
+            attachments: Some(vec![Attachment {
+                color: Some("#36a64f".to_string()),
+                pretext: None,
+                author_name: None,
+                author_icon: None,
+                title: Some(format!("Grades for {}", course_name)),
+                title_link: None,
+                text: None,
+                fields: Some(fields),
+                footer: Some("Intelligo LMS".to_string()),
+                footer_icon: None,
+                ts: Some(DateTime::now().timestamp()),
+                fallback: Some("Your grades".to_string())
+            }]),
+            replace_original: false,
+            delete_original: false
+        })
+    }
+
+    /// Handle /submit command - opens submission modal
+    pub async fn handle_submit_command(
+        &self,
+        command: &SlashCommand,
+        assignments: List<(String, String)> // (id, name)
+    ) -> Result<(), SlackError> {
+        let options: Vec<SelectOption> = assignments.iter().map(|(id, name)| {
+            SelectOption {
+                text: TextObject {
+                    type_: TextType::PlainText,
+                    text: name.clone(),
+                    emoji: Some(true),
+                    verbatim: None
+                },
+                value: id.clone(),
+                description: None
+            }
+        }).collect();
+
+        let view = ModalView {
+            type_: "modal".to_string(),
+            callback_id: "submit_assignment".to_string(),
+            title: TextObject {
+                type_: TextType::PlainText,
+                text: "Submit Assignment".to_string(),
+                emoji: Some(true),
+                verbatim: None
+            },
+            submit: Some(TextObject {
+                type_: TextType::PlainText,
+                text: "Submit".to_string(),
+                emoji: Some(true),
+                verbatim: None
+            }),
+            close: Some(TextObject {
+                type_: TextType::PlainText,
+                text: "Cancel".to_string(),
+                emoji: Some(true),
+                verbatim: None
+            }),
+            blocks: vec![
+                Block::Input {
+                    block_id: Some("assignment_select".to_string()),
+                    label: TextObject {
+                        type_: TextType::PlainText,
+                        text: "Select Assignment".to_string(),
+                        emoji: None,
+                        verbatim: None
+                    },
+                    element: BlockElement::StaticSelect {
+                        action_id: "assignment".to_string(),
+                        placeholder: Some(TextObject {
+                            type_: TextType::PlainText,
+                            text: "Choose an assignment".to_string(),
+                            emoji: None,
+                            verbatim: None
+                        }),
+                        options,
+                        initial_option: None
+                    },
+                    hint: None,
+                    optional: false
+                },
+                Block::Input {
+                    block_id: Some("submission_text".to_string()),
+                    label: TextObject {
+                        type_: TextType::PlainText,
+                        text: "Your Submission".to_string(),
+                        emoji: None,
+                        verbatim: None
+                    },
+                    element: BlockElement::PlainTextInput {
+                        action_id: "submission_content".to_string(),
+                        placeholder: Some(TextObject {
+                            type_: TextType::PlainText,
+                            text: "Enter your submission or paste a link".to_string(),
+                            emoji: None,
+                            verbatim: None
+                        }),
+                        initial_value: None,
+                        multiline: true
+                    },
+                    hint: Some(TextObject {
+                        type_: TextType::PlainText,
+                        text: "You can paste text or a link to your work".to_string(),
+                        emoji: None,
+                        verbatim: None
+                    }),
+                    optional: false
+                }
+            ],
+            private_metadata: Some(command.user_id.clone())
+        };
+
+        self.open_modal(&command.trigger_id, &view).await?;
+        Ok(())
+    }
+
+    /// Handle /course command - show course info
+    pub async fn handle_course_command(
+        &self,
+        command: &SlashCommand,
+        course_name: &str,
+        course_description: &str,
+        instructor: &str,
+        upcoming: List<(String, String, String)> // (type, name, due_date)
+    ) -> Result<CommandResponse, SlackError> {
+        let mut blocks = vec![
+            Block::Header {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::PlainText,
+                    text: course_name.to_string(),
+                    emoji: Some(true),
+                    verbatim: None
+                }
+            },
+            Block::Section {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::Mrkdwn,
+                    text: format!("*Instructor:* {}\n\n{}", instructor, course_description),
+                    emoji: None,
+                    verbatim: None
+                },
+                accessory: None,
+                fields: None
+            },
+            Block::Divider { block_id: None }
+        ];
+
+        if !upcoming.is_empty() {
+            blocks.push(Block::Section {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::Mrkdwn,
+                    text: "*Upcoming:*".to_string(),
+                    emoji: None,
+                    verbatim: None
+                },
+                accessory: None,
+                fields: None
+            });
+
+            for (item_type, name, due) in upcoming {
+                blocks.push(Block::Context {
+                    block_id: None,
+                    elements: vec![
+                        ContextElement::Text(TextObject {
+                            type_: TextType::Mrkdwn,
+                            text: format!(":calendar: {} - *{}* - Due: {}", item_type, name, due),
+                            emoji: None,
+                            verbatim: None
+                        })
+                    ]
+                });
+            }
+        }
+
+        Ok(CommandResponse {
+            response_type: ResponseType::Ephemeral,
+            text: Some(format!("Course info for {}", course_name)),
+            blocks: Some(blocks),
+            attachments: None,
+            replace_original: false,
+            delete_original: false
+        })
+    }
+
+    /// Send command response to response_url
+    pub async fn send_response(&self, response_url: &str, response: &CommandResponse) -> Result<(), SlackError> {
+        let mut body = Json::object([
+            ("response_type", Json::String(response.response_type.to_string())),
+            ("replace_original", Json::Bool(response.replace_original)),
+            ("delete_original", Json::Bool(response.delete_original))
+        ]);
+
+        if let Some(text) = &response.text {
+            body.as_object_mut().map(|o| o.insert("text".to_string(), Json::String(text.clone())));
+        }
+
+        if let Some(blocks) = &response.blocks {
+            body.as_object_mut().map(|o| o.insert("blocks".to_string(), self.blocks_to_json(blocks)));
+        }
+
+        if let Some(attachments) = &response.attachments {
+            body.as_object_mut().map(|o| o.insert("attachments".to_string(), self.attachments_to_json(attachments)));
+        }
+
+        let mut headers = Headers::new();
+        headers.set("Content-Type", "application/json");
+
+        self.client.post(response_url)
+            .headers(headers)
+            .body(&to_json(&body))
+            .send()
+            .await
+            .map_err(|e| SlackError::NetworkError { message: e.to_string() })?;
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // LMS CONVENIENCE METHODS
+    // =========================================================================
+
+    /// Post course announcement
+    pub async fn post_course_announcement(
+        &self,
+        course_id: &CourseId,
+        title: &str,
+        content: &str,
+        instructor_name: &str,
+        url: Option<&str>
+    ) -> Result<SlackMessage, SlackError> {
+        let channel = self.course_channels.get(course_id)
+            .or(self.config.default_channel.as_ref())
+            .ok_or(SlackError::ChannelNotFound { channel: course_id.clone() })?
+            .clone();
+
+        let blocks = vec![
+            Block::Header {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::PlainText,
+                    text: format!(":mega: {}", title),
+                    emoji: Some(true),
+                    verbatim: None
+                }
+            },
+            Block::Section {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::Mrkdwn,
+                    text: content.to_string(),
+                    emoji: None,
+                    verbatim: None
+                },
+                accessory: url.map(|u| BlockElement::Button {
+                    action_id: "view_announcement".to_string(),
+                    text: TextObject {
+                        type_: TextType::PlainText,
+                        text: "View in LMS".to_string(),
+                        emoji: Some(true),
+                        verbatim: None
+                    },
+                    url: Some(u.to_string()),
+                    value: None,
+                    style: None
+                }),
+                fields: None
+            },
+            Block::Context {
+                block_id: None,
+                elements: vec![
+                    ContextElement::Text(TextObject {
+                        type_: TextType::Mrkdwn,
+                        text: format!("Posted by {} | {}", instructor_name, DateTime::now().format("%B %d, %Y")),
+                        emoji: None,
+                        verbatim: None
+                    })
+                ]
+            }
+        ];
+
+        self.post_message(PostMessageInput {
+            channel,
+            text: format!("{}: {}", title, content),
+            blocks: Some(blocks),
+            attachments: None,
+            thread_ts: None,
+            reply_broadcast: false,
+            unfurl_links: false,
+            unfurl_media: false
+        }).await
+    }
+
+    /// Notify about new assignment
+    pub async fn notify_new_assignment(
+        &self,
+        course_id: &CourseId,
+        assignment_name: &str,
+        due_date: &str,
+        description: &str,
+        url: &str
+    ) -> Result<SlackMessage, SlackError> {
+        let channel = self.course_channels.get(course_id)
+            .or(self.config.default_channel.as_ref())
+            .ok_or(SlackError::ChannelNotFound { channel: course_id.clone() })?
+            .clone();
+
+        let blocks = vec![
+            Block::Section {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::Mrkdwn,
+                    text: format!(":clipboard: *New Assignment: {}*\n\n{}", assignment_name, description),
+                    emoji: None,
+                    verbatim: None
+                },
+                accessory: Some(BlockElement::Button {
+                    action_id: "view_assignment".to_string(),
+                    text: TextObject {
+                        type_: TextType::PlainText,
+                        text: "View Assignment".to_string(),
+                        emoji: Some(true),
+                        verbatim: None
+                    },
+                    url: Some(url.to_string()),
+                    value: None,
+                    style: Some(ButtonStyle::Primary)
+                }),
+                fields: None
+            },
+            Block::Context {
+                block_id: None,
+                elements: vec![
+                    ContextElement::Text(TextObject {
+                        type_: TextType::Mrkdwn,
+                        text: format!(":calendar: Due: {}", due_date),
+                        emoji: None,
+                        verbatim: None
+                    })
+                ]
+            }
+        ];
+
+        self.post_message(PostMessageInput {
+            channel,
+            text: format!("New assignment: {} - Due: {}", assignment_name, due_date),
+            blocks: Some(blocks),
+            attachments: None,
+            thread_ts: None,
+            reply_broadcast: false,
+            unfurl_links: false,
+            unfurl_media: false
+        }).await
+    }
+
+    /// Notify about grade
+    pub async fn notify_grade(
+        &self,
+        user_email: &str,
+        assignment_name: &str,
+        grade: &str,
+        feedback: Option<&str>,
+        url: &str
+    ) -> Result<(), SlackError> {
+        // Find user by email
+        let user = self.find_user_by_email(user_email).await?;
+
+        let mut text = format!(
+            ":star: Your grade for *{}* is ready!\n\n*Grade:* {}",
+            assignment_name, grade
+        );
+
+        if let Some(fb) = feedback {
+            text.push_str(&format!("\n\n*Feedback:* {}", fb));
+        }
+
+        let blocks = vec![
+            Block::Section {
+                block_id: None,
+                text: TextObject {
+                    type_: TextType::Mrkdwn,
+                    text,
+                    emoji: None,
+                    verbatim: None
+                },
+                accessory: Some(BlockElement::Button {
+                    action_id: "view_grade".to_string(),
+                    text: TextObject {
+                        type_: TextType::PlainText,
+                        text: "View Details".to_string(),
+                        emoji: Some(true),
+                        verbatim: None
+                    },
+                    url: Some(url.to_string()),
+                    value: None,
+                    style: None
+                }),
+                fields: None
+            }
+        ];
+
+        // Send DM
+        let body = Json::object([
+            ("channel", Json::String(user.id)),
+            ("text", Json::String(format!("Grade posted for {}", assignment_name))),
+            ("blocks", self.blocks_to_json(&blocks))
+        ]);
+
+        self.api_call("chat.postMessage", Some(&body)).await?;
+        Ok(())
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}

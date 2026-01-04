@@ -1,0 +1,2204 @@
+// =============================================================================
+// INTELLIGO LMS - Observation Hive
+// =============================================================================
+// AI-powered monitoring and analytics system following CHAI patterns.
+// Provides LMS performance analysis, learning analytics, engagement tracking,
+// early warning systems, completion prediction, and anomaly detection
+// for comprehensive educational insights.
+// =============================================================================
+
+module intelligo::ai::hives::observation_hive
+
+use intelligo::core::types::*
+use simplex_inference::{Model, Prompt}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set, VecDeque}
+use std::sync::{Arc, RwLock}
+
+// =============================================================================
+// Observation Hive Types
+// =============================================================================
+
+type AlertId = String
+type MetricId = String
+type AnalyticsReportId = String
+type PredictionId = String
+
+/// Observation Hive Configuration
+pub struct ObservationHiveConfig {
+    /// Model for analysis
+    analysis_model: ModelConfig,
+    /// Metric collection interval
+    collection_interval: Duration,
+    /// Alert evaluation interval
+    alert_eval_interval: Duration,
+    /// Data retention period
+    retention_period: Duration,
+    /// Enable real-time monitoring
+    realtime_enabled: bool,
+    /// Enable predictive analytics
+    prediction_enabled: bool,
+    /// Anomaly detection sensitivity (0.0-1.0)
+    anomaly_sensitivity: f64,
+    /// Early warning thresholds
+    warning_thresholds: WarningThresholds,
+}
+
+impl Default for ObservationHiveConfig {
+    fn default() -> Self {
+        ObservationHiveConfig {
+            analysis_model: ModelConfig {
+                provider: ModelProvider::Anthropic,
+                model_id: "claude-sonnet-4-20250514".to_string(),
+                temperature: 0.2,
+                max_tokens: 4096,
+                top_p: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: vec![],
+                input_cost_per_1k: 0.003,
+                output_cost_per_1k: 0.015,
+            },
+            collection_interval: Duration::minutes(5),
+            alert_eval_interval: Duration::minutes(1),
+            retention_period: Duration::days(90),
+            realtime_enabled: true,
+            prediction_enabled: true,
+            anomaly_sensitivity: 0.8,
+            warning_thresholds: WarningThresholds::default(),
+        }
+    }
+}
+
+/// Model configuration
+pub struct ModelConfig {
+    provider: ModelProvider,
+    model_id: String,
+    temperature: f64,
+    max_tokens: i32,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    stop_sequences: List<String>,
+    input_cost_per_1k: f64,
+    output_cost_per_1k: f64,
+}
+
+/// Model provider
+pub enum ModelProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+    Local { endpoint: String },
+}
+
+/// Warning thresholds
+pub struct WarningThresholds {
+    /// Days inactive before warning
+    inactivity_days: i32,
+    /// Minimum engagement score
+    min_engagement_score: f64,
+    /// Minimum grade for concern
+    min_grade_threshold: f32,
+    /// Assignment submission rate threshold
+    submission_rate_threshold: f64,
+    /// Login frequency threshold
+    login_frequency_threshold: f64,
+}
+
+impl Default for WarningThresholds {
+    fn default() -> Self {
+        WarningThresholds {
+            inactivity_days: 7,
+            min_engagement_score: 0.3,
+            min_grade_threshold: 70.0,
+            submission_rate_threshold: 0.8,
+            login_frequency_threshold: 0.5,
+        }
+    }
+}
+
+// =============================================================================
+// LMS Performance Types
+// =============================================================================
+
+/// System health metrics
+pub struct SystemHealth {
+    timestamp: DateTime,
+    /// Overall health score (0.0-1.0)
+    health_score: f64,
+    /// API response times
+    api_metrics: ApiMetrics,
+    /// Database metrics
+    database_metrics: DatabaseMetrics,
+    /// AI service metrics
+    ai_service_metrics: AiServiceMetrics,
+    /// Storage metrics
+    storage_metrics: StorageMetrics,
+    /// Active users count
+    active_users: i64,
+    /// Active sessions
+    active_sessions: i64,
+    /// Error rate
+    error_rate: f64,
+    /// Issues detected
+    issues: List<SystemIssue>,
+}
+
+/// API performance metrics
+pub struct ApiMetrics {
+    /// Average response time (ms)
+    avg_response_time: f64,
+    /// P95 response time
+    p95_response_time: f64,
+    /// P99 response time
+    p99_response_time: f64,
+    /// Requests per second
+    requests_per_second: f64,
+    /// Error rate
+    error_rate: f64,
+    /// Endpoints with issues
+    slow_endpoints: List<EndpointMetric>,
+}
+
+/// Endpoint metric
+pub struct EndpointMetric {
+    endpoint: String,
+    avg_time: f64,
+    error_rate: f64,
+    request_count: i64,
+}
+
+/// Database metrics
+pub struct DatabaseMetrics {
+    /// Query time average (ms)
+    avg_query_time: f64,
+    /// Slow query count
+    slow_query_count: i64,
+    /// Connection pool utilization
+    pool_utilization: f64,
+    /// Active connections
+    active_connections: i32,
+    /// Deadlock count
+    deadlock_count: i64,
+}
+
+/// AI service metrics
+pub struct AiServiceMetrics {
+    /// Average inference time (ms)
+    avg_inference_time: f64,
+    /// Total tokens used
+    tokens_used: i64,
+    /// Model availability
+    availability: f64,
+    /// Queue depth
+    queue_depth: i32,
+    /// Cost accumulated
+    cost_accumulated: f64,
+    /// Per-hive metrics
+    hive_metrics: Map<String, HiveMetric>,
+}
+
+/// Individual hive metric
+pub struct HiveMetric {
+    hive_name: String,
+    requests_processed: i64,
+    avg_response_time: f64,
+    error_rate: f64,
+    cost: f64,
+}
+
+/// Storage metrics
+pub struct StorageMetrics {
+    /// Total storage used (bytes)
+    storage_used: i64,
+    /// Storage limit (bytes)
+    storage_limit: i64,
+    /// Utilization percentage
+    utilization: f64,
+    /// Upload/download bandwidth
+    bandwidth_usage: BandwidthUsage,
+}
+
+/// Bandwidth usage
+pub struct BandwidthUsage {
+    upload_bytes_per_second: f64,
+    download_bytes_per_second: f64,
+}
+
+/// System issue
+pub struct SystemIssue {
+    issue_type: IssueType,
+    severity: IssueSeverity,
+    component: String,
+    description: String,
+    detected_at: DateTime,
+    resolved: bool,
+}
+
+/// Issue type
+pub enum IssueType {
+    HighLatency,
+    HighErrorRate,
+    ResourceExhaustion,
+    ServiceUnavailable,
+    SecurityConcern,
+    DataIntegrity,
+}
+
+/// Issue severity
+pub enum IssueSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+// =============================================================================
+// Learning Analytics Types
+// =============================================================================
+
+/// Learning analytics report
+pub struct LearningAnalyticsReport {
+    id: AnalyticsReportId,
+    report_type: ReportType,
+    scope: AnalyticsScope,
+    period: AnalyticsPeriod,
+    /// Summary metrics
+    summary: AnalyticsSummary,
+    /// Detailed metrics
+    details: AnalyticsDetails,
+    /// Insights generated
+    insights: List<Insight>,
+    /// Recommendations
+    recommendations: List<Recommendation>,
+    generated_at: DateTime,
+}
+
+/// Report type
+pub enum ReportType {
+    CourseOverview,
+    StudentProgress,
+    EngagementAnalysis,
+    AssessmentAnalysis,
+    ContentEffectiveness,
+    InstructorPerformance,
+    TrendAnalysis,
+}
+
+/// Analytics scope
+pub enum AnalyticsScope {
+    Platform,
+    Tenant { tenant_id: TenantId },
+    Course { course_id: CourseId },
+    Module { module_id: ModuleId },
+    Student { student_id: StudentId },
+    Cohort { cohort_ids: List<StudentId> },
+}
+
+/// Analytics period
+pub struct AnalyticsPeriod {
+    start: DateTime,
+    end: DateTime,
+    granularity: TimeGranularity,
+}
+
+/// Time granularity
+pub enum TimeGranularity {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+}
+
+/// Analytics summary
+pub struct AnalyticsSummary {
+    /// Total students
+    total_students: i64,
+    /// Active students (in period)
+    active_students: i64,
+    /// Average engagement score
+    avg_engagement: f64,
+    /// Average grade
+    avg_grade: f32,
+    /// Completion rate
+    completion_rate: f64,
+    /// Pass rate
+    pass_rate: f64,
+    /// At-risk students count
+    at_risk_count: i64,
+}
+
+/// Analytics details
+pub struct AnalyticsDetails {
+    /// Engagement over time
+    engagement_trend: List<TimeSeriesPoint>,
+    /// Grade distribution
+    grade_distribution: GradeDistribution,
+    /// Content engagement
+    content_engagement: List<ContentEngagement>,
+    /// Assessment performance
+    assessment_performance: List<AssessmentPerformance>,
+    /// Learning objective mastery
+    objective_mastery: List<ObjectiveMastery>,
+    /// Time spent analysis
+    time_analysis: TimeAnalysis,
+}
+
+/// Time series data point
+pub struct TimeSeriesPoint {
+    timestamp: DateTime,
+    value: f64,
+    label: Option<String>,
+}
+
+/// Grade distribution
+pub struct GradeDistribution {
+    a_count: i64,
+    b_count: i64,
+    c_count: i64,
+    d_count: i64,
+    f_count: i64,
+    mean: f32,
+    median: f32,
+    std_dev: f32,
+}
+
+/// Content engagement metrics
+pub struct ContentEngagement {
+    content_id: String,
+    content_type: ContentType,
+    title: String,
+    views: i64,
+    completions: i64,
+    avg_time_spent: i32,
+    engagement_score: f64,
+    drop_off_rate: f64,
+}
+
+/// Assessment performance
+pub struct AssessmentPerformance {
+    assessment_id: AssessmentId,
+    title: String,
+    attempts: i64,
+    avg_score: f32,
+    pass_rate: f64,
+    avg_time: i32,
+    question_analysis: List<QuestionAnalysis>,
+}
+
+/// Question analysis
+pub struct QuestionAnalysis {
+    question_id: String,
+    correct_rate: f64,
+    avg_time: i32,
+    discrimination_index: f64,
+    difficulty_index: f64,
+}
+
+/// Learning objective mastery
+pub struct ObjectiveMastery {
+    objective_id: LearningObjectiveId,
+    description: String,
+    avg_mastery: f64,
+    students_mastered: i64,
+    students_struggling: i64,
+}
+
+/// Time analysis
+pub struct TimeAnalysis {
+    total_time_spent: i64,
+    avg_session_length: i32,
+    peak_hours: List<i32>,
+    peak_days: List<i32>,
+    time_by_content_type: Map<ContentType, i64>,
+}
+
+/// Insight from analytics
+pub struct Insight {
+    insight_type: InsightType,
+    title: String,
+    description: String,
+    significance: InsightSignificance,
+    affected_entities: List<String>,
+    data_points: Map<String, f64>,
+}
+
+/// Insight type
+pub enum InsightType {
+    Trend,
+    Anomaly,
+    Correlation,
+    Prediction,
+    Pattern,
+    Comparison,
+}
+
+/// Insight significance
+pub enum InsightSignificance {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Recommendation from analytics
+pub struct Recommendation {
+    category: RecommendationCategory,
+    title: String,
+    description: String,
+    priority: RecommendationPriority,
+    expected_impact: String,
+    action_items: List<String>,
+}
+
+/// Recommendation category
+pub enum RecommendationCategory {
+    Content,
+    Assessment,
+    Engagement,
+    Intervention,
+    Pacing,
+    Accessibility,
+}
+
+/// Recommendation priority
+pub enum RecommendationPriority {
+    Low,
+    Medium,
+    High,
+    Urgent,
+}
+
+// =============================================================================
+// Engagement Tracking Types
+// =============================================================================
+
+/// Real-time engagement data
+pub struct EngagementSnapshot {
+    timestamp: DateTime,
+    /// Currently active users
+    active_users: i64,
+    /// Users by activity type
+    activity_breakdown: Map<ActivityType, i64>,
+    /// Content being viewed
+    active_content: List<ActiveContent>,
+    /// Live session metrics
+    session_metrics: SessionMetrics,
+}
+
+/// Activity type
+pub enum ActivityType {
+    ViewingContent,
+    TakingAssessment,
+    InDiscussion,
+    UsingTutor,
+    Browsing,
+    Idle,
+}
+
+/// Active content
+pub struct ActiveContent {
+    content_id: String,
+    content_type: ContentType,
+    title: String,
+    viewer_count: i64,
+}
+
+/// Session metrics
+pub struct SessionMetrics {
+    total_sessions: i64,
+    avg_duration: i32,
+    bounce_rate: f64,
+    pages_per_session: f64,
+}
+
+/// Student engagement profile
+pub struct StudentEngagement {
+    student_id: StudentId,
+    /// Overall engagement score (0.0-1.0)
+    engagement_score: f64,
+    /// Engagement trend
+    trend: EngagementTrend,
+    /// Activity metrics
+    activity_metrics: ActivityMetrics,
+    /// Behavioral indicators
+    behavioral_indicators: BehavioralIndicators,
+    /// Engagement history
+    history: List<EngagementRecord>,
+    /// Last updated
+    updated_at: DateTime,
+}
+
+/// Engagement trend
+pub enum EngagementTrend {
+    Increasing,
+    Stable,
+    Declining,
+    Volatile,
+}
+
+/// Activity metrics
+pub struct ActivityMetrics {
+    /// Days active in last 30 days
+    days_active_30d: i32,
+    /// Total sessions
+    total_sessions: i64,
+    /// Total time spent (minutes)
+    total_time: i64,
+    /// Content items completed
+    content_completed: i64,
+    /// Assessments attempted
+    assessments_attempted: i64,
+    /// Discussion posts
+    discussion_posts: i64,
+    /// Tutor interactions
+    tutor_interactions: i64,
+}
+
+/// Behavioral indicators
+pub struct BehavioralIndicators {
+    /// Login consistency
+    login_consistency: f64,
+    /// Assignment timeliness
+    assignment_timeliness: f64,
+    /// Content completion rate
+    content_completion_rate: f64,
+    /// Assessment retry rate
+    assessment_retry_rate: f64,
+    /// Help-seeking behavior
+    help_seeking_score: f64,
+    /// Collaboration level
+    collaboration_score: f64,
+}
+
+/// Engagement record
+pub struct EngagementRecord {
+    date: DateTime,
+    score: f64,
+    activities: i32,
+    time_spent: i32,
+}
+
+// =============================================================================
+// Early Warning System Types
+// =============================================================================
+
+/// At-risk student identification
+pub struct AtRiskStudent {
+    student_id: StudentId,
+    course_id: CourseId,
+    /// Risk level
+    risk_level: RiskLevel,
+    /// Risk score (0.0-1.0)
+    risk_score: f64,
+    /// Risk factors
+    risk_factors: List<RiskFactor>,
+    /// Recommended interventions
+    interventions: List<InterventionSuggestion>,
+    /// Alert status
+    alert_status: AlertStatus,
+    /// Detection timestamp
+    detected_at: DateTime,
+    /// Last reviewed
+    last_reviewed: Option<DateTime>,
+}
+
+/// Risk factor
+pub struct RiskFactor {
+    factor_type: RiskFactorType,
+    description: String,
+    severity: f64,
+    evidence: String,
+    trend: FactorTrend,
+}
+
+/// Risk factor type
+pub enum RiskFactorType {
+    Inactivity,
+    LowGrades,
+    MissedDeadlines,
+    DecliningEngagement,
+    FailedAttempts,
+    LowTimeOnTask,
+    NoProgress,
+    IrregularPattern,
+}
+
+/// Factor trend
+pub enum FactorTrend {
+    Improving,
+    Stable,
+    Worsening,
+    NewlyDetected,
+}
+
+/// Intervention suggestion
+pub struct InterventionSuggestion {
+    intervention_type: InterventionType,
+    description: String,
+    priority: InterventionPriority,
+    expected_outcome: String,
+    resources_needed: List<String>,
+}
+
+/// Intervention type
+pub enum InterventionType {
+    PersonalOutreach,
+    AutomatedReminder,
+    TutorSession,
+    PeerSupport,
+    ContentRecommendation,
+    DeadlineExtension,
+    AdditionalResources,
+    InstructorMeeting,
+}
+
+/// Intervention priority
+pub enum InterventionPriority {
+    Low,
+    Medium,
+    High,
+    Urgent,
+}
+
+/// Alert status
+pub enum AlertStatus {
+    New,
+    Acknowledged,
+    InProgress,
+    Resolved,
+    Escalated,
+    Dismissed,
+}
+
+/// Alert for instructors/admins
+pub struct Alert {
+    id: AlertId,
+    alert_type: AlertType,
+    severity: AlertSeverity,
+    title: String,
+    description: String,
+    affected_entities: List<String>,
+    data: Map<String, Dynamic>,
+    status: AlertStatus,
+    created_at: DateTime,
+    acknowledged_at: Option<DateTime>,
+    resolved_at: Option<DateTime>,
+}
+
+/// Alert type
+pub enum AlertType {
+    StudentAtRisk,
+    SystemIssue,
+    AnomalyDetected,
+    ThresholdBreached,
+    PredictionAlert,
+    ContentIssue,
+    SecurityConcern,
+}
+
+/// Alert severity
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+// =============================================================================
+// Prediction Types
+// =============================================================================
+
+/// Completion prediction
+pub struct CompletionPrediction {
+    id: PredictionId,
+    student_id: StudentId,
+    course_id: CourseId,
+    /// Predicted completion probability
+    completion_probability: f64,
+    /// Predicted final grade
+    predicted_grade: Option<f32>,
+    /// Predicted completion date
+    predicted_completion_date: Option<DateTime>,
+    /// Confidence in prediction
+    confidence: f64,
+    /// Factors influencing prediction
+    contributing_factors: List<PredictionFactor>,
+    /// Generated at
+    generated_at: DateTime,
+}
+
+/// Factor contributing to prediction
+pub struct PredictionFactor {
+    factor_name: String,
+    importance: f64,
+    current_value: f64,
+    impact: PredictionImpact,
+}
+
+/// Prediction impact
+pub enum PredictionImpact {
+    Positive,
+    Negative,
+    Neutral,
+}
+
+/// Course outcome prediction
+pub struct CourseOutcomePrediction {
+    course_id: CourseId,
+    /// Expected pass rate
+    predicted_pass_rate: f64,
+    /// Expected average grade
+    predicted_avg_grade: f32,
+    /// Expected completion rate
+    predicted_completion_rate: f64,
+    /// Student-level predictions
+    student_predictions: List<CompletionPrediction>,
+    /// Confidence
+    confidence: f64,
+    /// Generated at
+    generated_at: DateTime,
+}
+
+// =============================================================================
+// Anomaly Detection Types
+// =============================================================================
+
+/// Detected anomaly
+pub struct Anomaly {
+    id: String,
+    anomaly_type: AnomalyType,
+    severity: AnomalySeverity,
+    description: String,
+    /// Affected metric/dimension
+    affected_metric: String,
+    /// Expected value
+    expected_value: f64,
+    /// Actual value
+    actual_value: f64,
+    /// Deviation
+    deviation: f64,
+    /// Detection timestamp
+    detected_at: DateTime,
+    /// Context
+    context: AnomalyContext,
+}
+
+/// Anomaly type
+pub enum AnomalyType {
+    /// Unusual spike in metric
+    Spike,
+    /// Unusual drop in metric
+    Drop,
+    /// Pattern deviation
+    PatternDeviation,
+    /// Outlier value
+    Outlier,
+    /// Trend break
+    TrendBreak,
+    /// Correlation break
+    CorrelationBreak,
+}
+
+/// Anomaly severity
+pub enum AnomalySeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Anomaly context
+pub struct AnomalyContext {
+    entity_type: String,
+    entity_id: String,
+    related_entities: List<String>,
+    historical_context: String,
+}
+
+// =============================================================================
+// Observation Hive Specialists
+// =============================================================================
+
+/// LMS Performance Analyzer Specialist
+pub struct LMSPerformanceAnalyzer {
+    config: ModelConfig,
+    metrics_buffer: VecDeque<SystemHealth>,
+    buffer_size: usize,
+}
+
+impl LMSPerformanceAnalyzer {
+    pub fn new(config: ModelConfig) -> Self {
+        LMSPerformanceAnalyzer {
+            config,
+            metrics_buffer: VecDeque::with_capacity(1000),
+            buffer_size: 1000,
+        }
+    }
+
+    pub fn record_metrics(&mut self, health: SystemHealth) {
+        if self.metrics_buffer.len() >= self.buffer_size {
+            self.metrics_buffer.pop_front();
+        }
+        self.metrics_buffer.push_back(health);
+    }
+
+    pub fn analyze_health(&self) -> SystemHealth {
+        if self.metrics_buffer.is_empty() {
+            return self.default_health();
+        }
+
+        let latest = self.metrics_buffer.back().unwrap().clone();
+
+        // Analyze trends and detect issues
+        let mut issues = vec![];
+
+        // Check API latency
+        if latest.api_metrics.p95_response_time > 1000.0 {
+            issues.push(SystemIssue {
+                issue_type: IssueType::HighLatency,
+                severity: IssueSeverity::Warning,
+                component: "API".to_string(),
+                description: format!("P95 latency is {}ms", latest.api_metrics.p95_response_time),
+                detected_at: DateTime::now(),
+                resolved: false,
+            });
+        }
+
+        // Check error rate
+        if latest.error_rate > 0.01 {
+            issues.push(SystemIssue {
+                issue_type: IssueType::HighErrorRate,
+                severity: if latest.error_rate > 0.05 { IssueSeverity::Critical } else { IssueSeverity::Warning },
+                component: "System".to_string(),
+                description: format!("Error rate is {:.2}%", latest.error_rate * 100.0),
+                detected_at: DateTime::now(),
+                resolved: false,
+            });
+        }
+
+        // Check resource utilization
+        if latest.storage_metrics.utilization > 0.9 {
+            issues.push(SystemIssue {
+                issue_type: IssueType::ResourceExhaustion,
+                severity: IssueSeverity::Warning,
+                component: "Storage".to_string(),
+                description: format!("Storage utilization at {:.1}%", latest.storage_metrics.utilization * 100.0),
+                detected_at: DateTime::now(),
+                resolved: false,
+            });
+        }
+
+        // Calculate overall health score
+        let health_score = self.calculate_health_score(&latest, &issues);
+
+        SystemHealth {
+            health_score,
+            issues,
+            ..latest
+        }
+    }
+
+    fn calculate_health_score(&self, health: &SystemHealth, issues: &List<SystemIssue>) -> f64 {
+        let mut score = 1.0;
+
+        // Penalize for latency
+        if health.api_metrics.avg_response_time > 500.0 {
+            score -= 0.1;
+        }
+
+        // Penalize for errors
+        score -= health.error_rate * 5.0;
+
+        // Penalize for issues
+        for issue in issues {
+            match issue.severity {
+                IssueSeverity::Critical => score -= 0.3,
+                IssueSeverity::Error => score -= 0.2,
+                IssueSeverity::Warning => score -= 0.1,
+                IssueSeverity::Info => score -= 0.02,
+            }
+        }
+
+        score.max(0.0).min(1.0)
+    }
+
+    fn default_health(&self) -> SystemHealth {
+        SystemHealth {
+            timestamp: DateTime::now(),
+            health_score: 1.0,
+            api_metrics: ApiMetrics {
+                avg_response_time: 0.0,
+                p95_response_time: 0.0,
+                p99_response_time: 0.0,
+                requests_per_second: 0.0,
+                error_rate: 0.0,
+                slow_endpoints: vec![],
+            },
+            database_metrics: DatabaseMetrics {
+                avg_query_time: 0.0,
+                slow_query_count: 0,
+                pool_utilization: 0.0,
+                active_connections: 0,
+                deadlock_count: 0,
+            },
+            ai_service_metrics: AiServiceMetrics {
+                avg_inference_time: 0.0,
+                tokens_used: 0,
+                availability: 1.0,
+                queue_depth: 0,
+                cost_accumulated: 0.0,
+                hive_metrics: Map::new(),
+            },
+            storage_metrics: StorageMetrics {
+                storage_used: 0,
+                storage_limit: 0,
+                utilization: 0.0,
+                bandwidth_usage: BandwidthUsage {
+                    upload_bytes_per_second: 0.0,
+                    download_bytes_per_second: 0.0,
+                },
+            },
+            active_users: 0,
+            active_sessions: 0,
+            error_rate: 0.0,
+            issues: vec![],
+        }
+    }
+
+    pub fn get_trend(&self, metric_name: &str, duration: Duration) -> List<TimeSeriesPoint> {
+        let cutoff = DateTime::now() - duration;
+
+        self.metrics_buffer.iter()
+            .filter(|h| h.timestamp > cutoff)
+            .map(|h| {
+                let value = match metric_name {
+                    "health_score" => h.health_score,
+                    "response_time" => h.api_metrics.avg_response_time,
+                    "error_rate" => h.error_rate,
+                    "active_users" => h.active_users as f64,
+                    _ => 0.0,
+                };
+                TimeSeriesPoint {
+                    timestamp: h.timestamp.clone(),
+                    value,
+                    label: None,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Learning Analytics Engine Specialist
+pub struct LearningAnalyticsEngine {
+    config: ModelConfig,
+    system_prompt: String,
+}
+
+impl LearningAnalyticsEngine {
+    pub fn new(config: ModelConfig) -> Self {
+        LearningAnalyticsEngine {
+            config,
+            system_prompt: r#"You are an expert educational data analyst. Your role is to:
+
+1. Analyze learning data to identify patterns and trends
+2. Generate actionable insights for instructors and administrators
+3. Identify areas for improvement in courses and content
+4. Detect correlations between activities and outcomes
+5. Provide data-driven recommendations
+
+Analysis principles:
+- Focus on actionable insights
+- Consider statistical significance
+- Account for confounding factors
+- Present findings clearly
+- Prioritize student success
+
+Provide insights that help improve educational outcomes."#.to_string(),
+        }
+    }
+
+    pub async fn generate_report(&self, scope: &AnalyticsScope, period: &AnalyticsPeriod, data: &AnalyticsData) -> Result<LearningAnalyticsReport, ObservationError> {
+        // Calculate summary metrics
+        let summary = self.calculate_summary(data);
+
+        // Calculate detailed metrics
+        let details = self.calculate_details(data, period);
+
+        // Generate AI-powered insights
+        let insights = self.generate_insights(&summary, &details).await?;
+
+        // Generate recommendations
+        let recommendations = self.generate_recommendations(&summary, &details, &insights).await?;
+
+        Ok(LearningAnalyticsReport {
+            id: AnalyticsReportId(generate_uuid()),
+            report_type: ReportType::CourseOverview,
+            scope: scope.clone(),
+            period: period.clone(),
+            summary,
+            details,
+            insights,
+            recommendations,
+            generated_at: DateTime::now(),
+        })
+    }
+
+    fn calculate_summary(&self, data: &AnalyticsData) -> AnalyticsSummary {
+        AnalyticsSummary {
+            total_students: data.enrollments.len() as i64,
+            active_students: data.active_student_ids.len() as i64,
+            avg_engagement: data.engagement_scores.values().sum::<f64>() / data.engagement_scores.len().max(1) as f64,
+            avg_grade: data.grades.values().sum::<f32>() / data.grades.len().max(1) as f32,
+            completion_rate: data.completion_rate,
+            pass_rate: data.pass_rate,
+            at_risk_count: data.at_risk_students.len() as i64,
+        }
+    }
+
+    fn calculate_details(&self, data: &AnalyticsData, period: &AnalyticsPeriod) -> AnalyticsDetails {
+        AnalyticsDetails {
+            engagement_trend: data.engagement_trend.clone(),
+            grade_distribution: self.calculate_grade_distribution(&data.grades),
+            content_engagement: data.content_engagement.clone(),
+            assessment_performance: data.assessment_performance.clone(),
+            objective_mastery: data.objective_mastery.clone(),
+            time_analysis: data.time_analysis.clone(),
+        }
+    }
+
+    fn calculate_grade_distribution(&self, grades: &Map<StudentId, f32>) -> GradeDistribution {
+        let values: List<f32> = grades.values().cloned().collect();
+
+        let a_count = values.iter().filter(|&&g| g >= 90.0).count() as i64;
+        let b_count = values.iter().filter(|&&g| g >= 80.0 && g < 90.0).count() as i64;
+        let c_count = values.iter().filter(|&&g| g >= 70.0 && g < 80.0).count() as i64;
+        let d_count = values.iter().filter(|&&g| g >= 60.0 && g < 70.0).count() as i64;
+        let f_count = values.iter().filter(|&&g| g < 60.0).count() as i64;
+
+        let mean = if values.is_empty() { 0.0 } else {
+            values.iter().sum::<f32>() / values.len() as f32
+        };
+
+        let mut sorted = values.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if sorted.is_empty() { 0.0 } else {
+            sorted[sorted.len() / 2]
+        };
+
+        let variance: f32 = if values.is_empty() { 0.0 } else {
+            values.iter().map(|&g| (g - mean).powi(2)).sum::<f32>() / values.len() as f32
+        };
+        let std_dev = variance.sqrt();
+
+        GradeDistribution {
+            a_count,
+            b_count,
+            c_count,
+            d_count,
+            f_count,
+            mean,
+            median,
+            std_dev,
+        }
+    }
+
+    async fn generate_insights(&self, summary: &AnalyticsSummary, details: &AnalyticsDetails) -> Result<List<Insight>, ObservationError> {
+        let prompt = format!(
+            r#"Analyze the following learning analytics data and generate insights.
+
+## Summary
+- Total Students: {}
+- Active Students: {}
+- Average Engagement: {:.2}
+- Average Grade: {:.1}
+- Completion Rate: {:.1}%
+- Pass Rate: {:.1}%
+- At-Risk Students: {}
+
+## Grade Distribution
+A: {}, B: {}, C: {}, D: {}, F: {}
+Mean: {:.1}, Std Dev: {:.1}
+
+Generate insights as JSON array:
+[
+  {{
+    "insight_type": "trend|anomaly|correlation|pattern|comparison",
+    "title": "<brief title>",
+    "description": "<detailed description>",
+    "significance": "low|medium|high|critical",
+    "affected_entities": ["<entity>"],
+    "data_points": {{"metric": value}}
+  }}
+]"#,
+            summary.total_students,
+            summary.active_students,
+            summary.avg_engagement,
+            summary.avg_grade,
+            summary.completion_rate * 100.0,
+            summary.pass_rate * 100.0,
+            summary.at_risk_count,
+            details.grade_distribution.a_count,
+            details.grade_distribution.b_count,
+            details.grade_distribution.c_count,
+            details.grade_distribution.d_count,
+            details.grade_distribution.f_count,
+            details.grade_distribution.mean,
+            details.grade_distribution.std_dev
+        );
+
+        let model = Model::new(&self.config.model_id)
+            .with_temperature(self.config.temperature);
+
+        let response = model.complete(&Prompt::new()
+            .system(&self.system_prompt)
+            .user(&prompt))
+            .await
+            .map_err(|e| ObservationError::ModelError { message: e.to_string() })?;
+
+        self.parse_insights(&response.content)
+    }
+
+    fn parse_insights(&self, response: &str) -> Result<List<Insight>, ObservationError> {
+        let insights: List<InsightJson> = parse_json(response)
+            .map_err(|e| ObservationError::ParseError { message: e.to_string() })?;
+
+        Ok(insights.into_iter().map(|i| Insight {
+            insight_type: match i.insight_type.as_str() {
+                "trend" => InsightType::Trend,
+                "anomaly" => InsightType::Anomaly,
+                "correlation" => InsightType::Correlation,
+                "pattern" => InsightType::Pattern,
+                "comparison" => InsightType::Comparison,
+                _ => InsightType::Pattern,
+            },
+            title: i.title,
+            description: i.description,
+            significance: match i.significance.as_str() {
+                "critical" => InsightSignificance::Critical,
+                "high" => InsightSignificance::High,
+                "medium" => InsightSignificance::Medium,
+                _ => InsightSignificance::Low,
+            },
+            affected_entities: i.affected_entities,
+            data_points: i.data_points,
+        }).collect())
+    }
+
+    async fn generate_recommendations(&self, summary: &AnalyticsSummary, details: &AnalyticsDetails, insights: &List<Insight>) -> Result<List<Recommendation>, ObservationError> {
+        // Generate recommendations based on insights
+        let mut recommendations = vec![];
+
+        // Low engagement recommendation
+        if summary.avg_engagement < 0.5 {
+            recommendations.push(Recommendation {
+                category: RecommendationCategory::Engagement,
+                title: "Boost Student Engagement".to_string(),
+                description: "Engagement levels are below target. Consider adding interactive elements.".to_string(),
+                priority: RecommendationPriority::High,
+                expected_impact: "10-20% increase in engagement".to_string(),
+                action_items: vec![
+                    "Add discussion prompts after each module".to_string(),
+                    "Incorporate gamification elements".to_string(),
+                    "Send personalized progress emails".to_string(),
+                ],
+            });
+        }
+
+        // High at-risk count
+        if summary.at_risk_count > summary.total_students / 5 {
+            recommendations.push(Recommendation {
+                category: RecommendationCategory::Intervention,
+                title: "Implement Early Intervention Program".to_string(),
+                description: "Significant number of students are at risk. Proactive intervention needed.".to_string(),
+                priority: RecommendationPriority::Urgent,
+                expected_impact: "Reduce dropout by 15-25%".to_string(),
+                action_items: vec![
+                    "Contact at-risk students individually".to_string(),
+                    "Offer tutoring sessions".to_string(),
+                    "Review course difficulty".to_string(),
+                ],
+            });
+        }
+
+        Ok(recommendations)
+    }
+}
+
+/// Analytics data container
+pub struct AnalyticsData {
+    enrollments: List<EnrollmentId>,
+    active_student_ids: Set<StudentId>,
+    engagement_scores: Map<StudentId, f64>,
+    grades: Map<StudentId, f32>,
+    completion_rate: f64,
+    pass_rate: f64,
+    at_risk_students: List<StudentId>,
+    engagement_trend: List<TimeSeriesPoint>,
+    content_engagement: List<ContentEngagement>,
+    assessment_performance: List<AssessmentPerformance>,
+    objective_mastery: List<ObjectiveMastery>,
+    time_analysis: TimeAnalysis,
+}
+
+/// Engagement Tracker Specialist
+pub struct EngagementTracker {
+    /// Current engagement data
+    student_engagement: Map<StudentId, StudentEngagement>,
+    /// Real-time snapshot
+    current_snapshot: EngagementSnapshot,
+}
+
+impl EngagementTracker {
+    pub fn new() -> Self {
+        EngagementTracker {
+            student_engagement: Map::new(),
+            current_snapshot: EngagementSnapshot {
+                timestamp: DateTime::now(),
+                active_users: 0,
+                activity_breakdown: Map::new(),
+                active_content: vec![],
+                session_metrics: SessionMetrics {
+                    total_sessions: 0,
+                    avg_duration: 0,
+                    bounce_rate: 0.0,
+                    pages_per_session: 0.0,
+                },
+            },
+        }
+    }
+
+    pub fn track_activity(&mut self, student_id: &StudentId, activity: ActivityType, duration: Duration) {
+        let engagement = self.student_engagement.entry(student_id.clone())
+            .or_insert_with(|| StudentEngagement {
+                student_id: student_id.clone(),
+                engagement_score: 0.5,
+                trend: EngagementTrend::Stable,
+                activity_metrics: ActivityMetrics {
+                    days_active_30d: 0,
+                    total_sessions: 0,
+                    total_time: 0,
+                    content_completed: 0,
+                    assessments_attempted: 0,
+                    discussion_posts: 0,
+                    tutor_interactions: 0,
+                },
+                behavioral_indicators: BehavioralIndicators {
+                    login_consistency: 0.5,
+                    assignment_timeliness: 1.0,
+                    content_completion_rate: 0.0,
+                    assessment_retry_rate: 0.0,
+                    help_seeking_score: 0.0,
+                    collaboration_score: 0.0,
+                },
+                history: vec![],
+                updated_at: DateTime::now(),
+            });
+
+        // Update activity metrics
+        engagement.activity_metrics.total_sessions += 1;
+        engagement.activity_metrics.total_time += duration.as_minutes() as i64;
+
+        match activity {
+            ActivityType::ViewingContent => {},
+            ActivityType::TakingAssessment => engagement.activity_metrics.assessments_attempted += 1,
+            ActivityType::InDiscussion => engagement.activity_metrics.discussion_posts += 1,
+            ActivityType::UsingTutor => engagement.activity_metrics.tutor_interactions += 1,
+            _ => {},
+        }
+
+        // Recalculate engagement score
+        self.recalculate_engagement(student_id);
+
+        engagement.updated_at = DateTime::now();
+    }
+
+    fn recalculate_engagement(&mut self, student_id: &StudentId) {
+        if let Some(engagement) = self.student_engagement.get_mut(student_id) {
+            let bi = &engagement.behavioral_indicators;
+
+            // Weighted average of behavioral indicators
+            let score = (
+                bi.login_consistency * 0.2 +
+                bi.assignment_timeliness * 0.25 +
+                bi.content_completion_rate * 0.2 +
+                (1.0 - bi.assessment_retry_rate.min(1.0)) * 0.1 +
+                bi.help_seeking_score * 0.1 +
+                bi.collaboration_score * 0.15
+            );
+
+            engagement.engagement_score = score;
+
+            // Determine trend
+            if engagement.history.len() >= 7 {
+                let recent: f64 = engagement.history.iter().rev().take(7).map(|r| r.score).sum::<f64>() / 7.0;
+                let older: f64 = engagement.history.iter().rev().skip(7).take(7).map(|r| r.score).sum::<f64>() / 7.0;
+
+                engagement.trend = if recent > older + 0.1 {
+                    EngagementTrend::Increasing
+                } else if recent < older - 0.1 {
+                    EngagementTrend::Declining
+                } else {
+                    EngagementTrend::Stable
+                };
+            }
+        }
+    }
+
+    pub fn get_engagement(&self, student_id: &StudentId) -> Option<&StudentEngagement> {
+        self.student_engagement.get(student_id)
+    }
+
+    pub fn get_realtime_snapshot(&self) -> &EngagementSnapshot {
+        &self.current_snapshot
+    }
+
+    pub fn update_snapshot(&mut self, snapshot: EngagementSnapshot) {
+        self.current_snapshot = snapshot;
+    }
+}
+
+/// Early Warning System Specialist
+pub struct EarlyWarningSystem {
+    config: ModelConfig,
+    thresholds: WarningThresholds,
+}
+
+impl EarlyWarningSystem {
+    pub fn new(config: ModelConfig, thresholds: WarningThresholds) -> Self {
+        EarlyWarningSystem { config, thresholds }
+    }
+
+    pub fn evaluate_risk(&self, student_id: &StudentId, course_id: &CourseId, engagement: &StudentEngagement, grades: &Map<AssessmentId, f32>) -> AtRiskStudent {
+        let mut risk_factors = vec![];
+        let mut total_severity = 0.0;
+
+        // Check inactivity
+        let days_inactive = self.calculate_days_inactive(engagement);
+        if days_inactive > self.thresholds.inactivity_days {
+            let severity = (days_inactive as f64 / self.thresholds.inactivity_days as f64).min(1.0);
+            risk_factors.push(RiskFactor {
+                factor_type: RiskFactorType::Inactivity,
+                description: format!("Inactive for {} days", days_inactive),
+                severity,
+                evidence: format!("Last activity: {} days ago", days_inactive),
+                trend: FactorTrend::Worsening,
+            });
+            total_severity += severity;
+        }
+
+        // Check engagement score
+        if engagement.engagement_score < self.thresholds.min_engagement_score {
+            let severity = 1.0 - (engagement.engagement_score / self.thresholds.min_engagement_score);
+            risk_factors.push(RiskFactor {
+                factor_type: RiskFactorType::DecliningEngagement,
+                description: "Low engagement score".to_string(),
+                severity,
+                evidence: format!("Engagement score: {:.2}", engagement.engagement_score),
+                trend: match engagement.trend {
+                    EngagementTrend::Declining => FactorTrend::Worsening,
+                    EngagementTrend::Increasing => FactorTrend::Improving,
+                    _ => FactorTrend::Stable,
+                },
+            });
+            total_severity += severity;
+        }
+
+        // Check grades
+        let avg_grade: f32 = if grades.is_empty() { 100.0 } else {
+            grades.values().sum::<f32>() / grades.len() as f32
+        };
+        if avg_grade < self.thresholds.min_grade_threshold {
+            let severity = (self.thresholds.min_grade_threshold - avg_grade) as f64 / self.thresholds.min_grade_threshold as f64;
+            risk_factors.push(RiskFactor {
+                factor_type: RiskFactorType::LowGrades,
+                description: "Below passing grade threshold".to_string(),
+                severity,
+                evidence: format!("Average grade: {:.1}", avg_grade),
+                trend: FactorTrend::Stable, // Would need history to determine
+            });
+            total_severity += severity;
+        }
+
+        // Check submission rate
+        if engagement.behavioral_indicators.assignment_timeliness < self.thresholds.submission_rate_threshold {
+            let severity = 1.0 - engagement.behavioral_indicators.assignment_timeliness;
+            risk_factors.push(RiskFactor {
+                factor_type: RiskFactorType::MissedDeadlines,
+                description: "Low assignment submission rate".to_string(),
+                severity,
+                evidence: format!("Timeliness: {:.0}%", engagement.behavioral_indicators.assignment_timeliness * 100.0),
+                trend: FactorTrend::Stable,
+            });
+            total_severity += severity;
+        }
+
+        // Calculate risk score and level
+        let risk_score = if risk_factors.is_empty() { 0.0 } else {
+            total_severity / risk_factors.len() as f64
+        };
+
+        let risk_level = if risk_score > 0.8 {
+            RiskLevel::Critical
+        } else if risk_score > 0.6 {
+            RiskLevel::High
+        } else if risk_score > 0.4 {
+            RiskLevel::Medium
+        } else if risk_score > 0.2 {
+            RiskLevel::Low
+        } else {
+            RiskLevel::None
+        };
+
+        // Generate interventions
+        let interventions = self.suggest_interventions(&risk_factors, &risk_level);
+
+        AtRiskStudent {
+            student_id: student_id.clone(),
+            course_id: course_id.clone(),
+            risk_level,
+            risk_score,
+            risk_factors,
+            interventions,
+            alert_status: AlertStatus::New,
+            detected_at: DateTime::now(),
+            last_reviewed: None,
+        }
+    }
+
+    fn calculate_days_inactive(&self, engagement: &StudentEngagement) -> i32 {
+        (DateTime::now() - engagement.updated_at).as_days() as i32
+    }
+
+    fn suggest_interventions(&self, factors: &List<RiskFactor>, level: &RiskLevel) -> List<InterventionSuggestion> {
+        let mut interventions = vec![];
+
+        for factor in factors {
+            match factor.factor_type {
+                RiskFactorType::Inactivity => {
+                    interventions.push(InterventionSuggestion {
+                        intervention_type: InterventionType::AutomatedReminder,
+                        description: "Send re-engagement email with course highlights".to_string(),
+                        priority: if factor.severity > 0.8 { InterventionPriority::Urgent } else { InterventionPriority::High },
+                        expected_outcome: "Student returns to course within 48 hours".to_string(),
+                        resources_needed: vec![],
+                    });
+                },
+                RiskFactorType::LowGrades => {
+                    interventions.push(InterventionSuggestion {
+                        intervention_type: InterventionType::TutorSession,
+                        description: "Schedule one-on-one tutoring session".to_string(),
+                        priority: InterventionPriority::High,
+                        expected_outcome: "Improved understanding of material".to_string(),
+                        resources_needed: vec!["Tutor availability".to_string()],
+                    });
+                },
+                RiskFactorType::DecliningEngagement => {
+                    interventions.push(InterventionSuggestion {
+                        intervention_type: InterventionType::PersonalOutreach,
+                        description: "Instructor check-in to understand challenges".to_string(),
+                        priority: InterventionPriority::Medium,
+                        expected_outcome: "Identify and address barriers".to_string(),
+                        resources_needed: vec!["Instructor time".to_string()],
+                    });
+                },
+                RiskFactorType::MissedDeadlines => {
+                    interventions.push(InterventionSuggestion {
+                        intervention_type: InterventionType::DeadlineExtension,
+                        description: "Offer deadline extension with support plan".to_string(),
+                        priority: InterventionPriority::Medium,
+                        expected_outcome: "Student catches up on missed work".to_string(),
+                        resources_needed: vec![],
+                    });
+                },
+                _ => {},
+            }
+        }
+
+        // Add escalation for critical cases
+        if matches!(level, RiskLevel::Critical) {
+            interventions.push(InterventionSuggestion {
+                intervention_type: InterventionType::InstructorMeeting,
+                description: "Mandatory meeting with instructor to create success plan".to_string(),
+                priority: InterventionPriority::Urgent,
+                expected_outcome: "Clear path forward or course withdrawal decision".to_string(),
+                resources_needed: vec!["Instructor availability".to_string(), "Academic advisor".to_string()],
+            });
+        }
+
+        interventions
+    }
+}
+
+/// Completion Predictor Specialist
+pub struct CompletionPredictor {
+    config: ModelConfig,
+}
+
+impl CompletionPredictor {
+    pub fn new(config: ModelConfig) -> Self {
+        CompletionPredictor { config }
+    }
+
+    pub fn predict(&self, student_id: &StudentId, course_id: &CourseId, engagement: &StudentEngagement, grades: &Map<AssessmentId, f32>, progress: f64) -> CompletionPrediction {
+        // Extract features
+        let features = self.extract_features(engagement, grades, progress);
+
+        // Calculate completion probability (simplified model)
+        let completion_prob = self.calculate_completion_probability(&features);
+
+        // Predict grade
+        let predicted_grade = self.predict_grade(&features, grades);
+
+        // Estimate completion date
+        let completion_date = self.estimate_completion_date(progress, engagement);
+
+        // Identify contributing factors
+        let factors = self.identify_factors(&features);
+
+        CompletionPrediction {
+            id: PredictionId(generate_uuid()),
+            student_id: student_id.clone(),
+            course_id: course_id.clone(),
+            completion_probability: completion_prob,
+            predicted_grade: Some(predicted_grade),
+            predicted_completion_date: completion_date,
+            confidence: 0.75, // Would be calculated based on model confidence
+            contributing_factors: factors,
+            generated_at: DateTime::now(),
+        }
+    }
+
+    fn extract_features(&self, engagement: &StudentEngagement, grades: &Map<AssessmentId, f32>, progress: f64) -> PredictionFeatures {
+        let avg_grade = if grades.is_empty() { 0.0 } else {
+            grades.values().sum::<f32>() / grades.len() as f32
+        };
+
+        PredictionFeatures {
+            engagement_score: engagement.engagement_score,
+            average_grade: avg_grade,
+            progress: progress,
+            login_consistency: engagement.behavioral_indicators.login_consistency,
+            assignment_timeliness: engagement.behavioral_indicators.assignment_timeliness,
+            days_active_30d: engagement.activity_metrics.days_active_30d,
+            total_time: engagement.activity_metrics.total_time,
+            help_seeking: engagement.behavioral_indicators.help_seeking_score,
+        }
+    }
+
+    fn calculate_completion_probability(&self, features: &PredictionFeatures) -> f64 {
+        // Simplified logistic regression-style calculation
+        let raw_score =
+            features.engagement_score * 0.25 +
+            (features.average_grade / 100.0) as f64 * 0.2 +
+            features.progress * 0.2 +
+            features.login_consistency * 0.1 +
+            features.assignment_timeliness * 0.15 +
+            (features.days_active_30d as f64 / 30.0) * 0.1;
+
+        // Sigmoid-like transformation
+        (raw_score * 2.0).min(1.0).max(0.0)
+    }
+
+    fn predict_grade(&self, features: &PredictionFeatures, current_grades: &Map<AssessmentId, f32>) -> f32 {
+        if current_grades.is_empty() {
+            return features.engagement_score as f32 * 100.0;
+        }
+
+        // Weight current performance with engagement trend
+        let current_avg = current_grades.values().sum::<f32>() / current_grades.len() as f32;
+        let adjustment = (features.engagement_score as f32 - 0.5) * 10.0;
+
+        (current_avg + adjustment).max(0.0).min(100.0)
+    }
+
+    fn estimate_completion_date(&self, progress: f64, engagement: &StudentEngagement) -> Option<DateTime> {
+        if progress == 0.0 {
+            return None;
+        }
+
+        // Calculate rate of progress
+        let days_active = engagement.activity_metrics.days_active_30d as f64;
+        if days_active == 0.0 {
+            return None;
+        }
+
+        let progress_per_day = progress / 30.0 * (days_active / 30.0);
+        let remaining = 1.0 - progress;
+
+        if progress_per_day <= 0.0 {
+            return None;
+        }
+
+        let days_remaining = (remaining / progress_per_day) as i64;
+        Some(DateTime::now() + Duration::days(days_remaining))
+    }
+
+    fn identify_factors(&self, features: &PredictionFeatures) -> List<PredictionFactor> {
+        vec![
+            PredictionFactor {
+                factor_name: "Engagement".to_string(),
+                importance: 0.25,
+                current_value: features.engagement_score,
+                impact: if features.engagement_score > 0.6 { PredictionImpact::Positive } else { PredictionImpact::Negative },
+            },
+            PredictionFactor {
+                factor_name: "Current Grades".to_string(),
+                importance: 0.2,
+                current_value: features.average_grade as f64 / 100.0,
+                impact: if features.average_grade > 70.0 { PredictionImpact::Positive } else { PredictionImpact::Negative },
+            },
+            PredictionFactor {
+                factor_name: "Progress".to_string(),
+                importance: 0.2,
+                current_value: features.progress,
+                impact: PredictionImpact::Positive,
+            },
+            PredictionFactor {
+                factor_name: "Assignment Timeliness".to_string(),
+                importance: 0.15,
+                current_value: features.assignment_timeliness,
+                impact: if features.assignment_timeliness > 0.8 { PredictionImpact::Positive } else { PredictionImpact::Negative },
+            },
+        ]
+    }
+}
+
+/// Prediction features
+struct PredictionFeatures {
+    engagement_score: f64,
+    average_grade: f32,
+    progress: f64,
+    login_consistency: f64,
+    assignment_timeliness: f64,
+    days_active_30d: i32,
+    total_time: i64,
+    help_seeking: f64,
+}
+
+/// Anomaly Detector Specialist
+pub struct AnomalyDetector {
+    sensitivity: f64,
+    history: Map<String, VecDeque<f64>>,
+    history_size: usize,
+}
+
+impl AnomalyDetector {
+    pub fn new(sensitivity: f64) -> Self {
+        AnomalyDetector {
+            sensitivity,
+            history: Map::new(),
+            history_size: 100,
+        }
+    }
+
+    pub fn record_value(&mut self, metric_name: &str, value: f64) {
+        let history = self.history.entry(metric_name.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(self.history_size));
+
+        if history.len() >= self.history_size {
+            history.pop_front();
+        }
+        history.push_back(value);
+    }
+
+    pub fn detect(&self, metric_name: &str, current_value: f64) -> Option<Anomaly> {
+        let history = self.history.get(metric_name)?;
+
+        if history.len() < 10 {
+            return None; // Not enough data
+        }
+
+        // Calculate statistics
+        let values: Vec<f64> = history.iter().cloned().collect();
+        let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
+        let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        let std_dev = variance.sqrt();
+
+        if std_dev == 0.0 {
+            return None;
+        }
+
+        // Calculate z-score
+        let z_score = (current_value - mean).abs() / std_dev;
+        let threshold = 3.0 * (1.0 - self.sensitivity) + 2.0 * self.sensitivity;
+
+        if z_score > threshold {
+            let deviation = (current_value - mean) / mean * 100.0;
+            let anomaly_type = if current_value > mean {
+                AnomalyType::Spike
+            } else {
+                AnomalyType::Drop
+            };
+
+            Some(Anomaly {
+                id: generate_uuid(),
+                anomaly_type,
+                severity: if z_score > 4.0 { AnomalySeverity::Critical }
+                    else if z_score > 3.5 { AnomalySeverity::High }
+                    else if z_score > 3.0 { AnomalySeverity::Medium }
+                    else { AnomalySeverity::Low },
+                description: format!("{} deviation detected in {}", if deviation > 0.0 { "Positive" } else { "Negative" }, metric_name),
+                affected_metric: metric_name.to_string(),
+                expected_value: mean,
+                actual_value: current_value,
+                deviation,
+                detected_at: DateTime::now(),
+                context: AnomalyContext {
+                    entity_type: "Metric".to_string(),
+                    entity_id: metric_name.to_string(),
+                    related_entities: vec![],
+                    historical_context: format!("Mean: {:.2}, Std Dev: {:.2}, Z-Score: {:.2}", mean, std_dev, z_score),
+                },
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn detect_trend_break(&self, metric_name: &str) -> Option<Anomaly> {
+        let history = self.history.get(metric_name)?;
+
+        if history.len() < 20 {
+            return None;
+        }
+
+        let values: Vec<f64> = history.iter().cloned().collect();
+
+        // Calculate recent vs older trend
+        let recent: Vec<f64> = values.iter().rev().take(10).cloned().collect();
+        let older: Vec<f64> = values.iter().rev().skip(10).take(10).cloned().collect();
+
+        let recent_mean: f64 = recent.iter().sum::<f64>() / recent.len() as f64;
+        let older_mean: f64 = older.iter().sum::<f64>() / older.len() as f64;
+
+        let change_pct = (recent_mean - older_mean).abs() / older_mean * 100.0;
+
+        if change_pct > 30.0 {
+            Some(Anomaly {
+                id: generate_uuid(),
+                anomaly_type: AnomalyType::TrendBreak,
+                severity: if change_pct > 50.0 { AnomalySeverity::High } else { AnomalySeverity::Medium },
+                description: format!("Significant trend change detected in {}", metric_name),
+                affected_metric: metric_name.to_string(),
+                expected_value: older_mean,
+                actual_value: recent_mean,
+                deviation: change_pct,
+                detected_at: DateTime::now(),
+                context: AnomalyContext {
+                    entity_type: "Metric".to_string(),
+                    entity_id: metric_name.to_string(),
+                    related_entities: vec![],
+                    historical_context: format!("Previous 10-point mean: {:.2}, Recent 10-point mean: {:.2}", older_mean, recent_mean),
+                },
+            })
+        } else {
+            None
+        }
+    }
+}
+
+// =============================================================================
+// Observation Hive Actor
+// =============================================================================
+
+/// Main Observation Hive actor
+pub actor ObservationHive {
+    var config: ObservationHiveConfig = ObservationHiveConfig::default()
+    var performance_analyzer: LMSPerformanceAnalyzer
+    var analytics_engine: LearningAnalyticsEngine
+    var engagement_tracker: EngagementTracker
+    var warning_system: EarlyWarningSystem
+    var completion_predictor: CompletionPredictor
+    var anomaly_detector: AnomalyDetector
+
+    var alerts: Map<AlertId, Alert> = Map::new()
+    var at_risk_students: Map<(StudentId, CourseId), AtRiskStudent> = Map::new()
+
+    var metrics: ObservationMetrics = ObservationMetrics::default()
+    var is_running: bool = false
+
+    pub fn new() -> Self {
+        let config = ObservationHiveConfig::default();
+
+        ObservationHive {
+            config: config.clone(),
+            performance_analyzer: LMSPerformanceAnalyzer::new(config.analysis_model.clone()),
+            analytics_engine: LearningAnalyticsEngine::new(config.analysis_model.clone()),
+            engagement_tracker: EngagementTracker::new(),
+            warning_system: EarlyWarningSystem::new(config.analysis_model.clone(), config.warning_thresholds.clone()),
+            completion_predictor: CompletionPredictor::new(config.analysis_model.clone()),
+            anomaly_detector: AnomalyDetector::new(config.anomaly_sensitivity),
+            ..Default::default()
+        }
+    }
+
+    /// Start the observation hive
+    pub receive Start() -> Result<(), ObservationError> {
+        if self.is_running {
+            return Err(ObservationError::AlreadyRunning);
+        }
+
+        self.is_running = true;
+        println!("[ObservationHive] Started");
+
+        // Start monitoring tasks
+        spawn self.monitor_system_health();
+        spawn self.evaluate_student_risk();
+
+        checkpoint();
+        Ok(())
+    }
+
+    /// Stop the observation hive
+    pub receive Stop() {
+        self.is_running = false;
+        println!("[ObservationHive] Stopped");
+        checkpoint();
+    }
+
+    /// Record system health metrics
+    pub receive RecordSystemHealth(health: SystemHealth) {
+        self.performance_analyzer.record_metrics(health.clone());
+
+        // Check for anomalies
+        self.anomaly_detector.record_value("response_time", health.api_metrics.avg_response_time);
+        self.anomaly_detector.record_value("error_rate", health.error_rate);
+        self.anomaly_detector.record_value("active_users", health.active_users as f64);
+
+        if let Some(anomaly) = self.anomaly_detector.detect("error_rate", health.error_rate) {
+            self.create_alert_from_anomaly(&anomaly);
+        }
+
+        self.metrics.health_checks += 1;
+        checkpoint();
+    }
+
+    /// Get current system health
+    pub receive GetSystemHealth() -> SystemHealth {
+        self.performance_analyzer.analyze_health()
+    }
+
+    /// Track student activity
+    pub receive TrackActivity(student_id: StudentId, activity: ActivityType, duration: Duration) {
+        self.engagement_tracker.track_activity(&student_id, activity, duration);
+        self.metrics.activities_tracked += 1;
+        checkpoint();
+    }
+
+    /// Get student engagement
+    pub receive GetEngagement(student_id: StudentId) -> Option<StudentEngagement> {
+        self.engagement_tracker.get_engagement(&student_id).cloned()
+    }
+
+    /// Get real-time engagement snapshot
+    pub receive GetRealtimeSnapshot() -> EngagementSnapshot {
+        self.engagement_tracker.get_realtime_snapshot().clone()
+    }
+
+    /// Generate analytics report
+    pub receive GenerateReport(
+        scope: AnalyticsScope,
+        period: AnalyticsPeriod,
+        data: AnalyticsData
+    ) -> Result<LearningAnalyticsReport, ObservationError> {
+        let report = self.analytics_engine.generate_report(&scope, &period, &data).await?;
+        self.metrics.reports_generated += 1;
+        checkpoint();
+        Ok(report)
+    }
+
+    /// Evaluate student risk
+    pub receive EvaluateStudentRisk(
+        student_id: StudentId,
+        course_id: CourseId,
+        grades: Map<AssessmentId, f32>
+    ) -> AtRiskStudent {
+        let engagement = self.engagement_tracker.get_engagement(&student_id)
+            .cloned()
+            .unwrap_or_else(|| self.create_default_engagement(&student_id));
+
+        let risk = self.warning_system.evaluate_risk(&student_id, &course_id, &engagement, &grades);
+
+        // Store and create alert if needed
+        if !matches!(risk.risk_level, RiskLevel::None) {
+            self.at_risk_students.insert((student_id.clone(), course_id.clone()), risk.clone());
+
+            if matches!(risk.risk_level, RiskLevel::High | RiskLevel::Critical) {
+                self.create_risk_alert(&risk);
+            }
+        }
+
+        self.metrics.risk_evaluations += 1;
+        checkpoint();
+        risk
+    }
+
+    /// Get all at-risk students for a course
+    pub receive GetAtRiskStudents(course_id: CourseId) -> List<AtRiskStudent> {
+        self.at_risk_students.iter()
+            .filter(|((_, cid), _)| cid == &course_id)
+            .map(|(_, risk)| risk.clone())
+            .collect()
+    }
+
+    /// Predict course completion
+    pub receive PredictCompletion(
+        student_id: StudentId,
+        course_id: CourseId,
+        grades: Map<AssessmentId, f32>,
+        progress: f64
+    ) -> CompletionPrediction {
+        let engagement = self.engagement_tracker.get_engagement(&student_id)
+            .cloned()
+            .unwrap_or_else(|| self.create_default_engagement(&student_id));
+
+        let prediction = self.completion_predictor.predict(&student_id, &course_id, &engagement, &grades, progress);
+        self.metrics.predictions_made += 1;
+        checkpoint();
+        prediction
+    }
+
+    /// Get alerts
+    pub receive GetAlerts(status: Option<AlertStatus>) -> List<Alert> {
+        match status {
+            Some(s) => self.alerts.values()
+                .filter(|a| a.status == s)
+                .cloned()
+                .collect(),
+            None => self.alerts.values().cloned().collect(),
+        }
+    }
+
+    /// Acknowledge alert
+    pub receive AcknowledgeAlert(alert_id: AlertId) -> Result<(), ObservationError> {
+        let alert = self.alerts.get_mut(&alert_id)
+            .ok_or(ObservationError::AlertNotFound { id: alert_id.clone() })?;
+
+        alert.status = AlertStatus::Acknowledged;
+        alert.acknowledged_at = Some(DateTime::now());
+        checkpoint();
+        Ok(())
+    }
+
+    /// Resolve alert
+    pub receive ResolveAlert(alert_id: AlertId) -> Result<(), ObservationError> {
+        let alert = self.alerts.get_mut(&alert_id)
+            .ok_or(ObservationError::AlertNotFound { id: alert_id.clone() })?;
+
+        alert.status = AlertStatus::Resolved;
+        alert.resolved_at = Some(DateTime::now());
+        checkpoint();
+        Ok(())
+    }
+
+    /// Get metrics
+    pub receive GetMetrics() -> ObservationMetrics {
+        self.metrics.clone()
+    }
+
+    // Internal methods
+    fn create_default_engagement(&self, student_id: &StudentId) -> StudentEngagement {
+        StudentEngagement {
+            student_id: student_id.clone(),
+            engagement_score: 0.5,
+            trend: EngagementTrend::Stable,
+            activity_metrics: ActivityMetrics {
+                days_active_30d: 0,
+                total_sessions: 0,
+                total_time: 0,
+                content_completed: 0,
+                assessments_attempted: 0,
+                discussion_posts: 0,
+                tutor_interactions: 0,
+            },
+            behavioral_indicators: BehavioralIndicators {
+                login_consistency: 0.5,
+                assignment_timeliness: 1.0,
+                content_completion_rate: 0.0,
+                assessment_retry_rate: 0.0,
+                help_seeking_score: 0.0,
+                collaboration_score: 0.0,
+            },
+            history: vec![],
+            updated_at: DateTime::now(),
+        }
+    }
+
+    fn create_alert_from_anomaly(&mut self, anomaly: &Anomaly) {
+        let alert = Alert {
+            id: AlertId(generate_uuid()),
+            alert_type: AlertType::AnomalyDetected,
+            severity: match anomaly.severity {
+                AnomalySeverity::Critical => AlertSeverity::Critical,
+                AnomalySeverity::High => AlertSeverity::Error,
+                AnomalySeverity::Medium => AlertSeverity::Warning,
+                AnomalySeverity::Low => AlertSeverity::Info,
+            },
+            title: format!("Anomaly: {}", anomaly.affected_metric),
+            description: anomaly.description.clone(),
+            affected_entities: vec![anomaly.affected_metric.clone()],
+            data: Map::new(),
+            status: AlertStatus::New,
+            created_at: DateTime::now(),
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+
+        self.alerts.insert(alert.id.clone(), alert);
+        self.metrics.alerts_generated += 1;
+    }
+
+    fn create_risk_alert(&mut self, risk: &AtRiskStudent) {
+        let alert = Alert {
+            id: AlertId(generate_uuid()),
+            alert_type: AlertType::StudentAtRisk,
+            severity: match risk.risk_level {
+                RiskLevel::Critical => AlertSeverity::Critical,
+                RiskLevel::High => AlertSeverity::Error,
+                RiskLevel::Medium => AlertSeverity::Warning,
+                _ => AlertSeverity::Info,
+            },
+            title: format!("Student at {:?} risk", risk.risk_level),
+            description: format!("Student {} in course {} requires attention", risk.student_id.0, risk.course_id.0),
+            affected_entities: vec![risk.student_id.0.clone()],
+            data: Map::new(),
+            status: AlertStatus::New,
+            created_at: DateTime::now(),
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+
+        self.alerts.insert(alert.id.clone(), alert);
+        self.metrics.alerts_generated += 1;
+    }
+
+    async fn monitor_system_health(&mut self) {
+        while self.is_running {
+            // Would collect actual system metrics
+            sleep(self.config.collection_interval).await;
+        }
+    }
+
+    async fn evaluate_student_risk(&mut self) {
+        while self.is_running {
+            // Would periodically evaluate all students
+            sleep(Duration::hours(1)).await;
+        }
+    }
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+#[derive(Clone, Default)]
+pub struct ObservationMetrics {
+    pub health_checks: i64,
+    pub activities_tracked: i64,
+    pub reports_generated: i64,
+    pub risk_evaluations: i64,
+    pub predictions_made: i64,
+    pub alerts_generated: i64,
+    pub anomalies_detected: i64,
+}
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+pub enum ObservationError {
+    AlreadyRunning,
+    NotRunning,
+    AlertNotFound { id: AlertId },
+    ModelError { message: String },
+    ParseError { message: String },
+    DataNotAvailable,
+}
+
+// =============================================================================
+// JSON Helper Types
+// =============================================================================
+
+struct InsightJson {
+    insight_type: String,
+    title: String,
+    description: String,
+    significance: String,
+    affected_entities: List<String>,
+    data_points: Map<String, f64>,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+fn parse_json<T>(json_str: &str) -> Result<T, String> {
+    std::json::parse(json_str)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_observation_hive_creation() {
+        let hive = ObservationHive::new();
+        assert!(!hive.is_running);
+    }
+
+    #[test]
+    fn test_anomaly_detection() {
+        let mut detector = AnomalyDetector::new(0.8);
+
+        // Record normal values
+        for i in 0..50 {
+            detector.record_value("test_metric", 100.0 + (i as f64 % 10.0));
+        }
+
+        // Test normal value
+        let normal = detector.detect("test_metric", 105.0);
+        assert!(normal.is_none());
+
+        // Test anomalous value
+        let anomaly = detector.detect("test_metric", 500.0);
+        assert!(anomaly.is_some());
+    }
+
+    #[test]
+    fn test_risk_evaluation() {
+        let warning = EarlyWarningSystem::new(
+            ModelConfig::default(),
+            WarningThresholds::default()
+        );
+
+        let engagement = StudentEngagement {
+            student_id: StudentId("test".to_string()),
+            engagement_score: 0.2,
+            trend: EngagementTrend::Declining,
+            activity_metrics: ActivityMetrics::default(),
+            behavioral_indicators: BehavioralIndicators::default(),
+            history: vec![],
+            updated_at: DateTime::now() - Duration::days(10),
+        };
+
+        let risk = warning.evaluate_risk(
+            &StudentId("test".to_string()),
+            &CourseId("course1".to_string()),
+            &engagement,
+            &Map::new()
+        );
+
+        assert!(!matches!(risk.risk_level, RiskLevel::None));
+    }
+}

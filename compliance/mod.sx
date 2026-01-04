@@ -1,0 +1,18 @@
+/// Intelligo LMS - Compliance Module
+///
+/// Exports SCORM, xAPI, and LRS compliance implementations.
+
+module intelligo::compliance
+
+pub use intelligo::compliance::xapi::*
+pub use intelligo::compliance::lrs::*
+pub mod scorm { pub use intelligo::compliance::scorm::*; }
+
+// Re-export commonly used types
+pub use XapiStatement
+pub use XapiActor
+pub use XapiVerb
+pub use XapiObject
+pub use LearningRecordStore
+pub use Scorm12Runtime
+pub use Scorm2004Runtime

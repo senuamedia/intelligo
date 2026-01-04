@@ -1,0 +1,707 @@
+/// Intelligo LMS - Asset Management
+///
+/// CDN integration, asset optimization, and cache busting.
+/// Follows Aether CMS patterns for static asset handling.
+
+module intelligo::frontend::assets
+
+use intelligo::frontend::*
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Asset Manager
+// ============================================================================
+
+/// Central asset manager for CDN integration and optimization
+pub actor AssetManager {
+    config: AssetConfig,
+    cdn_config: CdnConfig,
+    manifest: AssetManifest,
+    image_optimizer: ImageOptimizer,
+    hash_cache: Map<String, String>,
+}
+
+impl AssetManager {
+    pub fn new(config: AssetConfig, cdn_config: CdnConfig) -> Self {
+        AssetManager {
+            config,
+            cdn_config,
+            manifest: AssetManifest::new(),
+            image_optimizer: ImageOptimizer::new(&config.image_optimization),
+            hash_cache: Map::new(),
+        }
+    }
+
+    /// Get the URL for an asset with cache busting
+    pub fn asset_url(self, path: &str) -> String {
+        let hash = self.get_asset_hash(path);
+        let cdn_base = &self.cdn_config.base_url;
+
+        if cdn_base.is_empty() {
+            if let Some(h) = hash {
+                format!("{}?v={}", path, h)
+            } else {
+                path.to_string()
+            }
+        } else {
+            if let Some(h) = hash {
+                format!("{}/{}?v={}", cdn_base, path.trim_start_matches('/'), h)
+            } else {
+                format!("{}/{}", cdn_base, path.trim_start_matches('/'))
+            }
+        }
+    }
+
+    /// Get hash for cache busting
+    fn get_asset_hash(self, path: &str) -> Option<String> {
+        if !self.config.hash_assets {
+            return None;
+        }
+
+        // Check cache first
+        if let Some(hash) = self.hash_cache.get(path) {
+            return Some(hash.clone());
+        }
+
+        // Check manifest
+        if let Some(entry) = self.manifest.entries.get(path) {
+            return Some(entry.hash.clone());
+        }
+
+        None
+    }
+
+    /// Register an asset and compute its hash
+    pub fn register_asset(mut self, path: &str, content: &[u8]) -> AssetEntry {
+        let hash = self.compute_hash(content);
+        let size = content.len() as i64;
+        let mime_type = self.detect_mime_type(path);
+
+        let entry = AssetEntry {
+            path: path.to_string(),
+            hash: hash.clone(),
+            size,
+            mime_type,
+            cdn_url: self.build_cdn_url(path, &hash),
+            preload: self.should_preload(path),
+            inline: size < self.config.inline_threshold,
+        };
+
+        self.manifest.entries.insert(path.to_string(), entry.clone());
+        self.hash_cache.insert(path.to_string(), hash);
+
+        entry
+    }
+
+    /// Compute content hash for cache busting
+    fn compute_hash(self, content: &[u8]) -> String {
+        // SHA-256 hash, take first 8 chars
+        let full_hash = crypto::sha256(content);
+        full_hash[0..8].to_string()
+    }
+
+    /// Build full CDN URL for asset
+    fn build_cdn_url(self, path: &str, hash: &str) -> String {
+        let base = if self.cdn_config.base_url.is_empty() {
+            "".to_string()
+        } else {
+            self.cdn_config.base_url.clone()
+        };
+
+        if self.config.hash_assets {
+            // Insert hash into filename for immutable caching
+            let (name, ext) = self.split_extension(path);
+            format!("{}/{}.{}.{}", base, name, hash, ext)
+        } else {
+            format!("{}/{}", base, path.trim_start_matches('/'))
+        }
+    }
+
+    /// Split path into name and extension
+    fn split_extension(self, path: &str) -> (String, String) {
+        if let Some(dot_pos) = path.rfind('.') {
+            (path[0..dot_pos].to_string(), path[dot_pos + 1..].to_string())
+        } else {
+            (path.to_string(), "".to_string())
+        }
+    }
+
+    /// Detect MIME type from path
+    fn detect_mime_type(self, path: &str) -> String {
+        let ext = path.rsplit('.').next().unwrap_or("");
+        match ext.to_lowercase().as_str() {
+            "js" => "application/javascript".to_string(),
+            "mjs" => "application/javascript".to_string(),
+            "css" => "text/css".to_string(),
+            "html" => "text/html".to_string(),
+            "json" => "application/json".to_string(),
+            "png" => "image/png".to_string(),
+            "jpg" | "jpeg" => "image/jpeg".to_string(),
+            "gif" => "image/gif".to_string(),
+            "svg" => "image/svg+xml".to_string(),
+            "webp" => "image/webp".to_string(),
+            "avif" => "image/avif".to_string(),
+            "woff" => "font/woff".to_string(),
+            "woff2" => "font/woff2".to_string(),
+            "ttf" => "font/ttf".to_string(),
+            "eot" => "application/vnd.ms-fontobject".to_string(),
+            "ico" => "image/x-icon".to_string(),
+            "mp4" => "video/mp4".to_string(),
+            "webm" => "video/webm".to_string(),
+            "mp3" => "audio/mpeg".to_string(),
+            "wav" => "audio/wav".to_string(),
+            "pdf" => "application/pdf".to_string(),
+            _ => "application/octet-stream".to_string(),
+        }
+    }
+
+    /// Check if asset should be preloaded
+    fn should_preload(self, path: &str) -> bool {
+        if !self.config.preload_critical {
+            return false;
+        }
+
+        // Preload critical CSS and fonts
+        let ext = path.rsplit('.').next().unwrap_or("");
+        match ext.to_lowercase().as_str() {
+            "css" => path.contains("critical") || path.contains("main"),
+            "woff2" => true, // Always preload fonts
+            _ => false,
+        }
+    }
+
+    /// Generate preload hints for critical assets
+    pub fn generate_preload_hints(self) -> Vec<PreloadHint> {
+        let mut hints = Vec::new();
+
+        for (_, entry) in self.manifest.entries.iter() {
+            if entry.preload {
+                let hint_type = self.get_preload_type(&entry.mime_type);
+                hints.push(PreloadHint {
+                    href: entry.cdn_url.clone(),
+                    as_type: hint_type,
+                    mime_type: Some(entry.mime_type.clone()),
+                    crossorigin: self.needs_crossorigin(&entry.mime_type),
+                });
+            }
+        }
+
+        hints
+    }
+
+    /// Get preload "as" attribute type
+    fn get_preload_type(self, mime_type: &str) -> String {
+        if mime_type.starts_with("font/") {
+            "font".to_string()
+        } else if mime_type.starts_with("image/") {
+            "image".to_string()
+        } else if mime_type == "text/css" {
+            "style".to_string()
+        } else if mime_type == "application/javascript" {
+            "script".to_string()
+        } else {
+            "fetch".to_string()
+        }
+    }
+
+    /// Check if crossorigin attribute is needed
+    fn needs_crossorigin(self, mime_type: &str) -> Option<String> {
+        if mime_type.starts_with("font/") {
+            Some("anonymous".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Get optimized image URL with responsive srcset
+    pub fn get_image_srcset(self, path: &str, alt: &str) -> ImageSrcset {
+        if !self.config.responsive_images {
+            return ImageSrcset {
+                src: self.asset_url(path),
+                srcset: None,
+                sizes: None,
+                alt: alt.to_string(),
+                loading: if self.config.lazy_load_images { "lazy".to_string() } else { "eager".to_string() },
+                decoding: "async".to_string(),
+            };
+        }
+
+        let base_url = self.asset_url(path);
+        let responsive_sizes = &self.config.image_optimization.responsive_sizes;
+
+        let srcset_parts: Vec<String> = responsive_sizes.iter().map(|size| {
+            let optimized_url = self.get_resized_image_url(path, *size);
+            format!("{} {}w", optimized_url, size)
+        }).collect();
+
+        let sizes = "(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw".to_string();
+
+        ImageSrcset {
+            src: base_url,
+            srcset: Some(srcset_parts.join(", ")),
+            sizes: Some(sizes),
+            alt: alt.to_string(),
+            loading: if self.config.lazy_load_images { "lazy".to_string() } else { "eager".to_string() },
+            decoding: "async".to_string(),
+        }
+    }
+
+    /// Get URL for resized image
+    fn get_resized_image_url(self, path: &str, width: i32) -> String {
+        let (name, ext) = self.split_extension(path);
+        let format = self.get_optimal_format();
+
+        if self.cdn_config.image_transform_enabled {
+            // Use CDN image transformation
+            format!("{}{}?w={}&f={}",
+                self.cdn_config.base_url,
+                path,
+                width,
+                format
+            )
+        } else {
+            // Pre-generated responsive images
+            format!("{}-{}w.{}", name, width, format)
+        }
+    }
+
+    /// Get optimal image format based on config
+    fn get_optimal_format(self) -> String {
+        // Prefer modern formats
+        for format in &self.config.image_optimization.formats {
+            match format {
+                ImageFormat::Avif => return "avif".to_string(),
+                ImageFormat::WebP => return "webp".to_string(),
+                _ => continue,
+            }
+        }
+        "jpg".to_string()
+    }
+
+    /// Generate inline asset if below threshold
+    pub fn get_inline_asset(self, path: &str, content: &[u8]) -> Option<String> {
+        if content.len() as i64 > self.config.inline_threshold {
+            return None;
+        }
+
+        let mime_type = self.detect_mime_type(path);
+        let base64 = base64::encode(content);
+
+        Some(format!("data:{};base64,{}", mime_type, base64))
+    }
+
+    /// Generate asset manifest for build
+    pub fn generate_manifest(self) -> String {
+        json::stringify(&self.manifest)
+    }
+
+    /// Load manifest from JSON
+    pub fn load_manifest(mut self, json_str: &str) -> Result<(), FrontendError> {
+        match json::parse(json_str) {
+            Ok(manifest) => {
+                self.manifest = manifest;
+                // Rebuild hash cache
+                for (path, entry) in self.manifest.entries.iter() {
+                    self.hash_cache.insert(path.clone(), entry.hash.clone());
+                }
+                Ok(())
+            }
+            Err(e) => Err(FrontendError::CacheError {
+                message: format!("Failed to parse manifest: {}", e)
+            }),
+        }
+    }
+}
+
+// ============================================================================
+// CDN Configuration
+// ============================================================================
+
+/// CDN configuration
+pub type CdnConfig = type {
+    // Base URL for CDN
+    base_url: String,
+
+    // Enable image transformation via CDN
+    image_transform_enabled: bool,
+
+    // CDN provider (cloudflare, cloudfront, fastly, bunny, etc.)
+    provider: CdnProvider,
+
+    // Custom headers for CDN requests
+    custom_headers: Map<String, String>,
+
+    // Fallback URL if CDN is unavailable
+    fallback_url: Option<String>,
+
+    // Enable CDN for development
+    enabled_in_dev: bool,
+}
+
+impl CdnConfig {
+    pub fn default() -> Self {
+        CdnConfig {
+            base_url: "".to_string(),
+            image_transform_enabled: false,
+            provider: CdnProvider::None,
+            custom_headers: Map::new(),
+            fallback_url: None,
+            enabled_in_dev: false,
+        }
+    }
+
+    pub fn cloudflare(zone: &str) -> Self {
+        CdnConfig {
+            base_url: format!("https://{}.r2.cloudflarestorage.com", zone),
+            image_transform_enabled: true,
+            provider: CdnProvider::Cloudflare,
+            custom_headers: Map::new(),
+            fallback_url: None,
+            enabled_in_dev: false,
+        }
+    }
+
+    pub fn cloudfront(distribution_id: &str) -> Self {
+        CdnConfig {
+            base_url: format!("https://{}.cloudfront.net", distribution_id),
+            image_transform_enabled: true,
+            provider: CdnProvider::CloudFront,
+            custom_headers: Map::new(),
+            fallback_url: None,
+            enabled_in_dev: false,
+        }
+    }
+
+    pub fn bunny(pull_zone: &str) -> Self {
+        CdnConfig {
+            base_url: format!("https://{}.b-cdn.net", pull_zone),
+            image_transform_enabled: true,
+            provider: CdnProvider::Bunny,
+            custom_headers: Map::new(),
+            fallback_url: None,
+            enabled_in_dev: false,
+        }
+    }
+}
+
+/// Supported CDN providers
+pub enum CdnProvider {
+    None,
+    Cloudflare,
+    CloudFront,
+    Fastly,
+    Bunny,
+    Custom,
+}
+
+// ============================================================================
+// Asset Manifest
+// ============================================================================
+
+/// Asset manifest for tracking all registered assets
+pub type AssetManifest = type {
+    entries: Map<String, AssetEntry>,
+    version: String,
+    build_time: i64,
+}
+
+impl AssetManifest {
+    pub fn new() -> Self {
+        AssetManifest {
+            entries: Map::new(),
+            version: "1.0.0".to_string(),
+            build_time: time::now_unix(),
+        }
+    }
+}
+
+/// Individual asset entry
+pub type AssetEntry = type {
+    path: String,
+    hash: String,
+    size: i64,
+    mime_type: String,
+    cdn_url: String,
+    preload: bool,
+    inline: bool,
+}
+
+// ============================================================================
+// Image Optimization
+// ============================================================================
+
+/// Image optimizer for responsive images
+pub actor ImageOptimizer {
+    config: ImageOptimization,
+}
+
+impl ImageOptimizer {
+    pub fn new(config: &ImageOptimization) -> Self {
+        ImageOptimizer {
+            config: config.clone(),
+        }
+    }
+
+    /// Generate optimized image variants
+    pub fn generate_variants(self, source_path: &str, source_data: &[u8]) -> Vec<ImageVariant> {
+        if !self.config.enabled {
+            return vec![];
+        }
+
+        let mut variants = Vec::new();
+
+        for size in &self.config.responsive_sizes {
+            if *size > self.config.max_width {
+                continue;
+            }
+
+            for format in &self.config.formats {
+                let variant = self.create_variant(source_path, source_data, *size, format);
+                variants.push(variant);
+            }
+        }
+
+        variants
+    }
+
+    /// Create a single image variant
+    fn create_variant(self, source_path: &str, _source_data: &[u8], width: i32, format: &ImageFormat) -> ImageVariant {
+        let (name, _) = self.split_extension(source_path);
+        let ext = match format {
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Png => "png",
+            ImageFormat::WebP => "webp",
+            ImageFormat::Avif => "avif",
+            ImageFormat::Svg => "svg",
+        };
+
+        let output_path = format!("{}-{}w.{}", name, width, ext);
+
+        // In real implementation, this would use an image processing library
+        // For now, we just define the variant metadata
+        ImageVariant {
+            path: output_path,
+            width,
+            format: format.clone(),
+            quality: self.config.quality,
+        }
+    }
+
+    fn split_extension(self, path: &str) -> (String, String) {
+        if let Some(dot_pos) = path.rfind('.') {
+            (path[0..dot_pos].to_string(), path[dot_pos + 1..].to_string())
+        } else {
+            (path.to_string(), "".to_string())
+        }
+    }
+}
+
+/// Image variant metadata
+pub type ImageVariant = type {
+    path: String,
+    width: i32,
+    format: ImageFormat,
+    quality: i32,
+}
+
+// ============================================================================
+// Preload Hints
+// ============================================================================
+
+/// Preload hint for critical resources
+pub type PreloadHint = type {
+    href: String,
+    as_type: String,
+    mime_type: Option<String>,
+    crossorigin: Option<String>,
+}
+
+impl PreloadHint {
+    /// Generate <link rel="preload"> HTML
+    pub fn to_html(self) -> String {
+        let mut attrs = format!("<link rel=\"preload\" href=\"{}\" as=\"{}\"",
+            self.href, self.as_type);
+
+        if let Some(ref mime) = self.mime_type {
+            attrs.push_str(&format!(" type=\"{}\"", mime));
+        }
+
+        if let Some(ref co) = self.crossorigin {
+            attrs.push_str(&format!(" crossorigin=\"{}\"", co));
+        }
+
+        attrs.push_str(">");
+        attrs
+    }
+}
+
+// ============================================================================
+// Responsive Image Srcset
+// ============================================================================
+
+/// Responsive image srcset data
+pub type ImageSrcset = type {
+    src: String,
+    srcset: Option<String>,
+    sizes: Option<String>,
+    alt: String,
+    loading: String,
+    decoding: String,
+}
+
+impl ImageSrcset {
+    /// Generate <img> HTML
+    pub fn to_html(self) -> String {
+        let mut img = format!("<img src=\"{}\"", self.src);
+
+        if let Some(ref srcset) = self.srcset {
+            img.push_str(&format!(" srcset=\"{}\"", srcset));
+        }
+
+        if let Some(ref sizes) = self.sizes {
+            img.push_str(&format!(" sizes=\"{}\"", sizes));
+        }
+
+        img.push_str(&format!(" alt=\"{}\" loading=\"{}\" decoding=\"{}\">",
+            html_escape(&self.alt), self.loading, self.decoding));
+
+        img
+    }
+}
+
+// ============================================================================
+// Static Asset Builder
+// ============================================================================
+
+/// Builds static assets for production deployment
+pub actor StaticAssetBuilder {
+    asset_manager: AssetManager,
+    output_dir: String,
+    source_dirs: Vec<String>,
+}
+
+impl StaticAssetBuilder {
+    pub fn new(asset_manager: AssetManager, output_dir: &str) -> Self {
+        StaticAssetBuilder {
+            asset_manager,
+            output_dir: output_dir.to_string(),
+            source_dirs: vec![],
+        }
+    }
+
+    /// Add source directory to process
+    pub fn add_source(mut self, dir: &str) {
+        self.source_dirs.push(dir.to_string());
+    }
+
+    /// Build all static assets
+    pub async fn build(mut self) -> Result<BuildResult, FrontendError> {
+        let mut result = BuildResult {
+            total_files: 0,
+            total_size: 0,
+            optimized_size: 0,
+            assets: vec![],
+        };
+
+        for source_dir in &self.source_dirs {
+            self.process_directory(source_dir, &mut result).await?;
+        }
+
+        // Generate manifest
+        let manifest = self.asset_manager.generate_manifest();
+        self.write_file(&format!("{}/manifest.json", self.output_dir), manifest.as_bytes()).await?;
+
+        Ok(result)
+    }
+
+    /// Process a directory of assets
+    async fn process_directory(mut self, dir: &str, result: &mut BuildResult) -> Result<(), FrontendError> {
+        let entries = fs::read_dir(dir).await.map_err(|e| {
+            FrontendError::RenderError { message: format!("Failed to read directory: {}", e) }
+        })?;
+
+        for entry in entries {
+            let path = entry.path();
+            if entry.is_dir() {
+                self.process_directory(&path, result).await?;
+            } else {
+                self.process_file(&path, result).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a single asset file
+    async fn process_file(mut self, path: &str, result: &mut BuildResult) -> Result<(), FrontendError> {
+        let content = fs::read(path).await.map_err(|e| {
+            FrontendError::RenderError { message: format!("Failed to read file: {}", e) }
+        })?;
+
+        let relative_path = self.get_relative_path(path);
+        let entry = self.asset_manager.register_asset(&relative_path, &content);
+
+        // Write to output with hashed filename
+        let output_path = format!("{}/{}", self.output_dir, self.get_hashed_path(&relative_path, &entry.hash));
+        self.write_file(&output_path, &content).await?;
+
+        result.total_files += 1;
+        result.total_size += content.len() as i64;
+        result.assets.push(entry);
+
+        Ok(())
+    }
+
+    /// Get relative path from source directory
+    fn get_relative_path(self, path: &str) -> String {
+        for source_dir in &self.source_dirs {
+            if path.starts_with(source_dir) {
+                return path[source_dir.len()..].trim_start_matches('/').to_string();
+            }
+        }
+        path.to_string()
+    }
+
+    /// Get hashed filename for cache busting
+    fn get_hashed_path(self, path: &str, hash: &str) -> String {
+        if let Some(dot_pos) = path.rfind('.') {
+            format!("{}.{}{}", &path[0..dot_pos], hash, &path[dot_pos..])
+        } else {
+            format!("{}.{}", path, hash)
+        }
+    }
+
+    /// Write file to disk
+    async fn write_file(self, path: &str, content: &[u8]) -> Result<(), FrontendError> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.rsplit_once('/') {
+            fs::create_dir_all(parent.0).await.ok();
+        }
+
+        fs::write(path, content).await.map_err(|e| {
+            FrontendError::RenderError { message: format!("Failed to write file: {}", e) }
+        })
+    }
+}
+
+/// Build result summary
+pub type BuildResult = type {
+    total_files: i32,
+    total_size: i64,
+    optimized_size: i64,
+    assets: Vec<AssetEntry>,
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// HTML escape for attribute values
+fn html_escape(s: &str) -> String {
+    s.replace("&", "&amp;")
+     .replace("<", "&lt;")
+     .replace(">", "&gt;")
+     .replace("\"", "&quot;")
+     .replace("'", "&#39;")
+}

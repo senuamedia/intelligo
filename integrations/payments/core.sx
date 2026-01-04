@@ -1,0 +1,1962 @@
+/// Intelligo LMS - Core Payment Abstraction
+///
+/// Payment abstraction layer that provides:
+/// - PaymentProvider trait for multiple providers
+/// - PaymentService actor that abstracts providers
+/// - Transaction history and revenue reporting
+/// - Enrollment on successful payment
+/// - Automatic access revocation on cancellation
+
+module intelligo::integrations::payments::core
+
+use intelligo::core::types::*
+use intelligo::integrations::payments::stripe::{StripeActor, StripeConfig, StripeError}
+use intelligo::integrations::payments::paypal::{PayPalActor, PayPalConfig, PayPalError}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+use std::json::{Json, to_json, from_json}
+
+// =============================================================================
+// PAYMENT PROVIDER TRAIT
+// =============================================================================
+
+/// Trait for payment providers
+trait PaymentProvider {
+    /// Provider name
+    fn name(&self) -> String;
+
+    /// Create a checkout session for one-time purchase
+    async fn create_checkout(
+        &mut self,
+        input: CheckoutInput
+    ) -> Result<CheckoutResult, PaymentError>;
+
+    /// Create a subscription checkout
+    async fn create_subscription_checkout(
+        &mut self,
+        input: SubscriptionCheckoutInput
+    ) -> Result<CheckoutResult, PaymentError>;
+
+    /// Capture an authorized payment
+    async fn capture_payment(
+        &mut self,
+        authorization_id: &str
+    ) -> Result<PaymentResult, PaymentError>;
+
+    /// Process a refund
+    async fn refund(
+        &mut self,
+        input: RefundInput
+    ) -> Result<RefundResult, PaymentError>;
+
+    /// Cancel a subscription
+    async fn cancel_subscription(
+        &mut self,
+        subscription_id: &str,
+        immediately: Bool
+    ) -> Result<(), PaymentError>;
+
+    /// Get subscription details
+    async fn get_subscription(
+        &mut self,
+        subscription_id: &str
+    ) -> Result<SubscriptionDetails, PaymentError>;
+
+    /// Get payment details
+    async fn get_payment(
+        &mut self,
+        payment_id: &str
+    ) -> Result<PaymentDetails, PaymentError>;
+
+    /// Handle webhook
+    async fn handle_webhook(
+        &mut self,
+        headers: &Map<String, String>,
+        body: &str
+    ) -> Result<WebhookOutcome, PaymentError>;
+
+    /// Create or get customer
+    async fn ensure_customer(
+        &mut self,
+        user_id: UserId,
+        email: &str,
+        name: Option<String>,
+        tenant_id: TenantId
+    ) -> Result<String, PaymentError>;
+
+    /// Payout to instructor (marketplace)
+    async fn payout(
+        &mut self,
+        input: PayoutInput
+    ) -> Result<PayoutResult, PaymentError>;
+}
+
+// =============================================================================
+// COMMON PAYMENT TYPES
+// =============================================================================
+
+/// Payment provider identifier
+enum PaymentProviderType {
+    Stripe,
+    PayPal,
+    Custom { name: String }
+}
+
+impl PaymentProviderType {
+    fn to_string(&self) -> String {
+        match self {
+            PaymentProviderType::Stripe => "stripe".to_string(),
+            PaymentProviderType::PayPal => "paypal".to_string(),
+            PaymentProviderType::Custom { name } => name.clone()
+        }
+    }
+
+    fn from_string(s: &str) -> PaymentProviderType {
+        match s.to_lowercase().as_str() {
+            "stripe" => PaymentProviderType::Stripe,
+            "paypal" => PaymentProviderType::PayPal,
+            _ => PaymentProviderType::Custom { name: s.to_string() }
+        }
+    }
+}
+
+/// Input for creating a checkout session
+type CheckoutInput {
+    /// Provider to use
+    provider: PaymentProviderType,
+    /// User making the purchase
+    user_id: UserId,
+    /// User email
+    user_email: String,
+    /// User name (optional)
+    user_name: Option<String>,
+    /// Course being purchased
+    course_id: CourseId,
+    /// Course name
+    course_name: String,
+    /// Course description
+    course_description: Option<String>,
+    /// Price amount
+    amount: f64,
+    /// Currency code
+    currency: String,
+    /// Tenant ID
+    tenant_id: TenantId,
+    /// Success redirect URL
+    success_url: String,
+    /// Cancel redirect URL
+    cancel_url: String,
+    /// Allow discount codes
+    allow_discounts: Bool,
+    /// Instructor ID for marketplace (gets paid)
+    instructor_id: Option<UserId>,
+    /// Instructor's payment account ID
+    instructor_payment_account: Option<String>,
+    /// Platform fee percentage
+    platform_fee_percent: Option<f64>,
+    /// Custom metadata
+    metadata: Map<String, String>
+}
+
+/// Input for subscription checkout
+type SubscriptionCheckoutInput {
+    /// Provider to use
+    provider: PaymentProviderType,
+    /// User making the purchase
+    user_id: UserId,
+    /// User email
+    user_email: String,
+    /// User name (optional)
+    user_name: Option<String>,
+    /// Course or plan being subscribed to
+    course_id: CourseId,
+    /// Plan ID (provider-specific)
+    plan_id: String,
+    /// Tenant ID
+    tenant_id: TenantId,
+    /// Success redirect URL
+    success_url: String,
+    /// Cancel redirect URL
+    cancel_url: String,
+    /// Trial period days
+    trial_days: Option<i32>,
+    /// Custom metadata
+    metadata: Map<String, String>
+}
+
+/// Result of checkout creation
+type CheckoutResult {
+    /// Provider-specific checkout ID
+    checkout_id: String,
+    /// URL to redirect user for payment
+    checkout_url: String,
+    /// Expiration time
+    expires_at: Option<DateTime>,
+    /// Provider used
+    provider: PaymentProviderType
+}
+
+/// Input for refund
+type RefundInput {
+    /// Provider
+    provider: PaymentProviderType,
+    /// Payment/transaction ID to refund
+    payment_id: String,
+    /// Amount to refund (None = full refund)
+    amount: Option<f64>,
+    /// Currency
+    currency: Option<String>,
+    /// Reason for refund
+    reason: RefundReason,
+    /// Note to customer
+    note: Option<String>,
+    /// Metadata
+    metadata: Map<String, String>
+}
+
+/// Refund reason
+enum RefundReason {
+    CustomerRequest,
+    Duplicate,
+    Fraudulent,
+    ProductNotDelivered,
+    Other { description: String }
+}
+
+impl RefundReason {
+    fn to_string(&self) -> String {
+        match self {
+            RefundReason::CustomerRequest => "customer_request".to_string(),
+            RefundReason::Duplicate => "duplicate".to_string(),
+            RefundReason::Fraudulent => "fraudulent".to_string(),
+            RefundReason::ProductNotDelivered => "product_not_delivered".to_string(),
+            RefundReason::Other { description } => description.clone()
+        }
+    }
+}
+
+/// Result of refund
+type RefundResult {
+    /// Refund ID
+    refund_id: String,
+    /// Status
+    status: RefundStatus,
+    /// Amount refunded
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Provider
+    provider: PaymentProviderType
+}
+
+/// Refund status
+enum RefundStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled
+}
+
+/// Result of payment capture
+type PaymentResult {
+    /// Payment ID
+    payment_id: String,
+    /// Status
+    status: PaymentStatus,
+    /// Amount
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Provider
+    provider: PaymentProviderType
+}
+
+/// Payment status
+enum PaymentStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+    RequiresAction
+}
+
+/// Subscription details
+type SubscriptionDetails {
+    /// Subscription ID
+    id: String,
+    /// Status
+    status: SubscriptionState,
+    /// Customer ID
+    customer_id: String,
+    /// Plan/Price ID
+    plan_id: String,
+    /// Current period start
+    current_period_start: DateTime,
+    /// Current period end
+    current_period_end: DateTime,
+    /// Will cancel at period end
+    cancel_at_period_end: Bool,
+    /// Trial end (if in trial)
+    trial_end: Option<DateTime>,
+    /// Provider
+    provider: PaymentProviderType,
+    /// Metadata
+    metadata: Map<String, String>
+}
+
+/// Subscription state
+enum SubscriptionState {
+    Active,
+    Trialing,
+    PastDue,
+    Cancelled,
+    Paused,
+    Unpaid,
+    Incomplete
+}
+
+impl SubscriptionState {
+    fn is_active(&self) -> Bool {
+        matches!(self, SubscriptionState::Active | SubscriptionState::Trialing)
+    }
+
+    fn requires_attention(&self) -> Bool {
+        matches!(self, SubscriptionState::PastDue | SubscriptionState::Unpaid | SubscriptionState::Incomplete)
+    }
+}
+
+/// Payment details
+type PaymentDetails {
+    /// Payment ID
+    id: String,
+    /// Status
+    status: PaymentStatus,
+    /// Amount
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Customer ID
+    customer_id: Option<String>,
+    /// Created at
+    created_at: DateTime,
+    /// Provider
+    provider: PaymentProviderType,
+    /// Metadata
+    metadata: Map<String, String>
+}
+
+/// Input for payout
+type PayoutInput {
+    /// Provider
+    provider: PaymentProviderType,
+    /// Recipient (email or account ID)
+    recipient: String,
+    /// Amount
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Note to recipient
+    note: Option<String>,
+    /// Reference ID (for tracking)
+    reference_id: String,
+    /// Metadata
+    metadata: Map<String, String>
+}
+
+/// Result of payout
+type PayoutResult {
+    /// Payout ID
+    payout_id: String,
+    /// Status
+    status: PayoutStatus,
+    /// Amount
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Provider
+    provider: PaymentProviderType
+}
+
+/// Payout status
+enum PayoutStatus {
+    Pending,
+    InTransit,
+    Paid,
+    Failed,
+    Cancelled
+}
+
+/// Webhook outcome
+type WebhookOutcome {
+    /// Event ID
+    event_id: String,
+    /// Event type
+    event_type: WebhookEventType,
+    /// Action taken
+    action: WebhookAction,
+    /// Provider
+    provider: PaymentProviderType
+}
+
+/// Webhook event type
+enum WebhookEventType {
+    PaymentSucceeded,
+    PaymentFailed,
+    SubscriptionCreated,
+    SubscriptionUpdated,
+    SubscriptionCancelled,
+    SubscriptionPaymentFailed,
+    RefundCreated,
+    PayoutCompleted,
+    CustomerCreated,
+    Unknown { event_type: String }
+}
+
+/// Webhook action to take
+enum WebhookAction {
+    /// Enroll user in course
+    Enroll {
+        user_id: Option<UserId>,
+        course_id: Option<CourseId>,
+        customer_email: Option<String>
+    },
+    /// Revoke access to course
+    RevokeAccess {
+        user_id: Option<UserId>,
+        course_id: Option<CourseId>,
+        subscription_id: String
+    },
+    /// Update subscription status
+    UpdateSubscription {
+        subscription_id: String,
+        status: SubscriptionState
+    },
+    /// Record payment
+    RecordPayment {
+        payment_id: String,
+        amount: f64,
+        currency: String
+    },
+    /// Record refund
+    RecordRefund {
+        refund_id: String,
+        payment_id: String,
+        amount: f64
+    },
+    /// No action needed
+    NoAction
+}
+
+// =============================================================================
+// PAYMENT ERROR
+// =============================================================================
+
+/// Unified payment error
+enum PaymentError {
+    /// Configuration error
+    ConfigurationError { message: String },
+    /// Provider error
+    ProviderError { provider: String, message: String },
+    /// Invalid request
+    InvalidRequest { message: String },
+    /// Payment declined
+    PaymentDeclined { reason: String, decline_code: Option<String> },
+    /// Subscription error
+    SubscriptionError { message: String },
+    /// Refund error
+    RefundError { message: String },
+    /// Webhook error
+    WebhookError { message: String },
+    /// Customer error
+    CustomerError { message: String },
+    /// Payout error
+    PayoutError { message: String },
+    /// Not found
+    NotFound { resource_type: String, id: String },
+    /// Rate limit
+    RateLimitError { retry_after: Duration },
+    /// Network error
+    NetworkError { message: String }
+}
+
+impl PaymentError {
+    fn to_lms_error(&self) -> LmsError {
+        match self {
+            PaymentError::ConfigurationError { message } =>
+                LmsError::IntegrationError { provider: "payment".to_string(), message: message.clone() },
+            PaymentError::ProviderError { provider, message } =>
+                LmsError::IntegrationError { provider: provider.clone(), message: message.clone() },
+            PaymentError::PaymentDeclined { reason, .. } =>
+                LmsError::IntegrationError { provider: "payment".to_string(), message: reason.clone() },
+            PaymentError::NotFound { entity_type, id } =>
+                LmsError::NotFound { entity_type: entity_type.clone(), id: id.clone() },
+            PaymentError::RateLimitError { retry_after } =>
+                LmsError::RateLimitExceeded { retry_after: *retry_after },
+            _ => LmsError::IntegrationError { provider: "payment".to_string(), message: format!("{:?}", self) }
+        }
+    }
+
+    fn from_stripe_error(err: StripeError) -> PaymentError {
+        match err {
+            StripeError::CardError { message, decline_code, .. } =>
+                PaymentError::PaymentDeclined { reason: message, decline_code },
+            StripeError::WebhookError { message } =>
+                PaymentError::WebhookError { message },
+            StripeError::RateLimitError { retry_after } =>
+                PaymentError::RateLimitError { retry_after: Duration::seconds(retry_after.unwrap_or(60)) },
+            _ => PaymentError::ProviderError { provider: "stripe".to_string(), message: format!("{:?}", err) }
+        }
+    }
+
+    fn from_paypal_error(err: PayPalError) -> PaymentError {
+        match err {
+            PayPalError::WebhookError { message } =>
+                PaymentError::WebhookError { message },
+            PayPalError::RateLimitError { retry_after } =>
+                PaymentError::RateLimitError { retry_after: Duration::seconds(retry_after.unwrap_or(60)) },
+            PayPalError::NotFound { resource_type, resource_id } =>
+                PaymentError::NotFound { resource_type, id: resource_id },
+            _ => PaymentError::ProviderError { provider: "paypal".to_string(), message: format!("{:?}", err) }
+        }
+    }
+}
+
+// =============================================================================
+// TRANSACTION TYPES
+// =============================================================================
+
+/// Unique identifier for a transaction
+type TransactionId = String
+
+/// Payment transaction record
+type Transaction {
+    /// Unique identifier
+    id: TransactionId,
+    /// Transaction UUID
+    uuid: String,
+    /// Provider used
+    provider: PaymentProviderType,
+    /// Provider's transaction ID
+    provider_transaction_id: String,
+    /// Transaction type
+    transaction_type: TransactionType,
+    /// Status
+    status: TransactionStatus,
+    /// User who made the payment
+    user_id: UserId,
+    /// Course purchased
+    course_id: Option<CourseId>,
+    /// Tenant
+    tenant_id: TenantId,
+    /// Amount
+    amount: f64,
+    /// Currency
+    currency: String,
+    /// Net amount (after fees)
+    net_amount: f64,
+    /// Platform fee
+    platform_fee: f64,
+    /// Provider fee
+    provider_fee: f64,
+    /// Instructor share (if marketplace)
+    instructor_amount: Option<f64>,
+    /// Instructor ID
+    instructor_id: Option<UserId>,
+    /// Related subscription ID
+    subscription_id: Option<String>,
+    /// Related enrollment ID
+    enrollment_id: Option<EnrollmentId>,
+    /// Refund info (if refunded)
+    refund: Option<RefundInfo>,
+    /// Description
+    description: String,
+    /// Customer email
+    customer_email: Option<String>,
+    /// Customer name
+    customer_name: Option<String>,
+    /// Metadata
+    metadata: Map<String, String>,
+    /// Created at
+    created_at: DateTime,
+    /// Updated at
+    updated_at: DateTime
+}
+
+/// Transaction type
+enum TransactionType {
+    /// One-time course purchase
+    Purchase,
+    /// Subscription payment
+    SubscriptionPayment,
+    /// Refund
+    Refund,
+    /// Payout to instructor
+    Payout,
+    /// Chargeback
+    Chargeback,
+    /// Adjustment
+    Adjustment
+}
+
+/// Transaction status
+enum TransactionStatus {
+    Pending,
+    Completed,
+    Failed,
+    Refunded,
+    PartiallyRefunded,
+    Disputed,
+    Cancelled
+}
+
+/// Refund information
+type RefundInfo {
+    /// Refund ID
+    refund_id: String,
+    /// Amount refunded
+    amount: f64,
+    /// Reason
+    reason: String,
+    /// Refunded at
+    refunded_at: DateTime,
+    /// Refunded by
+    refunded_by: Option<UserId>
+}
+
+/// Subscription record
+type SubscriptionRecord {
+    /// Internal ID
+    id: String,
+    /// Provider
+    provider: PaymentProviderType,
+    /// Provider's subscription ID
+    provider_subscription_id: String,
+    /// Provider's customer ID
+    provider_customer_id: String,
+    /// Plan ID
+    plan_id: String,
+    /// User
+    user_id: UserId,
+    /// Course
+    course_id: CourseId,
+    /// Tenant
+    tenant_id: TenantId,
+    /// Status
+    status: SubscriptionState,
+    /// Current period start
+    current_period_start: DateTime,
+    /// Current period end
+    current_period_end: DateTime,
+    /// Cancel at period end
+    cancel_at_period_end: Bool,
+    /// Trial end
+    trial_end: Option<DateTime>,
+    /// Cancelled at
+    cancelled_at: Option<DateTime>,
+    /// Related enrollment
+    enrollment_id: Option<EnrollmentId>,
+    /// Metadata
+    metadata: Map<String, String>,
+    /// Created at
+    created_at: DateTime,
+    /// Updated at
+    updated_at: DateTime
+}
+
+// =============================================================================
+// REVENUE REPORTING
+// =============================================================================
+
+/// Revenue report
+type RevenueReport {
+    /// Report period start
+    period_start: DateTime,
+    /// Report period end
+    period_end: DateTime,
+    /// Total gross revenue
+    gross_revenue: f64,
+    /// Total net revenue
+    net_revenue: f64,
+    /// Total refunds
+    total_refunds: f64,
+    /// Total platform fees
+    platform_fees: f64,
+    /// Total provider fees
+    provider_fees: f64,
+    /// Total instructor payouts
+    instructor_payouts: f64,
+    /// Transaction count
+    transaction_count: i32,
+    /// Refund count
+    refund_count: i32,
+    /// New subscription count
+    new_subscriptions: i32,
+    /// Cancelled subscription count
+    cancelled_subscriptions: i32,
+    /// Revenue by provider
+    by_provider: Map<String, ProviderRevenue>,
+    /// Revenue by course
+    by_course: Map<CourseId, CourseRevenue>,
+    /// Currency
+    currency: String
+}
+
+/// Revenue by provider
+type ProviderRevenue {
+    provider: String,
+    gross_revenue: f64,
+    net_revenue: f64,
+    transaction_count: i32,
+    fees: f64
+}
+
+/// Revenue by course
+type CourseRevenue {
+    course_id: CourseId,
+    course_name: String,
+    gross_revenue: f64,
+    net_revenue: f64,
+    enrollments: i32,
+    refunds: f64
+}
+
+/// Instructor earnings report
+type InstructorEarningsReport {
+    /// Instructor ID
+    instructor_id: UserId,
+    /// Report period
+    period_start: DateTime,
+    period_end: DateTime,
+    /// Total earnings
+    total_earnings: f64,
+    /// Pending payout
+    pending_payout: f64,
+    /// Paid out
+    paid_out: f64,
+    /// Earnings by course
+    by_course: Map<CourseId, CourseEarnings>,
+    /// Currency
+    currency: String
+}
+
+/// Course earnings for instructor
+type CourseEarnings {
+    course_id: CourseId,
+    course_name: String,
+    earnings: f64,
+    enrollments: i32,
+    refunds: f64
+}
+
+// =============================================================================
+// PAYMENT SERVICE ACTOR
+// =============================================================================
+
+/// Payment service configuration
+type PaymentServiceConfig {
+    /// Stripe config
+    stripe: Option<StripeConfig>,
+    /// PayPal config
+    paypal: Option<PayPalConfig>,
+    /// Default provider
+    default_provider: PaymentProviderType,
+    /// Platform fee percentage
+    default_platform_fee: f64,
+    /// Auto-enroll on payment
+    auto_enroll: Bool,
+    /// Auto-revoke on cancellation
+    auto_revoke: Bool,
+    /// Grace period for past due subscriptions
+    grace_period_days: i32
+}
+
+impl PaymentServiceConfig {
+    fn default() -> PaymentServiceConfig {
+        PaymentServiceConfig {
+            stripe: None,
+            paypal: None,
+            default_provider: PaymentProviderType::Stripe,
+            default_platform_fee: 10.0,
+            auto_enroll: true,
+            auto_revoke: true,
+            grace_period_days: 7
+        }
+    }
+}
+
+/// Payment service actor
+actor PaymentService {
+    /// Configuration
+    config: PaymentServiceConfig,
+
+    /// Stripe provider
+    stripe: Option<StripeActor>,
+
+    /// PayPal provider
+    paypal: Option<PayPalActor>,
+
+    /// Transaction store (in production, use database)
+    transactions: Map<TransactionId, Transaction>,
+
+    /// Subscription store
+    subscriptions: Map<String, SubscriptionRecord>,
+
+    /// Customer mapping (user_id -> provider -> customer_id)
+    customers: Map<UserId, Map<String, String>>,
+
+    /// Enrollment callback
+    enrollment_callback: Option<fn(UserId, CourseId, TenantId) -> Result<EnrollmentId, LmsError>>,
+
+    /// Revocation callback
+    revocation_callback: Option<fn(EnrollmentId) -> Result<(), LmsError>>
+}
+
+impl PaymentService {
+    /// Create new payment service
+    pub fn new(config: PaymentServiceConfig) -> Result<PaymentService, PaymentError> {
+        let stripe = config.stripe.as_ref().map(|c| StripeActor::new(c.clone()));
+        let paypal = config.paypal.as_ref().map(|c| PayPalActor::new(c.clone()));
+
+        Ok(PaymentService {
+            config,
+            stripe,
+            paypal,
+            transactions: Map::new(),
+            subscriptions: Map::new(),
+            customers: Map::new(),
+            enrollment_callback: None,
+            revocation_callback: None
+        })
+    }
+
+    /// Create from environment
+    pub fn from_env() -> Result<PaymentService, PaymentError> {
+        let stripe = StripeConfig::from_env().ok();
+        let paypal = PayPalConfig::from_env().ok();
+
+        let default_provider = if stripe.is_some() {
+            PaymentProviderType::Stripe
+        } else if paypal.is_some() {
+            PaymentProviderType::PayPal
+        } else {
+            return Err(PaymentError::ConfigurationError {
+                message: "No payment provider configured".to_string()
+            })
+        };
+
+        let config = PaymentServiceConfig {
+            stripe,
+            paypal,
+            default_provider,
+            ..PaymentServiceConfig::default()
+        };
+
+        PaymentService::new(config)
+    }
+
+    /// Set enrollment callback
+    pub fn set_enrollment_callback(&mut self, callback: fn(UserId, CourseId, TenantId) -> Result<EnrollmentId, LmsError>) {
+        self.enrollment_callback = Some(callback);
+    }
+
+    /// Set revocation callback
+    pub fn set_revocation_callback(&mut self, callback: fn(EnrollmentId) -> Result<(), LmsError>) {
+        self.revocation_callback = Some(callback);
+    }
+
+    // =========================================================================
+    // CHECKOUT
+    // =========================================================================
+
+    /// Create checkout session
+    pub async fn create_checkout(&mut self, input: CheckoutInput) -> Result<CheckoutResult, PaymentError> {
+        let provider = &input.provider;
+
+        match provider {
+            PaymentProviderType::Stripe => {
+                let stripe = self.stripe.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+                // Ensure customer exists
+                let customer_id = self.ensure_customer_internal(
+                    stripe,
+                    &input.user_id,
+                    &input.user_email,
+                    input.user_name.clone(),
+                    &input.tenant_id
+                ).await?;
+
+                // Get or create product and price
+                // In production, these would be managed separately
+                let mut metadata = input.metadata.clone();
+                metadata.insert("user_id".to_string(), input.user_id.clone());
+                metadata.insert("course_id".to_string(), input.course_id.clone());
+                metadata.insert("tenant_id".to_string(), input.tenant_id.clone());
+
+                // Create checkout session
+                use intelligo::integrations::payments::stripe::{CreateCheckoutInput, SessionMode};
+
+                let checkout_input = CreateCheckoutInput {
+                    customer_id: Some(customer_id),
+                    customer_email: None,
+                    price_id: format!("price_{}", input.course_id), // Would use actual price ID
+                    quantity: Some(1),
+                    success_url: input.success_url,
+                    cancel_url: input.cancel_url,
+                    mode: SessionMode::Payment,
+                    allow_promotion_codes: input.allow_discounts,
+                    metadata,
+                    connected_account_id: input.instructor_payment_account,
+                    application_fee_percent: input.platform_fee_percent
+                };
+
+                let session = stripe.create_checkout_session(checkout_input).await
+                    .map_err(PaymentError::from_stripe_error)?;
+
+                Ok(CheckoutResult {
+                    checkout_id: session.id,
+                    checkout_url: session.url.unwrap_or_default(),
+                    expires_at: Some(DateTime::from_timestamp(session.expires_at)),
+                    provider: PaymentProviderType::Stripe
+                })
+            },
+            PaymentProviderType::PayPal => {
+                let paypal = self.paypal.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+                use intelligo::integrations::payments::paypal::CreateOrderInput;
+
+                let mut metadata = input.metadata.clone();
+                metadata.insert("user_id".to_string(), input.user_id.clone());
+                metadata.insert("tenant_id".to_string(), input.tenant_id.clone());
+
+                let order_input = CreateOrderInput {
+                    course_id: input.course_id,
+                    course_name: input.course_name,
+                    course_description: input.course_description,
+                    amount: input.amount,
+                    currency: input.currency,
+                    user_id: input.user_id,
+                    return_url: input.success_url,
+                    cancel_url: input.cancel_url,
+                    instructor_merchant_id: input.instructor_payment_account,
+                    metadata
+                };
+
+                let order = paypal.create_order(order_input).await
+                    .map_err(PaymentError::from_paypal_error)?;
+
+                let approval_url = paypal.get_approval_url(&order)
+                    .ok_or(PaymentError::ProviderError {
+                        provider: "paypal".to_string(),
+                        message: "No approval URL in order".to_string()
+                    })?;
+
+                Ok(CheckoutResult {
+                    checkout_id: order.id,
+                    checkout_url: approval_url,
+                    expires_at: None,
+                    provider: PaymentProviderType::PayPal
+                })
+            },
+            PaymentProviderType::Custom { name } => {
+                Err(PaymentError::ConfigurationError {
+                    message: format!("Custom provider '{}' not implemented", name)
+                })
+            }
+        }
+    }
+
+    /// Create subscription checkout
+    pub async fn create_subscription_checkout(&mut self, input: SubscriptionCheckoutInput) -> Result<CheckoutResult, PaymentError> {
+        match &input.provider {
+            PaymentProviderType::Stripe => {
+                let stripe = self.stripe.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+                // Ensure customer
+                let customer_id = self.ensure_customer_internal(
+                    stripe,
+                    &input.user_id,
+                    &input.user_email,
+                    input.user_name.clone(),
+                    &input.tenant_id
+                ).await?;
+
+                let mut metadata = input.metadata.clone();
+                metadata.insert("user_id".to_string(), input.user_id.clone());
+                metadata.insert("course_id".to_string(), input.course_id.clone());
+                metadata.insert("tenant_id".to_string(), input.tenant_id.clone());
+
+                use intelligo::integrations::payments::stripe::{CreateCheckoutInput, SessionMode};
+
+                let checkout_input = CreateCheckoutInput {
+                    customer_id: Some(customer_id),
+                    customer_email: None,
+                    price_id: input.plan_id,
+                    quantity: Some(1),
+                    success_url: input.success_url,
+                    cancel_url: input.cancel_url,
+                    mode: SessionMode::Subscription,
+                    allow_promotion_codes: true,
+                    metadata,
+                    connected_account_id: None,
+                    application_fee_percent: None
+                };
+
+                let session = stripe.create_checkout_session(checkout_input).await
+                    .map_err(PaymentError::from_stripe_error)?;
+
+                Ok(CheckoutResult {
+                    checkout_id: session.id,
+                    checkout_url: session.url.unwrap_or_default(),
+                    expires_at: Some(DateTime::from_timestamp(session.expires_at)),
+                    provider: PaymentProviderType::Stripe
+                })
+            },
+            PaymentProviderType::PayPal => {
+                let paypal = self.paypal.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+                use intelligo::integrations::payments::paypal::CreateSubscriptionInput;
+
+                let subscription_input = CreateSubscriptionInput {
+                    plan_id: input.plan_id,
+                    user_id: input.user_id.clone(),
+                    course_id: input.course_id.clone(),
+                    return_url: input.success_url,
+                    cancel_url: input.cancel_url,
+                    custom_id: Some(format!("{}:{}", input.user_id, input.course_id)),
+                    start_time: input.trial_days.map(|days| DateTime::now() + Duration::days(days as i64))
+                };
+
+                let subscription = paypal.create_subscription(subscription_input).await
+                    .map_err(PaymentError::from_paypal_error)?;
+
+                let approval_url = paypal.get_subscription_approval_url(&subscription)
+                    .ok_or(PaymentError::ProviderError {
+                        provider: "paypal".to_string(),
+                        message: "No approval URL in subscription".to_string()
+                    })?;
+
+                Ok(CheckoutResult {
+                    checkout_id: subscription.id,
+                    checkout_url: approval_url,
+                    expires_at: None,
+                    provider: PaymentProviderType::PayPal
+                })
+            },
+            _ => Err(PaymentError::ConfigurationError { message: "Provider not supported".to_string() })
+        }
+    }
+
+    async fn ensure_customer_internal(
+        &mut self,
+        stripe: &mut StripeActor,
+        user_id: &UserId,
+        email: &str,
+        name: Option<String>,
+        tenant_id: &TenantId
+    ) -> Result<String, PaymentError> {
+        // Check cache
+        if let Some(provider_map) = self.customers.get(user_id) {
+            if let Some(customer_id) = provider_map.get("stripe") {
+                return Ok(customer_id.clone())
+            }
+        }
+
+        // Create customer
+        let customer = stripe.get_or_create_customer(
+            user_id.clone(),
+            email,
+            name,
+            tenant_id.clone()
+        ).await.map_err(PaymentError::from_stripe_error)?;
+
+        // Cache
+        let provider_map = self.customers.entry(user_id.clone()).or_insert(Map::new());
+        provider_map.insert("stripe".to_string(), customer.id.clone());
+
+        Ok(customer.id)
+    }
+
+    // =========================================================================
+    // REFUNDS
+    // =========================================================================
+
+    /// Process a refund
+    pub async fn refund(&mut self, input: RefundInput) -> Result<RefundResult, PaymentError> {
+        match &input.provider {
+            PaymentProviderType::Stripe => {
+                let stripe = self.stripe.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+                use intelligo::integrations::payments::stripe::{CreateRefundInput as StripeRefundInput, RefundReason as StripeRefundReason};
+
+                let reason = match &input.reason {
+                    RefundReason::Duplicate => Some(StripeRefundReason::Duplicate),
+                    RefundReason::Fraudulent => Some(StripeRefundReason::Fraudulent),
+                    RefundReason::CustomerRequest => Some(StripeRefundReason::RequestedByCustomer),
+                    _ => None
+                };
+
+                let refund_input = StripeRefundInput {
+                    payment_intent_id: Some(input.payment_id.clone()),
+                    charge_id: None,
+                    amount: input.amount.map(|a| (a * 100.0) as i64),
+                    reason,
+                    metadata: Some(input.metadata)
+                };
+
+                let refund = stripe.create_refund(refund_input).await
+                    .map_err(PaymentError::from_stripe_error)?;
+
+                // Update transaction
+                self.record_refund(&input.payment_id, &refund.id, refund.amount as f64 / 100.0, &input.reason);
+
+                Ok(RefundResult {
+                    refund_id: refund.id,
+                    status: match refund.status {
+                        intelligo::integrations::payments::stripe::RefundStatus::Succeeded => RefundStatus::Succeeded,
+                        intelligo::integrations::payments::stripe::RefundStatus::Failed => RefundStatus::Failed,
+                        intelligo::integrations::payments::stripe::RefundStatus::Canceled => RefundStatus::Cancelled,
+                        _ => RefundStatus::Pending
+                    },
+                    amount: refund.amount as f64 / 100.0,
+                    currency: refund.currency,
+                    provider: PaymentProviderType::Stripe
+                })
+            },
+            PaymentProviderType::PayPal => {
+                let paypal = self.paypal.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+                use intelligo::integrations::payments::paypal::CreateRefundInput as PayPalRefundInput;
+
+                let refund_input = PayPalRefundInput {
+                    capture_id: input.payment_id.clone(),
+                    amount: input.amount,
+                    currency: input.currency,
+                    note_to_payer: input.note,
+                    invoice_id: None
+                };
+
+                let refund = paypal.create_refund(refund_input).await
+                    .map_err(PaymentError::from_paypal_error)?;
+
+                let amount: f64 = refund.amount.value.parse().unwrap_or(0.0);
+
+                // Update transaction
+                self.record_refund(&input.payment_id, &refund.id, amount, &input.reason);
+
+                Ok(RefundResult {
+                    refund_id: refund.id,
+                    status: match refund.status {
+                        intelligo::integrations::payments::paypal::RefundStatus::Completed => RefundStatus::Succeeded,
+                        intelligo::integrations::payments::paypal::RefundStatus::Failed => RefundStatus::Failed,
+                        intelligo::integrations::payments::paypal::RefundStatus::Cancelled => RefundStatus::Cancelled,
+                        _ => RefundStatus::Pending
+                    },
+                    amount,
+                    currency: refund.amount.currency_code,
+                    provider: PaymentProviderType::PayPal
+                })
+            },
+            _ => Err(PaymentError::ConfigurationError { message: "Provider not supported".to_string() })
+        }
+    }
+
+    fn record_refund(&mut self, payment_id: &str, refund_id: &str, amount: f64, reason: &RefundReason) {
+        // Find and update transaction
+        for (_, transaction) in self.transactions.iter_mut() {
+            if transaction.provider_transaction_id == payment_id {
+                transaction.refund = Some(RefundInfo {
+                    refund_id: refund_id.to_string(),
+                    amount,
+                    reason: reason.to_string(),
+                    refunded_at: DateTime::now(),
+                    refunded_by: None
+                });
+                transaction.status = if amount >= transaction.amount {
+                    TransactionStatus::Refunded
+                } else {
+                    TransactionStatus::PartiallyRefunded
+                };
+                transaction.updated_at = DateTime::now();
+                break
+            }
+        }
+    }
+
+    // =========================================================================
+    // SUBSCRIPTIONS
+    // =========================================================================
+
+    /// Cancel a subscription
+    pub async fn cancel_subscription(
+        &mut self,
+        subscription_id: &str,
+        provider: PaymentProviderType,
+        immediately: Bool
+    ) -> Result<(), PaymentError> {
+        match provider {
+            PaymentProviderType::Stripe => {
+                let stripe = self.stripe.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+                if immediately {
+                    stripe.cancel_subscription(subscription_id).await
+                        .map_err(PaymentError::from_stripe_error)?;
+                } else {
+                    stripe.cancel_subscription_at_period_end(subscription_id).await
+                        .map_err(PaymentError::from_stripe_error)?;
+                }
+
+                // Update local record
+                if let Some(record) = self.subscriptions.get_mut(subscription_id) {
+                    record.status = if immediately {
+                        SubscriptionState::Cancelled
+                    } else {
+                        record.cancel_at_period_end = true;
+                        record.status.clone()
+                    };
+                    record.cancelled_at = Some(DateTime::now());
+                    record.updated_at = DateTime::now();
+
+                    // Revoke access if immediately and auto-revoke enabled
+                    if immediately && self.config.auto_revoke {
+                        if let (Some(enrollment_id), Some(callback)) = (&record.enrollment_id, &self.revocation_callback) {
+                            let _ = callback(enrollment_id.clone());
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+            PaymentProviderType::PayPal => {
+                let paypal = self.paypal.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+                let reason = if immediately { "Immediate cancellation" } else { "User requested cancellation" };
+                paypal.cancel_subscription(subscription_id, reason).await
+                    .map_err(PaymentError::from_paypal_error)?;
+
+                // Update local record
+                if let Some(record) = self.subscriptions.get_mut(subscription_id) {
+                    record.status = SubscriptionState::Cancelled;
+                    record.cancelled_at = Some(DateTime::now());
+                    record.updated_at = DateTime::now();
+
+                    // Revoke access
+                    if self.config.auto_revoke {
+                        if let (Some(enrollment_id), Some(callback)) = (&record.enrollment_id, &self.revocation_callback) {
+                            let _ = callback(enrollment_id.clone());
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+            _ => Err(PaymentError::ConfigurationError { message: "Provider not supported".to_string() })
+        }
+    }
+
+    /// Get subscription details
+    pub async fn get_subscription(
+        &mut self,
+        subscription_id: &str,
+        provider: PaymentProviderType
+    ) -> Result<SubscriptionDetails, PaymentError> {
+        match provider {
+            PaymentProviderType::Stripe => {
+                let stripe = self.stripe.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+                let sub = stripe.get_subscription(subscription_id).await
+                    .map_err(PaymentError::from_stripe_error)?;
+
+                Ok(SubscriptionDetails {
+                    id: sub.id,
+                    status: match sub.status {
+                        intelligo::integrations::payments::stripe::SubscriptionState::Active => SubscriptionState::Active,
+                        intelligo::integrations::payments::stripe::SubscriptionState::Trialing => SubscriptionState::Trialing,
+                        intelligo::integrations::payments::stripe::SubscriptionState::PastDue => SubscriptionState::PastDue,
+                        intelligo::integrations::payments::stripe::SubscriptionState::Canceled => SubscriptionState::Cancelled,
+                        intelligo::integrations::payments::stripe::SubscriptionState::Paused => SubscriptionState::Paused,
+                        intelligo::integrations::payments::stripe::SubscriptionState::Unpaid => SubscriptionState::Unpaid,
+                        _ => SubscriptionState::Incomplete
+                    },
+                    customer_id: sub.customer,
+                    plan_id: sub.items.data.get(0).map(|i| i.price.id.clone()).unwrap_or_default(),
+                    current_period_start: DateTime::from_timestamp(sub.current_period_start),
+                    current_period_end: DateTime::from_timestamp(sub.current_period_end),
+                    cancel_at_period_end: sub.cancel_at_period_end,
+                    trial_end: sub.trial_end.map(DateTime::from_timestamp),
+                    provider: PaymentProviderType::Stripe,
+                    metadata: sub.metadata
+                })
+            },
+            PaymentProviderType::PayPal => {
+                let paypal = self.paypal.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+                let sub = paypal.get_subscription(subscription_id).await
+                    .map_err(PaymentError::from_paypal_error)?;
+
+                Ok(SubscriptionDetails {
+                    id: sub.id,
+                    status: match sub.status {
+                        intelligo::integrations::payments::paypal::SubscriptionStatus::Active => SubscriptionState::Active,
+                        intelligo::integrations::payments::paypal::SubscriptionStatus::Suspended => SubscriptionState::Paused,
+                        intelligo::integrations::payments::paypal::SubscriptionStatus::Cancelled => SubscriptionState::Cancelled,
+                        intelligo::integrations::payments::paypal::SubscriptionStatus::Expired => SubscriptionState::Cancelled,
+                        _ => SubscriptionState::Incomplete
+                    },
+                    customer_id: sub.subscriber.map(|s| s.payer_id.unwrap_or_default()).unwrap_or_default(),
+                    plan_id: sub.plan_id,
+                    current_period_start: DateTime::parse_rfc3339(&sub.start_time).unwrap_or(DateTime::now()),
+                    current_period_end: sub.billing_info
+                        .and_then(|b| b.next_billing_time)
+                        .and_then(|t| DateTime::parse_rfc3339(&t).ok())
+                        .unwrap_or(DateTime::now()),
+                    cancel_at_period_end: false,
+                    trial_end: None,
+                    provider: PaymentProviderType::PayPal,
+                    metadata: Map::new()
+                })
+            },
+            _ => Err(PaymentError::ConfigurationError { message: "Provider not supported".to_string() })
+        }
+    }
+
+    // =========================================================================
+    // WEBHOOKS
+    // =========================================================================
+
+    /// Handle Stripe webhook
+    pub async fn handle_stripe_webhook(
+        &mut self,
+        payload: &str,
+        signature: &str
+    ) -> Result<WebhookOutcome, PaymentError> {
+        let stripe = self.stripe.as_mut()
+            .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+        let result = stripe.handle_webhook(payload, signature).await
+            .map_err(PaymentError::from_stripe_error)?;
+
+        // Process the result
+        match result {
+            intelligo::integrations::payments::stripe::WebhookResult::Processed { event_id, action } => {
+                let (event_type, webhook_action) = self.process_stripe_action(action).await?;
+                Ok(WebhookOutcome {
+                    event_id,
+                    event_type,
+                    action: webhook_action,
+                    provider: PaymentProviderType::Stripe
+                })
+            },
+            intelligo::integrations::payments::stripe::WebhookResult::AlreadyProcessed { event_id } => {
+                Ok(WebhookOutcome {
+                    event_id,
+                    event_type: WebhookEventType::Unknown { event_type: "already_processed".to_string() },
+                    action: WebhookAction::NoAction,
+                    provider: PaymentProviderType::Stripe
+                })
+            }
+        }
+    }
+
+    async fn process_stripe_action(
+        &mut self,
+        action: intelligo::integrations::payments::stripe::WebhookAction
+    ) -> Result<(WebhookEventType, WebhookAction), PaymentError> {
+        use intelligo::integrations::payments::stripe::WebhookAction as StripeAction;
+
+        match action {
+            StripeAction::EnrollUser { session_id, customer_id, course_id, user_id } => {
+                // Trigger enrollment if callback set and auto-enroll enabled
+                if self.config.auto_enroll {
+                    if let (Some(uid), Some(cid), Some(callback)) = (&user_id, &course_id, &self.enrollment_callback) {
+                        // In production, get tenant_id from session metadata
+                        let _ = callback(uid.clone(), cid.clone(), "default_tenant".to_string());
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::PaymentSucceeded,
+                    WebhookAction::Enroll {
+                        user_id,
+                        course_id,
+                        customer_email: None
+                    }
+                ))
+            },
+            StripeAction::RecordPayment { payment_intent_id, amount, currency } => {
+                // Record transaction
+                self.record_transaction(
+                    PaymentProviderType::Stripe,
+                    &payment_intent_id,
+                    TransactionType::Purchase,
+                    amount as f64 / 100.0,
+                    &currency,
+                    None,
+                    None,
+                    None
+                );
+
+                Ok((
+                    WebhookEventType::PaymentSucceeded,
+                    WebhookAction::RecordPayment {
+                        payment_id: payment_intent_id,
+                        amount: amount as f64 / 100.0,
+                        currency
+                    }
+                ))
+            },
+            StripeAction::RevokeAccess { subscription_id, customer_id, course_id } => {
+                // Find subscription and revoke
+                if let Some(record) = self.subscriptions.get(&subscription_id) {
+                    if self.config.auto_revoke {
+                        if let (Some(enrollment_id), Some(callback)) = (&record.enrollment_id, &self.revocation_callback) {
+                            let _ = callback(enrollment_id.clone());
+                        }
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::SubscriptionCancelled,
+                    WebhookAction::RevokeAccess {
+                        user_id: None,
+                        course_id,
+                        subscription_id
+                    }
+                ))
+            },
+            StripeAction::SubscriptionCreated { subscription_id, customer_id, metadata } => {
+                let user_id = metadata.get("user_id").cloned();
+                let course_id = metadata.get("course_id").cloned();
+
+                // Trigger enrollment
+                if self.config.auto_enroll {
+                    if let (Some(uid), Some(cid), Some(callback)) = (&user_id, &course_id, &self.enrollment_callback) {
+                        let tenant_id = metadata.get("tenant_id").cloned().unwrap_or("default".to_string());
+                        let _ = callback(uid.clone(), cid.clone(), tenant_id);
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::SubscriptionCreated,
+                    WebhookAction::Enroll {
+                        user_id,
+                        course_id,
+                        customer_email: None
+                    }
+                ))
+            },
+            StripeAction::SubscriptionUpdated { subscription_id, status, cancel_at_period_end } => {
+                let state = match status.as_str() {
+                    "active" => SubscriptionState::Active,
+                    "past_due" => SubscriptionState::PastDue,
+                    "canceled" => SubscriptionState::Cancelled,
+                    "unpaid" => SubscriptionState::Unpaid,
+                    _ => SubscriptionState::Active
+                };
+
+                // Update local record
+                if let Some(record) = self.subscriptions.get_mut(&subscription_id) {
+                    record.status = state.clone();
+                    record.cancel_at_period_end = cancel_at_period_end;
+                    record.updated_at = DateTime::now();
+                }
+
+                Ok((
+                    WebhookEventType::SubscriptionUpdated,
+                    WebhookAction::UpdateSubscription {
+                        subscription_id,
+                        status: state
+                    }
+                ))
+            },
+            StripeAction::InvoicePaymentFailed { invoice_id, subscription_id, attempt_count } => {
+                // Check if past grace period
+                if attempt_count > 3 && self.config.auto_revoke {
+                    if let Some(sub_id) = &subscription_id {
+                        if let Some(record) = self.subscriptions.get(sub_id) {
+                            if let (Some(enrollment_id), Some(callback)) = (&record.enrollment_id, &self.revocation_callback) {
+                                let _ = callback(enrollment_id.clone());
+                            }
+                        }
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::SubscriptionPaymentFailed,
+                    WebhookAction::UpdateSubscription {
+                        subscription_id: subscription_id.unwrap_or_default(),
+                        status: SubscriptionState::PastDue
+                    }
+                ))
+            },
+            _ => Ok((
+                WebhookEventType::Unknown { event_type: "other".to_string() },
+                WebhookAction::NoAction
+            ))
+        }
+    }
+
+    /// Handle PayPal webhook
+    pub async fn handle_paypal_webhook(
+        &mut self,
+        headers: &Map<String, String>,
+        body: &str
+    ) -> Result<WebhookOutcome, PaymentError> {
+        let paypal = self.paypal.as_mut()
+            .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+        // Convert to Headers type
+        let mut http_headers = std::http::Headers::new();
+        for (k, v) in headers {
+            http_headers.set(k, v);
+        }
+
+        let result = paypal.handle_webhook(&http_headers, body).await
+            .map_err(PaymentError::from_paypal_error)?;
+
+        match result {
+            intelligo::integrations::payments::paypal::WebhookResult::Processed { event_id, action } => {
+                let (event_type, webhook_action) = self.process_paypal_action(action).await?;
+                Ok(WebhookOutcome {
+                    event_id,
+                    event_type,
+                    action: webhook_action,
+                    provider: PaymentProviderType::PayPal
+                })
+            },
+            intelligo::integrations::payments::paypal::WebhookResult::AlreadyProcessed { event_id } => {
+                Ok(WebhookOutcome {
+                    event_id,
+                    event_type: WebhookEventType::Unknown { event_type: "already_processed".to_string() },
+                    action: WebhookAction::NoAction,
+                    provider: PaymentProviderType::PayPal
+                })
+            }
+        }
+    }
+
+    async fn process_paypal_action(
+        &mut self,
+        action: intelligo::integrations::payments::paypal::WebhookAction
+    ) -> Result<(WebhookEventType, WebhookAction), PaymentError> {
+        use intelligo::integrations::payments::paypal::WebhookAction as PayPalAction;
+
+        match action {
+            PayPalAction::EnrollUser { order_id, user_id, course_id, payer_email } => {
+                if self.config.auto_enroll {
+                    if let (Some(uid), Some(cid), Some(callback)) = (&user_id, &course_id, &self.enrollment_callback) {
+                        let _ = callback(uid.clone(), cid.clone(), "default_tenant".to_string());
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::PaymentSucceeded,
+                    WebhookAction::Enroll {
+                        user_id,
+                        course_id,
+                        customer_email: payer_email
+                    }
+                ))
+            },
+            PayPalAction::RecordPayment { capture_id, amount, currency } => {
+                self.record_transaction(
+                    PaymentProviderType::PayPal,
+                    &capture_id,
+                    TransactionType::Purchase,
+                    amount,
+                    &currency,
+                    None,
+                    None,
+                    None
+                );
+
+                Ok((
+                    WebhookEventType::PaymentSucceeded,
+                    WebhookAction::RecordPayment {
+                        payment_id: capture_id,
+                        amount,
+                        currency
+                    }
+                ))
+            },
+            PayPalAction::SubscriptionActivated { subscription_id, user_id, course_id } => {
+                if self.config.auto_enroll {
+                    if let (Some(uid), Some(cid), Some(callback)) = (&user_id, &course_id, &self.enrollment_callback) {
+                        let _ = callback(uid.clone(), cid.clone(), "default_tenant".to_string());
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::SubscriptionCreated,
+                    WebhookAction::Enroll {
+                        user_id,
+                        course_id,
+                        customer_email: None
+                    }
+                ))
+            },
+            PayPalAction::RevokeAccess { subscription_id, course_id } => {
+                if let Some(record) = self.subscriptions.get(&subscription_id) {
+                    if self.config.auto_revoke {
+                        if let (Some(enrollment_id), Some(callback)) = (&record.enrollment_id, &self.revocation_callback) {
+                            let _ = callback(enrollment_id.clone());
+                        }
+                    }
+                }
+
+                Ok((
+                    WebhookEventType::SubscriptionCancelled,
+                    WebhookAction::RevokeAccess {
+                        user_id: None,
+                        course_id,
+                        subscription_id
+                    }
+                ))
+            },
+            _ => Ok((
+                WebhookEventType::Unknown { event_type: "other".to_string() },
+                WebhookAction::NoAction
+            ))
+        }
+    }
+
+    // =========================================================================
+    // TRANSACTIONS
+    // =========================================================================
+
+    fn record_transaction(
+        &mut self,
+        provider: PaymentProviderType,
+        provider_tx_id: &str,
+        tx_type: TransactionType,
+        amount: f64,
+        currency: &str,
+        user_id: Option<UserId>,
+        course_id: Option<CourseId>,
+        tenant_id: Option<TenantId>
+    ) {
+        let id = generate_uuid();
+        let platform_fee = amount * (self.config.default_platform_fee / 100.0);
+        let provider_fee = amount * 0.029 + 0.30; // Estimated provider fee
+        let net_amount = amount - platform_fee - provider_fee;
+
+        let transaction = Transaction {
+            id: id.clone(),
+            uuid: generate_uuid(),
+            provider,
+            provider_transaction_id: provider_tx_id.to_string(),
+            transaction_type: tx_type,
+            status: TransactionStatus::Completed,
+            user_id: user_id.unwrap_or_default(),
+            course_id,
+            tenant_id: tenant_id.unwrap_or("default".to_string()),
+            amount,
+            currency: currency.to_string(),
+            net_amount,
+            platform_fee,
+            provider_fee,
+            instructor_amount: None,
+            instructor_id: None,
+            subscription_id: None,
+            enrollment_id: None,
+            refund: None,
+            description: "Course purchase".to_string(),
+            customer_email: None,
+            customer_name: None,
+            metadata: Map::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now()
+        };
+
+        self.transactions.insert(id, transaction);
+    }
+
+    /// Get transaction by ID
+    pub fn get_transaction(&self, transaction_id: &TransactionId) -> Option<&Transaction> {
+        self.transactions.get(transaction_id)
+    }
+
+    /// Get transactions for user
+    pub fn get_user_transactions(&self, user_id: &UserId) -> List<&Transaction> {
+        self.transactions.values()
+            .filter(|t| &t.user_id == user_id)
+            .collect()
+    }
+
+    /// Get transactions for course
+    pub fn get_course_transactions(&self, course_id: &CourseId) -> List<&Transaction> {
+        self.transactions.values()
+            .filter(|t| t.course_id.as_ref() == Some(course_id))
+            .collect()
+    }
+
+    // =========================================================================
+    // REPORTING
+    // =========================================================================
+
+    /// Generate revenue report
+    pub fn generate_revenue_report(
+        &self,
+        tenant_id: &TenantId,
+        start: DateTime,
+        end: DateTime,
+        currency: &str
+    ) -> RevenueReport {
+        let mut report = RevenueReport {
+            period_start: start,
+            period_end: end,
+            gross_revenue: 0.0,
+            net_revenue: 0.0,
+            total_refunds: 0.0,
+            platform_fees: 0.0,
+            provider_fees: 0.0,
+            instructor_payouts: 0.0,
+            transaction_count: 0,
+            refund_count: 0,
+            new_subscriptions: 0,
+            cancelled_subscriptions: 0,
+            by_provider: Map::new(),
+            by_course: Map::new(),
+            currency: currency.to_string()
+        };
+
+        for transaction in self.transactions.values() {
+            if &transaction.tenant_id != tenant_id {
+                continue
+            }
+            if transaction.created_at < start || transaction.created_at > end {
+                continue
+            }
+            if &transaction.currency != currency {
+                continue
+            }
+
+            match transaction.transaction_type {
+                TransactionType::Purchase | TransactionType::SubscriptionPayment => {
+                    report.gross_revenue += transaction.amount;
+                    report.net_revenue += transaction.net_amount;
+                    report.platform_fees += transaction.platform_fee;
+                    report.provider_fees += transaction.provider_fee;
+                    report.transaction_count += 1;
+
+                    // By provider
+                    let provider_key = transaction.provider.to_string();
+                    let provider_rev = report.by_provider.entry(provider_key.clone()).or_insert(ProviderRevenue {
+                        provider: provider_key,
+                        gross_revenue: 0.0,
+                        net_revenue: 0.0,
+                        transaction_count: 0,
+                        fees: 0.0
+                    });
+                    provider_rev.gross_revenue += transaction.amount;
+                    provider_rev.net_revenue += transaction.net_amount;
+                    provider_rev.transaction_count += 1;
+                    provider_rev.fees += transaction.provider_fee;
+
+                    // By course
+                    if let Some(course_id) = &transaction.course_id {
+                        let course_rev = report.by_course.entry(course_id.clone()).or_insert(CourseRevenue {
+                            course_id: course_id.clone(),
+                            course_name: "".to_string(), // Would need to look up
+                            gross_revenue: 0.0,
+                            net_revenue: 0.0,
+                            enrollments: 0,
+                            refunds: 0.0
+                        });
+                        course_rev.gross_revenue += transaction.amount;
+                        course_rev.net_revenue += transaction.net_amount;
+                        course_rev.enrollments += 1;
+                    }
+                },
+                TransactionType::Refund => {
+                    report.total_refunds += transaction.amount;
+                    report.refund_count += 1;
+
+                    if let Some(course_id) = &transaction.course_id {
+                        if let Some(course_rev) = report.by_course.get_mut(course_id) {
+                            course_rev.refunds += transaction.amount;
+                        }
+                    }
+                },
+                TransactionType::Payout => {
+                    report.instructor_payouts += transaction.amount;
+                },
+                _ => {}
+            }
+        }
+
+        // Count subscription changes
+        for record in self.subscriptions.values() {
+            if &record.tenant_id != tenant_id {
+                continue
+            }
+
+            if record.created_at >= start && record.created_at <= end {
+                report.new_subscriptions += 1;
+            }
+
+            if let Some(cancelled) = &record.cancelled_at {
+                if *cancelled >= start && *cancelled <= end {
+                    report.cancelled_subscriptions += 1;
+                }
+            }
+        }
+
+        report
+    }
+
+    /// Generate instructor earnings report
+    pub fn generate_instructor_report(
+        &self,
+        instructor_id: &UserId,
+        start: DateTime,
+        end: DateTime,
+        currency: &str
+    ) -> InstructorEarningsReport {
+        let mut report = InstructorEarningsReport {
+            instructor_id: instructor_id.clone(),
+            period_start: start,
+            period_end: end,
+            total_earnings: 0.0,
+            pending_payout: 0.0,
+            paid_out: 0.0,
+            by_course: Map::new(),
+            currency: currency.to_string()
+        };
+
+        for transaction in self.transactions.values() {
+            if transaction.instructor_id.as_ref() != Some(instructor_id) {
+                continue
+            }
+            if transaction.created_at < start || transaction.created_at > end {
+                continue
+            }
+            if &transaction.currency != currency {
+                continue
+            }
+
+            if let Some(instructor_amount) = transaction.instructor_amount {
+                match transaction.transaction_type {
+                    TransactionType::Purchase | TransactionType::SubscriptionPayment => {
+                        report.total_earnings += instructor_amount;
+                        report.pending_payout += instructor_amount;
+
+                        if let Some(course_id) = &transaction.course_id {
+                            let course_earnings = report.by_course.entry(course_id.clone()).or_insert(CourseEarnings {
+                                course_id: course_id.clone(),
+                                course_name: "".to_string(),
+                                earnings: 0.0,
+                                enrollments: 0,
+                                refunds: 0.0
+                            });
+                            course_earnings.earnings += instructor_amount;
+                            course_earnings.enrollments += 1;
+                        }
+                    },
+                    TransactionType::Payout => {
+                        report.paid_out += transaction.amount;
+                        report.pending_payout -= transaction.amount;
+                    },
+                    TransactionType::Refund => {
+                        report.total_earnings -= instructor_amount;
+                        report.pending_payout -= instructor_amount;
+
+                        if let Some(course_id) = &transaction.course_id {
+                            if let Some(course_earnings) = report.by_course.get_mut(course_id) {
+                                course_earnings.refunds += instructor_amount;
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        report
+    }
+
+    // =========================================================================
+    // PAYOUTS
+    // =========================================================================
+
+    /// Process payout to instructor
+    pub async fn payout(&mut self, input: PayoutInput) -> Result<PayoutResult, PaymentError> {
+        match &input.provider {
+            PaymentProviderType::Stripe => {
+                let stripe = self.stripe.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "Stripe not configured".to_string() })?;
+
+                use intelligo::integrations::payments::stripe::{CreateTransferInput, Currency};
+
+                let transfer_input = CreateTransferInput {
+                    amount: (input.amount * 100.0) as i64,
+                    currency: Currency::from_code(&input.currency),
+                    destination: input.recipient,
+                    source_transaction: None,
+                    transfer_group: Some(input.reference_id.clone()),
+                    metadata: Some(input.metadata)
+                };
+
+                let transfer = stripe.create_transfer(transfer_input).await
+                    .map_err(PaymentError::from_stripe_error)?;
+
+                Ok(PayoutResult {
+                    payout_id: transfer.id,
+                    status: PayoutStatus::Paid,
+                    amount: input.amount,
+                    currency: input.currency,
+                    provider: PaymentProviderType::Stripe
+                })
+            },
+            PaymentProviderType::PayPal => {
+                let paypal = self.paypal.as_mut()
+                    .ok_or(PaymentError::ConfigurationError { message: "PayPal not configured".to_string() })?;
+
+                use intelligo::integrations::payments::paypal::{CreatePayoutInput, PayoutItemInput, RecipientType};
+
+                let payout_input = CreatePayoutInput {
+                    batch_id: input.reference_id.clone(),
+                    email_subject: "Your Intelligo course earnings".to_string(),
+                    email_message: input.note,
+                    items: vec![PayoutItemInput {
+                        item_id: input.reference_id.clone(),
+                        receiver: input.recipient,
+                        receiver_type: RecipientType::Email,
+                        amount: input.amount,
+                        currency: input.currency.clone(),
+                        note: Some("Course revenue payout".to_string())
+                    }]
+                };
+
+                let batch = paypal.create_payout(payout_input).await
+                    .map_err(PaymentError::from_paypal_error)?;
+
+                Ok(PayoutResult {
+                    payout_id: batch.batch_header.payout_batch_id,
+                    status: PayoutStatus::Pending,
+                    amount: input.amount,
+                    currency: input.currency,
+                    provider: PaymentProviderType::PayPal
+                })
+            },
+            _ => Err(PaymentError::ConfigurationError { message: "Provider not supported".to_string() })
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}

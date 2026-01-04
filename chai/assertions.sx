@@ -1,0 +1,799 @@
+/// Intelligo LMS - Chai Assertions
+///
+/// Core assertion library with BDD and TDD style assertions.
+
+module intelligo::chai::assertions
+
+use std::collections::{Map, List}
+use std::time::Duration
+
+// =============================================================================
+// EXPECT INTERFACE (BDD Style)
+// =============================================================================
+
+/// Create an expectation for BDD-style assertions
+pub fn expect<T>(actual: T) -> Expectation<T> {
+    Expectation {
+        actual,
+        negated: false,
+        message: None
+    }
+}
+
+/// Expectation wrapper for chainable assertions
+pub type Expectation<T> {
+    actual: T,
+    negated: bool,
+    message: Option<String>
+}
+
+impl<T> Expectation<T> {
+    /// Negate the next assertion
+    pub fn not(self) -> Expectation<T> {
+        Expectation {
+            actual: self.actual,
+            negated: !self.negated,
+            message: self.message
+        }
+    }
+
+    /// Alias for not
+    pub fn to_not(self) -> Expectation<T> {
+        self.not()
+    }
+
+    /// Add custom failure message
+    pub fn because(mut self, msg: &str) -> Expectation<T> {
+        self.message = Some(msg.to_string());
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn to(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn be(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn been(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn is(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn that(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn which(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn and(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn has(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn have(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn with(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn at(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn of(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn same(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn but(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn does(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn still(self) -> Expectation<T> {
+        self
+    }
+
+    /// Chainable property - no-op for readability
+    pub fn also(self) -> Expectation<T> {
+        self
+    }
+}
+
+// Equality assertions
+impl<T: PartialEq + std::fmt::Debug> Expectation<T> {
+    /// Assert equality
+    pub fn equal(self, expected: T) -> AssertionResult {
+        let passed = if self.negated {
+            self.actual != expected
+        } else {
+            self.actual == expected
+        };
+
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} equal {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                expected
+            ),
+            self.message
+        )
+    }
+
+    /// Alias for equal
+    pub fn equals(self, expected: T) -> AssertionResult {
+        self.equal(expected)
+    }
+
+    /// Alias for equal
+    pub fn eq(self, expected: T) -> AssertionResult {
+        self.equal(expected)
+    }
+
+    /// Deep equality (same as equal for most types)
+    pub fn deep_equal(self, expected: T) -> AssertionResult {
+        self.equal(expected)
+    }
+
+    /// Alias for deep_equal
+    pub fn eql(self, expected: T) -> AssertionResult {
+        self.deep_equal(expected)
+    }
+}
+
+// Boolean assertions
+impl Expectation<bool> {
+    /// Assert value is true
+    pub fn true_(self) -> AssertionResult {
+        let passed = if self.negated { !self.actual } else { self.actual };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {} {} be true",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+
+    /// Assert value is false
+    pub fn false_(self) -> AssertionResult {
+        let passed = if self.negated { self.actual } else { !self.actual };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {} {} be false",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+}
+
+// Option assertions
+impl<T: std::fmt::Debug> Expectation<Option<T>> {
+    /// Assert option is Some
+    pub fn some(self) -> AssertionResult {
+        let is_some = self.actual.is_some();
+        let passed = if self.negated { !is_some } else { is_some };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be Some",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+
+    /// Assert option is None
+    pub fn none(self) -> AssertionResult {
+        let is_none = self.actual.is_none();
+        let passed = if self.negated { !is_none } else { is_none };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be None",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+}
+
+// Result assertions
+impl<T: std::fmt::Debug, E: std::fmt::Debug> Expectation<Result<T, E>> {
+    /// Assert result is Ok
+    pub fn ok(self) -> AssertionResult {
+        let is_ok = self.actual.is_ok();
+        let passed = if self.negated { !is_ok } else { is_ok };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be Ok",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+
+    /// Assert result is Err
+    pub fn err(self) -> AssertionResult {
+        let is_err = self.actual.is_err();
+        let passed = if self.negated { !is_err } else { is_err };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be Err",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+}
+
+// String assertions
+impl Expectation<String> {
+    /// Assert string contains substring
+    pub fn contain(self, substr: &str) -> AssertionResult {
+        let contains = self.actual.contains(substr);
+        let passed = if self.negated { !contains } else { contains };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected '{}' {} contain '{}'",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                substr
+            ),
+            self.message
+        )
+    }
+
+    /// Assert string starts with prefix
+    pub fn start_with(self, prefix: &str) -> AssertionResult {
+        let starts = self.actual.starts_with(prefix);
+        let passed = if self.negated { !starts } else { starts };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected '{}' {} start with '{}'",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                prefix
+            ),
+            self.message
+        )
+    }
+
+    /// Assert string ends with suffix
+    pub fn end_with(self, suffix: &str) -> AssertionResult {
+        let ends = self.actual.ends_with(suffix);
+        let passed = if self.negated { !ends } else { ends };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected '{}' {} end with '{}'",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                suffix
+            ),
+            self.message
+        )
+    }
+
+    /// Assert string matches regex
+    pub fn match_regex(self, pattern: &str) -> AssertionResult {
+        let re = regex::Regex::new(pattern).unwrap();
+        let matches = re.is_match(&self.actual);
+        let passed = if self.negated { !matches } else { matches };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected '{}' {} match pattern '{}'",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                pattern
+            ),
+            self.message
+        )
+    }
+
+    /// Assert string is empty
+    pub fn empty(self) -> AssertionResult {
+        let is_empty = self.actual.is_empty();
+        let passed = if self.negated { !is_empty } else { is_empty };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected '{}' {} be empty",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+
+    /// Assert string length
+    pub fn length(self, expected_len: usize) -> AssertionResult {
+        let actual_len = self.actual.len();
+        let passed = if self.negated {
+            actual_len != expected_len
+        } else {
+            actual_len == expected_len
+        };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected string of length {} {} have length {}",
+                actual_len,
+                if self.negated { "to not" } else { "to" },
+                expected_len
+            ),
+            self.message
+        )
+    }
+}
+
+// Numeric assertions
+impl<T: PartialOrd + std::fmt::Debug> Expectation<T> {
+    /// Assert value is above threshold
+    pub fn above(self, threshold: T) -> AssertionResult {
+        let is_above = self.actual > threshold;
+        let passed = if self.negated { !is_above } else { is_above };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be above {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                threshold
+            ),
+            self.message
+        )
+    }
+
+    /// Alias for above
+    pub fn greater_than(self, threshold: T) -> AssertionResult {
+        self.above(threshold)
+    }
+
+    /// Alias for above
+    pub fn gt(self, threshold: T) -> AssertionResult {
+        self.above(threshold)
+    }
+
+    /// Assert value is below threshold
+    pub fn below(self, threshold: T) -> AssertionResult {
+        let is_below = self.actual < threshold;
+        let passed = if self.negated { !is_below } else { is_below };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be below {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                threshold
+            ),
+            self.message
+        )
+    }
+
+    /// Alias for below
+    pub fn less_than(self, threshold: T) -> AssertionResult {
+        self.below(threshold)
+    }
+
+    /// Alias for below
+    pub fn lt(self, threshold: T) -> AssertionResult {
+        self.below(threshold)
+    }
+
+    /// Assert value is at least threshold
+    pub fn least(self, threshold: T) -> AssertionResult {
+        let is_at_least = self.actual >= threshold;
+        let passed = if self.negated { !is_at_least } else { is_at_least };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be at least {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                threshold
+            ),
+            self.message
+        )
+    }
+
+    /// Alias for least
+    pub fn gte(self, threshold: T) -> AssertionResult {
+        self.least(threshold)
+    }
+
+    /// Assert value is at most threshold
+    pub fn most(self, threshold: T) -> AssertionResult {
+        let is_at_most = self.actual <= threshold;
+        let passed = if self.negated { !is_at_most } else { is_at_most };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be at most {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                threshold
+            ),
+            self.message
+        )
+    }
+
+    /// Alias for most
+    pub fn lte(self, threshold: T) -> AssertionResult {
+        self.most(threshold)
+    }
+
+    /// Assert value is within range
+    pub fn within(self, min: T, max: T) -> AssertionResult {
+        let in_range = self.actual >= min && self.actual <= max;
+        let passed = if self.negated { !in_range } else { in_range };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} be within {:?} and {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                min,
+                max
+            ),
+            self.message
+        )
+    }
+}
+
+// Float-specific assertions
+impl Expectation<f64> {
+    /// Assert float is close to expected value within delta
+    pub fn close_to(self, expected: f64, delta: f64) -> AssertionResult {
+        let diff = (self.actual - expected).abs();
+        let is_close = diff <= delta;
+        let passed = if self.negated { !is_close } else { is_close };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {} {} be close to {} (within {}), difference was {}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                expected,
+                delta,
+                diff
+            ),
+            self.message
+        )
+    }
+
+    /// Assert float is NaN
+    pub fn nan(self) -> AssertionResult {
+        let is_nan = self.actual.is_nan();
+        let passed = if self.negated { !is_nan } else { is_nan };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {} {} be NaN",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+
+    /// Assert float is finite
+    pub fn finite(self) -> AssertionResult {
+        let is_finite = self.actual.is_finite();
+        let passed = if self.negated { !is_finite } else { is_finite };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {} {} be finite",
+                self.actual,
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+}
+
+// Collection assertions
+impl<T: std::fmt::Debug> Expectation<Vec<T>> {
+    /// Assert collection length
+    pub fn length(self, expected_len: usize) -> AssertionResult {
+        let actual_len = self.actual.len();
+        let passed = if self.negated {
+            actual_len != expected_len
+        } else {
+            actual_len == expected_len
+        };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected collection of length {} {} have length {}",
+                actual_len,
+                if self.negated { "to not" } else { "to" },
+                expected_len
+            ),
+            self.message
+        )
+    }
+
+    /// Assert collection is empty
+    pub fn empty(self) -> AssertionResult {
+        let is_empty = self.actual.is_empty();
+        let passed = if self.negated { !is_empty } else { is_empty };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected collection with {} items {} be empty",
+                self.actual.len(),
+                if self.negated { "to not" } else { "to" }
+            ),
+            self.message
+        )
+    }
+}
+
+impl<T: PartialEq + std::fmt::Debug> Expectation<Vec<T>> {
+    /// Assert collection contains item
+    pub fn contain(self, item: &T) -> AssertionResult {
+        let contains = self.actual.contains(item);
+        let passed = if self.negated { !contains } else { contains };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} contain {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                item
+            ),
+            self.message
+        )
+    }
+
+    /// Assert collection includes all items
+    pub fn include_all(self, items: &[T]) -> AssertionResult {
+        let includes_all = items.iter().all(|item| self.actual.contains(item));
+        let passed = if self.negated { !includes_all } else { includes_all };
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {:?} {} include all of {:?}",
+                self.actual,
+                if self.negated { "to not" } else { "to" },
+                items
+            ),
+            self.message
+        )
+    }
+}
+
+// =============================================================================
+// ASSERT INTERFACE (TDD Style)
+// =============================================================================
+
+/// TDD-style assertions
+pub struct Assert;
+
+impl Assert {
+    /// Assert condition is true
+    pub fn is_true(condition: bool) -> AssertionResult {
+        AssertionResult::new(condition, "Expected condition to be true".to_string(), None)
+    }
+
+    /// Assert condition is false
+    pub fn is_false(condition: bool) -> AssertionResult {
+        AssertionResult::new(!condition, "Expected condition to be false".to_string(), None)
+    }
+
+    /// Assert values are equal
+    pub fn equal<T: PartialEq + std::fmt::Debug>(actual: T, expected: T) -> AssertionResult {
+        let passed = actual == expected;
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to equal {:?}", actual, expected),
+            None
+        )
+    }
+
+    /// Assert values are not equal
+    pub fn not_equal<T: PartialEq + std::fmt::Debug>(actual: T, expected: T) -> AssertionResult {
+        let passed = actual != expected;
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to not equal {:?}", actual, expected),
+            None
+        )
+    }
+
+    /// Assert value is null/none
+    pub fn is_none<T: std::fmt::Debug>(value: Option<T>) -> AssertionResult {
+        let passed = value.is_none();
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to be None", value),
+            None
+        )
+    }
+
+    /// Assert value is not null/none
+    pub fn is_some<T: std::fmt::Debug>(value: Option<T>) -> AssertionResult {
+        let passed = value.is_some();
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to be Some", value),
+            None
+        )
+    }
+
+    /// Assert result is Ok
+    pub fn is_ok<T: std::fmt::Debug, E: std::fmt::Debug>(result: Result<T, E>) -> AssertionResult {
+        let passed = result.is_ok();
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to be Ok", result),
+            None
+        )
+    }
+
+    /// Assert result is Err
+    pub fn is_err<T: std::fmt::Debug, E: std::fmt::Debug>(result: Result<T, E>) -> AssertionResult {
+        let passed = result.is_err();
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to be Err", result),
+            None
+        )
+    }
+
+    /// Assert string contains substring
+    pub fn contains(haystack: &str, needle: &str) -> AssertionResult {
+        let passed = haystack.contains(needle);
+        AssertionResult::new(
+            passed,
+            format!("Expected '{}' to contain '{}'", haystack, needle),
+            None
+        )
+    }
+
+    /// Assert value is greater than threshold
+    pub fn greater_than<T: PartialOrd + std::fmt::Debug>(actual: T, expected: T) -> AssertionResult {
+        let passed = actual > expected;
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to be greater than {:?}", actual, expected),
+            None
+        )
+    }
+
+    /// Assert value is less than threshold
+    pub fn less_than<T: PartialOrd + std::fmt::Debug>(actual: T, expected: T) -> AssertionResult {
+        let passed = actual < expected;
+        AssertionResult::new(
+            passed,
+            format!("Expected {:?} to be less than {:?}", actual, expected),
+            None
+        )
+    }
+
+    /// Force a test failure
+    pub fn fail(message: &str) -> AssertionResult {
+        AssertionResult::new(false, message.to_string(), None)
+    }
+
+    /// Assert floats are approximately equal
+    pub fn approx_equal(actual: f64, expected: f64, epsilon: f64) -> AssertionResult {
+        let diff = (actual - expected).abs();
+        let passed = diff <= epsilon;
+        AssertionResult::new(
+            passed,
+            format!(
+                "Expected {} to be approximately equal to {} (epsilon: {}), diff was {}",
+                actual, expected, epsilon, diff
+            ),
+            None
+        )
+    }
+}
+
+// =============================================================================
+// ASSERTION RESULT
+// =============================================================================
+
+/// Result of an assertion
+pub type AssertionResult {
+    passed: bool,
+    message: String,
+    custom_message: Option<String>
+}
+
+impl AssertionResult {
+    pub fn new(passed: bool, message: String, custom_message: Option<String>) -> Self {
+        let result = AssertionResult {
+            passed,
+            message,
+            custom_message
+        };
+
+        // Panic on failure for immediate feedback
+        if !result.passed {
+            result.panic();
+        }
+
+        result
+    }
+
+    pub fn is_passed(&self) -> bool {
+        self.passed
+    }
+
+    pub fn get_message(&self) -> &str {
+        &self.message
+    }
+
+    fn panic(&self) {
+        let msg = match &self.custom_message {
+            Some(custom) => format!("{}: {}", custom, self.message),
+            None => self.message.clone()
+        };
+        std::panic::panic_any(AssertionError { message: msg });
+    }
+}
+
+/// Assertion error for test failures
+pub type AssertionError {
+    message: String
+}
+
+impl std::fmt::Display for AssertionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "AssertionError: {}", self.message)
+    }
+}

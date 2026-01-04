@@ -1,0 +1,1067 @@
+/// Intelligo LMS - Tenant Core
+///
+/// Core tenant entity definitions, tenant context management, and tenant resolution
+/// strategies for multi-tenant LMS deployments.
+
+module intelligo::tenant::core
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+use std::http::{HttpRequest}
+
+// =============================================================================
+// TENANT ENTITY
+// =============================================================================
+
+/// Core tenant entity representing an organization in the LMS
+type Tenant {
+    /// Unique identifier
+    id: TenantId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Human-readable slug (used in URLs)
+    slug: String,
+
+    /// Organization name
+    name: String,
+
+    /// Legal/business name
+    legal_name: Option<String>,
+
+    /// Tenant type
+    tenant_type: TenantType,
+
+    /// Current status
+    status: TenantStatus,
+
+    /// Subscription tier
+    tier: SubscriptionTier,
+
+    /// Primary contact email
+    contact_email: String,
+
+    /// Support email
+    support_email: Option<String>,
+
+    /// Primary contact phone
+    contact_phone: Option<String>,
+
+    /// Billing email
+    billing_email: Option<String>,
+
+    /// Physical address
+    address: Option<TenantAddress>,
+
+    /// Time zone for the tenant
+    timezone: String,
+
+    /// Default locale
+    locale: String,
+
+    /// Default currency
+    currency: String,
+
+    /// Custom domains
+    domains: List<TenantDomain>,
+
+    /// Primary domain
+    primary_domain: Option<String>,
+
+    /// Branding configuration reference
+    branding_id: Option<String>,
+
+    /// Feature flags enabled for this tenant
+    features: Set<String>,
+
+    /// Settings overrides
+    settings: Map<String, Dynamic>,
+
+    /// Parent tenant (for hierarchical tenancy)
+    parent_id: Option<TenantId>,
+
+    /// Child tenant IDs
+    child_ids: List<TenantId>,
+
+    /// Database connection (for isolated DB mode)
+    database_config: Option<TenantDatabaseConfig>,
+
+    /// Storage configuration
+    storage_config: Option<TenantStorageConfig>,
+
+    /// Created timestamp
+    created_at: DateTime,
+
+    /// Updated timestamp
+    updated_at: DateTime,
+
+    /// Activated timestamp
+    activated_at: Option<DateTime>,
+
+    /// Trial end date
+    trial_ends_at: Option<DateTime>,
+
+    /// Metadata
+    metadata: Map<String, Dynamic>
+}
+
+impl Tenant {
+    /// Create a new tenant
+    fn new(name: String, slug: String, contact_email: String) -> Tenant {
+        let now = DateTime::now();
+        Tenant {
+            id: TenantId(generate_tenant_id()),
+            uuid: generate_uuid(),
+            slug,
+            name,
+            legal_name: None,
+            tenant_type: TenantType::Organization,
+            status: TenantStatus::Active,
+            tier: SubscriptionTier::Free,
+            contact_email,
+            support_email: None,
+            contact_phone: None,
+            billing_email: None,
+            address: None,
+            timezone: "UTC".to_string(),
+            locale: "en-US".to_string(),
+            currency: "USD".to_string(),
+            domains: vec![],
+            primary_domain: None,
+            branding_id: None,
+            features: Set::new(),
+            settings: Map::new(),
+            parent_id: None,
+            child_ids: vec![],
+            database_config: None,
+            storage_config: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: Some(now),
+            trial_ends_at: None,
+            metadata: Map::new()
+        }
+    }
+
+    /// Check if tenant is active
+    fn is_active(&self) -> Bool {
+        match &self.status {
+            TenantStatus::Active => true,
+            _ => false
+        }
+    }
+
+    /// Check if tenant is in trial
+    fn is_trial(&self) -> Bool {
+        if let Some(trial_end) = &self.trial_ends_at {
+            DateTime::now() < *trial_end
+        } else {
+            false
+        }
+    }
+
+    /// Check if trial has expired
+    fn is_trial_expired(&self) -> Bool {
+        if let Some(trial_end) = &self.trial_ends_at {
+            DateTime::now() >= *trial_end && self.tier == SubscriptionTier::Free
+        } else {
+            false
+        }
+    }
+
+    /// Check if feature is enabled
+    fn has_feature(&self, feature: &str) -> Bool {
+        self.features.contains(feature) || self.tier.includes_feature(feature)
+    }
+
+    /// Get setting value with default
+    fn get_setting<T>(&self, key: &str, default: T) -> T {
+        self.settings.get(key)
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or(default)
+    }
+}
+
+/// Tenant type classification
+enum TenantType {
+    /// Single organization/company
+    Organization,
+    /// Educational institution
+    Educational,
+    /// Enterprise with multiple sub-tenants
+    Enterprise,
+    /// Reseller/partner
+    Partner,
+    /// Individual/personal use
+    Individual,
+    /// Internal/system tenant
+    System
+}
+
+impl TenantType {
+    fn to_string(&self) -> String {
+        match self {
+            TenantType::Organization => "organization",
+            TenantType::Educational => "educational",
+            TenantType::Enterprise => "enterprise",
+            TenantType::Partner => "partner",
+            TenantType::Individual => "individual",
+            TenantType::System => "system"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<TenantType> {
+        match s {
+            "organization" => Some(TenantType::Organization),
+            "educational" => Some(TenantType::Educational),
+            "enterprise" => Some(TenantType::Enterprise),
+            "partner" => Some(TenantType::Partner),
+            "individual" => Some(TenantType::Individual),
+            "system" => Some(TenantType::System),
+            _ => None
+        }
+    }
+}
+
+/// Subscription tier
+enum SubscriptionTier {
+    /// Free tier with basic features
+    Free,
+    /// Starter tier for small teams
+    Starter,
+    /// Professional tier for growing organizations
+    Professional,
+    /// Business tier for larger organizations
+    Business,
+    /// Enterprise tier with full features
+    Enterprise,
+    /// Custom tier with negotiated features
+    Custom { plan_id: String }
+}
+
+impl SubscriptionTier {
+    fn to_string(&self) -> String {
+        match self {
+            SubscriptionTier::Free => "free",
+            SubscriptionTier::Starter => "starter",
+            SubscriptionTier::Professional => "professional",
+            SubscriptionTier::Business => "business",
+            SubscriptionTier::Enterprise => "enterprise",
+            SubscriptionTier::Custom { .. } => "custom"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<SubscriptionTier> {
+        match s {
+            "free" => Some(SubscriptionTier::Free),
+            "starter" => Some(SubscriptionTier::Starter),
+            "professional" => Some(SubscriptionTier::Professional),
+            "business" => Some(SubscriptionTier::Business),
+            "enterprise" => Some(SubscriptionTier::Enterprise),
+            _ => None
+        }
+    }
+
+    /// Check if tier includes a feature
+    fn includes_feature(&self, feature: &str) -> Bool {
+        let tier_features = match self {
+            SubscriptionTier::Free => vec![
+                "basic_courses", "basic_assessments", "basic_reporting"
+            ],
+            SubscriptionTier::Starter => vec![
+                "basic_courses", "basic_assessments", "basic_reporting",
+                "custom_branding", "email_support", "course_certificates"
+            ],
+            SubscriptionTier::Professional => vec![
+                "basic_courses", "basic_assessments", "basic_reporting",
+                "custom_branding", "email_support", "course_certificates",
+                "advanced_reporting", "api_access", "sso", "scorm_support"
+            ],
+            SubscriptionTier::Business => vec![
+                "basic_courses", "basic_assessments", "basic_reporting",
+                "custom_branding", "email_support", "course_certificates",
+                "advanced_reporting", "api_access", "sso", "scorm_support",
+                "ai_tutor", "ai_grading", "advanced_analytics", "webhooks",
+                "multi_language", "priority_support"
+            ],
+            SubscriptionTier::Enterprise => vec![
+                "basic_courses", "basic_assessments", "basic_reporting",
+                "custom_branding", "email_support", "course_certificates",
+                "advanced_reporting", "api_access", "sso", "scorm_support",
+                "ai_tutor", "ai_grading", "advanced_analytics", "webhooks",
+                "multi_language", "priority_support", "dedicated_support",
+                "custom_integrations", "sla", "white_label", "multi_tenant"
+            ],
+            SubscriptionTier::Custom { .. } => vec![] // Determined by custom plan
+        };
+
+        tier_features.contains(&feature)
+    }
+
+    /// Get tier weight for comparison
+    fn weight(&self) -> i32 {
+        match self {
+            SubscriptionTier::Free => 0,
+            SubscriptionTier::Starter => 10,
+            SubscriptionTier::Professional => 20,
+            SubscriptionTier::Business => 30,
+            SubscriptionTier::Enterprise => 40,
+            SubscriptionTier::Custom { .. } => 50
+        }
+    }
+}
+
+/// Physical address
+type TenantAddress {
+    line1: String,
+    line2: Option<String>,
+    city: String,
+    state: Option<String>,
+    postal_code: String,
+    country: String
+}
+
+/// Custom domain configuration
+type TenantDomain {
+    /// Domain name
+    domain: String,
+
+    /// Whether this is the primary domain
+    is_primary: Bool,
+
+    /// Verification status
+    verified: Bool,
+
+    /// Verification token
+    verification_token: Option<String>,
+
+    /// SSL certificate status
+    ssl_status: SslStatus,
+
+    /// Created timestamp
+    created_at: DateTime,
+
+    /// Verified timestamp
+    verified_at: Option<DateTime>
+}
+
+/// SSL certificate status
+enum SslStatus {
+    Pending,
+    Provisioning,
+    Active,
+    Failed { error: String },
+    Expired
+}
+
+/// Database configuration for isolated tenants
+type TenantDatabaseConfig {
+    /// Database type
+    db_type: String,
+
+    /// Connection string or reference
+    connection_ref: String,
+
+    /// Schema name (for schema isolation)
+    schema: Option<String>,
+
+    /// Whether to use dedicated connection pool
+    dedicated_pool: Bool,
+
+    /// Pool size
+    pool_size: i32
+}
+
+/// Storage configuration
+type TenantStorageConfig {
+    /// Storage provider
+    provider: String,
+
+    /// Bucket/container name
+    bucket: String,
+
+    /// Path prefix
+    prefix: String,
+
+    /// CDN URL
+    cdn_url: Option<String>
+}
+
+// =============================================================================
+// TENANT CONTEXT
+// =============================================================================
+
+/// Thread-local tenant context for request handling
+type TenantContext {
+    /// Current tenant
+    tenant: Tenant,
+
+    /// Resolution method used
+    resolution_method: ResolutionMethod,
+
+    /// Request context
+    request_id: Option<String>,
+
+    /// User context (if authenticated)
+    user_id: Option<UserId>,
+
+    /// Session start time
+    started_at: DateTime,
+
+    /// Feature flags for this request
+    effective_features: Set<String>,
+
+    /// Settings cache
+    settings_cache: Map<String, Dynamic>
+}
+
+impl TenantContext {
+    /// Create context from tenant
+    fn from_tenant(tenant: Tenant, method: ResolutionMethod) -> TenantContext {
+        let effective_features = tenant.features.clone();
+
+        TenantContext {
+            tenant,
+            resolution_method: method,
+            request_id: None,
+            user_id: None,
+            started_at: DateTime::now(),
+            effective_features,
+            settings_cache: Map::new()
+        }
+    }
+
+    /// Get tenant ID
+    fn tenant_id(&self) -> &TenantId {
+        &self.tenant.id
+    }
+
+    /// Check if feature is enabled
+    fn has_feature(&self, feature: &str) -> Bool {
+        self.effective_features.contains(feature) ||
+        self.tenant.tier.includes_feature(feature)
+    }
+
+    /// Get setting with tenant override
+    fn get_setting<T>(&self, key: &str, default: T) -> T {
+        self.settings_cache.get(key)
+            .and_then(|v| v.try_into().ok())
+            .or_else(|| self.tenant.settings.get(key).and_then(|v| v.try_into().ok()))
+            .unwrap_or(default)
+    }
+}
+
+/// Method used to resolve tenant
+enum ResolutionMethod {
+    /// Resolved from request host header
+    Domain { domain: String },
+    /// Resolved from subdomain
+    Subdomain { subdomain: String },
+    /// Resolved from URL path
+    Path { path_segment: String },
+    /// Resolved from HTTP header
+    Header { header_name: String, value: String },
+    /// Resolved from JWT token
+    Token,
+    /// Resolved from API key
+    ApiKey,
+    /// Default/system tenant
+    Default,
+    /// Explicitly set
+    Explicit { tenant_id: TenantId }
+}
+
+// =============================================================================
+// TENANT RESOLVER
+// =============================================================================
+
+/// Configuration for tenant resolution
+type TenantResolverConfig {
+    /// Primary resolution strategy
+    primary_strategy: ResolutionStrategy,
+
+    /// Fallback strategies
+    fallback_strategies: List<ResolutionStrategy>,
+
+    /// Default tenant ID if resolution fails
+    default_tenant_id: Option<TenantId>,
+
+    /// Header name for header-based resolution
+    tenant_header: String,
+
+    /// Path prefix for path-based resolution
+    path_prefix: String,
+
+    /// Cache tenant resolutions
+    cache_enabled: Bool,
+
+    /// Cache TTL
+    cache_ttl: Duration
+}
+
+impl Default for TenantResolverConfig {
+    fn default() -> Self {
+        TenantResolverConfig {
+            primary_strategy: ResolutionStrategy::Domain,
+            fallback_strategies: vec![
+                ResolutionStrategy::Header,
+                ResolutionStrategy::Token
+            ],
+            default_tenant_id: None,
+            tenant_header: "X-Tenant-ID".to_string(),
+            path_prefix: "/t/".to_string(),
+            cache_enabled: true,
+            cache_ttl: Duration::minutes(5)
+        }
+    }
+}
+
+/// Strategy for resolving tenant from request
+enum ResolutionStrategy {
+    /// Use the request domain/host
+    Domain,
+    /// Extract subdomain (e.g., tenant1.lms.example.com)
+    Subdomain { base_domain: String },
+    /// Extract from URL path (e.g., /t/tenant1/...)
+    Path,
+    /// Read from HTTP header
+    Header,
+    /// Extract from JWT token claim
+    Token { claim: String },
+    /// Extract from API key
+    ApiKey,
+    /// Always use default tenant
+    Default
+}
+
+/// Tenant resolver actor
+actor TenantResolver {
+    var config: TenantResolverConfig
+    var tenant_cache: Map<String, (Tenant, DateTime)> = Map::new()
+    var domain_cache: Map<String, TenantId> = Map::new()
+    var tenants: Map<TenantId, Tenant> = Map::new()
+
+    fn new(config: TenantResolverConfig) -> Self {
+        TenantResolver {
+            config,
+            ..Default::default()
+        }
+    }
+
+    /// Resolve tenant from HTTP request
+    receive ResolveFromRequest(request: HttpRequest) -> Result<TenantContext, TenantError> {
+        // Try primary strategy
+        let result = self.try_resolution(&self.config.primary_strategy, &request);
+
+        if let Ok(context) = result {
+            return Ok(context);
+        }
+
+        // Try fallback strategies
+        for strategy in &self.config.fallback_strategies {
+            if let Ok(context) = self.try_resolution(strategy, &request) {
+                return Ok(context);
+            }
+        }
+
+        // Use default tenant if configured
+        if let Some(default_id) = &self.config.default_tenant_id {
+            if let Some(tenant) = self.tenants.get(default_id) {
+                return Ok(TenantContext::from_tenant(tenant.clone(), ResolutionMethod::Default));
+            }
+        }
+
+        Err(TenantError::TenantNotFound {
+            identifier: "Unable to resolve tenant".to_string()
+        })
+    }
+
+    fn try_resolution(&self, strategy: &ResolutionStrategy, request: &HttpRequest) -> Result<TenantContext, TenantError> {
+        match strategy {
+            ResolutionStrategy::Domain => self.resolve_by_domain(request),
+            ResolutionStrategy::Subdomain { base_domain } => self.resolve_by_subdomain(request, base_domain),
+            ResolutionStrategy::Path => self.resolve_by_path(request),
+            ResolutionStrategy::Header => self.resolve_by_header(request),
+            ResolutionStrategy::Token { claim } => self.resolve_by_token(request, claim),
+            ResolutionStrategy::ApiKey => self.resolve_by_api_key(request),
+            ResolutionStrategy::Default => self.resolve_default()
+        }
+    }
+
+    fn resolve_by_domain(&self, request: &HttpRequest) -> Result<TenantContext, TenantError> {
+        let host = request.headers.get("Host")
+            .ok_or(TenantError::ResolutionFailed { reason: "No Host header".to_string() })?;
+
+        // Check cache
+        if let Some(tenant_id) = self.domain_cache.get(host) {
+            if let Some(tenant) = self.tenants.get(tenant_id) {
+                return Ok(TenantContext::from_tenant(
+                    tenant.clone(),
+                    ResolutionMethod::Domain { domain: host.clone() }
+                ));
+            }
+        }
+
+        // Search for tenant with this domain
+        for tenant in self.tenants.values() {
+            for domain in &tenant.domains {
+                if &domain.domain == host && domain.verified {
+                    return Ok(TenantContext::from_tenant(
+                        tenant.clone(),
+                        ResolutionMethod::Domain { domain: host.clone() }
+                    ));
+                }
+            }
+
+            if tenant.primary_domain.as_ref() == Some(host) {
+                return Ok(TenantContext::from_tenant(
+                    tenant.clone(),
+                    ResolutionMethod::Domain { domain: host.clone() }
+                ));
+            }
+        }
+
+        Err(TenantError::TenantNotFound { identifier: host.clone() })
+    }
+
+    fn resolve_by_subdomain(&self, request: &HttpRequest, base_domain: &str) -> Result<TenantContext, TenantError> {
+        let host = request.headers.get("Host")
+            .ok_or(TenantError::ResolutionFailed { reason: "No Host header".to_string() })?;
+
+        // Extract subdomain
+        if !host.ends_with(base_domain) {
+            return Err(TenantError::ResolutionFailed {
+                reason: "Host does not match base domain".to_string()
+            });
+        }
+
+        let subdomain = host.strip_suffix(base_domain)
+            .and_then(|s| s.strip_suffix('.'))
+            .ok_or(TenantError::ResolutionFailed {
+                reason: "Invalid subdomain format".to_string()
+            })?;
+
+        // Find tenant by slug
+        for tenant in self.tenants.values() {
+            if tenant.slug == subdomain {
+                return Ok(TenantContext::from_tenant(
+                    tenant.clone(),
+                    ResolutionMethod::Subdomain { subdomain: subdomain.to_string() }
+                ));
+            }
+        }
+
+        Err(TenantError::TenantNotFound { identifier: subdomain.to_string() })
+    }
+
+    fn resolve_by_path(&self, request: &HttpRequest) -> Result<TenantContext, TenantError> {
+        let path = &request.uri;
+
+        if !path.starts_with(&self.config.path_prefix) {
+            return Err(TenantError::ResolutionFailed {
+                reason: "Path does not contain tenant prefix".to_string()
+            });
+        }
+
+        let remaining = &path[self.config.path_prefix.len()..];
+        let segment = remaining.split('/').next()
+            .ok_or(TenantError::ResolutionFailed {
+                reason: "No tenant segment in path".to_string()
+            })?;
+
+        // Find tenant by slug or ID
+        for tenant in self.tenants.values() {
+            if tenant.slug == segment || tenant.id.0 == segment {
+                return Ok(TenantContext::from_tenant(
+                    tenant.clone(),
+                    ResolutionMethod::Path { path_segment: segment.to_string() }
+                ));
+            }
+        }
+
+        Err(TenantError::TenantNotFound { identifier: segment.to_string() })
+    }
+
+    fn resolve_by_header(&self, request: &HttpRequest) -> Result<TenantContext, TenantError> {
+        let tenant_id = request.headers.get(&self.config.tenant_header)
+            .ok_or(TenantError::ResolutionFailed {
+                reason: "Tenant header not present".to_string()
+            })?;
+
+        let tenant = self.tenants.get(&TenantId(tenant_id.clone()))
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.clone() })?;
+
+        Ok(TenantContext::from_tenant(
+            tenant.clone(),
+            ResolutionMethod::Header {
+                header_name: self.config.tenant_header.clone(),
+                value: tenant_id.clone()
+            }
+        ))
+    }
+
+    fn resolve_by_token(&self, request: &HttpRequest, claim: &str) -> Result<TenantContext, TenantError> {
+        let auth_header = request.headers.get("Authorization")
+            .ok_or(TenantError::ResolutionFailed {
+                reason: "No Authorization header".to_string()
+            })?;
+
+        // Parse JWT and extract tenant claim
+        let token = auth_header.strip_prefix("Bearer ")
+            .ok_or(TenantError::ResolutionFailed {
+                reason: "Invalid Authorization header format".to_string()
+            })?;
+
+        // Decode JWT and get claim (simplified)
+        let tenant_id = decode_jwt_claim(token, claim)?;
+
+        let tenant = self.tenants.get(&TenantId(tenant_id.clone()))
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id })?;
+
+        Ok(TenantContext::from_tenant(tenant.clone(), ResolutionMethod::Token))
+    }
+
+    fn resolve_by_api_key(&self, request: &HttpRequest) -> Result<TenantContext, TenantError> {
+        let api_key = request.headers.get("X-API-Key")
+            .or_else(|| request.headers.get("Authorization").and_then(|h| h.strip_prefix("ApiKey ")))
+            .ok_or(TenantError::ResolutionFailed {
+                reason: "No API key provided".to_string()
+            })?;
+
+        // Look up tenant by API key (would involve key storage lookup)
+        let tenant_id = lookup_tenant_by_api_key(api_key)?;
+
+        let tenant = self.tenants.get(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: api_key.to_string() })?;
+
+        Ok(TenantContext::from_tenant(tenant.clone(), ResolutionMethod::ApiKey))
+    }
+
+    fn resolve_default(&self) -> Result<TenantContext, TenantError> {
+        if let Some(default_id) = &self.config.default_tenant_id {
+            if let Some(tenant) = self.tenants.get(default_id) {
+                return Ok(TenantContext::from_tenant(tenant.clone(), ResolutionMethod::Default));
+            }
+        }
+
+        Err(TenantError::ResolutionFailed {
+            reason: "No default tenant configured".to_string()
+        })
+    }
+
+    /// Register a tenant
+    receive RegisterTenant(tenant: Tenant) {
+        let id = tenant.id.clone();
+
+        // Index domains
+        for domain in &tenant.domains {
+            if domain.verified {
+                self.domain_cache.insert(domain.domain.clone(), id.clone());
+            }
+        }
+
+        if let Some(ref primary) = tenant.primary_domain {
+            self.domain_cache.insert(primary.clone(), id.clone());
+        }
+
+        self.tenants.insert(id, tenant);
+        checkpoint();
+    }
+
+    /// Unregister a tenant
+    receive UnregisterTenant(tenant_id: TenantId) {
+        if let Some(tenant) = self.tenants.remove(&tenant_id) {
+            // Remove domain cache entries
+            for domain in &tenant.domains {
+                self.domain_cache.remove(&domain.domain);
+            }
+
+            if let Some(ref primary) = tenant.primary_domain {
+                self.domain_cache.remove(primary);
+            }
+        }
+        checkpoint();
+    }
+
+    /// Get tenant by ID
+    receive GetTenant(tenant_id: TenantId) -> Option<Tenant> {
+        self.tenants.get(&tenant_id).cloned()
+    }
+
+    /// Get tenant by slug
+    receive GetTenantBySlug(slug: String) -> Option<Tenant> {
+        self.tenants.values()
+            .find(|t| t.slug == slug)
+            .cloned()
+    }
+
+    /// Update tenant
+    receive UpdateTenant(tenant: Tenant) {
+        let id = tenant.id.clone();
+
+        // Update domain cache
+        if let Some(old) = self.tenants.get(&id) {
+            for domain in &old.domains {
+                self.domain_cache.remove(&domain.domain);
+            }
+            if let Some(ref primary) = old.primary_domain {
+                self.domain_cache.remove(primary);
+            }
+        }
+
+        for domain in &tenant.domains {
+            if domain.verified {
+                self.domain_cache.insert(domain.domain.clone(), id.clone());
+            }
+        }
+
+        if let Some(ref primary) = tenant.primary_domain {
+            self.domain_cache.insert(primary.clone(), id.clone());
+        }
+
+        self.tenants.insert(id, tenant);
+        checkpoint();
+    }
+
+    /// Clear caches
+    receive ClearCache() {
+        self.tenant_cache.clear();
+    }
+}
+
+// =============================================================================
+// TENANT ERRORS
+// =============================================================================
+
+/// Tenant-related errors
+enum TenantError {
+    /// Tenant not found
+    TenantNotFound { identifier: String },
+
+    /// Resolution failed
+    ResolutionFailed { reason: String },
+
+    /// Tenant suspended
+    TenantSuspended { tenant_id: TenantId, reason: String },
+
+    /// Tenant deleted
+    TenantDeleted { tenant_id: TenantId },
+
+    /// Feature not available
+    FeatureNotAvailable { feature: String, tier: String },
+
+    /// Limit exceeded
+    LimitExceeded { limit_type: String, current: i64, max: i64 },
+
+    /// Domain verification failed
+    DomainVerificationFailed { domain: String, reason: String },
+
+    /// Configuration error
+    ConfigurationError { message: String },
+
+    /// Internal error
+    Internal { message: String },
+
+    /// Security violation (SQL injection, etc.)
+    SecurityViolation { message: String, sql_fragment: String },
+
+    /// Tenant isolation violation
+    TenantIsolationViolation { message: String, table: String }
+}
+
+impl TenantError {
+    fn to_string(&self) -> String {
+        match self {
+            TenantError::TenantNotFound { identifier } =>
+                format!("Tenant not found: {}", identifier),
+            TenantError::ResolutionFailed { reason } =>
+                format!("Tenant resolution failed: {}", reason),
+            TenantError::TenantSuspended { tenant_id, reason } =>
+                format!("Tenant {} is suspended: {}", tenant_id.0, reason),
+            TenantError::TenantDeleted { tenant_id } =>
+                format!("Tenant {} has been deleted", tenant_id.0),
+            TenantError::FeatureNotAvailable { feature, tier } =>
+                format!("Feature '{}' is not available in tier '{}'", feature, tier),
+            TenantError::LimitExceeded { limit_type, current, max } =>
+                format!("Limit exceeded for {}: {}/{}", limit_type, current, max),
+            TenantError::DomainVerificationFailed { domain, reason } =>
+                format!("Domain verification failed for {}: {}", domain, reason),
+            TenantError::ConfigurationError { message } =>
+                format!("Configuration error: {}", message),
+            TenantError::Internal { message } =>
+                format!("Internal error: {}", message),
+            TenantError::SecurityViolation { message, sql_fragment } =>
+                format!("Security violation: {} (fragment: {})", message, sql_fragment),
+            TenantError::TenantIsolationViolation { message, table } =>
+                format!("Tenant isolation violation on table '{}': {}", table, message)
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Generate a tenant ID
+fn generate_tenant_id() -> String {
+    format!("tenant_{}", generate_uuid())
+}
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+/// Decode JWT claim using proper JWT parsing
+fn decode_jwt_claim(token: &str, claim: &str) -> Result<String, TenantError> {
+    // Parse JWT structure (header.payload.signature)
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(TenantError::ResolutionFailed {
+            reason: "Invalid JWT format: expected 3 parts".to_string()
+        });
+    }
+
+    // Decode the payload (middle part)
+    let payload_b64 = parts[1];
+    let payload_bytes = base64::decode_url_safe(payload_b64)
+        .map_err(|e| TenantError::ResolutionFailed {
+            reason: format!("Failed to decode JWT payload: {}", e)
+        })?;
+
+    let payload_str = String::from_utf8(payload_bytes)
+        .map_err(|e| TenantError::ResolutionFailed {
+            reason: format!("Invalid UTF-8 in JWT payload: {}", e)
+        })?;
+
+    let claims: std::json::JsonValue = std::json::from_str(&payload_str)
+        .map_err(|e| TenantError::ResolutionFailed {
+            reason: format!("Failed to parse JWT claims: {}", e)
+        })?;
+
+    // Extract the requested claim
+    claims.get(claim)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or(TenantError::ResolutionFailed {
+            reason: format!("Claim '{}' not found in JWT", claim)
+        })
+}
+
+/// Verify JWT signature (for production use)
+fn verify_jwt_signature(token: &str, secret: &str) -> Result<bool, TenantError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(TenantError::ResolutionFailed {
+            reason: "Invalid JWT format".to_string()
+        });
+    }
+
+    let header_payload = format!("{}.{}", parts[0], parts[1]);
+    let signature_b64 = parts[2];
+
+    // Decode existing signature
+    let existing_signature = base64::decode_url_safe(signature_b64)
+        .map_err(|e| TenantError::ResolutionFailed {
+            reason: format!("Failed to decode signature: {}", e)
+        })?;
+
+    // Compute expected signature using HMAC-SHA256
+    let expected_signature = std::crypto::hmac_sha256(secret.as_bytes(), header_payload.as_bytes());
+
+    // Constant-time comparison to prevent timing attacks
+    Ok(std::crypto::constant_time_eq(&existing_signature, &expected_signature))
+}
+
+/// Look up tenant by API key from storage
+fn lookup_tenant_by_api_key(api_key: &str) -> Result<TenantId, TenantError> {
+    // Hash the API key for lookup (API keys are stored hashed)
+    let api_key_hash = std::crypto::sha256(api_key.as_bytes());
+    let hash_hex = std::hex::encode(&api_key_hash);
+
+    // Query the database for the tenant
+    let result = db::query_one(
+        "SELECT tenant_id FROM api_keys WHERE key_hash = $1 AND revoked = false AND (expires_at IS NULL OR expires_at > NOW())",
+        [&hash_hex]
+    );
+
+    match result {
+        Ok(Some(row)) => {
+            let tenant_id: String = row.get("tenant_id");
+            Ok(tenant_id)
+        },
+        Ok(None) => Err(TenantError::ResolutionFailed {
+            reason: "Invalid or expired API key".to_string()
+        }),
+        Err(e) => Err(TenantError::ResolutionFailed {
+            reason: format!("Database error during API key lookup: {}", e)
+        })
+    }
+}
+
+/// Validate API key format
+fn validate_api_key_format(api_key: &str) -> bool {
+    // API keys should be in format: prefix_base64data
+    // e.g., "int_abc123..." where int_ is the prefix
+    if api_key.len() < 20 || api_key.len() > 100 {
+        return false;
+    }
+
+    // Check for valid prefix
+    let valid_prefixes = ["int_", "sk_", "pk_"];
+    if !valid_prefixes.iter().any(|p| api_key.starts_with(p)) {
+        return false;
+    }
+
+    // Check remaining characters are valid base64url
+    let key_part = &api_key[4..];
+    key_part.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_tenant_creation() {
+        let tenant = Tenant::new(
+            "Test Org".to_string(),
+            "test-org".to_string(),
+            "admin@test.org".to_string()
+        );
+
+        assert_eq!(tenant.name, "Test Org");
+        assert_eq!(tenant.slug, "test-org");
+        assert!(tenant.is_active());
+    }
+
+    #[test]
+    fn test_subscription_tier_features() {
+        assert!(SubscriptionTier::Free.includes_feature("basic_courses"));
+        assert!(!SubscriptionTier::Free.includes_feature("ai_tutor"));
+        assert!(SubscriptionTier::Business.includes_feature("ai_tutor"));
+        assert!(SubscriptionTier::Enterprise.includes_feature("white_label"));
+    }
+
+    #[test]
+    fn test_tenant_context() {
+        let tenant = Tenant::new(
+            "Test".to_string(),
+            "test".to_string(),
+            "test@test.com".to_string()
+        );
+
+        let context = TenantContext::from_tenant(
+            tenant,
+            ResolutionMethod::Default
+        );
+
+        assert!(context.has_feature("basic_courses"));
+    }
+}

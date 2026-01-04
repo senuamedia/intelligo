@@ -1,0 +1,959 @@
+/// Intelligo LMS - Tenant Management
+///
+/// Tenant CRUD operations, provisioning workflows, suspension handling,
+/// and lifecycle management for multi-tenant deployments.
+
+module intelligo::tenant::management
+
+use intelligo::tenant::core::*
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// TENANT STATUS
+// =============================================================================
+
+/// Tenant lifecycle status
+enum TenantStatus {
+    /// Pending activation (awaiting verification)
+    Pending,
+    /// Active and operational
+    Active,
+    /// Suspended (can be reactivated)
+    Suspended { reason: SuspensionReason, suspended_at: DateTime },
+    /// Archived (read-only, can be restored)
+    Archived { archived_at: DateTime },
+    /// Deleted (soft delete, pending permanent removal)
+    Deleted { deleted_at: DateTime, purge_at: DateTime },
+    /// In maintenance mode
+    Maintenance { message: String, estimated_end: Option<DateTime> }
+}
+
+impl TenantStatus {
+    fn is_operational(&self) -> Bool {
+        match self {
+            TenantStatus::Active => true,
+            _ => false
+        }
+    }
+
+    fn allows_read(&self) -> Bool {
+        match self {
+            TenantStatus::Active => true,
+            TenantStatus::Maintenance { .. } => true,
+            TenantStatus::Archived { .. } => true,
+            _ => false
+        }
+    }
+
+    fn allows_write(&self) -> Bool {
+        match self {
+            TenantStatus::Active => true,
+            _ => false
+        }
+    }
+}
+
+/// Reason for tenant suspension
+enum SuspensionReason {
+    /// Non-payment of subscription
+    NonPayment,
+    /// Terms of service violation
+    TosViolation { details: String },
+    /// Security concern
+    SecurityConcern { details: String },
+    /// Requested by tenant admin
+    AdminRequested,
+    /// System maintenance
+    Maintenance,
+    /// Trial expired
+    TrialExpired,
+    /// Other reason
+    Other { reason: String }
+}
+
+impl SuspensionReason {
+    fn to_string(&self) -> String {
+        match self {
+            SuspensionReason::NonPayment => "Non-payment".to_string(),
+            SuspensionReason::TosViolation { details } => format!("TOS Violation: {}", details),
+            SuspensionReason::SecurityConcern { details } => format!("Security: {}", details),
+            SuspensionReason::AdminRequested => "Admin requested".to_string(),
+            SuspensionReason::Maintenance => "Maintenance".to_string(),
+            SuspensionReason::TrialExpired => "Trial expired".to_string(),
+            SuspensionReason::Other { reason } => reason.clone()
+        }
+    }
+}
+
+// =============================================================================
+// TENANT CREATION
+// =============================================================================
+
+/// Request to create a new tenant
+type CreateTenantRequest {
+    /// Organization name
+    name: String,
+
+    /// URL slug (must be unique)
+    slug: String,
+
+    /// Primary contact email
+    contact_email: String,
+
+    /// Tenant type
+    tenant_type: TenantType,
+
+    /// Initial subscription tier
+    tier: SubscriptionTier,
+
+    /// Time zone
+    timezone: Option<String>,
+
+    /// Locale
+    locale: Option<String>,
+
+    /// Currency
+    currency: Option<String>,
+
+    /// Initial admin user
+    admin_user: Option<CreateAdminUser>,
+
+    /// Custom domain
+    custom_domain: Option<String>,
+
+    /// Initial features to enable
+    features: List<String>,
+
+    /// Initial settings
+    settings: Map<String, Dynamic>,
+
+    /// Trial duration (if starting a trial)
+    trial_days: Option<i32>,
+
+    /// Parent tenant ID (for sub-tenants)
+    parent_id: Option<TenantId>,
+
+    /// Metadata
+    metadata: Map<String, Dynamic>
+}
+
+/// Initial admin user for tenant
+type CreateAdminUser {
+    email: String,
+    first_name: String,
+    last_name: String,
+    password: Option<String>,
+    send_invitation: Bool
+}
+
+/// Result of tenant creation
+type CreateTenantResult {
+    /// Created tenant
+    tenant: Tenant,
+
+    /// Created admin user ID (if created)
+    admin_user_id: Option<UserId>,
+
+    /// Invitation sent (if applicable)
+    invitation_sent: Bool,
+
+    /// Provisioning status
+    provisioning_status: ProvisioningStatus
+}
+
+/// Status of tenant provisioning
+enum ProvisioningStatus {
+    /// Provisioning complete
+    Complete,
+    /// Still provisioning
+    InProgress { steps_complete: i32, total_steps: i32 },
+    /// Provisioning failed
+    Failed { error: String }
+}
+
+// =============================================================================
+// TENANT MANAGER
+// =============================================================================
+
+/// Tenant management actor
+actor TenantManager {
+    var tenants: Map<TenantId, Tenant> = Map::new()
+    var slugs: Map<String, TenantId> = Map::new()
+    var provisioning_queue: List<ProvisioningTask> = vec![]
+    var audit_log: List<TenantAuditEntry> = vec![]
+
+    fn new() -> Self {
+        TenantManager::default()
+    }
+
+    /// Create a new tenant
+    receive CreateTenant(request: CreateTenantRequest) -> Result<CreateTenantResult, TenantError> {
+        // Validate slug uniqueness
+        if self.slugs.contains_key(&request.slug) {
+            return Err(TenantError::ConfigurationError {
+                message: format!("Slug '{}' is already in use", request.slug)
+            });
+        }
+
+        // Validate slug format
+        if !is_valid_slug(&request.slug) {
+            return Err(TenantError::ConfigurationError {
+                message: "Slug must contain only lowercase letters, numbers, and hyphens".to_string()
+            });
+        }
+
+        // Create tenant
+        let mut tenant = Tenant::new(
+            request.name.clone(),
+            request.slug.clone(),
+            request.contact_email.clone()
+        );
+
+        tenant.tenant_type = request.tenant_type;
+        tenant.tier = request.tier;
+
+        if let Some(tz) = request.timezone {
+            tenant.timezone = tz;
+        }
+
+        if let Some(locale) = request.locale {
+            tenant.locale = locale;
+        }
+
+        if let Some(currency) = request.currency {
+            tenant.currency = currency;
+        }
+
+        // Set trial end date if applicable
+        if let Some(days) = request.trial_days {
+            tenant.trial_ends_at = Some(DateTime::now() + Duration::days(days as i64));
+        }
+
+        // Set parent if sub-tenant
+        tenant.parent_id = request.parent_id;
+
+        // Add features
+        for feature in request.features {
+            tenant.features.insert(feature);
+        }
+
+        // Add settings
+        tenant.settings = request.settings;
+
+        // Add metadata
+        tenant.metadata = request.metadata;
+
+        // Add custom domain if provided
+        if let Some(domain) = request.custom_domain {
+            tenant.domains.push(TenantDomain {
+                domain,
+                is_primary: true,
+                verified: false,
+                verification_token: Some(generate_verification_token()),
+                ssl_status: SslStatus::Pending,
+                created_at: DateTime::now(),
+                verified_at: None
+            });
+        }
+
+        // Store tenant
+        let tenant_id = tenant.id.clone();
+        self.tenants.insert(tenant_id.clone(), tenant.clone());
+        self.slugs.insert(request.slug.clone(), tenant_id.clone());
+
+        // Log creation
+        self.log_audit(TenantAuditEntry {
+            tenant_id: tenant_id.clone(),
+            action: TenantAction::Created,
+            actor: None,
+            timestamp: DateTime::now(),
+            details: Map::new()
+        });
+
+        // Queue provisioning tasks
+        self.queue_provisioning(&tenant);
+
+        // Create admin user if requested
+        let admin_user_id = if let Some(admin) = request.admin_user {
+            Some(self.create_admin_user(&tenant_id, &admin)?)
+        } else {
+            None
+        };
+
+        checkpoint();
+
+        Ok(CreateTenantResult {
+            tenant,
+            admin_user_id,
+            invitation_sent: false,
+            provisioning_status: ProvisioningStatus::Complete
+        })
+    }
+
+    /// Get tenant by ID
+    receive GetTenant(tenant_id: TenantId) -> Option<Tenant> {
+        self.tenants.get(&tenant_id).cloned()
+    }
+
+    /// Get tenant by slug
+    receive GetTenantBySlug(slug: String) -> Option<Tenant> {
+        self.slugs.get(&slug)
+            .and_then(|id| self.tenants.get(id))
+            .cloned()
+    }
+
+    /// Update tenant
+    receive UpdateTenant(tenant_id: TenantId, update: UpdateTenantRequest) -> Result<Tenant, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        // Update fields
+        if let Some(name) = update.name {
+            tenant.name = name;
+        }
+
+        if let Some(legal_name) = update.legal_name {
+            tenant.legal_name = Some(legal_name);
+        }
+
+        if let Some(contact_email) = update.contact_email {
+            tenant.contact_email = contact_email;
+        }
+
+        if let Some(support_email) = update.support_email {
+            tenant.support_email = Some(support_email);
+        }
+
+        if let Some(timezone) = update.timezone {
+            tenant.timezone = timezone;
+        }
+
+        if let Some(locale) = update.locale {
+            tenant.locale = locale;
+        }
+
+        if let Some(currency) = update.currency {
+            tenant.currency = currency;
+        }
+
+        if let Some(settings) = update.settings {
+            for (key, value) in settings {
+                tenant.settings.insert(key, value);
+            }
+        }
+
+        if let Some(features) = update.features {
+            tenant.features = features;
+        }
+
+        tenant.updated_at = DateTime::now();
+
+        let updated = tenant.clone();
+
+        self.log_audit(TenantAuditEntry {
+            tenant_id,
+            action: TenantAction::Updated,
+            actor: update.actor,
+            timestamp: DateTime::now(),
+            details: Map::new()
+        });
+
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Suspend tenant
+    receive SuspendTenant(tenant_id: TenantId, reason: SuspensionReason, actor: Option<UserId>) -> Result<Tenant, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        tenant.status = TenantStatus::Suspended {
+            reason: reason.clone(),
+            suspended_at: DateTime::now()
+        };
+        tenant.updated_at = DateTime::now();
+
+        let updated = tenant.clone();
+
+        self.log_audit(TenantAuditEntry {
+            tenant_id,
+            action: TenantAction::Suspended { reason: reason.to_string() },
+            actor,
+            timestamp: DateTime::now(),
+            details: Map::new()
+        });
+
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Reactivate suspended tenant
+    receive ReactivateTenant(tenant_id: TenantId, actor: Option<UserId>) -> Result<Tenant, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        match &tenant.status {
+            TenantStatus::Suspended { .. } => {
+                tenant.status = TenantStatus::Active;
+                tenant.updated_at = DateTime::now();
+            },
+            TenantStatus::Archived { .. } => {
+                tenant.status = TenantStatus::Active;
+                tenant.updated_at = DateTime::now();
+            },
+            _ => {
+                return Err(TenantError::ConfigurationError {
+                    message: "Tenant is not suspended or archived".to_string()
+                });
+            }
+        }
+
+        let updated = tenant.clone();
+
+        self.log_audit(TenantAuditEntry {
+            tenant_id,
+            action: TenantAction::Reactivated,
+            actor,
+            timestamp: DateTime::now(),
+            details: Map::new()
+        });
+
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Archive tenant
+    receive ArchiveTenant(tenant_id: TenantId, actor: Option<UserId>) -> Result<Tenant, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        tenant.status = TenantStatus::Archived {
+            archived_at: DateTime::now()
+        };
+        tenant.updated_at = DateTime::now();
+
+        let updated = tenant.clone();
+
+        self.log_audit(TenantAuditEntry {
+            tenant_id,
+            action: TenantAction::Archived,
+            actor,
+            timestamp: DateTime::now(),
+            details: Map::new()
+        });
+
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Soft delete tenant
+    receive DeleteTenant(tenant_id: TenantId, purge_days: i32, actor: Option<UserId>) -> Result<Tenant, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        let now = DateTime::now();
+        tenant.status = TenantStatus::Deleted {
+            deleted_at: now,
+            purge_at: now + Duration::days(purge_days as i64)
+        };
+        tenant.updated_at = now;
+
+        // Remove from slug index
+        self.slugs.remove(&tenant.slug);
+
+        let updated = tenant.clone();
+
+        self.log_audit(TenantAuditEntry {
+            tenant_id,
+            action: TenantAction::Deleted,
+            actor,
+            timestamp: now,
+            details: Map::new()
+        });
+
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Permanently purge deleted tenant
+    receive PurgeTenant(tenant_id: TenantId, actor: Option<UserId>) -> Result<(), TenantError> {
+        let tenant = self.tenants.get(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        match &tenant.status {
+            TenantStatus::Deleted { .. } => {
+                // Remove tenant completely
+                self.tenants.remove(&tenant_id);
+
+                self.log_audit(TenantAuditEntry {
+                    tenant_id: tenant_id.clone(),
+                    action: TenantAction::Purged,
+                    actor,
+                    timestamp: DateTime::now(),
+                    details: Map::new()
+                });
+
+                checkpoint();
+
+                Ok(())
+            },
+            _ => Err(TenantError::ConfigurationError {
+                message: "Tenant must be in Deleted status to purge".to_string()
+            })
+        }
+    }
+
+    /// Update subscription tier
+    receive UpdateTier(tenant_id: TenantId, tier: SubscriptionTier, actor: Option<UserId>) -> Result<Tenant, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        let old_tier = tenant.tier.to_string();
+        tenant.tier = tier.clone();
+        tenant.updated_at = DateTime::now();
+
+        let updated = tenant.clone();
+
+        let mut details = Map::new();
+        details.insert("old_tier".to_string(), Dynamic::String(old_tier));
+        details.insert("new_tier".to_string(), Dynamic::String(tier.to_string()));
+
+        self.log_audit(TenantAuditEntry {
+            tenant_id,
+            action: TenantAction::TierChanged,
+            actor,
+            timestamp: DateTime::now(),
+            details
+        });
+
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Add domain to tenant
+    receive AddDomain(tenant_id: TenantId, domain: String) -> Result<TenantDomain, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        // Check if domain already exists
+        for existing in &tenant.domains {
+            if existing.domain == domain {
+                return Err(TenantError::ConfigurationError {
+                    message: "Domain already registered".to_string()
+                });
+            }
+        }
+
+        let new_domain = TenantDomain {
+            domain: domain.clone(),
+            is_primary: tenant.domains.is_empty(),
+            verified: false,
+            verification_token: Some(generate_verification_token()),
+            ssl_status: SslStatus::Pending,
+            created_at: DateTime::now(),
+            verified_at: None
+        };
+
+        tenant.domains.push(new_domain.clone());
+        tenant.updated_at = DateTime::now();
+
+        checkpoint();
+
+        Ok(new_domain)
+    }
+
+    /// Verify domain
+    receive VerifyDomain(tenant_id: TenantId, domain: String, token: String) -> Result<TenantDomain, TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        for d in &mut tenant.domains {
+            if d.domain == domain {
+                if d.verification_token.as_ref() == Some(&token) {
+                    d.verified = true;
+                    d.verified_at = Some(DateTime::now());
+                    d.verification_token = None;
+                    d.ssl_status = SslStatus::Provisioning;
+
+                    tenant.updated_at = DateTime::now();
+
+                    if d.is_primary && tenant.primary_domain.is_none() {
+                        tenant.primary_domain = Some(domain.clone());
+                    }
+
+                    checkpoint();
+
+                    return Ok(d.clone());
+                } else {
+                    return Err(TenantError::DomainVerificationFailed {
+                        domain,
+                        reason: "Invalid verification token".to_string()
+                    });
+                }
+            }
+        }
+
+        Err(TenantError::ConfigurationError {
+            message: "Domain not found".to_string()
+        })
+    }
+
+    /// Remove domain
+    receive RemoveDomain(tenant_id: TenantId, domain: String) -> Result<(), TenantError> {
+        let tenant = self.tenants.get_mut(&tenant_id)
+            .ok_or(TenantError::TenantNotFound { identifier: tenant_id.0.clone() })?;
+
+        let original_len = tenant.domains.len();
+        tenant.domains.retain(|d| d.domain != domain);
+
+        if tenant.domains.len() == original_len {
+            return Err(TenantError::ConfigurationError {
+                message: "Domain not found".to_string()
+            });
+        }
+
+        if tenant.primary_domain.as_ref() == Some(&domain) {
+            tenant.primary_domain = tenant.domains.first()
+                .filter(|d| d.verified)
+                .map(|d| d.domain.clone());
+        }
+
+        tenant.updated_at = DateTime::now();
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// List all tenants
+    receive ListTenants(filter: TenantFilter) -> List<Tenant> {
+        self.tenants.values()
+            .filter(|t| self.matches_filter(t, &filter))
+            .cloned()
+            .collect()
+    }
+
+    /// Get tenant statistics
+    receive GetStatistics() -> TenantStatistics {
+        let mut stats = TenantStatistics::default();
+
+        for tenant in self.tenants.values() {
+            stats.total += 1;
+
+            match &tenant.status {
+                TenantStatus::Active => stats.active += 1,
+                TenantStatus::Suspended { .. } => stats.suspended += 1,
+                TenantStatus::Pending => stats.pending += 1,
+                TenantStatus::Archived { .. } => stats.archived += 1,
+                TenantStatus::Deleted { .. } => stats.deleted += 1,
+                TenantStatus::Maintenance { .. } => stats.maintenance += 1,
+            }
+
+            match &tenant.tier {
+                SubscriptionTier::Free => stats.by_tier.entry("free".to_string()).or_insert(0) += 1,
+                SubscriptionTier::Starter => stats.by_tier.entry("starter".to_string()).or_insert(0) += 1,
+                SubscriptionTier::Professional => stats.by_tier.entry("professional".to_string()).or_insert(0) += 1,
+                SubscriptionTier::Business => stats.by_tier.entry("business".to_string()).or_insert(0) += 1,
+                SubscriptionTier::Enterprise => stats.by_tier.entry("enterprise".to_string()).or_insert(0) += 1,
+                SubscriptionTier::Custom { .. } => stats.by_tier.entry("custom".to_string()).or_insert(0) += 1,
+            }
+
+            if tenant.is_trial() {
+                stats.in_trial += 1;
+            }
+        }
+
+        stats
+    }
+
+    /// Get audit log for tenant
+    receive GetAuditLog(tenant_id: TenantId, limit: i32) -> List<TenantAuditEntry> {
+        self.audit_log.iter()
+            .filter(|e| e.tenant_id == tenant_id)
+            .take(limit as usize)
+            .cloned()
+            .collect()
+    }
+
+    // Internal methods
+
+    fn matches_filter(&self, tenant: &Tenant, filter: &TenantFilter) -> Bool {
+        if let Some(ref status) = filter.status {
+            let matches_status = match (&tenant.status, status.as_str()) {
+                (TenantStatus::Active, "active") => true,
+                (TenantStatus::Pending, "pending") => true,
+                (TenantStatus::Suspended { .. }, "suspended") => true,
+                (TenantStatus::Archived { .. }, "archived") => true,
+                (TenantStatus::Deleted { .. }, "deleted") => true,
+                (TenantStatus::Maintenance { .. }, "maintenance") => true,
+                _ => false
+            };
+            if !matches_status {
+                return false;
+            }
+        }
+
+        if let Some(ref tier) = filter.tier {
+            if tenant.tier.to_string() != *tier {
+                return false;
+            }
+        }
+
+        if let Some(ref search) = filter.search {
+            let lower = search.to_lowercase();
+            if !tenant.name.to_lowercase().contains(&lower) &&
+               !tenant.slug.to_lowercase().contains(&lower) &&
+               !tenant.contact_email.to_lowercase().contains(&lower) {
+                return false;
+            }
+        }
+
+        if let Some(ref parent) = filter.parent_id {
+            if tenant.parent_id.as_ref() != Some(parent) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn queue_provisioning(&mut self, tenant: &Tenant) {
+        // Queue provisioning tasks for new tenant
+        self.provisioning_queue.push(ProvisioningTask {
+            tenant_id: tenant.id.clone(),
+            task_type: ProvisioningTaskType::CreateDatabase,
+            status: TaskStatus::Pending,
+            created_at: DateTime::now()
+        });
+
+        self.provisioning_queue.push(ProvisioningTask {
+            tenant_id: tenant.id.clone(),
+            task_type: ProvisioningTaskType::CreateStorage,
+            status: TaskStatus::Pending,
+            created_at: DateTime::now()
+        });
+
+        self.provisioning_queue.push(ProvisioningTask {
+            tenant_id: tenant.id.clone(),
+            task_type: ProvisioningTaskType::ConfigureBranding,
+            status: TaskStatus::Pending,
+            created_at: DateTime::now()
+        });
+
+        self.provisioning_queue.push(ProvisioningTask {
+            tenant_id: tenant.id.clone(),
+            task_type: ProvisioningTaskType::SetupDefaults,
+            status: TaskStatus::Pending,
+            created_at: DateTime::now()
+        });
+    }
+
+    fn create_admin_user(&self, tenant_id: &TenantId, admin: &CreateAdminUser) -> Result<UserId, TenantError> {
+        // Would create admin user via user service
+        Ok(UserId(format!("admin_{}", generate_uuid())))
+    }
+
+    fn log_audit(&mut self, entry: TenantAuditEntry) {
+        self.audit_log.push(entry);
+
+        // Keep audit log bounded
+        if self.audit_log.len() > 10000 {
+            self.audit_log = self.audit_log.split_off(5000);
+        }
+    }
+}
+
+// =============================================================================
+// SUPPORTING TYPES
+// =============================================================================
+
+/// Update tenant request
+type UpdateTenantRequest {
+    name: Option<String>,
+    legal_name: Option<String>,
+    contact_email: Option<String>,
+    support_email: Option<String>,
+    timezone: Option<String>,
+    locale: Option<String>,
+    currency: Option<String>,
+    settings: Option<Map<String, Dynamic>>,
+    features: Option<Set<String>>,
+    actor: Option<UserId>
+}
+
+/// Tenant filter for queries
+type TenantFilter {
+    status: Option<String>,
+    tier: Option<String>,
+    search: Option<String>,
+    parent_id: Option<TenantId>,
+    created_after: Option<DateTime>,
+    created_before: Option<DateTime>
+}
+
+/// Tenant statistics
+type TenantStatistics {
+    total: i64,
+    active: i64,
+    pending: i64,
+    suspended: i64,
+    archived: i64,
+    deleted: i64,
+    maintenance: i64,
+    in_trial: i64,
+    by_tier: Map<String, i64>
+}
+
+impl Default for TenantStatistics {
+    fn default() -> Self {
+        TenantStatistics {
+            total: 0,
+            active: 0,
+            pending: 0,
+            suspended: 0,
+            archived: 0,
+            deleted: 0,
+            maintenance: 0,
+            in_trial: 0,
+            by_tier: Map::new()
+        }
+    }
+}
+
+/// Provisioning task
+type ProvisioningTask {
+    tenant_id: TenantId,
+    task_type: ProvisioningTaskType,
+    status: TaskStatus,
+    created_at: DateTime
+}
+
+/// Provisioning task types
+enum ProvisioningTaskType {
+    CreateDatabase,
+    CreateStorage,
+    ConfigureBranding,
+    SetupDefaults,
+    SendWelcomeEmail,
+    CreateDefaultRoles,
+    SetupIntegrations
+}
+
+/// Task status
+enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed { error: String }
+}
+
+/// Audit log entry
+type TenantAuditEntry {
+    tenant_id: TenantId,
+    action: TenantAction,
+    actor: Option<UserId>,
+    timestamp: DateTime,
+    details: Map<String, Dynamic>
+}
+
+/// Tenant audit actions
+enum TenantAction {
+    Created,
+    Updated,
+    Suspended { reason: String },
+    Reactivated,
+    Archived,
+    Deleted,
+    Purged,
+    TierChanged,
+    DomainAdded,
+    DomainRemoved,
+    DomainVerified,
+    SettingChanged,
+    FeatureEnabled,
+    FeatureDisabled
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Validate slug format
+fn is_valid_slug(slug: &str) -> Bool {
+    if slug.is_empty() || slug.len() > 63 {
+        return false;
+    }
+
+    // Must start with letter
+    if !slug.chars().next().map_or(false, |c| c.is_ascii_lowercase()) {
+        return false;
+    }
+
+    // Must end with letter or digit
+    if !slug.chars().last().map_or(false, |c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
+    // Only lowercase letters, digits, and hyphens
+    slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Generate a verification token
+fn generate_verification_token() -> String {
+    format!("verify_{}", generate_uuid())
+}
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_slug_validation() {
+        assert!(is_valid_slug("my-org"));
+        assert!(is_valid_slug("test123"));
+        assert!(is_valid_slug("a"));
+        assert!(!is_valid_slug(""));
+        assert!(!is_valid_slug("-start"));
+        assert!(!is_valid_slug("end-"));
+        assert!(!is_valid_slug("UPPER"));
+        assert!(!is_valid_slug("has space"));
+    }
+
+    #[test]
+    fn test_tenant_status() {
+        let active = TenantStatus::Active;
+        assert!(active.is_operational());
+        assert!(active.allows_read());
+        assert!(active.allows_write());
+
+        let suspended = TenantStatus::Suspended {
+            reason: SuspensionReason::NonPayment,
+            suspended_at: DateTime::now()
+        };
+        assert!(!suspended.is_operational());
+        assert!(!suspended.allows_read());
+        assert!(!suspended.allows_write());
+
+        let archived = TenantStatus::Archived {
+            archived_at: DateTime::now()
+        };
+        assert!(archived.allows_read());
+        assert!(!archived.allows_write());
+    }
+}

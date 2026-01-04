@@ -1,0 +1,194 @@
+/// Intelligo LMS - SCORM Player Integration Tests
+///
+/// Tests SCORM content delivery and runtime data management.
+
+module intelligo::tests::integration::scorm_player
+
+use intelligo::chai::*
+use intelligo::compliance::scorm::*
+
+pub fn register_tests() {
+    describe("SCORM Player Integration", || {
+        describe("SCORM 1.2 content launch", || {
+            it("initializes runtime on content launch", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                let result = runtime.lms_initialize("");
+
+                expect(&result).to().equal(&"true".to_string());
+            });
+
+            it("preserves state between sessions", || {
+                // First session
+                let mut runtime1 = Scorm12Runtime::new("learner_1", "Test, Learner");
+                runtime1.lms_initialize("");
+                runtime1.set_value("cmi.core.lesson_location", "page_5").unwrap();
+                runtime1.set_value("cmi.core.lesson_status", "incomplete").unwrap();
+                let state = runtime1.lms_finish("");
+
+                // Simulate save to database
+                let saved_state = runtime1.export_state();
+
+                // Second session - restore state
+                let mut runtime2 = Scorm12Runtime::new("learner_1", "Test, Learner");
+                runtime2.import_state(&saved_state);
+                runtime2.lms_initialize("");
+
+                let location = runtime2.get_value("cmi.core.lesson_location").unwrap();
+                expect(&location).to().equal(&"page_5".to_string());
+            });
+
+            it("tracks cumulative session time", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                // First session: 30 minutes
+                runtime.set_value("cmi.core.session_time", "00:30:00").unwrap();
+                runtime.commit_session();
+
+                // Second session: 15 minutes
+                runtime.set_value("cmi.core.session_time", "00:15:00").unwrap();
+                runtime.commit_session();
+
+                let total = runtime.get_value("cmi.core.total_time").unwrap();
+                expect(&total).to().equal(&"00:45:00".to_string());
+            });
+        });
+
+        describe("SCORM 2004 sequencing", || {
+            it("respects flow control mode", || {
+                let mut sequencer = Scorm2004Sequencer::new();
+                sequencer.set_control_mode(ControlMode {
+                    choice: true,
+                    flow: true,
+                    forward_only: false
+                });
+
+                let can_go_back = sequencer.can_navigate(NavigationRequest::Previous);
+                expect(&can_go_back).to().be_true();
+            });
+
+            it("enforces forward-only mode", || {
+                let mut sequencer = Scorm2004Sequencer::new();
+                sequencer.set_control_mode(ControlMode {
+                    choice: false,
+                    flow: true,
+                    forward_only: true
+                });
+
+                let can_go_back = sequencer.can_navigate(NavigationRequest::Previous);
+                expect(&can_go_back).to().be_false();
+            });
+
+            it("tracks objective completion", || {
+                let mut runtime = Scorm2004Runtime::new("learner_1", "Test, Learner");
+
+                // Set objective satisfied
+                runtime.set_value("cmi.objectives.0.id", "objective_1").unwrap();
+                runtime.set_value("cmi.objectives.0.success_status", "passed").unwrap();
+                runtime.set_value("cmi.objectives.0.completion_status", "completed").unwrap();
+
+                // Check objective status
+                let status = runtime.get_value("cmi.objectives.0.success_status").unwrap();
+                expect(&status).to().equal(&"passed".to_string());
+            });
+
+            it("evaluates rollup rules", || {
+                let mut sequencer = Scorm2004Sequencer::new();
+
+                // Add activities with rollup
+                sequencer.add_activity(SequencingActivity {
+                    id: "parent".to_string(),
+                    children: vec!["child1".to_string(), "child2".to_string()],
+                    rollup_rules: vec![
+                        RollupRule {
+                            child_activity_set: ChildActivitySet::All,
+                            condition: RollupCondition::Completed,
+                            action: RollupAction::SetCompleted
+                        }
+                    ],
+                    ..Default::default()
+                });
+
+                // Complete all children
+                sequencer.mark_completed("child1");
+                sequencer.mark_completed("child2");
+
+                // Parent should roll up to completed
+                expect(&sequencer.is_completed("parent")).to().be_true();
+            });
+        });
+
+        describe("interaction tracking", || {
+            it("records learner interactions", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                // Record a multiple choice interaction
+                runtime.set_value("cmi.interactions.0.id", "q1").unwrap();
+                runtime.set_value("cmi.interactions.0.type", "choice").unwrap();
+                runtime.set_value("cmi.interactions.0.student_response", "a").unwrap();
+                runtime.set_value("cmi.interactions.0.result", "correct").unwrap();
+                runtime.set_value("cmi.interactions.0.latency", "00:01:30").unwrap();
+
+                let count = runtime.get_value("cmi.interactions._count").unwrap();
+                expect(&count).to().equal(&"1".to_string());
+            });
+
+            it("supports various interaction types", || {
+                let mut runtime = Scorm2004Runtime::new("learner_1", "Test, Learner");
+
+                // Multiple choice
+                runtime.set_value("cmi.interactions.0.type", "choice").unwrap();
+
+                // Fill in the blank
+                runtime.set_value("cmi.interactions.1.type", "fill-in").unwrap();
+
+                // Matching
+                runtime.set_value("cmi.interactions.2.type", "matching").unwrap();
+
+                // Sequencing
+                runtime.set_value("cmi.interactions.3.type", "sequencing").unwrap();
+            });
+        });
+
+        describe("error handling", || {
+            it("returns appropriate error codes", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                // Try to set value before Initialize
+                let result = runtime.set_value("cmi.core.lesson_status", "completed");
+                expect(&result.is_err()).to().be_true();
+
+                // Check error code
+                let error = runtime.lms_get_last_error();
+                expect(&error).to().not().equal(&"0".to_string());
+            });
+
+            it("provides error descriptions", || {
+                let mut runtime = Scorm12Runtime::new("learner_1", "Test, Learner");
+
+                // Cause an error
+                runtime.set_value("cmi.invalid.element", "value");
+
+                let error_string = runtime.lms_get_error_string(runtime.lms_get_last_error());
+                expect(&error_string.len()).to().be_greater_than(&0);
+            });
+        });
+
+        describe("content completion", || {
+            it("marks content complete when criteria met", || {
+                let mut runtime = Scorm2004Runtime::new("learner_1", "Test, Learner");
+                runtime.lms_initialize("");
+
+                // Set completion criteria
+                runtime.set_value("cmi.completion_status", "completed").unwrap();
+                runtime.set_value("cmi.success_status", "passed").unwrap();
+                runtime.set_value("cmi.score.scaled", "0.85").unwrap();
+
+                runtime.lms_finish("");
+
+                // Verify final state
+                expect(&runtime.cmi.completion_status).to().equal(&"completed".to_string());
+            });
+        });
+    });
+}

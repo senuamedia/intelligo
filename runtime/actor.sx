@@ -1,0 +1,654 @@
+/// Intelligo LMS - Actor System
+///
+/// Provides actor-based concurrency primitives for the LMS runtime.
+
+module intelligo::runtime::actor
+
+use std::collections::{Map, List}
+use std::sync::{Arc, Mutex, RwLock, mpsc}
+use std::thread::{JoinHandle, spawn}
+use std::time::{Duration, Instant}
+
+// =============================================================================
+// ACTOR TRAITS
+// =============================================================================
+
+/// Base trait for all actors
+pub trait Actor: Send + Sync + 'static {
+    /// Handle a message
+    fn receive(&mut self, msg: Message, ctx: &mut ActorContext);
+
+    /// Called when actor starts
+    fn pre_start(&mut self, _ctx: &mut ActorContext) {}
+
+    /// Called when actor stops
+    fn post_stop(&mut self, _ctx: &mut ActorContext) {}
+
+    /// Called when actor restarts after failure
+    fn pre_restart(&mut self, _reason: &ActorError, _ctx: &mut ActorContext) {}
+
+    /// Called after restart completes
+    fn post_restart(&mut self, _reason: &ActorError, _ctx: &mut ActorContext) {}
+
+    /// Supervision strategy for child actors
+    fn supervisor_strategy(&self) -> SupervisorStrategy {
+        SupervisorStrategy::default()
+    }
+}
+
+/// Trait for typed actors with specific message types
+pub trait TypedActor<M: Send + 'static>: Send + Sync + 'static {
+    type Response: Send + 'static;
+
+    fn receive(&mut self, msg: M, ctx: &mut ActorContext) -> Self::Response;
+}
+
+// =============================================================================
+// MESSAGES
+// =============================================================================
+
+/// Generic message type
+pub type Message {
+    payload: Box<dyn std::any::Any + Send>,
+    sender: Option<ActorRef>,
+    correlation_id: Option<String>,
+    timestamp: Instant
+}
+
+impl Message {
+    pub fn new<T: Send + 'static>(payload: T) -> Message {
+        Message {
+            payload: Box::new(payload),
+            sender: None,
+            correlation_id: None,
+            timestamp: Instant::now()
+        }
+    }
+
+    pub fn with_sender<T: Send + 'static>(payload: T, sender: ActorRef) -> Message {
+        Message {
+            payload: Box::new(payload),
+            sender: Some(sender),
+            correlation_id: None,
+            timestamp: Instant::now()
+        }
+    }
+
+    pub fn with_correlation<T: Send + 'static>(payload: T, correlation_id: &str) -> Message {
+        Message {
+            payload: Box::new(payload),
+            sender: None,
+            correlation_id: Some(correlation_id.to_string()),
+            timestamp: Instant::now()
+        }
+    }
+
+    pub fn downcast<T: 'static>(&self) -> Option<&T> {
+        self.payload.downcast_ref::<T>()
+    }
+
+    pub fn is<T: 'static>(&self) -> bool {
+        self.payload.is::<T>()
+    }
+}
+
+/// System messages for actor lifecycle
+pub enum SystemMessage {
+    Start,
+    Stop,
+    Restart { reason: ActorError },
+    PoisonPill,
+    Watch { target: ActorRef },
+    Unwatch { target: ActorRef },
+    Terminated { actor: ActorRef }
+}
+
+// =============================================================================
+// ACTOR REFERENCE
+// =============================================================================
+
+/// Reference to an actor for message sending
+#[derive(Clone)]
+pub type ActorRef {
+    path: ActorPath,
+    mailbox: Arc<Mutex<mpsc::Sender<Message>>>,
+    state: Arc<RwLock<ActorState>>
+}
+
+impl ActorRef {
+    /// Send a message to the actor (fire-and-forget)
+    pub fn tell(&self, msg: Message) {
+        if let Ok(mailbox) = self.mailbox.lock() {
+            let _ = mailbox.send(msg);
+        }
+    }
+
+    /// Send a message and wait for response
+    pub async fn ask<T: Send + 'static, R: Send + 'static>(&self, msg: T, timeout: Duration) -> Result<R, ActorError> {
+        let (tx, rx) = mpsc::channel();
+        let response_actor = ActorRef::oneshot(tx);
+
+        let message = Message::with_sender(msg, response_actor);
+        self.tell(message);
+
+        match rx.recv_timeout(timeout) {
+            Ok(response) => {
+                if let Some(value) = response.downcast::<R>() {
+                    Ok(value.clone())
+                } else {
+                    Err(ActorError::TypeMismatch("Response type mismatch".to_string()))
+                }
+            }
+            Err(_) => Err(ActorError::Timeout)
+        }
+    }
+
+    /// Create a one-shot actor for receiving a single response
+    fn oneshot(tx: mpsc::Sender<Message>) -> ActorRef {
+        ActorRef {
+            path: ActorPath::temp(),
+            mailbox: Arc::new(Mutex::new(tx)),
+            state: Arc::new(RwLock::new(ActorState::Running))
+        }
+    }
+
+    /// Get the actor's path
+    pub fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    /// Check if actor is alive
+    pub fn is_alive(&self) -> bool {
+        matches!(*self.state.read().unwrap(), ActorState::Running)
+    }
+
+    /// Stop the actor
+    pub fn stop(&self) {
+        self.tell(Message::new(SystemMessage::Stop));
+    }
+}
+
+/// Actor path representing the hierarchical location
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub type ActorPath {
+    system: String,
+    segments: List<String>
+}
+
+impl ActorPath {
+    pub fn new(system: &str, segments: Vec<&str>) -> ActorPath {
+        ActorPath {
+            system: system.to_string(),
+            segments: segments.iter().map(|s| s.to_string()).collect()
+        }
+    }
+
+    pub fn child(&self, name: &str) -> ActorPath {
+        let mut segments = self.segments.clone();
+        segments.push(name.to_string());
+        ActorPath {
+            system: self.system.clone(),
+            segments
+        }
+    }
+
+    pub fn temp() -> ActorPath {
+        ActorPath {
+            system: "temp".to_string(),
+            segments: vec![format!("temp-{}", std::time::now().as_nanos())]
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}://{}", self.system, self.segments.join("/"))
+    }
+}
+
+/// Actor state
+#[derive(Clone, Debug)]
+pub enum ActorState {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed(String)
+}
+
+// =============================================================================
+// ACTOR CONTEXT
+// =============================================================================
+
+/// Context provided to actors during message handling
+pub type ActorContext {
+    self_ref: ActorRef,
+    system: Arc<ActorSystem>,
+    children: Map<String, ActorRef>,
+    watchers: List<ActorRef>,
+    watching: List<ActorRef>,
+    stash: List<Message>
+}
+
+impl ActorContext {
+    /// Get reference to self
+    pub fn self_ref(&self) -> ActorRef {
+        self.self_ref.clone()
+    }
+
+    /// Get the actor system
+    pub fn system(&self) -> &ActorSystem {
+        &self.system
+    }
+
+    /// Spawn a child actor
+    pub fn spawn<A: Actor>(&mut self, name: &str, actor: A) -> ActorRef {
+        let child_ref = self.system.spawn_child(self.self_ref.path(), name, actor);
+        self.children.insert(name.to_string(), child_ref.clone());
+        child_ref
+    }
+
+    /// Stop a child actor
+    pub fn stop_child(&mut self, name: &str) {
+        if let Some(child) = self.children.remove(name) {
+            child.stop();
+        }
+    }
+
+    /// Get a child by name
+    pub fn child(&self, name: &str) -> Option<&ActorRef> {
+        self.children.get(name)
+    }
+
+    /// Watch another actor for termination
+    pub fn watch(&mut self, target: &ActorRef) {
+        self.watching.push(target.clone());
+        target.tell(Message::new(SystemMessage::Watch {
+            target: self.self_ref.clone()
+        }));
+    }
+
+    /// Stop watching an actor
+    pub fn unwatch(&mut self, target: &ActorRef) {
+        self.watching.retain(|a| a.path() != target.path());
+        target.tell(Message::new(SystemMessage::Unwatch {
+            target: self.self_ref.clone()
+        }));
+    }
+
+    /// Stash the current message for later processing
+    pub fn stash(&mut self, msg: Message) {
+        self.stash.push(msg);
+    }
+
+    /// Unstash all messages
+    pub fn unstash_all(&mut self) {
+        for msg in self.stash.drain(..) {
+            self.self_ref.tell(msg);
+        }
+    }
+
+    /// Reply to sender if present
+    pub fn reply<T: Send + 'static>(&self, msg: &Message, response: T) {
+        if let Some(ref sender) = msg.sender {
+            sender.tell(Message::new(response));
+        }
+    }
+
+    /// Schedule a message to self
+    pub fn schedule_once(&self, delay: Duration, msg: Message) {
+        let self_ref = self.self_ref.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            self_ref.tell(msg);
+        });
+    }
+
+    /// Schedule a recurring message
+    pub fn schedule_periodic(&self, initial_delay: Duration, interval: Duration, msg_factory: impl Fn() -> Message + Send + 'static) -> ScheduleHandle {
+        let self_ref = self.self_ref.clone();
+        let handle = Arc::new(Mutex::new(true));
+        let handle_clone = handle.clone();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(initial_delay);
+            while *handle_clone.lock().unwrap() {
+                self_ref.tell(msg_factory());
+                std::thread::sleep(interval);
+            }
+        });
+
+        ScheduleHandle { active: handle }
+    }
+}
+
+/// Handle to cancel scheduled tasks
+pub struct ScheduleHandle {
+    active: Arc<Mutex<bool>>
+}
+
+impl ScheduleHandle {
+    pub fn cancel(&self) {
+        *self.active.lock().unwrap() = false;
+    }
+}
+
+// =============================================================================
+// ACTOR SYSTEM
+// =============================================================================
+
+/// The actor system managing all actors
+pub type ActorSystem {
+    name: String,
+    actors: Arc<RwLock<Map<String, ActorEntry>>>,
+    config: ActorSystemConfig,
+    scheduler: Arc<Scheduler>,
+    event_stream: Arc<EventStream>
+}
+
+/// Entry in the actor registry
+type ActorEntry {
+    actor_ref: ActorRef,
+    handle: Option<JoinHandle<()>>
+}
+
+/// Configuration for the actor system
+pub type ActorSystemConfig {
+    default_mailbox_size: usize,
+    default_timeout: Duration,
+    max_restarts: i32,
+    restart_window: Duration
+}
+
+impl Default for ActorSystemConfig {
+    fn default() -> ActorSystemConfig {
+        ActorSystemConfig {
+            default_mailbox_size: 1000,
+            default_timeout: Duration::from_secs(30),
+            max_restarts: 10,
+            restart_window: Duration::from_secs(60)
+        }
+    }
+}
+
+impl ActorSystem {
+    /// Create a new actor system
+    pub fn new(name: &str) -> ActorSystem {
+        ActorSystem::with_config(name, ActorSystemConfig::default())
+    }
+
+    /// Create with custom configuration
+    pub fn with_config(name: &str, config: ActorSystemConfig) -> ActorSystem {
+        ActorSystem {
+            name: name.to_string(),
+            actors: Arc::new(RwLock::new(Map::new())),
+            config,
+            scheduler: Arc::new(Scheduler::new()),
+            event_stream: Arc::new(EventStream::new())
+        }
+    }
+
+    /// Spawn a top-level actor
+    pub fn spawn<A: Actor>(&self, name: &str, actor: A) -> ActorRef {
+        let path = ActorPath::new(&self.name, vec![name]);
+        self.spawn_at(path, actor)
+    }
+
+    /// Spawn an actor at a specific path
+    fn spawn_at<A: Actor>(&self, path: ActorPath, mut actor: A) -> ActorRef {
+        let (tx, rx) = mpsc::channel();
+
+        let actor_ref = ActorRef {
+            path: path.clone(),
+            mailbox: Arc::new(Mutex::new(tx)),
+            state: Arc::new(RwLock::new(ActorState::Starting))
+        };
+
+        let actor_ref_clone = actor_ref.clone();
+        let system = Arc::new(self.clone());
+
+        let handle = std::thread::spawn(move || {
+            let mut ctx = ActorContext {
+                self_ref: actor_ref_clone.clone(),
+                system,
+                children: Map::new(),
+                watchers: vec![],
+                watching: vec![],
+                stash: vec![]
+            };
+
+            // Pre-start hook
+            actor.pre_start(&mut ctx);
+            *actor_ref_clone.state.write().unwrap() = ActorState::Running;
+
+            // Message loop
+            while let Ok(msg) = rx.recv() {
+                // Check for system messages
+                if let Some(sys_msg) = msg.downcast::<SystemMessage>() {
+                    match sys_msg {
+                        SystemMessage::Stop | SystemMessage::PoisonPill => {
+                            *actor_ref_clone.state.write().unwrap() = ActorState::Stopping;
+                            actor.post_stop(&mut ctx);
+                            *actor_ref_clone.state.write().unwrap() = ActorState::Stopped;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Handle regular message
+                actor.receive(msg, &mut ctx);
+            }
+        });
+
+        // Register actor
+        self.actors.write().unwrap().insert(
+            path.to_string(),
+            ActorEntry {
+                actor_ref: actor_ref.clone(),
+                handle: Some(handle)
+            }
+        );
+
+        actor_ref
+    }
+
+    /// Spawn a child actor
+    fn spawn_child<A: Actor>(&self, parent_path: &ActorPath, name: &str, actor: A) -> ActorRef {
+        let child_path = parent_path.child(name);
+        self.spawn_at(child_path, actor)
+    }
+
+    /// Look up an actor by path
+    pub fn lookup(&self, path: &str) -> Option<ActorRef> {
+        self.actors.read().unwrap()
+            .get(path)
+            .map(|entry| entry.actor_ref.clone())
+    }
+
+    /// Shutdown the actor system
+    pub fn shutdown(&self) {
+        let actors = self.actors.read().unwrap();
+        for (_, entry) in actors.iter() {
+            entry.actor_ref.stop();
+        }
+    }
+
+    /// Get the event stream
+    pub fn event_stream(&self) -> &EventStream {
+        &self.event_stream
+    }
+
+    /// Get the scheduler
+    pub fn scheduler(&self) -> &Scheduler {
+        &self.scheduler
+    }
+}
+
+impl Clone for ActorSystem {
+    fn clone(&self) -> ActorSystem {
+        ActorSystem {
+            name: self.name.clone(),
+            actors: self.actors.clone(),
+            config: self.config.clone(),
+            scheduler: self.scheduler.clone(),
+            event_stream: self.event_stream.clone()
+        }
+    }
+}
+
+// =============================================================================
+// SUPERVISION
+// =============================================================================
+
+/// Supervision strategy for handling child failures
+#[derive(Clone)]
+pub type SupervisorStrategy {
+    directive: SupervisorDirective,
+    max_restarts: i32,
+    within: Duration
+}
+
+impl Default for SupervisorStrategy {
+    fn default() -> SupervisorStrategy {
+        SupervisorStrategy {
+            directive: SupervisorDirective::Restart,
+            max_restarts: 10,
+            within: Duration::from_secs(60)
+        }
+    }
+}
+
+/// What to do when a child fails
+#[derive(Clone)]
+pub enum SupervisorDirective {
+    Resume,
+    Restart,
+    Stop,
+    Escalate
+}
+
+/// Actor error types
+#[derive(Clone, Debug)]
+pub enum ActorError {
+    Timeout,
+    Stopped,
+    Failed(String),
+    TypeMismatch(String),
+    NotFound(String)
+}
+
+impl std::fmt::Display for ActorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ActorError::Timeout => write!(f, "Actor timeout"),
+            ActorError::Stopped => write!(f, "Actor stopped"),
+            ActorError::Failed(msg) => write!(f, "Actor failed: {}", msg),
+            ActorError::TypeMismatch(msg) => write!(f, "Type mismatch: {}", msg),
+            ActorError::NotFound(path) => write!(f, "Actor not found: {}", path)
+        }
+    }
+}
+
+// =============================================================================
+// EVENT STREAM
+// =============================================================================
+
+/// System-wide event stream for pub/sub
+pub type EventStream {
+    subscribers: Arc<RwLock<Map<String, List<ActorRef>>>>
+}
+
+impl EventStream {
+    pub fn new() -> EventStream {
+        EventStream {
+            subscribers: Arc::new(RwLock::new(Map::new()))
+        }
+    }
+
+    /// Subscribe to events of a type
+    pub fn subscribe(&self, event_type: &str, subscriber: ActorRef) {
+        let mut subs = self.subscribers.write().unwrap();
+        subs.entry(event_type.to_string())
+            .or_insert_with(Vec::new)
+            .push(subscriber);
+    }
+
+    /// Unsubscribe from events
+    pub fn unsubscribe(&self, event_type: &str, subscriber: &ActorRef) {
+        if let Some(subs) = self.subscribers.write().unwrap().get_mut(event_type) {
+            subs.retain(|s| s.path() != subscriber.path());
+        }
+    }
+
+    /// Publish an event
+    pub fn publish<T: Send + Clone + 'static>(&self, event_type: &str, event: T) {
+        if let Some(subs) = self.subscribers.read().unwrap().get(event_type) {
+            for subscriber in subs {
+                subscriber.tell(Message::new(event.clone()));
+            }
+        }
+    }
+}
+
+// =============================================================================
+// SCHEDULER
+// =============================================================================
+
+/// Task scheduler for the actor system
+pub type Scheduler {
+    tasks: Arc<Mutex<Map<String, ScheduleHandle>>>
+}
+
+impl Scheduler {
+    pub fn new() -> Scheduler {
+        Scheduler {
+            tasks: Arc::new(Mutex::new(Map::new()))
+        }
+    }
+
+    /// Schedule a one-time task
+    pub fn schedule_once<F: FnOnce() + Send + 'static>(&self, delay: Duration, task: F) {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            task();
+        });
+    }
+
+    /// Schedule a recurring task
+    pub fn schedule_periodic<F: Fn() + Send + 'static>(
+        &self,
+        name: &str,
+        initial_delay: Duration,
+        interval: Duration,
+        task: F
+    ) -> ScheduleHandle {
+        let handle = Arc::new(Mutex::new(true));
+        let handle_clone = handle.clone();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(initial_delay);
+            while *handle_clone.lock().unwrap() {
+                task();
+                std::thread::sleep(interval);
+            }
+        });
+
+        let schedule_handle = ScheduleHandle { active: handle };
+        self.tasks.lock().unwrap().insert(name.to_string(), schedule_handle.clone());
+        schedule_handle
+    }
+
+    /// Cancel a scheduled task
+    pub fn cancel(&self, name: &str) {
+        if let Some(handle) = self.tasks.lock().unwrap().remove(name) {
+            handle.cancel();
+        }
+    }
+}
+
+impl Clone for ScheduleHandle {
+    fn clone(&self) -> ScheduleHandle {
+        ScheduleHandle {
+            active: self.active.clone()
+        }
+    }
+}

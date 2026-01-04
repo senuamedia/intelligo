@@ -1,0 +1,14 @@
+/// Intelligo LMS - AI Module
+///
+/// Exports AI coordinator and all AI hives for intelligent learning features.
+
+module intelligo::ai
+
+pub use intelligo::ai::coordinator::*
+pub mod hives { pub use intelligo::ai::hives::*; }
+
+// Re-export commonly used types
+pub use AiCoordinator
+pub use AiRequest
+pub use AiResponse
+pub use AiRequestType

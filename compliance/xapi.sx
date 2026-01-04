@@ -1,0 +1,3623 @@
+/// Intelligo LMS - xAPI (Experience API) Integration
+///
+/// Implementation of the xAPI (Tin Can) 1.0.3 specification for learning activity tracking.
+/// Provides statement generation, verb registry, activity types, statement builder with
+/// fluent API, context activities (parent, grouping, category), result handling with score,
+/// success, completion, duration, response, extensions support, statement validation,
+/// and batch statement generation.
+
+module intelligo::compliance::xapi
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+use std::http::{HttpClient, HttpRequest, HttpResponse, HttpMethod}
+use std::json::{Json, JsonValue}
+use std::crypto::{sha256, sha1}
+
+// =============================================================================
+// IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for a statement
+type StatementId = String
+
+/// IRI (Internationalized Resource Identifier)
+type IRI = String
+
+/// Language code (e.g., "en-US")
+type LanguageCode = String
+
+/// Language map (language -> text)
+type LanguageMap = Map<LanguageCode, String>
+
+// =============================================================================
+// XAPI STATEMENT
+// =============================================================================
+
+/// Complete xAPI Statement
+type Statement {
+    /// Unique identifier for this statement
+    id: Option<StatementId>,
+
+    /// Actor who performed the action
+    actor: Actor,
+
+    /// Verb describing the action
+    verb: Verb,
+
+    /// Object the action was performed on
+    object: Object,
+
+    /// Result of the action
+    result: Option<Result>,
+
+    /// Context surrounding the action
+    context: Option<Context>,
+
+    /// Timestamp when action occurred (ISO 8601)
+    timestamp: Option<String>,
+
+    /// Timestamp when stored in LRS (ISO 8601, set by LRS)
+    stored: Option<String>,
+
+    /// Authority asserting this statement (usually the LRS)
+    authority: Option<Actor>,
+
+    /// Statement version (default: "1.0.0")
+    version: Option<String>,
+
+    /// Attachments
+    attachments: Option<List<Attachment>>
+}
+
+impl Statement {
+    fn new(actor: Actor, verb: Verb, object: Object) -> Statement {
+        Statement {
+            id: Some(generate_uuid()),
+            actor,
+            verb,
+            object,
+            result: None,
+            context: None,
+            timestamp: Some(DateTime::now().to_iso8601()),
+            stored: None,
+            authority: None,
+            version: Some("1.0.0".to_string()),
+            attachments: None
+        }
+    }
+
+    /// Add result to statement
+    fn with_result(mut self, result: Result) -> Statement {
+        self.result = Some(result);
+        self
+    }
+
+    /// Add context to statement
+    fn with_context(mut self, context: Context) -> Statement {
+        self.context = Some(context);
+        self
+    }
+
+    /// Convert to JSON
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref id) = self.id {
+            json.insert("id".to_string(), JsonValue::String(id.clone()));
+        }
+
+        json.insert("actor".to_string(), self.actor.to_json());
+        json.insert("verb".to_string(), self.verb.to_json());
+        json.insert("object".to_string(), self.object.to_json());
+
+        if let Some(ref result) = self.result {
+            json.insert("result".to_string(), result.to_json());
+        }
+
+        if let Some(ref context) = self.context {
+            json.insert("context".to_string(), context.to_json());
+        }
+
+        if let Some(ref timestamp) = self.timestamp {
+            json.insert("timestamp".to_string(), JsonValue::String(timestamp.clone()));
+        }
+
+        if let Some(ref version) = self.version {
+            json.insert("version".to_string(), JsonValue::String(version.clone()));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    /// Parse from JSON
+    fn from_json(json: &JsonValue) -> Option<Statement> {
+        let obj = json.as_object()?;
+
+        Some(Statement {
+            id: obj.get("id").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            actor: Actor::from_json(obj.get("actor")?)?,
+            verb: Verb::from_json(obj.get("verb")?)?,
+            object: Object::from_json(obj.get("object")?)?,
+            result: obj.get("result").and_then(|v| Result::from_json(v)),
+            context: obj.get("context").and_then(|v| Context::from_json(v)),
+            timestamp: obj.get("timestamp").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            stored: obj.get("stored").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            authority: obj.get("authority").and_then(|v| Actor::from_json(v)),
+            version: obj.get("version").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            attachments: obj.get("attachments").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| Attachment::from_json(a))
+                        .collect()
+                })
+            })
+        })
+    }
+}
+
+// =============================================================================
+// ACTOR
+// =============================================================================
+
+/// Actor in an xAPI statement (Agent or Group)
+enum Actor {
+    /// Individual agent
+    Agent(Agent),
+    /// Group of agents
+    Group(Group)
+}
+
+impl Actor {
+    fn to_json(&self) -> JsonValue {
+        match self {
+            Actor::Agent(agent) => agent.to_json(),
+            Actor::Group(group) => group.to_json()
+        }
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Actor> {
+        let obj = json.as_object()?;
+        let object_type = obj.get("objectType").and_then(|v| v.as_string());
+
+        if object_type == Some("Group") {
+            Group::from_json(json).map(Actor::Group)
+        } else {
+            Agent::from_json(json).map(Actor::Agent)
+        }
+    }
+}
+
+/// Agent (individual learner or system)
+type Agent {
+    /// Object type (always "Agent" for agents)
+    object_type: Option<String>,
+
+    /// Name of the agent
+    name: Option<String>,
+
+    /// Mailto IRI (email)
+    mbox: Option<IRI>,
+
+    /// SHA1 hash of mailto IRI
+    mbox_sha1sum: Option<String>,
+
+    /// OpenID URI
+    openid: Option<IRI>,
+
+    /// Account on a system
+    account: Option<Account>
+}
+
+impl Agent {
+    /// Create agent from email
+    fn from_email(email: &str, name: Option<String>) -> Agent {
+        Agent {
+            object_type: Some("Agent".to_string()),
+            name,
+            mbox: Some(format!("mailto:{}", email)),
+            mbox_sha1sum: None,
+            openid: None,
+            account: None
+        }
+    }
+
+    /// Create agent from account
+    fn from_account(home_page: &str, account_name: &str, name: Option<String>) -> Agent {
+        Agent {
+            object_type: Some("Agent".to_string()),
+            name,
+            mbox: None,
+            mbox_sha1sum: None,
+            openid: None,
+            account: Some(Account {
+                home_page: home_page.to_string(),
+                name: account_name.to_string()
+            })
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref object_type) = self.object_type {
+            json.insert("objectType".to_string(), JsonValue::String(object_type.clone()));
+        }
+
+        if let Some(ref name) = self.name {
+            json.insert("name".to_string(), JsonValue::String(name.clone()));
+        }
+
+        if let Some(ref mbox) = self.mbox {
+            json.insert("mbox".to_string(), JsonValue::String(mbox.clone()));
+        }
+
+        if let Some(ref mbox_sha1sum) = self.mbox_sha1sum {
+            json.insert("mbox_sha1sum".to_string(), JsonValue::String(mbox_sha1sum.clone()));
+        }
+
+        if let Some(ref openid) = self.openid {
+            json.insert("openid".to_string(), JsonValue::String(openid.clone()));
+        }
+
+        if let Some(ref account) = self.account {
+            json.insert("account".to_string(), account.to_json());
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Agent> {
+        let obj = json.as_object()?;
+
+        Some(Agent {
+            object_type: obj.get("objectType").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            name: obj.get("name").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            mbox: obj.get("mbox").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            mbox_sha1sum: obj.get("mbox_sha1sum").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            openid: obj.get("openid").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            account: obj.get("account").and_then(|v| Account::from_json(v))
+        })
+    }
+}
+
+/// Account on a system
+type Account {
+    /// Homepage of the account system
+    home_page: IRI,
+
+    /// Account name/ID
+    name: String
+}
+
+impl Account {
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+        json.insert("homePage".to_string(), JsonValue::String(self.home_page.clone()));
+        json.insert("name".to_string(), JsonValue::String(self.name.clone()));
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Account> {
+        let obj = json.as_object()?;
+        Some(Account {
+            home_page: obj.get("homePage").and_then(|v| v.as_string())?.to_string(),
+            name: obj.get("name").and_then(|v| v.as_string())?.to_string()
+        })
+    }
+}
+
+/// Group of agents
+type Group {
+    /// Object type (always "Group")
+    object_type: String,
+
+    /// Name of the group
+    name: Option<String>,
+
+    /// Members of the group
+    member: Option<List<Agent>>,
+
+    /// Identified group fields (same as Agent)
+    mbox: Option<IRI>,
+    mbox_sha1sum: Option<String>,
+    openid: Option<IRI>,
+    account: Option<Account>
+}
+
+impl Group {
+    /// Create anonymous group
+    fn anonymous(members: List<Agent>) -> Group {
+        Group {
+            object_type: "Group".to_string(),
+            name: None,
+            member: Some(members),
+            mbox: None,
+            mbox_sha1sum: None,
+            openid: None,
+            account: None
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+        json.insert("objectType".to_string(), JsonValue::String(self.object_type.clone()));
+
+        if let Some(ref name) = self.name {
+            json.insert("name".to_string(), JsonValue::String(name.clone()));
+        }
+
+        if let Some(ref members) = self.member {
+            let members_json: Vec<JsonValue> = members.iter().map(|m| m.to_json()).collect();
+            json.insert("member".to_string(), JsonValue::Array(members_json));
+        }
+
+        if let Some(ref mbox) = self.mbox {
+            json.insert("mbox".to_string(), JsonValue::String(mbox.clone()));
+        }
+
+        if let Some(ref account) = self.account {
+            json.insert("account".to_string(), account.to_json());
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Group> {
+        let obj = json.as_object()?;
+
+        Some(Group {
+            object_type: "Group".to_string(),
+            name: obj.get("name").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            member: obj.get("member").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|m| Agent::from_json(m)).collect()
+            }),
+            mbox: obj.get("mbox").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            mbox_sha1sum: obj.get("mbox_sha1sum").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            openid: obj.get("openid").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            account: obj.get("account").and_then(|v| Account::from_json(v))
+        })
+    }
+}
+
+// =============================================================================
+// VERB
+// =============================================================================
+
+/// Verb describing the action taken
+type Verb {
+    /// Verb IRI (unique identifier)
+    id: IRI,
+
+    /// Human-readable names in different languages
+    display: Option<LanguageMap>
+}
+
+impl Verb {
+    /// Create verb with ID and display name
+    fn new(id: IRI, display_en: Option<String>) -> Verb {
+        let display = display_en.map(|d| {
+            let mut map = Map::new();
+            map.insert("en-US".to_string(), d);
+            map
+        });
+
+        Verb { id, display }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+        json.insert("id".to_string(), JsonValue::String(self.id.clone()));
+
+        if let Some(ref display) = self.display {
+            let display_json: Map<String, JsonValue> = display.iter()
+                .map(|(k, v)| (k.clone(), JsonValue::String(v.clone())))
+                .collect();
+            json.insert("display".to_string(), JsonValue::Object(display_json));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Verb> {
+        let obj = json.as_object()?;
+
+        Some(Verb {
+            id: obj.get("id").and_then(|v| v.as_string())?.to_string(),
+            display: obj.get("display").and_then(|v| v.as_object()).map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_string().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+        })
+    }
+}
+
+// =============================================================================
+// STANDARD VERBS
+// =============================================================================
+
+/// Standard xAPI verbs for learning activities
+type Verbs;
+
+impl Verbs {
+    /// Answered a question
+    fn answered() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/answered".to_string(),
+            Some("answered".to_string())
+        )
+    }
+
+    /// Asked a question
+    fn asked() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/asked".to_string(),
+            Some("asked".to_string())
+        )
+    }
+
+    /// Attempted an activity
+    fn attempted() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/attempted".to_string(),
+            Some("attempted".to_string())
+        )
+    }
+
+    /// Attended an event
+    fn attended() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/attended".to_string(),
+            Some("attended".to_string())
+        )
+    }
+
+    /// Commented on something
+    fn commented() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/commented".to_string(),
+            Some("commented".to_string())
+        )
+    }
+
+    /// Completed an activity
+    fn completed() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/completed".to_string(),
+            Some("completed".to_string())
+        )
+    }
+
+    /// Exited/closed an activity
+    fn exited() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/exited".to_string(),
+            Some("exited".to_string())
+        )
+    }
+
+    /// Experienced/consumed content
+    fn experienced() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/experienced".to_string(),
+            Some("experienced".to_string())
+        )
+    }
+
+    /// Failed an activity
+    fn failed() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/failed".to_string(),
+            Some("failed".to_string())
+        )
+    }
+
+    /// Imported content
+    fn imported() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/imported".to_string(),
+            Some("imported".to_string())
+        )
+    }
+
+    /// Initialized/started an activity
+    fn initialized() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/initialized".to_string(),
+            Some("initialized".to_string())
+        )
+    }
+
+    /// Interacted with content
+    fn interacted() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/interacted".to_string(),
+            Some("interacted".to_string())
+        )
+    }
+
+    /// Launched an activity
+    fn launched() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/launched".to_string(),
+            Some("launched".to_string())
+        )
+    }
+
+    /// Mastered a skill/activity
+    fn mastered() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/mastered".to_string(),
+            Some("mastered".to_string())
+        )
+    }
+
+    /// Passed an assessment
+    fn passed() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/passed".to_string(),
+            Some("passed".to_string())
+        )
+    }
+
+    /// Preferred a choice
+    fn preferred() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/preferred".to_string(),
+            Some("preferred".to_string())
+        )
+    }
+
+    /// Progressed in an activity
+    fn progressed() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/progressed".to_string(),
+            Some("progressed".to_string())
+        )
+    }
+
+    /// Registered for a course/event
+    fn registered() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/registered".to_string(),
+            Some("registered".to_string())
+        )
+    }
+
+    /// Responded to something
+    fn responded() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/responded".to_string(),
+            Some("responded".to_string())
+        )
+    }
+
+    /// Resumed a suspended activity
+    fn resumed() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/resumed".to_string(),
+            Some("resumed".to_string())
+        )
+    }
+
+    /// Scored on an activity
+    fn scored() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/scored".to_string(),
+            Some("scored".to_string())
+        )
+    }
+
+    /// Shared content
+    fn shared() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/shared".to_string(),
+            Some("shared".to_string())
+        )
+    }
+
+    /// Suspended an activity
+    fn suspended() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/suspended".to_string(),
+            Some("suspended".to_string())
+        )
+    }
+
+    /// Terminated an activity
+    fn terminated() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/terminated".to_string(),
+            Some("terminated".to_string())
+        )
+    }
+
+    /// Voided a statement
+    fn voided() -> Verb {
+        Verb::new(
+            "http://adlnet.gov/expapi/verbs/voided".to_string(),
+            Some("voided".to_string())
+        )
+    }
+
+    /// Watched video content
+    fn watched() -> Verb {
+        Verb::new(
+            "https://w3id.org/xapi/video/verbs/watched".to_string(),
+            Some("watched".to_string())
+        )
+    }
+
+    /// Played media
+    fn played() -> Verb {
+        Verb::new(
+            "https://w3id.org/xapi/video/verbs/played".to_string(),
+            Some("played".to_string())
+        )
+    }
+
+    /// Paused media
+    fn paused() -> Verb {
+        Verb::new(
+            "https://w3id.org/xapi/video/verbs/paused".to_string(),
+            Some("paused".to_string())
+        )
+    }
+
+    /// Seeked in media
+    fn seeked() -> Verb {
+        Verb::new(
+            "https://w3id.org/xapi/video/verbs/seeked".to_string(),
+            Some("seeked".to_string())
+        )
+    }
+}
+
+// =============================================================================
+// OBJECT
+// =============================================================================
+
+/// Object of the statement (what was acted upon)
+enum Object {
+    /// Activity (learning content)
+    Activity(Activity),
+    /// Another agent
+    Agent(Agent),
+    /// Reference to another statement
+    StatementRef(StatementRef),
+    /// Sub-statement
+    SubStatement(Box<SubStatement>)
+}
+
+impl Object {
+    fn to_json(&self) -> JsonValue {
+        match self {
+            Object::Activity(activity) => activity.to_json(),
+            Object::Agent(agent) => agent.to_json(),
+            Object::StatementRef(stmt_ref) => stmt_ref.to_json(),
+            Object::SubStatement(sub) => sub.to_json()
+        }
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Object> {
+        let obj = json.as_object()?;
+        let object_type = obj.get("objectType").and_then(|v| v.as_string());
+
+        match object_type {
+            Some("Agent") => Agent::from_json(json).map(Object::Agent),
+            Some("Group") => Agent::from_json(json).map(Object::Agent),
+            Some("StatementRef") => StatementRef::from_json(json).map(Object::StatementRef),
+            Some("SubStatement") => SubStatement::from_json(json).map(|s| Object::SubStatement(Box::new(s))),
+            _ => Activity::from_json(json).map(Object::Activity)
+        }
+    }
+}
+
+/// Activity (learning object)
+type Activity {
+    /// Object type (always "Activity")
+    object_type: Option<String>,
+
+    /// Activity IRI (unique identifier)
+    id: IRI,
+
+    /// Activity definition
+    definition: Option<ActivityDefinition>
+}
+
+impl Activity {
+    /// Create activity with ID
+    fn new(id: IRI) -> Activity {
+        Activity {
+            object_type: Some("Activity".to_string()),
+            id,
+            definition: None
+        }
+    }
+
+    /// Create activity with definition
+    fn with_definition(id: IRI, definition: ActivityDefinition) -> Activity {
+        Activity {
+            object_type: Some("Activity".to_string()),
+            id,
+            definition: Some(definition)
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref object_type) = self.object_type {
+            json.insert("objectType".to_string(), JsonValue::String(object_type.clone()));
+        }
+
+        json.insert("id".to_string(), JsonValue::String(self.id.clone()));
+
+        if let Some(ref definition) = self.definition {
+            json.insert("definition".to_string(), definition.to_json());
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Activity> {
+        let obj = json.as_object()?;
+
+        Some(Activity {
+            object_type: obj.get("objectType").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            id: obj.get("id").and_then(|v| v.as_string())?.to_string(),
+            definition: obj.get("definition").and_then(|v| ActivityDefinition::from_json(v))
+        })
+    }
+}
+
+/// Activity definition
+type ActivityDefinition {
+    /// Human-readable name
+    name: Option<LanguageMap>,
+
+    /// Human-readable description
+    description: Option<LanguageMap>,
+
+    /// Activity type IRI
+    activity_type: Option<IRI>,
+
+    /// More info URL
+    more_info: Option<IRI>,
+
+    /// Interaction type (for assessment activities)
+    interaction_type: Option<InteractionType>,
+
+    /// Correct response patterns
+    correct_responses_pattern: Option<List<String>>,
+
+    /// Choices for choice/sequencing interactions
+    choices: Option<List<InteractionComponent>>,
+
+    /// Scale for likert interactions
+    scale: Option<List<InteractionComponent>>,
+
+    /// Source for matching interactions
+    source: Option<List<InteractionComponent>>,
+
+    /// Target for matching interactions
+    target: Option<List<InteractionComponent>>,
+
+    /// Steps for performance interactions
+    steps: Option<List<InteractionComponent>>,
+
+    /// Extensions
+    extensions: Option<Map<IRI, JsonValue>>
+}
+
+impl ActivityDefinition {
+    fn new() -> ActivityDefinition {
+        ActivityDefinition {
+            name: None,
+            description: None,
+            activity_type: None,
+            more_info: None,
+            interaction_type: None,
+            correct_responses_pattern: None,
+            choices: None,
+            scale: None,
+            source: None,
+            target: None,
+            steps: None,
+            extensions: None
+        }
+    }
+
+    /// Set name
+    fn with_name(mut self, lang: &str, name: &str) -> ActivityDefinition {
+        let mut map = self.name.unwrap_or_else(Map::new);
+        map.insert(lang.to_string(), name.to_string());
+        self.name = Some(map);
+        self
+    }
+
+    /// Set description
+    fn with_description(mut self, lang: &str, desc: &str) -> ActivityDefinition {
+        let mut map = self.description.unwrap_or_else(Map::new);
+        map.insert(lang.to_string(), desc.to_string());
+        self.description = Some(map);
+        self
+    }
+
+    /// Set activity type
+    fn with_type(mut self, activity_type: IRI) -> ActivityDefinition {
+        self.activity_type = Some(activity_type);
+        self
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref name) = self.name {
+            let name_json: Map<String, JsonValue> = name.iter()
+                .map(|(k, v)| (k.clone(), JsonValue::String(v.clone())))
+                .collect();
+            json.insert("name".to_string(), JsonValue::Object(name_json));
+        }
+
+        if let Some(ref description) = self.description {
+            let desc_json: Map<String, JsonValue> = description.iter()
+                .map(|(k, v)| (k.clone(), JsonValue::String(v.clone())))
+                .collect();
+            json.insert("description".to_string(), JsonValue::Object(desc_json));
+        }
+
+        if let Some(ref activity_type) = self.activity_type {
+            json.insert("type".to_string(), JsonValue::String(activity_type.clone()));
+        }
+
+        if let Some(ref more_info) = self.more_info {
+            json.insert("moreInfo".to_string(), JsonValue::String(more_info.clone()));
+        }
+
+        if let Some(ref interaction_type) = self.interaction_type {
+            json.insert("interactionType".to_string(), JsonValue::String(interaction_type.to_string()));
+        }
+
+        if let Some(ref patterns) = self.correct_responses_pattern {
+            let patterns_json: Vec<JsonValue> = patterns.iter()
+                .map(|p| JsonValue::String(p.clone()))
+                .collect();
+            json.insert("correctResponsesPattern".to_string(), JsonValue::Array(patterns_json));
+        }
+
+        if let Some(ref choices) = self.choices {
+            json.insert("choices".to_string(), self.components_to_json(choices));
+        }
+
+        if let Some(ref extensions) = self.extensions {
+            json.insert("extensions".to_string(), JsonValue::Object(extensions.clone()));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn components_to_json(&self, components: &List<InteractionComponent>) -> JsonValue {
+        let arr: Vec<JsonValue> = components.iter().map(|c| c.to_json()).collect();
+        JsonValue::Array(arr)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<ActivityDefinition> {
+        let obj = json.as_object()?;
+
+        Some(ActivityDefinition {
+            name: obj.get("name").and_then(|v| v.as_object()).map(|o| {
+                o.iter().filter_map(|(k, v)| v.as_string().map(|s| (k.clone(), s.to_string()))).collect()
+            }),
+            description: obj.get("description").and_then(|v| v.as_object()).map(|o| {
+                o.iter().filter_map(|(k, v)| v.as_string().map(|s| (k.clone(), s.to_string()))).collect()
+            }),
+            activity_type: obj.get("type").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            more_info: obj.get("moreInfo").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            interaction_type: obj.get("interactionType").and_then(|v| v.as_string()).and_then(|s| InteractionType::from_string(&s)),
+            correct_responses_pattern: obj.get("correctResponsesPattern").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|v| v.as_string().map(|s| s.to_string())).collect()
+            }),
+            choices: obj.get("choices").and_then(|v| parse_interaction_components(v)),
+            scale: obj.get("scale").and_then(|v| parse_interaction_components(v)),
+            source: obj.get("source").and_then(|v| parse_interaction_components(v)),
+            target: obj.get("target").and_then(|v| parse_interaction_components(v)),
+            steps: obj.get("steps").and_then(|v| parse_interaction_components(v)),
+            extensions: obj.get("extensions").and_then(|v| v.as_object()).cloned()
+        })
+    }
+}
+
+/// Interaction type for assessment activities
+enum InteractionType {
+    TrueFalse,
+    Choice,
+    FillIn,
+    LongFillIn,
+    Matching,
+    Performance,
+    Sequencing,
+    Likert,
+    Numeric,
+    Other
+}
+
+impl InteractionType {
+    fn to_string(&self) -> String {
+        match self {
+            InteractionType::TrueFalse => "true-false",
+            InteractionType::Choice => "choice",
+            InteractionType::FillIn => "fill-in",
+            InteractionType::LongFillIn => "long-fill-in",
+            InteractionType::Matching => "matching",
+            InteractionType::Performance => "performance",
+            InteractionType::Sequencing => "sequencing",
+            InteractionType::Likert => "likert",
+            InteractionType::Numeric => "numeric",
+            InteractionType::Other => "other"
+        }.to_string()
+    }
+
+    fn from_string(s: &str) -> Option<InteractionType> {
+        match s {
+            "true-false" => Some(InteractionType::TrueFalse),
+            "choice" => Some(InteractionType::Choice),
+            "fill-in" => Some(InteractionType::FillIn),
+            "long-fill-in" => Some(InteractionType::LongFillIn),
+            "matching" => Some(InteractionType::Matching),
+            "performance" => Some(InteractionType::Performance),
+            "sequencing" => Some(InteractionType::Sequencing),
+            "likert" => Some(InteractionType::Likert),
+            "numeric" => Some(InteractionType::Numeric),
+            "other" => Some(InteractionType::Other),
+            _ => None
+        }
+    }
+}
+
+/// Interaction component (choice, scale item, etc.)
+type InteractionComponent {
+    /// Component ID
+    id: String,
+
+    /// Component description
+    description: Option<LanguageMap>
+}
+
+impl InteractionComponent {
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+        json.insert("id".to_string(), JsonValue::String(self.id.clone()));
+
+        if let Some(ref description) = self.description {
+            let desc_json: Map<String, JsonValue> = description.iter()
+                .map(|(k, v)| (k.clone(), JsonValue::String(v.clone())))
+                .collect();
+            json.insert("description".to_string(), JsonValue::Object(desc_json));
+        }
+
+        JsonValue::Object(json)
+    }
+}
+
+/// Statement reference
+type StatementRef {
+    /// Object type (always "StatementRef")
+    object_type: String,
+
+    /// ID of referenced statement
+    id: StatementId
+}
+
+impl StatementRef {
+    fn new(id: StatementId) -> StatementRef {
+        StatementRef {
+            object_type: "StatementRef".to_string(),
+            id
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+        json.insert("objectType".to_string(), JsonValue::String(self.object_type.clone()));
+        json.insert("id".to_string(), JsonValue::String(self.id.clone()));
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<StatementRef> {
+        let obj = json.as_object()?;
+        Some(StatementRef {
+            object_type: "StatementRef".to_string(),
+            id: obj.get("id").and_then(|v| v.as_string())?.to_string()
+        })
+    }
+}
+
+/// Sub-statement (embedded statement)
+type SubStatement {
+    actor: Actor,
+    verb: Verb,
+    object: Object,
+    result: Option<Result>,
+    context: Option<Context>,
+    timestamp: Option<String>
+}
+
+impl SubStatement {
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+        json.insert("objectType".to_string(), JsonValue::String("SubStatement".to_string()));
+        json.insert("actor".to_string(), self.actor.to_json());
+        json.insert("verb".to_string(), self.verb.to_json());
+        json.insert("object".to_string(), self.object.to_json());
+
+        if let Some(ref result) = self.result {
+            json.insert("result".to_string(), result.to_json());
+        }
+
+        if let Some(ref context) = self.context {
+            json.insert("context".to_string(), context.to_json());
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<SubStatement> {
+        let obj = json.as_object()?;
+
+        Some(SubStatement {
+            actor: Actor::from_json(obj.get("actor")?)?,
+            verb: Verb::from_json(obj.get("verb")?)?,
+            object: Object::from_json(obj.get("object")?)?,
+            result: obj.get("result").and_then(|v| Result::from_json(v)),
+            context: obj.get("context").and_then(|v| Context::from_json(v)),
+            timestamp: obj.get("timestamp").and_then(|v| v.as_string()).map(|s| s.to_string())
+        })
+    }
+}
+
+// =============================================================================
+// ACTIVITY TYPES
+// =============================================================================
+
+/// Standard activity types
+type ActivityTypes;
+
+impl ActivityTypes {
+    /// Assessment activity
+    fn assessment() -> IRI {
+        "http://adlnet.gov/expapi/activities/assessment".to_string()
+    }
+
+    /// Attempt at an activity
+    fn attempt() -> IRI {
+        "http://adlnet.gov/expapi/activities/attempt".to_string()
+    }
+
+    /// Course
+    fn course() -> IRI {
+        "http://adlnet.gov/expapi/activities/course".to_string()
+    }
+
+    /// File
+    fn file() -> IRI {
+        "http://adlnet.gov/expapi/activities/file".to_string()
+    }
+
+    /// Interaction
+    fn interaction() -> IRI {
+        "http://adlnet.gov/expapi/activities/interaction".to_string()
+    }
+
+    /// Lesson
+    fn lesson() -> IRI {
+        "http://adlnet.gov/expapi/activities/lesson".to_string()
+    }
+
+    /// Link/URL
+    fn link() -> IRI {
+        "http://adlnet.gov/expapi/activities/link".to_string()
+    }
+
+    /// Media
+    fn media() -> IRI {
+        "http://adlnet.gov/expapi/activities/media".to_string()
+    }
+
+    /// Meeting
+    fn meeting() -> IRI {
+        "http://adlnet.gov/expapi/activities/meeting".to_string()
+    }
+
+    /// Module
+    fn module() -> IRI {
+        "http://adlnet.gov/expapi/activities/module".to_string()
+    }
+
+    /// Objective
+    fn objective() -> IRI {
+        "http://adlnet.gov/expapi/activities/objective".to_string()
+    }
+
+    /// Performance
+    fn performance() -> IRI {
+        "http://adlnet.gov/expapi/activities/performance".to_string()
+    }
+
+    /// Profile
+    fn profile() -> IRI {
+        "http://adlnet.gov/expapi/activities/profile".to_string()
+    }
+
+    /// Question
+    fn question() -> IRI {
+        "http://adlnet.gov/expapi/activities/question".to_string()
+    }
+
+    /// Simulation
+    fn simulation() -> IRI {
+        "http://adlnet.gov/expapi/activities/simulation".to_string()
+    }
+
+    /// Video
+    fn video() -> IRI {
+        "https://w3id.org/xapi/video/activity-type/video".to_string()
+    }
+
+    /// Audio
+    fn audio() -> IRI {
+        "https://w3id.org/xapi/audio/activity-type/audio".to_string()
+    }
+}
+
+// =============================================================================
+// RESULT
+// =============================================================================
+
+/// Result of an action
+type Result {
+    /// Score
+    score: Option<Score>,
+
+    /// Success status
+    success: Option<Bool>,
+
+    /// Completion status
+    completion: Option<Bool>,
+
+    /// Response given by actor
+    response: Option<String>,
+
+    /// Duration (ISO 8601)
+    duration: Option<String>,
+
+    /// Extensions
+    extensions: Option<Map<IRI, JsonValue>>
+}
+
+impl Result {
+    fn new() -> Result {
+        Result {
+            score: None,
+            success: None,
+            completion: None,
+            response: None,
+            duration: None,
+            extensions: None
+        }
+    }
+
+    /// Set score
+    fn with_score(mut self, score: Score) -> Result {
+        self.score = Some(score);
+        self
+    }
+
+    /// Set success
+    fn with_success(mut self, success: Bool) -> Result {
+        self.success = Some(success);
+        self
+    }
+
+    /// Set completion
+    fn with_completion(mut self, completion: Bool) -> Result {
+        self.completion = Some(completion);
+        self
+    }
+
+    /// Set response
+    fn with_response(mut self, response: String) -> Result {
+        self.response = Some(response);
+        self
+    }
+
+    /// Set duration
+    fn with_duration(mut self, duration: Duration) -> Result {
+        self.duration = Some(format_iso8601_duration(duration));
+        self
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref score) = self.score {
+            json.insert("score".to_string(), score.to_json());
+        }
+
+        if let Some(success) = self.success {
+            json.insert("success".to_string(), JsonValue::Bool(success));
+        }
+
+        if let Some(completion) = self.completion {
+            json.insert("completion".to_string(), JsonValue::Bool(completion));
+        }
+
+        if let Some(ref response) = self.response {
+            json.insert("response".to_string(), JsonValue::String(response.clone()));
+        }
+
+        if let Some(ref duration) = self.duration {
+            json.insert("duration".to_string(), JsonValue::String(duration.clone()));
+        }
+
+        if let Some(ref extensions) = self.extensions {
+            json.insert("extensions".to_string(), JsonValue::Object(extensions.clone()));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Result> {
+        let obj = json.as_object()?;
+
+        Some(Result {
+            score: obj.get("score").and_then(|v| Score::from_json(v)),
+            success: obj.get("success").and_then(|v| v.as_bool()),
+            completion: obj.get("completion").and_then(|v| v.as_bool()),
+            response: obj.get("response").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            duration: obj.get("duration").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            extensions: obj.get("extensions").and_then(|v| v.as_object()).cloned()
+        })
+    }
+}
+
+/// Score in a result
+type Score {
+    /// Scaled score (-1 to 1)
+    scaled: Option<f32>,
+
+    /// Raw score
+    raw: Option<f32>,
+
+    /// Minimum possible score
+    min: Option<f32>,
+
+    /// Maximum possible score
+    max: Option<f32>
+}
+
+impl Score {
+    fn new() -> Score {
+        Score {
+            scaled: None,
+            raw: None,
+            min: None,
+            max: None
+        }
+    }
+
+    /// Create from raw score with min/max
+    fn from_raw(raw: f32, min: f32, max: f32) -> Score {
+        let scaled = if max > min {
+            Some((raw - min) / (max - min) * 2.0 - 1.0) // Convert to -1 to 1
+        } else {
+            None
+        };
+
+        Score {
+            scaled,
+            raw: Some(raw),
+            min: Some(min),
+            max: Some(max)
+        }
+    }
+
+    /// Create from percentage (0-100)
+    fn from_percentage(percent: f32) -> Score {
+        Score {
+            scaled: Some(percent / 50.0 - 1.0), // Convert 0-100 to -1 to 1
+            raw: Some(percent),
+            min: Some(0.0),
+            max: Some(100.0)
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(scaled) = self.scaled {
+            json.insert("scaled".to_string(), JsonValue::Number(scaled as f64));
+        }
+
+        if let Some(raw) = self.raw {
+            json.insert("raw".to_string(), JsonValue::Number(raw as f64));
+        }
+
+        if let Some(min) = self.min {
+            json.insert("min".to_string(), JsonValue::Number(min as f64));
+        }
+
+        if let Some(max) = self.max {
+            json.insert("max".to_string(), JsonValue::Number(max as f64));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Score> {
+        let obj = json.as_object()?;
+
+        Some(Score {
+            scaled: obj.get("scaled").and_then(|v| v.as_f64()).map(|n| n as f32),
+            raw: obj.get("raw").and_then(|v| v.as_f64()).map(|n| n as f32),
+            min: obj.get("min").and_then(|v| v.as_f64()).map(|n| n as f32),
+            max: obj.get("max").and_then(|v| v.as_f64()).map(|n| n as f32)
+        })
+    }
+}
+
+// =============================================================================
+// CONTEXT
+// =============================================================================
+
+/// Context surrounding the action
+type Context {
+    /// Registration (attempt) UUID
+    registration: Option<String>,
+
+    /// Instructor
+    instructor: Option<Actor>,
+
+    /// Team
+    team: Option<Group>,
+
+    /// Context activities
+    context_activities: Option<ContextActivities>,
+
+    /// Revision of the content
+    revision: Option<String>,
+
+    /// Platform
+    platform: Option<String>,
+
+    /// Language (RFC 5646)
+    language: Option<String>,
+
+    /// Statement reference
+    statement: Option<StatementRef>,
+
+    /// Extensions
+    extensions: Option<Map<IRI, JsonValue>>
+}
+
+impl Context {
+    fn new() -> Context {
+        Context {
+            registration: None,
+            instructor: None,
+            team: None,
+            context_activities: None,
+            revision: None,
+            platform: None,
+            language: None,
+            statement: None,
+            extensions: None
+        }
+    }
+
+    /// Set registration
+    fn with_registration(mut self, registration: String) -> Context {
+        self.registration = Some(registration);
+        self
+    }
+
+    /// Set instructor
+    fn with_instructor(mut self, instructor: Actor) -> Context {
+        self.instructor = Some(instructor);
+        self
+    }
+
+    /// Set platform
+    fn with_platform(mut self, platform: String) -> Context {
+        self.platform = Some(platform);
+        self
+    }
+
+    /// Set language
+    fn with_language(mut self, language: String) -> Context {
+        self.language = Some(language);
+        self
+    }
+
+    /// Set context activities
+    fn with_context_activities(mut self, activities: ContextActivities) -> Context {
+        self.context_activities = Some(activities);
+        self
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref registration) = self.registration {
+            json.insert("registration".to_string(), JsonValue::String(registration.clone()));
+        }
+
+        if let Some(ref instructor) = self.instructor {
+            json.insert("instructor".to_string(), instructor.to_json());
+        }
+
+        if let Some(ref team) = self.team {
+            json.insert("team".to_string(), team.to_json());
+        }
+
+        if let Some(ref context_activities) = self.context_activities {
+            json.insert("contextActivities".to_string(), context_activities.to_json());
+        }
+
+        if let Some(ref revision) = self.revision {
+            json.insert("revision".to_string(), JsonValue::String(revision.clone()));
+        }
+
+        if let Some(ref platform) = self.platform {
+            json.insert("platform".to_string(), JsonValue::String(platform.clone()));
+        }
+
+        if let Some(ref language) = self.language {
+            json.insert("language".to_string(), JsonValue::String(language.clone()));
+        }
+
+        if let Some(ref extensions) = self.extensions {
+            json.insert("extensions".to_string(), JsonValue::Object(extensions.clone()));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Context> {
+        let obj = json.as_object()?;
+
+        Some(Context {
+            registration: obj.get("registration").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            instructor: obj.get("instructor").and_then(|v| Actor::from_json(v)),
+            team: obj.get("team").and_then(|v| Group::from_json(v)),
+            context_activities: obj.get("contextActivities").and_then(|v| ContextActivities::from_json(v)),
+            revision: obj.get("revision").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            platform: obj.get("platform").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            language: obj.get("language").and_then(|v| v.as_string()).map(|s| s.to_string()),
+            statement: obj.get("statement").and_then(|v| StatementRef::from_json(v)),
+            extensions: obj.get("extensions").and_then(|v| v.as_object()).cloned()
+        })
+    }
+}
+
+/// Context activities
+type ContextActivities {
+    /// Parent activities (immediate context)
+    parent: Option<List<Activity>>,
+
+    /// Grouping activities (wider context)
+    grouping: Option<List<Activity>>,
+
+    /// Category activities (profile/recipe)
+    category: Option<List<Activity>>,
+
+    /// Other related activities
+    other: Option<List<Activity>>
+}
+
+impl ContextActivities {
+    fn new() -> ContextActivities {
+        ContextActivities {
+            parent: None,
+            grouping: None,
+            category: None,
+            other: None
+        }
+    }
+
+    /// Add parent activity
+    fn with_parent(mut self, activity: Activity) -> ContextActivities {
+        let mut parents = self.parent.unwrap_or_default();
+        parents.push(activity);
+        self.parent = Some(parents);
+        self
+    }
+
+    /// Add grouping activity
+    fn with_grouping(mut self, activity: Activity) -> ContextActivities {
+        let mut groupings = self.grouping.unwrap_or_default();
+        groupings.push(activity);
+        self.grouping = Some(groupings);
+        self
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut json = Map::new();
+
+        if let Some(ref parent) = self.parent {
+            let arr: Vec<JsonValue> = parent.iter().map(|a| a.to_json()).collect();
+            json.insert("parent".to_string(), JsonValue::Array(arr));
+        }
+
+        if let Some(ref grouping) = self.grouping {
+            let arr: Vec<JsonValue> = grouping.iter().map(|a| a.to_json()).collect();
+            json.insert("grouping".to_string(), JsonValue::Array(arr));
+        }
+
+        if let Some(ref category) = self.category {
+            let arr: Vec<JsonValue> = category.iter().map(|a| a.to_json()).collect();
+            json.insert("category".to_string(), JsonValue::Array(arr));
+        }
+
+        if let Some(ref other) = self.other {
+            let arr: Vec<JsonValue> = other.iter().map(|a| a.to_json()).collect();
+            json.insert("other".to_string(), JsonValue::Array(arr));
+        }
+
+        JsonValue::Object(json)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<ContextActivities> {
+        let obj = json.as_object()?;
+
+        fn parse_activities(value: Option<&JsonValue>) -> Option<List<Activity>> {
+            value.and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|a| Activity::from_json(a)).collect()
+            })
+        }
+
+        Some(ContextActivities {
+            parent: parse_activities(obj.get("parent")),
+            grouping: parse_activities(obj.get("grouping")),
+            category: parse_activities(obj.get("category")),
+            other: parse_activities(obj.get("other"))
+        })
+    }
+}
+
+/// Attachment
+type Attachment {
+    /// Usage type IRI
+    usage_type: IRI,
+
+    /// Display name
+    display: LanguageMap,
+
+    /// Description
+    description: Option<LanguageMap>,
+
+    /// Content type (MIME)
+    content_type: String,
+
+    /// Length in bytes
+    length: i64,
+
+    /// SHA-2 hash
+    sha2: String,
+
+    /// File URL (if not inline)
+    file_url: Option<IRI>
+}
+
+impl Attachment {
+    fn to_json(&self) -> JsonValue {
+        let mut obj = JsonObject::new();
+        obj.insert("usageType".to_string(), JsonValue::String(self.usage_type.0.clone()));
+        obj.insert("display".to_string(), language_map_to_json(&self.display));
+        if let Some(ref desc) = self.description {
+            obj.insert("description".to_string(), language_map_to_json(desc));
+        }
+        obj.insert("contentType".to_string(), JsonValue::String(self.content_type.clone()));
+        obj.insert("length".to_string(), JsonValue::Number(self.length as f64));
+        obj.insert("sha2".to_string(), JsonValue::String(self.sha2.clone()));
+        if let Some(ref url) = self.file_url {
+            obj.insert("fileUrl".to_string(), JsonValue::String(url.0.clone()));
+        }
+        JsonValue::Object(obj)
+    }
+
+    fn from_json(json: &JsonValue) -> Option<Attachment> {
+        let obj = json.as_object()?;
+
+        let usage_type = obj.get("usageType")
+            .and_then(|v| v.as_string())
+            .map(|s| IRI(s.to_string()))?;
+
+        let display = obj.get("display")
+            .and_then(|v| parse_language_map(v))
+            .unwrap_or_default();
+
+        let description = obj.get("description")
+            .and_then(|v| parse_language_map(v));
+
+        let content_type = obj.get("contentType")
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string())?;
+
+        let length = obj.get("length")
+            .and_then(|v| v.as_number())
+            .map(|n| n as i64)?;
+
+        let sha2 = obj.get("sha2")
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string())?;
+
+        let file_url = obj.get("fileUrl")
+            .and_then(|v| v.as_string())
+            .map(|s| IRI(s.to_string()));
+
+        Some(Attachment {
+            usage_type,
+            display,
+            description,
+            content_type,
+            length,
+            sha2,
+            file_url
+        })
+    }
+}
+
+// =============================================================================
+// XAPI CLIENT
+// =============================================================================
+
+/// LRS connection configuration
+type LrsConfig {
+    /// Endpoint URL
+    endpoint: String,
+
+    /// Authorization header (Basic auth or OAuth token)
+    authorization: String,
+
+    /// Version header value
+    version: String
+}
+
+impl LrsConfig {
+    /// Create config with Basic auth
+    fn with_basic_auth(endpoint: String, username: String, password: String) -> LrsConfig {
+        let credentials = base64_encode(&format!("{}:{}", username, password));
+        LrsConfig {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            authorization: format!("Basic {}", credentials),
+            version: "1.0.3".to_string()
+        }
+    }
+
+    /// Create config with OAuth token
+    fn with_oauth(endpoint: String, token: String) -> LrsConfig {
+        LrsConfig {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            authorization: format!("Bearer {}", token),
+            version: "1.0.3".to_string()
+        }
+    }
+}
+
+/// Messages for xApiClient actor
+enum XApiMessage {
+    /// Send a single statement
+    SendStatement {
+        statement: Statement,
+        reply_to: Actor<Result<StatementId, XApiError>>
+    },
+
+    /// Send multiple statements
+    SendStatements {
+        statements: List<Statement>,
+        reply_to: Actor<Result<List<StatementId>, XApiError>>
+    },
+
+    /// Get a statement by ID
+    GetStatement {
+        statement_id: StatementId,
+        reply_to: Actor<Result<Statement, XApiError>>
+    },
+
+    /// Query statements
+    QueryStatements {
+        query: StatementQuery,
+        reply_to: Actor<Result<StatementResult, XApiError>>
+    },
+
+    /// Void a statement
+    VoidStatement {
+        statement_id: StatementId,
+        actor: Actor,
+        reply_to: Actor<Result<StatementId, XApiError>>
+    },
+
+    /// Get state
+    GetState {
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        reply_to: Actor<Result<JsonValue, XApiError>>
+    },
+
+    /// Set state
+    SetState {
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        state: JsonValue,
+        reply_to: Actor<Result<(), XApiError>>
+    },
+
+    /// Delete state
+    DeleteState {
+        activity_id: IRI,
+        agent: Agent,
+        state_id: String,
+        registration: Option<String>,
+        reply_to: Actor<Result<(), XApiError>>
+    }
+}
+
+/// Statement query parameters
+type StatementQuery {
+    /// Agent filter
+    agent: Option<Agent>,
+
+    /// Verb IRI filter
+    verb: Option<IRI>,
+
+    /// Activity IRI filter
+    activity: Option<IRI>,
+
+    /// Registration filter
+    registration: Option<String>,
+
+    /// Related activities flag
+    related_activities: Option<Bool>,
+
+    /// Related agents flag
+    related_agents: Option<Bool>,
+
+    /// Since timestamp (ISO 8601)
+    since: Option<String>,
+
+    /// Until timestamp (ISO 8601)
+    until: Option<String>,
+
+    /// Limit results
+    limit: Option<i32>,
+
+    /// Ascending order
+    ascending: Option<Bool>,
+
+    /// Format (ids, exact, canonical)
+    format: Option<StatementFormat>
+}
+
+/// Statement response format
+enum StatementFormat {
+    /// Return only statement IDs
+    Ids,
+    /// Return exact representation
+    Exact,
+    /// Return canonical representation
+    Canonical
+}
+
+impl StatementFormat {
+    fn to_string(&self) -> String {
+        match self {
+            StatementFormat::Ids => "ids",
+            StatementFormat::Exact => "exact",
+            StatementFormat::Canonical => "canonical"
+        }.to_string()
+    }
+}
+
+impl StatementQuery {
+    fn new() -> StatementQuery {
+        StatementQuery {
+            agent: None,
+            verb: None,
+            activity: None,
+            registration: None,
+            related_activities: None,
+            related_agents: None,
+            since: None,
+            until: None,
+            limit: None,
+            ascending: None
+        }
+    }
+
+    /// Build query string
+    fn to_query_string(&self) -> String {
+        let mut params = vec![];
+
+        if let Some(ref agent) = self.agent {
+            params.push(format!("agent={}", url_encode(&agent.to_json().to_string())));
+        }
+
+        if let Some(ref verb) = self.verb {
+            params.push(format!("verb={}", url_encode(verb)));
+        }
+
+        if let Some(ref activity) = self.activity {
+            params.push(format!("activity={}", url_encode(activity)));
+        }
+
+        if let Some(ref registration) = self.registration {
+            params.push(format!("registration={}", registration));
+        }
+
+        if let Some(related_activities) = self.related_activities {
+            params.push(format!("related_activities={}", related_activities));
+        }
+
+        if let Some(related_agents) = self.related_agents {
+            params.push(format!("related_agents={}", related_agents));
+        }
+
+        if let Some(ref since) = self.since {
+            params.push(format!("since={}", url_encode(since)));
+        }
+
+        if let Some(ref until) = self.until {
+            params.push(format!("until={}", url_encode(until)));
+        }
+
+        if let Some(limit) = self.limit {
+            params.push(format!("limit={}", limit));
+        }
+
+        if let Some(ascending) = self.ascending {
+            params.push(format!("ascending={}", ascending));
+        }
+
+        params.join("&")
+    }
+}
+
+/// Statement query result
+type StatementResult {
+    /// Returned statements
+    statements: List<Statement>,
+
+    /// More results URL
+    more: Option<String>
+}
+
+/// xAPI error type
+enum XApiError {
+    /// Network error
+    NetworkError { message: String },
+    /// Authentication error
+    AuthError { message: String },
+    /// Bad request
+    BadRequest { message: String },
+    /// Not found
+    NotFound { resource: String },
+    /// Conflict
+    Conflict { message: String },
+    /// Server error
+    ServerError { message: String },
+    /// Parse error
+    ParseError { message: String }
+}
+
+impl XApiError {
+    fn message(&self) -> String {
+        match self {
+            XApiError::NetworkError { message } => format!("Network error: {}", message),
+            XApiError::AuthError { message } => format!("Authentication error: {}", message),
+            XApiError::BadRequest { message } => format!("Bad request: {}", message),
+            XApiError::NotFound { resource } => format!("Not found: {}", resource),
+            XApiError::Conflict { message } => format!("Conflict: {}", message),
+            XApiError::ServerError { message } => format!("Server error: {}", message),
+            XApiError::ParseError { message } => format!("Parse error: {}", message)
+        }
+    }
+}
+
+/// xAPI Client actor
+actor XApiClient {
+    config: LrsConfig,
+    http_client: HttpClient,
+
+    /// Initialize client
+    fn init(config: LrsConfig) -> XApiClient {
+        XApiClient {
+            config,
+            http_client: HttpClient::new()
+        }
+    }
+
+    /// Handle messages
+    fn receive(&mut self, msg: XApiMessage) {
+        match msg {
+            XApiMessage::SendStatement { statement, reply_to } => {
+                let result = self.send_statement(statement);
+                reply_to.send(result);
+            },
+
+            XApiMessage::SendStatements { statements, reply_to } => {
+                let result = self.send_statements(statements);
+                reply_to.send(result);
+            },
+
+            XApiMessage::GetStatement { statement_id, reply_to } => {
+                let result = self.get_statement(&statement_id);
+                reply_to.send(result);
+            },
+
+            XApiMessage::QueryStatements { query, reply_to } => {
+                let result = self.query_statements(query);
+                reply_to.send(result);
+            },
+
+            XApiMessage::VoidStatement { statement_id, actor, reply_to } => {
+                let result = self.void_statement(&statement_id, actor);
+                reply_to.send(result);
+            },
+
+            XApiMessage::GetState { activity_id, agent, state_id, registration, reply_to } => {
+                let result = self.get_state(&activity_id, &agent, &state_id, registration.as_deref());
+                reply_to.send(result);
+            },
+
+            XApiMessage::SetState { activity_id, agent, state_id, registration, state, reply_to } => {
+                let result = self.set_state(&activity_id, &agent, &state_id, registration.as_deref(), state);
+                reply_to.send(result);
+            },
+
+            XApiMessage::DeleteState { activity_id, agent, state_id, registration, reply_to } => {
+                let result = self.delete_state(&activity_id, &agent, &state_id, registration.as_deref());
+                reply_to.send(result);
+            }
+        }
+    }
+
+    /// Send a statement to LRS
+    fn send_statement(&self, statement: Statement) -> Result<StatementId, XApiError> {
+        let url = format!("{}/statements", self.config.endpoint);
+
+        let request = HttpRequest::new(HttpMethod::POST, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version)
+            .header("Content-Type", "application/json")
+            .body(statement.to_json().to_string());
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response)?;
+
+        // Parse statement ID from response
+        let body = response.body();
+        let json: JsonValue = Json::parse(&body)
+            .map_err(|e| XApiError::ParseError { message: e.to_string() })?;
+
+        json.as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string())
+            .ok_or(XApiError::ParseError { message: "No statement ID in response".to_string() })
+    }
+
+    /// Send multiple statements
+    fn send_statements(&self, statements: List<Statement>) -> Result<List<StatementId>, XApiError> {
+        let url = format!("{}/statements", self.config.endpoint);
+
+        let statements_json: Vec<JsonValue> = statements.iter().map(|s| s.to_json()).collect();
+        let body = JsonValue::Array(statements_json).to_string();
+
+        let request = HttpRequest::new(HttpMethod::POST, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version)
+            .header("Content-Type", "application/json")
+            .body(body);
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response)?;
+
+        let body = response.body();
+        let json: JsonValue = Json::parse(&body)
+            .map_err(|e| XApiError::ParseError { message: e.to_string() })?;
+
+        json.as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_string().map(|s| s.to_string())).collect())
+            .ok_or(XApiError::ParseError { message: "Invalid response format".to_string() })
+    }
+
+    /// Get a statement by ID
+    fn get_statement(&self, statement_id: &StatementId) -> Result<Statement, XApiError> {
+        let url = format!("{}/statements?statementId={}", self.config.endpoint, statement_id);
+
+        let request = HttpRequest::new(HttpMethod::GET, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version);
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response)?;
+
+        let body = response.body();
+        let json: JsonValue = Json::parse(&body)
+            .map_err(|e| XApiError::ParseError { message: e.to_string() })?;
+
+        Statement::from_json(&json)
+            .ok_or(XApiError::ParseError { message: "Invalid statement format".to_string() })
+    }
+
+    /// Query statements
+    fn query_statements(&self, query: StatementQuery) -> Result<StatementResult, XApiError> {
+        let query_string = query.to_query_string();
+        let url = if query_string.is_empty() {
+            format!("{}/statements", self.config.endpoint)
+        } else {
+            format!("{}/statements?{}", self.config.endpoint, query_string)
+        };
+
+        let request = HttpRequest::new(HttpMethod::GET, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version);
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response)?;
+
+        let body = response.body();
+        let json: JsonValue = Json::parse(&body)
+            .map_err(|e| XApiError::ParseError { message: e.to_string() })?;
+
+        let obj = json.as_object()
+            .ok_or(XApiError::ParseError { message: "Invalid response format".to_string() })?;
+
+        let statements = obj.get("statements")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|s| Statement::from_json(s)).collect())
+            .unwrap_or_default();
+
+        let more = obj.get("more")
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string());
+
+        Ok(StatementResult { statements, more })
+    }
+
+    /// Void a statement
+    fn void_statement(&self, statement_id: &StatementId, actor: Actor) -> Result<StatementId, XApiError> {
+        let voiding_statement = Statement::new(
+            actor,
+            Verbs::voided(),
+            Object::StatementRef(StatementRef::new(statement_id.clone()))
+        );
+
+        self.send_statement(voiding_statement)
+    }
+
+    /// Get state document
+    fn get_state(&self, activity_id: &IRI, agent: &Agent, state_id: &str, registration: Option<&str>) -> Result<JsonValue, XApiError> {
+        let mut url = format!(
+            "{}/activities/state?activityId={}&agent={}&stateId={}",
+            self.config.endpoint,
+            url_encode(activity_id),
+            url_encode(&agent.to_json().to_string()),
+            url_encode(state_id)
+        );
+
+        if let Some(reg) = registration {
+            url.push_str(&format!("&registration={}", reg));
+        }
+
+        let request = HttpRequest::new(HttpMethod::GET, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version);
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        if response.status() == 404 {
+            return Err(XApiError::NotFound { resource: format!("State: {}", state_id) })
+        }
+
+        self.handle_response(response)?;
+
+        let body = response.body();
+        Json::parse(&body)
+            .map_err(|e| XApiError::ParseError { message: e.to_string() })
+    }
+
+    /// Set state document
+    fn set_state(&self, activity_id: &IRI, agent: &Agent, state_id: &str, registration: Option<&str>, state: JsonValue) -> Result<(), XApiError> {
+        let mut url = format!(
+            "{}/activities/state?activityId={}&agent={}&stateId={}",
+            self.config.endpoint,
+            url_encode(activity_id),
+            url_encode(&agent.to_json().to_string()),
+            url_encode(state_id)
+        );
+
+        if let Some(reg) = registration {
+            url.push_str(&format!("&registration={}", reg));
+        }
+
+        let request = HttpRequest::new(HttpMethod::PUT, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version)
+            .header("Content-Type", "application/json")
+            .body(state.to_string());
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response)?;
+
+        Ok(())
+    }
+
+    /// Delete state document
+    fn delete_state(&self, activity_id: &IRI, agent: &Agent, state_id: &str, registration: Option<&str>) -> Result<(), XApiError> {
+        let mut url = format!(
+            "{}/activities/state?activityId={}&agent={}&stateId={}",
+            self.config.endpoint,
+            url_encode(activity_id),
+            url_encode(&agent.to_json().to_string()),
+            url_encode(state_id)
+        );
+
+        if let Some(reg) = registration {
+            url.push_str(&format!("&registration={}", reg));
+        }
+
+        let request = HttpRequest::new(HttpMethod::DELETE, &url)
+            .header("Authorization", &self.config.authorization)
+            .header("X-Experience-API-Version", &self.config.version);
+
+        let response = self.http_client.send(request)
+            .map_err(|e| XApiError::NetworkError { message: e.to_string() })?;
+
+        self.handle_response(response)?;
+
+        Ok(())
+    }
+
+    /// Handle HTTP response and check for errors
+    fn handle_response(&self, response: HttpResponse) -> Result<(), XApiError> {
+        match response.status() {
+            200..=299 => Ok(()),
+            400 => Err(XApiError::BadRequest { message: response.body() }),
+            401 | 403 => Err(XApiError::AuthError { message: "Authentication failed".to_string() }),
+            404 => Err(XApiError::NotFound { resource: "Resource".to_string() }),
+            409 => Err(XApiError::Conflict { message: response.body() }),
+            _ => Err(XApiError::ServerError { message: format!("HTTP {}: {}", response.status(), response.body()) })
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+/// Parse a language map from JSON
+fn parse_language_map(json: &JsonValue) -> Option<LanguageMap> {
+    json.as_object().map(|obj| {
+        obj.iter()
+            .filter_map(|(k, v)| v.as_string().map(|s| (k.clone(), s.to_string())))
+            .collect()
+    })
+}
+
+/// Convert a language map to JSON
+fn language_map_to_json(map: &LanguageMap) -> JsonValue {
+    let mut obj = JsonObject::new();
+    for (lang, text) in map {
+        obj.insert(lang.clone(), JsonValue::String(text.clone()));
+    }
+    JsonValue::Object(obj)
+}
+
+/// Parse interaction components (choices, scale, source, target, steps)
+fn parse_interaction_components(json: &JsonValue) -> Option<List<InteractionComponent>> {
+    json.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|item| InteractionComponent::from_json(item))
+            .collect()
+    })
+}
+
+/// Base64 encode
+fn base64_encode(input: &str) -> String {
+    std::encoding::base64_encode(input)
+}
+
+/// URL encode
+fn url_encode(input: &str) -> String {
+    std::encoding::url_encode(input)
+}
+
+/// Format ISO 8601 duration
+fn format_iso8601_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    format!("PT{}H{}M{}S", hours, minutes, seconds)
+}
+
+/// Create xAPI client
+fn create_xapi_client(config: LrsConfig) -> XApiClient {
+    XApiClient::init(config)
+}
+
+// =============================================================================
+// STATEMENT BUILDERS
+// =============================================================================
+
+/// Helper to build common learning statements
+type StatementBuilder;
+
+impl StatementBuilder {
+    /// Build "completed course" statement
+    fn completed_course(actor: Actor, course_id: &str, course_name: &str) -> Statement {
+        let activity = Activity::with_definition(
+            course_id.to_string(),
+            ActivityDefinition::new()
+                .with_name("en-US", course_name)
+                .with_type(ActivityTypes::course())
+        );
+
+        Statement::new(actor, Verbs::completed(), Object::Activity(activity))
+            .with_result(Result::new().with_completion(true))
+    }
+
+    /// Build "passed assessment" statement
+    fn passed_assessment(actor: Actor, assessment_id: &str, assessment_name: &str, score: Score) -> Statement {
+        let activity = Activity::with_definition(
+            assessment_id.to_string(),
+            ActivityDefinition::new()
+                .with_name("en-US", assessment_name)
+                .with_type(ActivityTypes::assessment())
+        );
+
+        Statement::new(actor, Verbs::passed(), Object::Activity(activity))
+            .with_result(Result::new().with_score(score).with_success(true).with_completion(true))
+    }
+
+    /// Build "failed assessment" statement
+    fn failed_assessment(actor: Actor, assessment_id: &str, assessment_name: &str, score: Score) -> Statement {
+        let activity = Activity::with_definition(
+            assessment_id.to_string(),
+            ActivityDefinition::new()
+                .with_name("en-US", assessment_name)
+                .with_type(ActivityTypes::assessment())
+        );
+
+        Statement::new(actor, Verbs::failed(), Object::Activity(activity))
+            .with_result(Result::new().with_score(score).with_success(false).with_completion(true))
+    }
+
+    /// Build "launched lesson" statement
+    fn launched_lesson(actor: Actor, lesson_id: &str, lesson_name: &str) -> Statement {
+        let activity = Activity::with_definition(
+            lesson_id.to_string(),
+            ActivityDefinition::new()
+                .with_name("en-US", lesson_name)
+                .with_type(ActivityTypes::lesson())
+        );
+
+        Statement::new(actor, Verbs::launched(), Object::Activity(activity))
+    }
+
+    /// Build "progressed in lesson" statement
+    fn progressed_lesson(actor: Actor, lesson_id: &str, progress: f32) -> Statement {
+        let activity = Activity::new(lesson_id.to_string());
+
+        let mut extensions = Map::new();
+        extensions.insert(
+            "https://w3id.org/xapi/cmi5/result/extensions/progress".to_string(),
+            JsonValue::Number(progress as f64)
+        );
+
+        Statement::new(actor, Verbs::progressed(), Object::Activity(activity))
+            .with_result(Result {
+                score: None,
+                success: None,
+                completion: Some(progress >= 1.0),
+                response: None,
+                duration: None,
+                extensions: Some(extensions)
+            })
+    }
+
+    /// Build "watched video" statement
+    fn watched_video(actor: Actor, video_id: &str, video_name: &str, duration: Duration, progress: f32) -> Statement {
+        let activity = Activity::with_definition(
+            video_id.to_string(),
+            ActivityDefinition::new()
+                .with_name("en-US", video_name)
+                .with_type(ActivityTypes::video())
+        );
+
+        Statement::new(actor, Verbs::watched(), Object::Activity(activity))
+            .with_result(Result::new()
+                .with_duration(duration)
+                .with_completion(progress >= 0.95)
+            )
+    }
+
+    /// Build "answered question" statement
+    fn answered_question(
+        actor: Actor,
+        question_id: &str,
+        question_text: &str,
+        response: &str,
+        correct: Bool
+    ) -> Statement {
+        let activity = Activity::with_definition(
+            question_id.to_string(),
+            ActivityDefinition::new()
+                .with_name("en-US", question_text)
+                .with_type(ActivityTypes::question())
+        );
+
+        Statement::new(actor, Verbs::answered(), Object::Activity(activity))
+            .with_result(Result::new()
+                .with_response(response.to_string())
+                .with_success(correct)
+            )
+    }
+}
+
+// =============================================================================
+// FLUENT STATEMENT BUILDER
+// =============================================================================
+
+/// Fluent API builder for constructing xAPI statements
+type FluentStatementBuilder {
+    /// The statement being built
+    statement: Statement,
+
+    /// Validation errors accumulated
+    errors: List<String>
+}
+
+impl FluentStatementBuilder {
+    /// Start building a statement with an actor
+    fn actor(actor: Actor) -> FluentStatementBuilder {
+        let statement = Statement {
+            id: Some(generate_uuid()),
+            actor,
+            verb: Verb::new(String::new(), None),
+            object: Object::Activity(Activity::new(String::new())),
+            result: None,
+            context: None,
+            timestamp: Some(DateTime::now().to_iso8601()),
+            stored: None,
+            authority: None,
+            version: Some("1.0.3".to_string()),
+            attachments: None
+        };
+
+        FluentStatementBuilder {
+            statement,
+            errors: vec![]
+        }
+    }
+
+    /// Create builder from email
+    fn from_email(email: &str, name: Option<String>) -> FluentStatementBuilder {
+        Self::actor(Actor::Agent(Agent::from_email(email, name)))
+    }
+
+    /// Create builder from account
+    fn from_account(home_page: &str, account_name: &str, name: Option<String>) -> FluentStatementBuilder {
+        Self::actor(Actor::Agent(Agent::from_account(home_page, account_name, name)))
+    }
+
+    /// Create builder from Intelligo user
+    fn from_user(user_id: &UserId, tenant_id: &TenantId, name: Option<String>) -> FluentStatementBuilder {
+        let home_page = format!("https://intelligo.ai/tenants/{}", tenant_id);
+        Self::from_account(&home_page, user_id, name)
+    }
+
+    // =========================================================================
+    // VERB METHODS
+    // =========================================================================
+
+    /// Set the verb
+    fn verb(mut self, verb: Verb) -> FluentStatementBuilder {
+        self.statement.verb = verb;
+        self
+    }
+
+    /// Set verb to completed
+    fn completed(self) -> FluentStatementBuilder {
+        self.verb(Verbs::completed())
+    }
+
+    /// Set verb to passed
+    fn passed(self) -> FluentStatementBuilder {
+        self.verb(Verbs::passed())
+    }
+
+    /// Set verb to failed
+    fn failed(self) -> FluentStatementBuilder {
+        self.verb(Verbs::failed())
+    }
+
+    /// Set verb to attempted
+    fn attempted(self) -> FluentStatementBuilder {
+        self.verb(Verbs::attempted())
+    }
+
+    /// Set verb to experienced
+    fn experienced(self) -> FluentStatementBuilder {
+        self.verb(Verbs::experienced())
+    }
+
+    /// Set verb to launched
+    fn launched(self) -> FluentStatementBuilder {
+        self.verb(Verbs::launched())
+    }
+
+    /// Set verb to initialized
+    fn initialized(self) -> FluentStatementBuilder {
+        self.verb(Verbs::initialized())
+    }
+
+    /// Set verb to terminated
+    fn terminated(self) -> FluentStatementBuilder {
+        self.verb(Verbs::terminated())
+    }
+
+    /// Set verb to progressed
+    fn progressed(self) -> FluentStatementBuilder {
+        self.verb(Verbs::progressed())
+    }
+
+    /// Set verb to suspended
+    fn suspended(self) -> FluentStatementBuilder {
+        self.verb(Verbs::suspended())
+    }
+
+    /// Set verb to resumed
+    fn resumed(self) -> FluentStatementBuilder {
+        self.verb(Verbs::resumed())
+    }
+
+    /// Set verb to answered
+    fn answered(self) -> FluentStatementBuilder {
+        self.verb(Verbs::answered())
+    }
+
+    /// Set verb to voided
+    fn voided(self) -> FluentStatementBuilder {
+        self.verb(Verbs::voided())
+    }
+
+    /// Set verb to scored
+    fn scored(self) -> FluentStatementBuilder {
+        self.verb(Verbs::scored())
+    }
+
+    /// Set verb to mastered
+    fn mastered(self) -> FluentStatementBuilder {
+        self.verb(Verbs::mastered())
+    }
+
+    // =========================================================================
+    // OBJECT METHODS
+    // =========================================================================
+
+    /// Set the object to an activity
+    fn activity(mut self, id: IRI, definition: Option<ActivityDefinition>) -> FluentStatementBuilder {
+        let activity = match definition {
+            Some(def) => Activity::with_definition(id, def),
+            None => Activity::new(id)
+        };
+        self.statement.object = Object::Activity(activity);
+        self
+    }
+
+    /// Set the object to a course
+    fn course(self, id: IRI, name: &str) -> FluentStatementBuilder {
+        let def = ActivityDefinition::new()
+            .with_name("en-US", name)
+            .with_type(ActivityTypes::course());
+        self.activity(id, Some(def))
+    }
+
+    /// Set the object to a lesson
+    fn lesson(self, id: IRI, name: &str) -> FluentStatementBuilder {
+        let def = ActivityDefinition::new()
+            .with_name("en-US", name)
+            .with_type(ActivityTypes::lesson());
+        self.activity(id, Some(def))
+    }
+
+    /// Set the object to an assessment
+    fn assessment(self, id: IRI, name: &str) -> FluentStatementBuilder {
+        let def = ActivityDefinition::new()
+            .with_name("en-US", name)
+            .with_type(ActivityTypes::assessment());
+        self.activity(id, Some(def))
+    }
+
+    /// Set the object to a module
+    fn module(self, id: IRI, name: &str) -> FluentStatementBuilder {
+        let def = ActivityDefinition::new()
+            .with_name("en-US", name)
+            .with_type(ActivityTypes::module());
+        self.activity(id, Some(def))
+    }
+
+    /// Set the object to a question
+    fn question(self, id: IRI, text: &str, interaction_type: Option<InteractionType>) -> FluentStatementBuilder {
+        let mut def = ActivityDefinition::new()
+            .with_name("en-US", text)
+            .with_type(ActivityTypes::question());
+        def.interaction_type = interaction_type;
+        self.activity(id, Some(def))
+    }
+
+    /// Set the object to a video
+    fn video(self, id: IRI, name: &str) -> FluentStatementBuilder {
+        let def = ActivityDefinition::new()
+            .with_name("en-US", name)
+            .with_type(ActivityTypes::video());
+        self.activity(id, Some(def))
+    }
+
+    /// Set the object to a statement reference (for voiding)
+    fn statement_ref(mut self, statement_id: StatementId) -> FluentStatementBuilder {
+        self.statement.object = Object::StatementRef(StatementRef::new(statement_id));
+        self
+    }
+
+    // =========================================================================
+    // RESULT METHODS
+    // =========================================================================
+
+    /// Set the result
+    fn result(mut self, result: Result) -> FluentStatementBuilder {
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Set score with scaled value (must be -1 to 1)
+    fn score_scaled(mut self, scaled: f32) -> FluentStatementBuilder {
+        if scaled < -1.0 || scaled > 1.0 {
+            self.errors.push("Scaled score must be between -1 and 1".to_string());
+        }
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        let mut score = result.score.unwrap_or_else(Score::new);
+        score.scaled = Some(scaled);
+        result.score = Some(score);
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Set score with raw value
+    fn score_raw(mut self, raw: f32, min: f32, max: f32) -> FluentStatementBuilder {
+        if min > max {
+            self.errors.push("Score min cannot be greater than max".to_string());
+        }
+        if raw < min || raw > max {
+            self.errors.push("Raw score must be between min and max".to_string());
+        }
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        let score = Score::from_raw(raw, min, max);
+        result.score = Some(score);
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Set score from percentage
+    fn score_percentage(mut self, percent: f32) -> FluentStatementBuilder {
+        if percent < 0.0 || percent > 100.0 {
+            self.errors.push("Percentage must be between 0 and 100".to_string());
+        }
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        result.score = Some(Score::from_percentage(percent));
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Set success status
+    fn success(mut self, success: Bool) -> FluentStatementBuilder {
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        result.success = Some(success);
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Mark as successful
+    fn succeeded(self) -> FluentStatementBuilder {
+        self.success(true)
+    }
+
+    /// Mark as not successful
+    fn not_succeeded(self) -> FluentStatementBuilder {
+        self.success(false)
+    }
+
+    /// Set completion status
+    fn completion(mut self, completion: Bool) -> FluentStatementBuilder {
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        result.completion = Some(completion);
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Mark as complete
+    fn complete(self) -> FluentStatementBuilder {
+        self.completion(true)
+    }
+
+    /// Mark as incomplete
+    fn incomplete(self) -> FluentStatementBuilder {
+        self.completion(false)
+    }
+
+    /// Set the response
+    fn response(mut self, response: String) -> FluentStatementBuilder {
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        result.response = Some(response);
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Set the duration
+    fn duration(mut self, duration: Duration) -> FluentStatementBuilder {
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        result.duration = Some(format_iso8601_duration(duration));
+        self.statement.result = Some(result);
+        self
+    }
+
+    /// Set duration in seconds
+    fn duration_secs(self, seconds: i64) -> FluentStatementBuilder {
+        self.duration(Duration::from_secs(seconds as u64))
+    }
+
+    /// Add a result extension
+    fn result_extension(mut self, iri: IRI, value: JsonValue) -> FluentStatementBuilder {
+        let mut result = self.statement.result.unwrap_or_else(Result::new);
+        let mut extensions = result.extensions.unwrap_or_else(Map::new);
+        extensions.insert(iri, value);
+        result.extensions = Some(extensions);
+        self.statement.result = Some(result);
+        self
+    }
+
+    // =========================================================================
+    // CONTEXT METHODS
+    // =========================================================================
+
+    /// Set the context
+    fn context(mut self, context: Context) -> FluentStatementBuilder {
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Set the registration UUID
+    fn registration(mut self, registration: String) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        context.registration = Some(registration);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Set the instructor
+    fn instructor(mut self, instructor: Actor) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        context.instructor = Some(instructor);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Set the team
+    fn team(mut self, team: Group) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        context.team = Some(team);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Set the platform
+    fn platform(mut self, platform: String) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        context.platform = Some(platform);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Set the language
+    fn language(mut self, language: String) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        context.language = Some(language);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Set the revision
+    fn revision(mut self, revision: String) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        context.revision = Some(revision);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Add a parent activity
+    fn parent(mut self, activity: Activity) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        let mut ctx_activities = context.context_activities.unwrap_or_else(ContextActivities::new);
+        ctx_activities = ctx_activities.with_parent(activity);
+        context.context_activities = Some(ctx_activities);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Add a parent activity by ID
+    fn parent_id(self, activity_id: IRI) -> FluentStatementBuilder {
+        self.parent(Activity::new(activity_id))
+    }
+
+    /// Add a grouping activity
+    fn grouping(mut self, activity: Activity) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        let mut ctx_activities = context.context_activities.unwrap_or_else(ContextActivities::new);
+        ctx_activities = ctx_activities.with_grouping(activity);
+        context.context_activities = Some(ctx_activities);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Add a grouping activity by ID
+    fn grouping_id(self, activity_id: IRI) -> FluentStatementBuilder {
+        self.grouping(Activity::new(activity_id))
+    }
+
+    /// Add a category activity
+    fn category(mut self, activity: Activity) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        let mut ctx_activities = context.context_activities.unwrap_or_else(ContextActivities::new);
+        let mut categories = ctx_activities.category.unwrap_or_default();
+        categories.push(activity);
+        ctx_activities.category = Some(categories);
+        context.context_activities = Some(ctx_activities);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Add a category activity by ID (for xAPI profiles)
+    fn category_id(self, activity_id: IRI) -> FluentStatementBuilder {
+        self.category(Activity::new(activity_id))
+    }
+
+    /// Add an other activity
+    fn other(mut self, activity: Activity) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        let mut ctx_activities = context.context_activities.unwrap_or_else(ContextActivities::new);
+        let mut others = ctx_activities.other.unwrap_or_default();
+        others.push(activity);
+        ctx_activities.other = Some(others);
+        context.context_activities = Some(ctx_activities);
+        self.statement.context = Some(context);
+        self
+    }
+
+    /// Add a context extension
+    fn context_extension(mut self, iri: IRI, value: JsonValue) -> FluentStatementBuilder {
+        let mut context = self.statement.context.unwrap_or_else(Context::new);
+        let mut extensions = context.extensions.unwrap_or_else(Map::new);
+        extensions.insert(iri, value);
+        context.extensions = Some(extensions);
+        self.statement.context = Some(context);
+        self
+    }
+
+    // =========================================================================
+    // METADATA METHODS
+    // =========================================================================
+
+    /// Set the statement ID
+    fn id(mut self, id: StatementId) -> FluentStatementBuilder {
+        self.statement.id = Some(id);
+        self
+    }
+
+    /// Set the timestamp
+    fn timestamp(mut self, timestamp: DateTime) -> FluentStatementBuilder {
+        self.statement.timestamp = Some(timestamp.to_iso8601());
+        self
+    }
+
+    /// Set the authority
+    fn authority(mut self, authority: Actor) -> FluentStatementBuilder {
+        self.statement.authority = Some(authority);
+        self
+    }
+
+    /// Add an attachment
+    fn attachment(mut self, attachment: Attachment) -> FluentStatementBuilder {
+        let mut attachments = self.statement.attachments.unwrap_or_default();
+        attachments.push(attachment);
+        self.statement.attachments = Some(attachments);
+        self
+    }
+
+    // =========================================================================
+    // BUILD METHODS
+    // =========================================================================
+
+    /// Validate the statement
+    fn validate(&self) -> List<String> {
+        let mut errors = self.errors.clone();
+
+        // Validate verb ID is set
+        if self.statement.verb.id.is_empty() {
+            errors.push("Verb ID is required".to_string());
+        }
+
+        // Validate object ID is set
+        match &self.statement.object {
+            Object::Activity(activity) if activity.id.is_empty() => {
+                errors.push("Activity ID is required".to_string());
+            },
+            Object::StatementRef(stmt_ref) if stmt_ref.id.is_empty() => {
+                errors.push("Statement reference ID is required".to_string());
+            },
+            _ => {}
+        }
+
+        // Validate voiding statement has StatementRef object
+        if self.statement.verb.id == "http://adlnet.gov/expapi/verbs/voided" {
+            if !matches!(self.statement.object, Object::StatementRef(_)) {
+                errors.push("Voiding statement must have StatementRef object".to_string());
+            }
+        }
+
+        // Validate score if present
+        if let Some(ref result) = self.statement.result {
+            if let Some(ref score) = result.score {
+                if let Some(scaled) = score.scaled {
+                    if scaled < -1.0 || scaled > 1.0 {
+                        errors.push("Scaled score must be between -1 and 1".to_string());
+                    }
+                }
+                if let (Some(min), Some(max)) = (score.min, score.max) {
+                    if min > max {
+                        errors.push("Score min cannot be greater than max".to_string());
+                    }
+                }
+                if let (Some(raw), Some(min)) = (score.raw, score.min) {
+                    if raw < min {
+                        errors.push("Raw score cannot be less than min".to_string());
+                    }
+                }
+                if let (Some(raw), Some(max)) = (score.raw, score.max) {
+                    if raw > max {
+                        errors.push("Raw score cannot be greater than max".to_string());
+                    }
+                }
+            }
+        }
+
+        errors
+    }
+
+    /// Build the statement (returns errors if invalid)
+    fn build(self) -> Result<Statement, List<String>> {
+        let errors = self.validate();
+        if errors.is_empty() {
+            Ok(self.statement)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Build the statement without validation
+    fn build_unchecked(self) -> Statement {
+        self.statement
+    }
+}
+
+// =============================================================================
+// BATCH STATEMENT GENERATOR
+// =============================================================================
+
+/// Generator for creating multiple xAPI statements efficiently
+type BatchStatementGenerator {
+    /// Template settings
+    template: StatementTemplate,
+
+    /// Generated statements
+    statements: List<Statement>,
+
+    /// Tenant ID for IRI generation
+    tenant_id: TenantId,
+
+    /// Base IRI for activities
+    base_iri: IRI
+}
+
+/// Template for batch statement generation
+type StatementTemplate {
+    /// Default actor
+    default_actor: Option<Actor>,
+
+    /// Default context
+    default_context: Option<Context>,
+
+    /// Default authority
+    default_authority: Option<Actor>,
+
+    /// Default platform
+    default_platform: Option<String>,
+
+    /// Default language
+    default_language: Option<String>,
+
+    /// Include cmi5 profile category
+    use_cmi5_profile: Bool
+}
+
+impl StatementTemplate {
+    fn new() -> StatementTemplate {
+        StatementTemplate {
+            default_actor: None,
+            default_context: None,
+            default_authority: None,
+            default_platform: Some("Intelligo LMS".to_string()),
+            default_language: Some("en-US".to_string()),
+            use_cmi5_profile: false
+        }
+    }
+}
+
+impl BatchStatementGenerator {
+    /// Create a new batch generator
+    fn new(tenant_id: TenantId) -> BatchStatementGenerator {
+        BatchStatementGenerator {
+            template: StatementTemplate::new(),
+            statements: vec![],
+            tenant_id: tenant_id.clone(),
+            base_iri: format!("https://intelligo.ai/tenants/{}/xapi", tenant_id)
+        }
+    }
+
+    /// Create with template
+    fn with_template(tenant_id: TenantId, template: StatementTemplate) -> BatchStatementGenerator {
+        BatchStatementGenerator {
+            template,
+            statements: vec![],
+            tenant_id: tenant_id.clone(),
+            base_iri: format!("https://intelligo.ai/tenants/{}/xapi", tenant_id)
+        }
+    }
+
+    /// Set the base IRI
+    fn set_base_iri(&mut self, base_iri: IRI) {
+        self.base_iri = base_iri;
+    }
+
+    /// Generate activity IRI
+    fn make_activity_iri(&self, activity_type: &str, id: &str) -> IRI {
+        format!("{}/activities/{}/{}", self.base_iri, activity_type, id)
+    }
+
+    /// Generate course IRI
+    fn make_course_iri(&self, course_id: &CourseId) -> IRI {
+        self.make_activity_iri("course", course_id)
+    }
+
+    /// Generate lesson IRI
+    fn make_lesson_iri(&self, lesson_id: &LessonId) -> IRI {
+        self.make_activity_iri("lesson", lesson_id)
+    }
+
+    /// Generate assessment IRI
+    fn make_assessment_iri(&self, assessment_id: &AssessmentId) -> IRI {
+        self.make_activity_iri("assessment", assessment_id)
+    }
+
+    /// Generate module IRI
+    fn make_module_iri(&self, module_id: &ModuleId) -> IRI {
+        self.make_activity_iri("module", module_id)
+    }
+
+    /// Apply template settings to a statement
+    fn apply_template(&self, statement: &mut Statement) {
+        // Apply default context settings
+        if self.template.default_context.is_some() || self.template.default_platform.is_some() {
+            let mut context = statement.context.take().unwrap_or_else(Context::new);
+
+            if let Some(ref default_ctx) = self.template.default_context {
+                if context.registration.is_none() {
+                    context.registration = default_ctx.registration.clone();
+                }
+                if context.instructor.is_none() {
+                    context.instructor = default_ctx.instructor.clone();
+                }
+            }
+
+            if context.platform.is_none() {
+                context.platform = self.template.default_platform.clone();
+            }
+
+            if context.language.is_none() {
+                context.language = self.template.default_language.clone();
+            }
+
+            // Add cmi5 profile category if enabled
+            if self.template.use_cmi5_profile {
+                let mut ctx_activities = context.context_activities.take().unwrap_or_else(ContextActivities::new);
+                let mut categories = ctx_activities.category.unwrap_or_default();
+                categories.push(Activity::new("https://w3id.org/xapi/cmi5/context/categories/cmi5".to_string()));
+                ctx_activities.category = Some(categories);
+                context.context_activities = Some(ctx_activities);
+            }
+
+            statement.context = Some(context);
+        }
+
+        // Apply default authority
+        if statement.authority.is_none() {
+            statement.authority = self.template.default_authority.clone();
+        }
+    }
+
+    /// Add a course completed statement
+    fn add_course_completed(
+        &mut self,
+        actor: Actor,
+        course_id: &CourseId,
+        course_name: &str,
+        score: Option<Score>,
+        duration: Option<Duration>
+    ) {
+        let activity_iri = self.make_course_iri(course_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", course_name)
+                .with_type(ActivityTypes::course())
+        );
+
+        let mut result = Result::new().with_completion(true);
+        if let Some(s) = score {
+            result.score = Some(s);
+        }
+        if let Some(d) = duration {
+            result.duration = Some(format_iso8601_duration(d));
+        }
+
+        let mut statement = Statement::new(actor, Verbs::completed(), Object::Activity(activity))
+            .with_result(result);
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add an assessment passed statement
+    fn add_assessment_passed(
+        &mut self,
+        actor: Actor,
+        assessment_id: &AssessmentId,
+        assessment_name: &str,
+        score: Score,
+        duration: Option<Duration>,
+        parent_course: Option<&CourseId>
+    ) {
+        let activity_iri = self.make_assessment_iri(assessment_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", assessment_name)
+                .with_type(ActivityTypes::assessment())
+        );
+
+        let mut result = Result::new()
+            .with_score(score)
+            .with_success(true)
+            .with_completion(true);
+
+        if let Some(d) = duration {
+            result.duration = Some(format_iso8601_duration(d));
+        }
+
+        let mut statement = Statement::new(actor, Verbs::passed(), Object::Activity(activity))
+            .with_result(result);
+
+        // Add parent course context
+        if let Some(course_id) = parent_course {
+            let parent = Activity::new(self.make_course_iri(course_id));
+            let ctx_activities = ContextActivities::new().with_parent(parent);
+            statement = statement.with_context(Context::new().with_context_activities(ctx_activities));
+        }
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add an assessment failed statement
+    fn add_assessment_failed(
+        &mut self,
+        actor: Actor,
+        assessment_id: &AssessmentId,
+        assessment_name: &str,
+        score: Score,
+        duration: Option<Duration>,
+        parent_course: Option<&CourseId>
+    ) {
+        let activity_iri = self.make_assessment_iri(assessment_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", assessment_name)
+                .with_type(ActivityTypes::assessment())
+        );
+
+        let mut result = Result::new()
+            .with_score(score)
+            .with_success(false)
+            .with_completion(true);
+
+        if let Some(d) = duration {
+            result.duration = Some(format_iso8601_duration(d));
+        }
+
+        let mut statement = Statement::new(actor, Verbs::failed(), Object::Activity(activity))
+            .with_result(result);
+
+        if let Some(course_id) = parent_course {
+            let parent = Activity::new(self.make_course_iri(course_id));
+            let ctx_activities = ContextActivities::new().with_parent(parent);
+            statement = statement.with_context(Context::new().with_context_activities(ctx_activities));
+        }
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add a lesson launched statement
+    fn add_lesson_launched(
+        &mut self,
+        actor: Actor,
+        lesson_id: &LessonId,
+        lesson_name: &str,
+        parent_module: Option<&ModuleId>,
+        parent_course: Option<&CourseId>
+    ) {
+        let activity_iri = self.make_lesson_iri(lesson_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", lesson_name)
+                .with_type(ActivityTypes::lesson())
+        );
+
+        let mut statement = Statement::new(actor, Verbs::launched(), Object::Activity(activity));
+
+        // Add context activities
+        let mut ctx_activities = ContextActivities::new();
+        if let Some(module_id) = parent_module {
+            ctx_activities = ctx_activities.with_parent(Activity::new(self.make_module_iri(module_id)));
+        }
+        if let Some(course_id) = parent_course {
+            ctx_activities = ctx_activities.with_grouping(Activity::new(self.make_course_iri(course_id)));
+        }
+
+        if parent_module.is_some() || parent_course.is_some() {
+            statement = statement.with_context(Context::new().with_context_activities(ctx_activities));
+        }
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add a lesson completed statement
+    fn add_lesson_completed(
+        &mut self,
+        actor: Actor,
+        lesson_id: &LessonId,
+        lesson_name: &str,
+        duration: Option<Duration>,
+        parent_module: Option<&ModuleId>,
+        parent_course: Option<&CourseId>
+    ) {
+        let activity_iri = self.make_lesson_iri(lesson_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", lesson_name)
+                .with_type(ActivityTypes::lesson())
+        );
+
+        let mut result = Result::new().with_completion(true);
+        if let Some(d) = duration {
+            result.duration = Some(format_iso8601_duration(d));
+        }
+
+        let mut statement = Statement::new(actor, Verbs::completed(), Object::Activity(activity))
+            .with_result(result);
+
+        let mut ctx_activities = ContextActivities::new();
+        if let Some(module_id) = parent_module {
+            ctx_activities = ctx_activities.with_parent(Activity::new(self.make_module_iri(module_id)));
+        }
+        if let Some(course_id) = parent_course {
+            ctx_activities = ctx_activities.with_grouping(Activity::new(self.make_course_iri(course_id)));
+        }
+
+        if parent_module.is_some() || parent_course.is_some() {
+            statement = statement.with_context(Context::new().with_context_activities(ctx_activities));
+        }
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add a progress statement
+    fn add_progress(
+        &mut self,
+        actor: Actor,
+        activity_id: IRI,
+        activity_name: &str,
+        activity_type: IRI,
+        progress_percent: f32
+    ) {
+        let activity = Activity::with_definition(
+            activity_id,
+            ActivityDefinition::new()
+                .with_name("en-US", activity_name)
+                .with_type(activity_type)
+        );
+
+        let mut extensions = Map::new();
+        extensions.insert(
+            "https://w3id.org/xapi/cmi5/result/extensions/progress".to_string(),
+            JsonValue::Number(progress_percent as f64)
+        );
+
+        let result = Result {
+            score: None,
+            success: None,
+            completion: Some(progress_percent >= 1.0),
+            response: None,
+            duration: None,
+            extensions: Some(extensions)
+        };
+
+        let mut statement = Statement::new(actor, Verbs::progressed(), Object::Activity(activity))
+            .with_result(result);
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add a question answered statement
+    fn add_question_answered(
+        &mut self,
+        actor: Actor,
+        question_id: &str,
+        question_text: &str,
+        response: &str,
+        correct: Bool,
+        parent_assessment: Option<&AssessmentId>
+    ) {
+        let activity_iri = self.make_activity_iri("question", question_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", question_text)
+                .with_type(ActivityTypes::question())
+        );
+
+        let result = Result::new()
+            .with_response(response.to_string())
+            .with_success(correct);
+
+        let mut statement = Statement::new(actor, Verbs::answered(), Object::Activity(activity))
+            .with_result(result);
+
+        if let Some(assessment_id) = parent_assessment {
+            let parent = Activity::new(self.make_assessment_iri(assessment_id));
+            let ctx_activities = ContextActivities::new().with_parent(parent);
+            statement = statement.with_context(Context::new().with_context_activities(ctx_activities));
+        }
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add a video watched statement
+    fn add_video_watched(
+        &mut self,
+        actor: Actor,
+        video_id: &str,
+        video_name: &str,
+        duration: Duration,
+        progress: f32,
+        parent_lesson: Option<&LessonId>
+    ) {
+        let activity_iri = self.make_activity_iri("video", video_id);
+        let activity = Activity::with_definition(
+            activity_iri,
+            ActivityDefinition::new()
+                .with_name("en-US", video_name)
+                .with_type(ActivityTypes::video())
+        );
+
+        let result = Result::new()
+            .with_duration(duration)
+            .with_completion(progress >= 0.95);
+
+        let mut statement = Statement::new(actor, Verbs::watched(), Object::Activity(activity))
+            .with_result(result);
+
+        if let Some(lesson_id) = parent_lesson {
+            let parent = Activity::new(self.make_lesson_iri(lesson_id));
+            let ctx_activities = ContextActivities::new().with_parent(parent);
+            statement = statement.with_context(Context::new().with_context_activities(ctx_activities));
+        }
+
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Add a custom statement
+    fn add_statement(&mut self, mut statement: Statement) {
+        self.apply_template(&mut statement);
+        self.statements.push(statement);
+    }
+
+    /// Get all generated statements
+    fn get_statements(&self) -> &List<Statement> {
+        &self.statements
+    }
+
+    /// Take all generated statements (consumes the generator)
+    fn take_statements(self) -> List<Statement> {
+        self.statements
+    }
+
+    /// Clear all generated statements
+    fn clear(&mut self) {
+        self.statements.clear();
+    }
+
+    /// Get statement count
+    fn count(&self) -> usize {
+        self.statements.len()
+    }
+
+    /// Validate all statements
+    fn validate_all(&self) -> List<(usize, List<String>)> {
+        self.statements.iter().enumerate()
+            .filter_map(|(i, stmt)| {
+                let builder = FluentStatementBuilder {
+                    statement: stmt.clone(),
+                    errors: vec![]
+                };
+                let errors = builder.validate();
+                if errors.is_empty() {
+                    None
+                } else {
+                    Some((i, errors))
+                }
+            })
+            .collect()
+    }
+}
+
+// =============================================================================
+// STATEMENT VALIDATION
+// =============================================================================
+
+/// Validation result for statements
+type StatementValidation {
+    valid: Bool,
+    errors: List<String>,
+    warnings: List<String>
+}
+
+impl StatementValidation {
+    fn new() -> StatementValidation {
+        StatementValidation {
+            valid: true,
+            errors: vec![],
+            warnings: vec![]
+        }
+    }
+
+    fn add_error(&mut self, error: String) {
+        self.valid = false;
+        self.errors.push(error);
+    }
+
+    fn add_warning(&mut self, warning: String) {
+        self.warnings.push(warning);
+    }
+}
+
+/// Validate a statement according to xAPI 1.0.3 spec
+fn validate_statement(statement: &Statement) -> StatementValidation {
+    let mut result = StatementValidation::new();
+
+    // Validate verb
+    if statement.verb.id.is_empty() {
+        result.add_error("Verb ID is required".to_string());
+    }
+
+    // Validate object
+    match &statement.object {
+        Object::Activity(activity) => {
+            if activity.id.is_empty() {
+                result.add_error("Activity ID is required".to_string());
+            }
+        },
+        Object::StatementRef(stmt_ref) => {
+            if stmt_ref.id.is_empty() {
+                result.add_error("Statement reference ID is required".to_string());
+            }
+        },
+        Object::Agent(_) | Object::SubStatement(_) => {}
+    }
+
+    // Validate voiding statement
+    if statement.verb.id == "http://adlnet.gov/expapi/verbs/voided" {
+        match &statement.object {
+            Object::StatementRef(_) => {},
+            _ => result.add_error("Voided verb requires StatementRef as object".to_string())
+        }
+    }
+
+    // Validate score
+    if let Some(ref res) = statement.result {
+        if let Some(ref score) = res.score {
+            if let Some(scaled) = score.scaled {
+                if scaled < -1.0 || scaled > 1.0 {
+                    result.add_error("Scaled score must be between -1 and 1".to_string());
+                }
+            }
+            if let (Some(min), Some(max)) = (score.min, score.max) {
+                if min > max {
+                    result.add_error("Score min cannot be greater than max".to_string());
+                }
+            }
+            if let (Some(raw), Some(min)) = (score.raw, score.min) {
+                if raw < min {
+                    result.add_error("Raw score cannot be less than min".to_string());
+                }
+            }
+            if let (Some(raw), Some(max)) = (score.raw, score.max) {
+                if raw > max {
+                    result.add_error("Raw score cannot be greater than max".to_string());
+                }
+            }
+        }
+
+        // Warn about duration format
+        if let Some(ref duration) = res.duration {
+            if !duration.starts_with("P") {
+                result.add_warning("Duration should be in ISO 8601 format".to_string());
+            }
+        }
+    }
+
+    // Validate timestamp format
+    if let Some(ref timestamp) = statement.timestamp {
+        // Basic check for ISO 8601 format
+        if !timestamp.contains("T") {
+            result.add_warning("Timestamp should be in ISO 8601 format".to_string());
+        }
+    }
+
+    result
+}
+
+// =============================================================================
+// EXTENSIONS HELPERS
+// =============================================================================
+
+/// Standard extension IRIs
+type ExtensionIRIs;
+
+impl ExtensionIRIs {
+    /// cmi5 session ID
+    fn cmi5_session_id() -> IRI {
+        "https://w3id.org/xapi/cmi5/context/extensions/sessionid".to_string()
+    }
+
+    /// cmi5 mastery score
+    fn cmi5_mastery_score() -> IRI {
+        "https://w3id.org/xapi/cmi5/context/extensions/masteryscore".to_string()
+    }
+
+    /// cmi5 launch mode
+    fn cmi5_launch_mode() -> IRI {
+        "https://w3id.org/xapi/cmi5/context/extensions/launchmode".to_string()
+    }
+
+    /// cmi5 move on
+    fn cmi5_move_on() -> IRI {
+        "https://w3id.org/xapi/cmi5/context/extensions/moveon".to_string()
+    }
+
+    /// cmi5 progress
+    fn cmi5_progress() -> IRI {
+        "https://w3id.org/xapi/cmi5/result/extensions/progress".to_string()
+    }
+
+    /// Video time
+    fn video_time() -> IRI {
+        "https://w3id.org/xapi/video/extensions/time".to_string()
+    }
+
+    /// Video progress
+    fn video_progress() -> IRI {
+        "https://w3id.org/xapi/video/extensions/progress".to_string()
+    }
+
+    /// Video played segments
+    fn video_played_segments() -> IRI {
+        "https://w3id.org/xapi/video/extensions/played-segments".to_string()
+    }
+
+    /// Attempt number
+    fn attempt_number() -> IRI {
+        "http://id.tincanapi.com/extension/attempt-id".to_string()
+    }
+
+    /// Browser info
+    fn browser_info() -> IRI {
+        "http://id.tincanapi.com/extension/browser-info".to_string()
+    }
+}
+
+// =============================================================================
+// CONVENIENCE FUNCTIONS
+// =============================================================================
+
+/// Create a fluent statement builder from user
+fn statement_for_user(user_id: &UserId, tenant_id: &TenantId, name: Option<String>) -> FluentStatementBuilder {
+    FluentStatementBuilder::from_user(user_id, tenant_id, name)
+}
+
+/// Create a batch generator for a tenant
+fn create_batch_generator(tenant_id: &TenantId) -> BatchStatementGenerator {
+    BatchStatementGenerator::new(tenant_id.clone())
+}
+
+/// Create a voiding statement
+fn void_statement(voider: Actor, statement_id_to_void: StatementId) -> Statement {
+    Statement::new(
+        voider,
+        Verbs::voided(),
+        Object::StatementRef(StatementRef::new(statement_id_to_void))
+    )
+}

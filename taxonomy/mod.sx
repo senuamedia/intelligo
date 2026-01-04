@@ -1,0 +1,20 @@
+/// Intelligo LMS - Taxonomy System
+///
+/// Provides hierarchical classification for learning content,
+/// skills, competencies, and organizational structures.
+
+module intelligo::taxonomy
+
+pub use intelligo::taxonomy::categories::*
+pub use intelligo::taxonomy::skills::*
+pub use intelligo::taxonomy::competencies::*
+pub use intelligo::taxonomy::tags::*
+pub use intelligo::taxonomy::learning_objectives::*
+
+// Re-export common items
+pub use Category
+pub use Skill
+pub use Competency
+pub use Tag
+pub use LearningObjective
+pub use TaxonomyLevel

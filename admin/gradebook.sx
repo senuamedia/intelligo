@@ -1,0 +1,1413 @@
+/// Intelligo LMS - Gradebook Administration
+///
+/// Comprehensive gradebook management including grade entry, overrides,
+/// bulk operations, grade scales, and grade export functionality.
+
+module intelligo::admin::gradebook
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// GRADEBOOK VIEWS
+// =============================================================================
+
+/// Gradebook view for a course
+type CourseGradebook {
+    /// Course information
+    course: CourseInfo,
+
+    /// Grading scheme
+    grading_scheme: GradingScheme,
+
+    /// Column definitions (assessments)
+    columns: List<GradebookColumn>,
+
+    /// Student rows
+    students: List<StudentGradebookRow>,
+
+    /// Category summaries
+    categories: List<CategorySummary>,
+
+    /// Course statistics
+    stats: GradebookStats
+}
+
+/// Course info for gradebook header
+type CourseInfo {
+    id: CourseId,
+    title: String,
+    code: String,
+    enrollment_count: i32,
+    passing_grade: f32
+}
+
+/// Gradebook column (assessment)
+type GradebookColumn {
+    /// Assessment ID
+    id: AssessmentId,
+
+    /// Display name
+    name: String,
+
+    /// Short name for narrow columns
+    short_name: String,
+
+    /// Assessment type
+    assessment_type: AssessmentType,
+
+    /// Category for grouping
+    category: String,
+
+    /// Maximum points
+    max_points: f32,
+
+    /// Weight in final grade
+    weight: f32,
+
+    /// Due date
+    due_date: Option<DateTime>,
+
+    /// Whether column is hidden from students
+    hidden: Bool,
+
+    /// Whether column is locked (no more changes)
+    locked: Bool,
+
+    /// Grading status
+    grading_status: ColumnGradingStatus,
+
+    /// Position in gradebook
+    position: i32
+}
+
+/// Column grading status
+type ColumnGradingStatus {
+    total_submissions: i32,
+    graded_count: i32,
+    pending_count: i32,
+    missing_count: i32
+}
+
+/// Student row in gradebook
+type StudentGradebookRow {
+    /// Student info
+    student: StudentInfo,
+
+    /// Grades by assessment ID
+    grades: Map<AssessmentId, GradebookCell>,
+
+    /// Category totals
+    category_totals: Map<String, CategoryTotal>,
+
+    /// Overall grade
+    overall: OverallGrade,
+
+    /// Enrollment status
+    enrollment_status: EnrollmentStatus
+}
+
+/// Student info for gradebook
+type StudentInfo {
+    id: UserId,
+    name: String,
+    email: String,
+    student_id: Option<String>,
+    avatar: Option<String>,
+    last_activity: Option<DateTime>
+}
+
+/// Individual grade cell
+type GradebookCell {
+    /// Submission ID (if submitted)
+    submission_id: Option<SubmissionId>,
+
+    /// Score achieved
+    score: Option<f32>,
+
+    /// Maximum possible score
+    max_score: f32,
+
+    /// Percentage
+    percentage: Option<f32>,
+
+    /// Letter grade
+    letter_grade: Option<String>,
+
+    /// Cell status
+    status: CellStatus,
+
+    /// Graded by (user ID or "auto" or "AI")
+    graded_by: Option<String>,
+
+    /// Graded at
+    graded_at: Option<DateTime>,
+
+    /// Submitted at
+    submitted_at: Option<DateTime>,
+
+    /// Late status
+    late: Bool,
+
+    /// Excused from assignment
+    excused: Bool,
+
+    /// Override active
+    override_active: Bool,
+
+    /// Comments/feedback
+    comments: Option<String>
+}
+
+/// Cell status
+enum CellStatus {
+    /// No submission yet
+    NotSubmitted,
+    /// Submitted but not graded
+    Submitted,
+    /// Currently being graded
+    Grading,
+    /// Graded
+    Graded,
+    /// Resubmitted after grading
+    Resubmitted,
+    /// Missing (past due, no submission)
+    Missing,
+    /// Excused from assignment
+    Excused
+}
+
+/// Category total
+type CategoryTotal {
+    category: String,
+    earned_points: f32,
+    possible_points: f32,
+    percentage: f32,
+    weight: f32,
+    weighted_score: f32
+}
+
+/// Overall grade
+type OverallGrade {
+    /// Total earned points
+    earned_points: f32,
+
+    /// Total possible points
+    possible_points: f32,
+
+    /// Percentage
+    percentage: f32,
+
+    /// Letter grade
+    letter_grade: Option<String>,
+
+    /// Pass/fail status
+    passing: Bool,
+
+    /// Override active
+    override_active: Bool,
+
+    /// Override value
+    override_grade: Option<String>
+}
+
+/// Category summary
+type CategorySummary {
+    name: String,
+    weight: f32,
+    assessment_count: i32,
+    drop_lowest: i32,
+    avg_percentage: f32
+}
+
+/// Gradebook statistics
+type GradebookStats {
+    /// Class average
+    class_average: f32,
+
+    /// Median grade
+    median_grade: f32,
+
+    /// Highest grade
+    highest_grade: f32,
+
+    /// Lowest grade
+    lowest_grade: f32,
+
+    /// Standard deviation
+    std_deviation: f32,
+
+    /// Pass rate
+    pass_rate: f32,
+
+    /// Grade distribution
+    distribution: GradeDistribution
+}
+
+/// Grade distribution buckets
+type GradeDistribution {
+    buckets: List<DistributionBucket>
+}
+
+/// Distribution bucket
+type DistributionBucket {
+    label: String,
+    min: f32,
+    max: f32,
+    count: i32,
+    percentage: f32
+}
+
+// =============================================================================
+// GRADE OPERATIONS
+// =============================================================================
+
+/// Input for entering a grade
+type GradeEntryInput {
+    /// Submission ID (if exists)
+    submission_id: Option<SubmissionId>,
+
+    /// Assessment ID
+    assessment_id: AssessmentId,
+
+    /// Student ID
+    student_id: UserId,
+
+    /// Score
+    score: Option<f32>,
+
+    /// Comments/feedback
+    comments: Option<String>,
+
+    /// Rubric scores (if rubric grading)
+    rubric_scores: Option<Map<String, RubricCriterionScore>>,
+
+    /// Mark as excused
+    excused: Bool,
+
+    /// Override any existing grade
+    force_override: Bool
+}
+
+/// Rubric criterion score
+type RubricCriterionScore {
+    criterion_id: String,
+    level_id: String,
+    score: f32,
+    feedback: Option<String>
+}
+
+/// Bulk grade update
+type BulkGradeInput {
+    /// Target assessments and students
+    targets: List<GradeTarget>,
+
+    /// Action to perform
+    action: BulkGradeAction
+}
+
+/// Target for grade operation
+type GradeTarget {
+    assessment_id: AssessmentId,
+    student_id: UserId
+}
+
+/// Bulk grade action
+enum BulkGradeAction {
+    /// Set all to specific score
+    SetScore { score: f32 },
+
+    /// Add points to current score
+    AddPoints { points: f32 },
+
+    /// Subtract points from current score
+    SubtractPoints { points: f32 },
+
+    /// Set as percentage of max
+    SetPercentage { percentage: f32 },
+
+    /// Mark as excused
+    MarkExcused,
+
+    /// Remove excused status
+    RemoveExcused,
+
+    /// Mark as missing
+    MarkMissing,
+
+    /// Clear grades
+    ClearGrades
+}
+
+/// Grade override
+type GradeOverride {
+    id: String,
+    student_id: UserId,
+    course_id: CourseId,
+    override_type: OverrideType,
+    original_value: Option<String>,
+    override_value: String,
+    reason: String,
+    applied_by: UserId,
+    applied_at: DateTime,
+    expires_at: Option<DateTime>
+}
+
+/// Override type
+enum OverrideType {
+    /// Override specific assessment grade
+    AssessmentGrade { assessment_id: AssessmentId },
+
+    /// Override category total
+    CategoryTotal { category: String },
+
+    /// Override final grade
+    FinalGrade,
+
+    /// Excuse from assessment
+    Excuse { assessment_id: AssessmentId },
+
+    /// Drop specific grade
+    Drop { assessment_id: AssessmentId }
+}
+
+// =============================================================================
+// GRADING SCHEMES
+// =============================================================================
+
+/// Grading scheme configuration
+type GradingScheme {
+    /// Scheme ID
+    id: String,
+
+    /// Scheme name
+    name: String,
+
+    /// Grade type
+    grade_type: GradingType,
+
+    /// Grade scale (for letter grades)
+    scale: Option<GradeScale>,
+
+    /// Category weights
+    category_weights: Map<String, CategoryWeight>,
+
+    /// Calculate on points or weighted categories
+    calculation_method: CalculationMethod,
+
+    /// How to handle missing assignments
+    missing_policy: MissingPolicy,
+
+    /// How to handle late submissions
+    late_policy: LatePolicy,
+
+    /// Rounding rules
+    rounding: RoundingPolicy
+}
+
+/// Category weight configuration
+type CategoryWeight {
+    name: String,
+    weight: f32,
+    drop_lowest: i32,
+    drop_highest: i32
+}
+
+/// Calculation method
+enum CalculationMethod {
+    /// Simple points sum
+    TotalPoints,
+
+    /// Weighted categories
+    WeightedCategories,
+
+    /// Weighted with equal weight per category
+    EqualCategoryWeight
+}
+
+/// Missing assignment policy
+type MissingPolicy {
+    /// What to treat missing as
+    treatment: MissingTreatment,
+
+    /// Score to assign for missing
+    default_score: Option<f32>,
+
+    /// Days after due date to mark as missing
+    days_until_missing: i32
+}
+
+/// How to treat missing assignments
+enum MissingTreatment {
+    /// Don't include in calculation
+    Exclude,
+    /// Treat as zero
+    Zero,
+    /// Treat as specific score
+    DefaultScore
+}
+
+/// Rounding policy
+type RoundingPolicy {
+    /// Decimal places for display
+    decimal_places: i32,
+
+    /// Rounding mode
+    mode: RoundingMode,
+
+    /// Final grade rounding
+    final_rounding: FinalRounding
+}
+
+/// Rounding mode
+enum RoundingMode {
+    /// Always round up
+    Up,
+    /// Always round down
+    Down,
+    /// Round to nearest (half up)
+    Nearest
+}
+
+/// Final grade rounding
+enum FinalRounding {
+    /// No rounding
+    None,
+    /// Round to nearest integer
+    Integer,
+    /// Round to specific decimal places
+    DecimalPlaces { places: i32 }
+}
+
+/// Grade scale (letter grades)
+type GradeScale {
+    id: String,
+    name: String,
+    levels: List<GradeLevel>
+}
+
+/// Grade level
+type GradeLevel {
+    /// Letter or label
+    label: String,
+
+    /// Minimum percentage (inclusive)
+    min_percent: f32,
+
+    /// GPA points (optional)
+    gpa_points: Option<f32>,
+
+    /// Color for display
+    color: Option<String>
+}
+
+impl GradeScale {
+    /// Standard A-F scale
+    fn standard_af() -> GradeScale {
+        GradeScale {
+            id: "standard_af".to_string(),
+            name: "Standard A-F".to_string(),
+            levels: vec![
+                GradeLevel { label: "A".to_string(), min_percent: 90.0, gpa_points: Some(4.0), color: Some("#22C55E".to_string()) },
+                GradeLevel { label: "B".to_string(), min_percent: 80.0, gpa_points: Some(3.0), color: Some("#3B82F6".to_string()) },
+                GradeLevel { label: "C".to_string(), min_percent: 70.0, gpa_points: Some(2.0), color: Some("#F59E0B".to_string()) },
+                GradeLevel { label: "D".to_string(), min_percent: 60.0, gpa_points: Some(1.0), color: Some("#F97316".to_string()) },
+                GradeLevel { label: "F".to_string(), min_percent: 0.0, gpa_points: Some(0.0), color: Some("#EF4444".to_string()) }
+            ]
+        }
+    }
+
+    /// Standard with plus/minus
+    fn standard_plus_minus() -> GradeScale {
+        GradeScale {
+            id: "standard_plus_minus".to_string(),
+            name: "Standard with Plus/Minus".to_string(),
+            levels: vec![
+                GradeLevel { label: "A+".to_string(), min_percent: 97.0, gpa_points: Some(4.0), color: Some("#22C55E".to_string()) },
+                GradeLevel { label: "A".to_string(), min_percent: 93.0, gpa_points: Some(4.0), color: Some("#22C55E".to_string()) },
+                GradeLevel { label: "A-".to_string(), min_percent: 90.0, gpa_points: Some(3.7), color: Some("#22C55E".to_string()) },
+                GradeLevel { label: "B+".to_string(), min_percent: 87.0, gpa_points: Some(3.3), color: Some("#3B82F6".to_string()) },
+                GradeLevel { label: "B".to_string(), min_percent: 83.0, gpa_points: Some(3.0), color: Some("#3B82F6".to_string()) },
+                GradeLevel { label: "B-".to_string(), min_percent: 80.0, gpa_points: Some(2.7), color: Some("#3B82F6".to_string()) },
+                GradeLevel { label: "C+".to_string(), min_percent: 77.0, gpa_points: Some(2.3), color: Some("#F59E0B".to_string()) },
+                GradeLevel { label: "C".to_string(), min_percent: 73.0, gpa_points: Some(2.0), color: Some("#F59E0B".to_string()) },
+                GradeLevel { label: "C-".to_string(), min_percent: 70.0, gpa_points: Some(1.7), color: Some("#F59E0B".to_string()) },
+                GradeLevel { label: "D+".to_string(), min_percent: 67.0, gpa_points: Some(1.3), color: Some("#F97316".to_string()) },
+                GradeLevel { label: "D".to_string(), min_percent: 63.0, gpa_points: Some(1.0), color: Some("#F97316".to_string()) },
+                GradeLevel { label: "D-".to_string(), min_percent: 60.0, gpa_points: Some(0.7), color: Some("#F97316".to_string()) },
+                GradeLevel { label: "F".to_string(), min_percent: 0.0, gpa_points: Some(0.0), color: Some("#EF4444".to_string()) }
+            ]
+        }
+    }
+
+    /// Pass/Fail scale
+    fn pass_fail() -> GradeScale {
+        GradeScale {
+            id: "pass_fail".to_string(),
+            name: "Pass/Fail".to_string(),
+            levels: vec![
+                GradeLevel { label: "Pass".to_string(), min_percent: 60.0, gpa_points: None, color: Some("#22C55E".to_string()) },
+                GradeLevel { label: "Fail".to_string(), min_percent: 0.0, gpa_points: None, color: Some("#EF4444".to_string()) }
+            ]
+        }
+    }
+
+    /// Get grade label for percentage
+    fn get_grade(&self, percentage: f32) -> Option<String> {
+        for level in &self.levels {
+            if percentage >= level.min_percent {
+                return Some(level.label.clone())
+            }
+        }
+        None
+    }
+
+    /// Get GPA points for percentage
+    fn get_gpa(&self, percentage: f32) -> Option<f32> {
+        for level in &self.levels {
+            if percentage >= level.min_percent {
+                return level.gpa_points
+            }
+        }
+        None
+    }
+}
+
+// =============================================================================
+// GRADEBOOK ACTOR
+// =============================================================================
+
+/// Gradebook management actor
+actor GradebookActor {
+    state {
+        /// Grading schemes
+        schemes: Map<String, GradingScheme>,
+
+        /// Grade scales
+        scales: Map<String, GradeScale>,
+
+        /// Active overrides
+        overrides: Map<String, GradeOverride>,
+
+        /// Pending grading queue
+        pending_queue: List<PendingGrade>
+    }
+
+    /// Initialize gradebook actor
+    fn init() -> GradebookActor {
+        let mut scales = Map::new();
+        scales.insert("standard_af".to_string(), GradeScale::standard_af());
+        scales.insert("standard_plus_minus".to_string(), GradeScale::standard_plus_minus());
+        scales.insert("pass_fail".to_string(), GradeScale::pass_fail());
+
+        GradebookActor {
+            state: GradebookActorState {
+                schemes: Map::new(),
+                scales,
+                overrides: Map::new(),
+                pending_queue: vec![]
+            }
+        }
+    }
+
+    /// Get gradebook for a course
+    fn get_gradebook(&self, course_id: &CourseId) -> Result<CourseGradebook, LmsError> {
+        // Fetch course information
+        let course = db::query_one(
+            "SELECT id, title, code, passing_grade FROM courses WHERE id = $1",
+            [course_id]
+        ).map_err(|_| LmsError::NotFound {
+            entity_type: "Course".to_string(),
+            id: course_id.clone()
+        })?;
+
+        let course_info = CourseInfo {
+            id: course.get("id"),
+            title: course.get("title"),
+            code: course.get("code"),
+            enrollment_count: self.get_enrollment_count(course_id),
+            passing_grade: course.get("passing_grade"),
+        };
+
+        // Fetch grading scheme
+        let grading_scheme = self.state.schemes.get(course_id)
+            .cloned()
+            .unwrap_or_else(|| GradingScheme::default_weighted());
+
+        // Fetch assessments as columns
+        let assessments = db::query(
+            "SELECT a.id, a.title, a.short_name, a.assessment_type, a.category,
+                    a.max_points, a.weight, a.due_date, a.hidden, a.locked, a.position,
+                    COUNT(s.id) as total_submissions,
+                    COUNT(CASE WHEN s.graded_at IS NOT NULL THEN 1 END) as graded_count
+             FROM assessments a
+             LEFT JOIN submissions s ON s.assessment_id = a.id
+             WHERE a.course_id = $1
+             GROUP BY a.id
+             ORDER BY a.position, a.due_date",
+            [course_id]
+        ).unwrap_or_default();
+
+        let columns: List<GradebookColumn> = assessments.iter().map(|row| {
+            let total = row.get::<i32>("total_submissions");
+            let graded = row.get::<i32>("graded_count");
+            GradebookColumn {
+                id: row.get("id"),
+                name: row.get("title"),
+                short_name: row.get::<Option<String>>("short_name").unwrap_or_else(|| row.get("title")),
+                assessment_type: row.get("assessment_type"),
+                category: row.get("category"),
+                max_points: row.get("max_points"),
+                weight: row.get("weight"),
+                due_date: row.get("due_date"),
+                hidden: row.get("hidden"),
+                locked: row.get("locked"),
+                grading_status: ColumnGradingStatus {
+                    total_submissions: total,
+                    graded_count: graded,
+                    pending_count: total - graded,
+                    missing_count: self.get_enrollment_count(course_id) - total,
+                },
+                position: row.get("position"),
+            }
+        }).collect();
+
+        // Fetch enrolled students and their grades
+        let enrollments = db::query(
+            "SELECT u.id, u.name, u.email, e.student_id, u.avatar, e.last_activity, e.status
+             FROM enrollments e
+             JOIN users u ON u.id = e.user_id
+             WHERE e.course_id = $1 AND e.role = 'student'
+             ORDER BY u.name",
+            [course_id]
+        ).unwrap_or_default();
+
+        let students: List<StudentGradebookRow> = enrollments.iter().map(|row| {
+            let student_id: UserId = row.get("id");
+            let grades = self.get_student_grades_map(course_id, &student_id, &columns);
+            let category_totals = self.calculate_category_totals(&grades, &columns);
+            let overall = self.calculate_overall_grade(&category_totals, &grading_scheme);
+
+            StudentGradebookRow {
+                student: StudentInfo {
+                    id: student_id,
+                    name: row.get("name"),
+                    email: row.get("email"),
+                    student_id: row.get("student_id"),
+                    avatar: row.get("avatar"),
+                    last_activity: row.get("last_activity"),
+                },
+                grades,
+                category_totals,
+                overall,
+                enrollment_status: row.get("status"),
+            }
+        }).collect();
+
+        // Calculate category summaries
+        let categories = self.calculate_category_summaries(&columns);
+
+        // Calculate course statistics
+        let stats = self.calculate_gradebook_stats(&students);
+
+        Ok(CourseGradebook {
+            course: course_info,
+            grading_scheme,
+            columns,
+            students,
+            categories,
+            stats,
+        })
+    }
+
+    /// Get enrollment count for a course
+    fn get_enrollment_count(&self, course_id: &CourseId) -> i32 {
+        db::query_one(
+            "SELECT COUNT(*) as count FROM enrollments WHERE course_id = $1 AND role = 'student'",
+            [course_id]
+        ).map(|row| row.get::<i32>("count")).unwrap_or(0)
+    }
+
+    /// Get grades for a student as a map
+    fn get_student_grades_map(&self, course_id: &CourseId, student_id: &UserId, columns: &List<GradebookColumn>) -> Map<AssessmentId, GradebookCell> {
+        let grades_data = db::query(
+            "SELECT s.assessment_id, s.id as submission_id, s.submitted_at,
+                    g.score, g.max_score, g.percentage, g.letter_grade,
+                    g.graded_by, g.graded_at, g.late, g.excused, g.comments,
+                    o.active as override_active
+             FROM submissions s
+             LEFT JOIN grades g ON g.submission_id = s.id
+             LEFT JOIN grade_overrides o ON o.grade_id = g.id
+             WHERE s.user_id = $1 AND s.assessment_id IN (
+                SELECT id FROM assessments WHERE course_id = $2
+             )",
+            [student_id, course_id]
+        ).unwrap_or_default();
+
+        let mut grades_map: Map<AssessmentId, GradebookCell> = Map::new();
+
+        // Initialize with empty cells for all columns
+        for col in columns {
+            grades_map.insert(col.id.clone(), GradebookCell {
+                submission_id: None,
+                score: None,
+                max_score: col.max_points,
+                percentage: None,
+                letter_grade: None,
+                status: if col.due_date.map(|d| d < DateTime::now()).unwrap_or(false) {
+                    CellStatus::Missing
+                } else {
+                    CellStatus::NotSubmitted
+                },
+                graded_by: None,
+                graded_at: None,
+                submitted_at: None,
+                late: false,
+                excused: false,
+                override_active: false,
+                comments: None,
+            });
+        }
+
+        // Fill in actual grades
+        for row in grades_data {
+            let assessment_id: AssessmentId = row.get("assessment_id");
+            let score: Option<f32> = row.get("score");
+            let status = if row.get::<bool>("excused") {
+                CellStatus::Excused
+            } else if score.is_some() {
+                CellStatus::Graded
+            } else {
+                CellStatus::Submitted
+            };
+
+            grades_map.insert(assessment_id, GradebookCell {
+                submission_id: row.get("submission_id"),
+                score,
+                max_score: row.get("max_score"),
+                percentage: row.get("percentage"),
+                letter_grade: row.get("letter_grade"),
+                status,
+                graded_by: row.get("graded_by"),
+                graded_at: row.get("graded_at"),
+                submitted_at: row.get("submitted_at"),
+                late: row.get("late"),
+                excused: row.get("excused"),
+                override_active: row.get::<Option<bool>>("override_active").unwrap_or(false),
+                comments: row.get("comments"),
+            });
+        }
+
+        grades_map
+    }
+
+    /// Calculate category totals from grades
+    fn calculate_category_totals(&self, grades: &Map<AssessmentId, GradebookCell>, columns: &List<GradebookColumn>) -> Map<String, CategoryTotal> {
+        let mut category_scores: Map<String, (f32, f32, f32)> = Map::new(); // (earned, possible, weight)
+
+        for col in columns {
+            if let Some(cell) = grades.get(&col.id) {
+                if !cell.excused {
+                    let entry = category_scores.entry(col.category.clone()).or_insert((0.0, 0.0, col.weight));
+                    if let Some(score) = cell.score {
+                        entry.0 += score;
+                    }
+                    entry.1 += col.max_points;
+                }
+            }
+        }
+
+        category_scores.into_iter().map(|(category, (earned, possible, weight))| {
+            let percentage = if possible > 0.0 { (earned / possible) * 100.0 } else { 0.0 };
+            (category.clone(), CategoryTotal {
+                category,
+                earned_points: earned,
+                possible_points: possible,
+                percentage,
+                weight,
+                weighted_score: percentage * weight / 100.0,
+            })
+        }).collect()
+    }
+
+    /// Calculate overall grade from category totals
+    fn calculate_overall_grade(&self, category_totals: &Map<String, CategoryTotal>, scheme: &GradingScheme) -> OverallGrade {
+        let total_earned: f32 = category_totals.values().map(|c| c.earned_points).sum();
+        let total_possible: f32 = category_totals.values().map(|c| c.possible_points).sum();
+        let weighted_total: f32 = category_totals.values().map(|c| c.weighted_score).sum();
+        let total_weight: f32 = category_totals.values().map(|c| c.weight).sum();
+
+        let percentage = if total_weight > 0.0 {
+            (weighted_total / total_weight) * 100.0
+        } else if total_possible > 0.0 {
+            (total_earned / total_possible) * 100.0
+        } else {
+            0.0
+        };
+
+        let scale = self.state.scales.get(&scheme.grade_scale)
+            .cloned()
+            .unwrap_or_else(|| GradeScale::standard_af());
+        let letter_grade = scale.percentage_to_letter(percentage);
+        let passing = percentage >= scheme.passing_threshold;
+
+        OverallGrade {
+            earned_points: total_earned,
+            possible_points: total_possible,
+            percentage,
+            letter_grade: Some(letter_grade),
+            passing,
+            gpa_points: scale.letter_to_gpa(&letter_grade),
+        }
+    }
+
+    /// Calculate category summaries for the course
+    fn calculate_category_summaries(&self, columns: &List<GradebookColumn>) -> List<CategorySummary> {
+        let mut categories: Map<String, CategorySummary> = Map::new();
+
+        for col in columns {
+            let entry = categories.entry(col.category.clone()).or_insert(CategorySummary {
+                name: col.category.clone(),
+                weight: col.weight,
+                assessment_count: 0,
+                total_points: 0.0,
+                drop_lowest: 0,
+            });
+            entry.assessment_count += 1;
+            entry.total_points += col.max_points;
+        }
+
+        categories.into_values().collect()
+    }
+
+    /// Calculate gradebook statistics
+    fn calculate_gradebook_stats(&self, students: &List<StudentGradebookRow>) -> GradebookStats {
+        if students.is_empty() {
+            return GradebookStats::default();
+        }
+
+        let percentages: Vec<f32> = students.iter()
+            .map(|s| s.overall.percentage)
+            .collect();
+
+        let sum: f32 = percentages.iter().sum();
+        let mean = sum / percentages.len() as f32;
+
+        let mut sorted = percentages.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = sorted[sorted.len() / 2];
+
+        let variance: f32 = percentages.iter()
+            .map(|p| (p - mean).powi(2))
+            .sum::<f32>() / percentages.len() as f32;
+        let std_dev = variance.sqrt();
+
+        let passing_count = students.iter().filter(|s| s.overall.passing).count() as i32;
+
+        GradebookStats {
+            mean,
+            median,
+            std_dev,
+            min: sorted.first().copied().unwrap_or(0.0),
+            max: sorted.last().copied().unwrap_or(0.0),
+            passing_count,
+            failing_count: students.len() as i32 - passing_count,
+            grade_distribution: self.calculate_grade_distribution(&students),
+        }
+    }
+
+    /// Calculate grade distribution
+    fn calculate_grade_distribution(&self, students: &List<StudentGradebookRow>) -> Map<String, i32> {
+        let mut distribution: Map<String, i32> = Map::new();
+        for student in students {
+            if let Some(ref letter) = student.overall.letter_grade {
+                *distribution.entry(letter.clone()).or_insert(0) += 1;
+            }
+        }
+        distribution
+    }
+
+    /// Get student's grades for a course
+    fn get_student_grades(&self, course_id: &CourseId, student_id: &UserId) -> Result<StudentGradebookRow, LmsError> {
+        // Fetch student and enrollment info
+        let enrollment = db::query_one(
+            "SELECT u.id, u.name, u.email, e.student_id, u.avatar, e.last_activity, e.status
+             FROM enrollments e
+             JOIN users u ON u.id = e.user_id
+             WHERE e.course_id = $1 AND e.user_id = $2 AND e.role = 'student'",
+            [course_id, student_id]
+        ).map_err(|_| LmsError::NotFound {
+            entity_type: "Student".to_string(),
+            id: student_id.clone()
+        })?;
+
+        // Fetch grading scheme
+        let grading_scheme = self.state.schemes.get(course_id)
+            .cloned()
+            .unwrap_or_else(|| GradingScheme::default_weighted());
+
+        // Fetch assessment columns
+        let assessments = db::query(
+            "SELECT id, title, short_name, assessment_type, category, max_points, weight, due_date, hidden, locked, position
+             FROM assessments WHERE course_id = $1 ORDER BY position, due_date",
+            [course_id]
+        ).unwrap_or_default();
+
+        let columns: List<GradebookColumn> = assessments.iter().map(|row| {
+            GradebookColumn {
+                id: row.get("id"),
+                name: row.get("title"),
+                short_name: row.get::<Option<String>>("short_name").unwrap_or_else(|| row.get("title")),
+                assessment_type: row.get("assessment_type"),
+                category: row.get("category"),
+                max_points: row.get("max_points"),
+                weight: row.get("weight"),
+                due_date: row.get("due_date"),
+                hidden: row.get("hidden"),
+                locked: row.get("locked"),
+                grading_status: ColumnGradingStatus {
+                    total_submissions: 0,
+                    graded_count: 0,
+                    pending_count: 0,
+                    missing_count: 0,
+                },
+                position: row.get("position"),
+            }
+        }).collect();
+
+        // Get grades for this student
+        let grades = self.get_student_grades_map(course_id, student_id, &columns);
+        let category_totals = self.calculate_category_totals(&grades, &columns);
+        let overall = self.calculate_overall_grade(&category_totals, &grading_scheme);
+
+        Ok(StudentGradebookRow {
+            student: StudentInfo {
+                id: enrollment.get("id"),
+                name: enrollment.get("name"),
+                email: enrollment.get("email"),
+                student_id: enrollment.get("student_id"),
+                avatar: enrollment.get("avatar"),
+                last_activity: enrollment.get("last_activity"),
+            },
+            grades,
+            category_totals,
+            overall,
+            enrollment_status: enrollment.get("status"),
+        })
+    }
+
+    /// Enter or update a grade
+    fn enter_grade(&mut self, input: GradeEntryInput, grader_id: &UserId) -> Result<GradebookCell, LmsError> {
+        // Validate input
+        if input.score.is_some() && input.excused {
+            return Err(LmsError::ValidationFailed {
+                errors: vec![ValidationError {
+                    field: "score".to_string(),
+                    message: "Cannot set score when marking as excused".to_string(),
+                    code: "INVALID_COMBINATION".to_string()
+                }]
+            })
+        }
+
+        // Create grade cell
+        let cell = GradebookCell {
+            submission_id: input.submission_id,
+            score: input.score,
+            max_score: 100.0, // Would be fetched from assessment
+            percentage: input.score.map(|s| s), // Simplified
+            letter_grade: None,
+            status: if input.excused { CellStatus::Excused } else { CellStatus::Graded },
+            graded_by: Some(grader_id.clone()),
+            graded_at: Some(DateTime::now()),
+            submitted_at: None,
+            late: false,
+            excused: input.excused,
+            override_active: input.force_override,
+            comments: input.comments
+        };
+
+        Ok(cell)
+    }
+
+    /// Bulk grade update
+    fn bulk_update(&mut self, input: BulkGradeInput, grader_id: &UserId) -> Result<BulkGradeResult, LmsError> {
+        let mut results = vec![];
+        let mut success_count = 0;
+        let mut error_count = 0;
+
+        for target in input.targets {
+            match self.apply_bulk_action(&target, &input.action, grader_id) {
+                Ok(cell) => {
+                    results.push(BulkGradeItemResult {
+                        target: target,
+                        success: true,
+                        error: None
+                    });
+                    success_count += 1;
+                },
+                Err(e) => {
+                    results.push(BulkGradeItemResult {
+                        target: target,
+                        success: false,
+                        error: Some(format!("{:?}", e))
+                    });
+                    error_count += 1;
+                }
+            }
+        }
+
+        Ok(BulkGradeResult {
+            results,
+            success_count,
+            error_count
+        })
+    }
+
+    /// Apply a bulk action to a single target
+    fn apply_bulk_action(&mut self, target: &GradeTarget, action: &BulkGradeAction, grader_id: &UserId) -> Result<GradebookCell, LmsError> {
+        // Implementation would apply the action based on type
+        match action {
+            BulkGradeAction::SetScore { score } => {
+                self.enter_grade(GradeEntryInput {
+                    submission_id: None,
+                    assessment_id: target.assessment_id.clone(),
+                    student_id: target.student_id.clone(),
+                    score: Some(*score),
+                    comments: None,
+                    rubric_scores: None,
+                    excused: false,
+                    force_override: true
+                }, grader_id)
+            },
+            BulkGradeAction::MarkExcused => {
+                self.enter_grade(GradeEntryInput {
+                    submission_id: None,
+                    assessment_id: target.assessment_id.clone(),
+                    student_id: target.student_id.clone(),
+                    score: None,
+                    comments: None,
+                    rubric_scores: None,
+                    excused: true,
+                    force_override: true
+                }, grader_id)
+            },
+            _ => Err(LmsError::Internal { message: "Action not implemented".to_string() })
+        }
+    }
+
+    /// Add grade override
+    fn add_override(&mut self, override_input: GradeOverride) -> Result<GradeOverride, LmsError> {
+        let id = override_input.id.clone();
+        self.state.overrides.insert(id, override_input.clone());
+        Ok(override_input)
+    }
+
+    /// Remove grade override
+    fn remove_override(&mut self, override_id: &str) -> Result<(), LmsError> {
+        self.state.overrides.remove(override_id);
+        Ok(())
+    }
+
+    /// Get pending grading items
+    fn get_pending(&self, instructor_id: &UserId, course_id: Option<&CourseId>) -> List<PendingGrade> {
+        self.state.pending_queue.iter()
+            .filter(|p| {
+                if let Some(cid) = course_id {
+                    &p.course_id == cid
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Calculate final grade for student
+    fn calculate_final_grade(&self, course_id: &CourseId, student_id: &UserId) -> Result<OverallGrade, LmsError> {
+        // Would calculate based on grading scheme
+        Ok(OverallGrade {
+            earned_points: 0.0,
+            possible_points: 0.0,
+            percentage: 0.0,
+            letter_grade: None,
+            passing: false,
+            override_active: false,
+            override_grade: None
+        })
+    }
+
+    /// Export grades
+    fn export_grades(&self, course_id: &CourseId, format: GradeExportFormat) -> Result<GradeExport, LmsError> {
+        // Would generate export file
+        Ok(GradeExport {
+            filename: format!("grades-{}.csv", course_id),
+            content_type: "text/csv".to_string(),
+            data: vec![]
+        })
+    }
+
+    /// Import grades
+    fn import_grades(&mut self, course_id: &CourseId, data: List<GradeImportRow>, importer_id: &UserId) -> Result<GradeImportResult, LmsError> {
+        let mut imported = 0;
+        let mut skipped = 0;
+        let mut errors = vec![];
+
+        for (i, row) in data.iter().enumerate() {
+            match self.import_grade_row(course_id, row, importer_id) {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    errors.push(GradeImportError {
+                        row: i as i32,
+                        field: None,
+                        message: format!("{:?}", e)
+                    });
+                    skipped += 1;
+                }
+            }
+        }
+
+        Ok(GradeImportResult {
+            imported,
+            skipped,
+            errors
+        })
+    }
+
+    /// Import single grade row
+    fn import_grade_row(&mut self, course_id: &CourseId, row: &GradeImportRow, importer_id: &UserId) -> Result<(), LmsError> {
+        // Would validate and import the grade
+        Ok(())
+    }
+
+    /// Recalculate all grades for a course
+    fn recalculate_course(&mut self, course_id: &CourseId) -> Result<i32, LmsError> {
+        // Would recalculate all student grades
+        Ok(0)
+    }
+
+    /// Get grade history for a cell
+    fn get_grade_history(&self, assessment_id: &AssessmentId, student_id: &UserId) -> List<GradeHistoryEntry> {
+        vec![]
+    }
+}
+
+/// Pending grade item
+type PendingGrade {
+    submission_id: SubmissionId,
+    assessment_id: AssessmentId,
+    student_id: UserId,
+    course_id: CourseId,
+    student_name: String,
+    assessment_title: String,
+    course_title: String,
+    submitted_at: DateTime,
+    is_late: Bool,
+    is_resubmission: Bool
+}
+
+/// Bulk grade result
+type BulkGradeResult {
+    results: List<BulkGradeItemResult>,
+    success_count: i32,
+    error_count: i32
+}
+
+/// Individual bulk grade result
+type BulkGradeItemResult {
+    target: GradeTarget,
+    success: Bool,
+    error: Option<String>
+}
+
+/// Grade export format
+enum GradeExportFormat {
+    Csv,
+    Excel,
+    Pdf,
+    Canvas,
+    Moodle
+}
+
+/// Grade export data
+type GradeExport {
+    filename: String,
+    content_type: String,
+    data: List<u8>
+}
+
+/// Grade import row
+type GradeImportRow {
+    student_id: Option<String>,
+    student_email: Option<String>,
+    assessment_id: Option<String>,
+    assessment_name: Option<String>,
+    score: Option<f32>,
+    comments: Option<String>
+}
+
+/// Grade import result
+type GradeImportResult {
+    imported: i32,
+    skipped: i32,
+    errors: List<GradeImportError>
+}
+
+/// Grade import error
+type GradeImportError {
+    row: i32,
+    field: Option<String>,
+    message: String
+}
+
+/// Grade history entry
+type GradeHistoryEntry {
+    id: String,
+    timestamp: DateTime,
+    action: String,
+    old_score: Option<f32>,
+    new_score: Option<f32>,
+    old_grade: Option<String>,
+    new_grade: Option<String>,
+    changed_by: UserId,
+    reason: Option<String>
+}
+
+// =============================================================================
+// GRADE CALCULATION
+// =============================================================================
+
+/// Grade calculator
+type GradeCalculator {
+    scheme: GradingScheme
+}
+
+impl GradeCalculator {
+    /// Create calculator from scheme
+    fn new(scheme: GradingScheme) -> GradeCalculator {
+        GradeCalculator { scheme }
+    }
+
+    /// Calculate overall grade from grades
+    fn calculate(&self, grades: &List<GradebookCell>, columns: &List<GradebookColumn>) -> OverallGrade {
+        match self.scheme.calculation_method {
+            CalculationMethod::TotalPoints => self.calculate_total_points(grades, columns),
+            CalculationMethod::WeightedCategories => self.calculate_weighted(grades, columns),
+            CalculationMethod::EqualCategoryWeight => self.calculate_equal_weight(grades, columns)
+        }
+    }
+
+    /// Calculate using total points method
+    fn calculate_total_points(&self, grades: &List<GradebookCell>, columns: &List<GradebookColumn>) -> OverallGrade {
+        let mut earned = 0.0;
+        let mut possible = 0.0;
+
+        for (grade, column) in grades.iter().zip(columns.iter()) {
+            if grade.excused {
+                continue;
+            }
+
+            if let Some(score) = grade.score {
+                earned += score;
+                possible += column.max_points;
+            } else {
+                // Handle missing based on policy
+                match self.scheme.missing_policy.treatment {
+                    MissingTreatment::Exclude => {},
+                    MissingTreatment::Zero => {
+                        possible += column.max_points;
+                    },
+                    MissingTreatment::DefaultScore => {
+                        if let Some(default) = self.scheme.missing_policy.default_score {
+                            earned += default;
+                        }
+                        possible += column.max_points;
+                    }
+                }
+            }
+        }
+
+        let percentage = if possible > 0.0 { (earned / possible) * 100.0 } else { 0.0 };
+        let percentage = self.round_percentage(percentage);
+
+        let letter_grade = self.scheme.scale.as_ref()
+            .and_then(|s| s.get_grade(percentage));
+
+        OverallGrade {
+            earned_points: earned,
+            possible_points: possible,
+            percentage,
+            letter_grade,
+            passing: percentage >= 60.0, // Would use course passing grade
+            override_active: false,
+            override_grade: None
+        }
+    }
+
+    /// Calculate using weighted categories
+    fn calculate_weighted(&self, grades: &List<GradebookCell>, columns: &List<GradebookColumn>) -> OverallGrade {
+        let mut category_scores: Map<String, (f32, f32)> = Map::new();
+
+        // Group grades by category
+        for (grade, column) in grades.iter().zip(columns.iter()) {
+            if grade.excused {
+                continue;
+            }
+
+            let entry = category_scores.entry(column.category.clone())
+                .or_insert((0.0, 0.0));
+
+            if let Some(score) = grade.score {
+                entry.0 += score;
+                entry.1 += column.max_points;
+            }
+        }
+
+        // Calculate weighted total
+        let mut weighted_sum = 0.0;
+        let mut weight_sum = 0.0;
+
+        for (category, (earned, possible)) in &category_scores {
+            if let Some(weight_config) = self.scheme.category_weights.get(category) {
+                if *possible > 0.0 {
+                    let category_pct = (*earned / *possible) * 100.0;
+                    weighted_sum += category_pct * weight_config.weight;
+                    weight_sum += weight_config.weight;
+                }
+            }
+        }
+
+        let percentage = if weight_sum > 0.0 { weighted_sum / weight_sum } else { 0.0 };
+        let percentage = self.round_percentage(percentage);
+
+        let letter_grade = self.scheme.scale.as_ref()
+            .and_then(|s| s.get_grade(percentage));
+
+        OverallGrade {
+            earned_points: weighted_sum,
+            possible_points: weight_sum * 100.0,
+            percentage,
+            letter_grade,
+            passing: percentage >= 60.0,
+            override_active: false,
+            override_grade: None
+        }
+    }
+
+    /// Calculate with equal category weight
+    fn calculate_equal_weight(&self, grades: &List<GradebookCell>, columns: &List<GradebookColumn>) -> OverallGrade {
+        // Similar to weighted but all categories have equal weight
+        self.calculate_weighted(grades, columns)
+    }
+
+    /// Round percentage according to policy
+    fn round_percentage(&self, value: f32) -> f32 {
+        let multiplier = 10.0_f32.powi(self.scheme.rounding.decimal_places);
+
+        match self.scheme.rounding.mode {
+            RoundingMode::Up => (value * multiplier).ceil() / multiplier,
+            RoundingMode::Down => (value * multiplier).floor() / multiplier,
+            RoundingMode::Nearest => (value * multiplier).round() / multiplier
+        }
+    }
+}

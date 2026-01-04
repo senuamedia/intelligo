@@ -1,0 +1,680 @@
+// SIS Core - Provider trait and abstractions for Intelligo LMS
+// Defines the interface for all SIS integrations
+
+module intelligo::integrations::sis::core
+
+use intelligo::integrations::sis::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+
+/// SIS Provider trait - interface for all SIS implementations
+pub trait SisProvider {
+    /// Get provider configuration
+    fn get_config(self) -> SisConfig
+
+    /// Test connection to the SIS
+    async fn test_connection(self) -> Result<ConnectionTestResult, SisError>
+
+    /// Fetch all users from SIS
+    async fn fetch_users(self, options: FetchOptions) -> Result<Vec<SisUser>, SisError>
+
+    /// Fetch a single user by source ID
+    async fn fetch_user(self, source_id: String) -> Result<Option<SisUser>, SisError>
+
+    /// Fetch all courses from SIS
+    async fn fetch_courses(self, options: FetchOptions) -> Result<Vec<SisCourse>, SisError>
+
+    /// Fetch a single course by source ID
+    async fn fetch_course(self, source_id: String) -> Result<Option<SisCourse>, SisError>
+
+    /// Fetch all classes/sections from SIS
+    async fn fetch_classes(self, options: FetchOptions) -> Result<Vec<SisClass>, SisError>
+
+    /// Fetch a single class by source ID
+    async fn fetch_class(self, source_id: String) -> Result<Option<SisClass>, SisError>
+
+    /// Fetch all enrollments from SIS
+    async fn fetch_enrollments(self, options: FetchOptions) -> Result<Vec<SisEnrollment>, SisError>
+
+    /// Fetch enrollments for a specific class
+    async fn fetch_class_enrollments(
+        self,
+        class_id: String,
+        options: FetchOptions
+    ) -> Result<Vec<SisEnrollment>, SisError>
+
+    /// Fetch all terms from SIS
+    async fn fetch_terms(self, options: FetchOptions) -> Result<Vec<SisTerm>, SisError>
+
+    /// Push grades back to SIS (if supported)
+    async fn push_grades(self, grades: Vec<SisGrade>) -> Result<GradePushResult, SisError>
+
+    /// Check if grade passback is supported
+    fn supports_grade_passback(self) -> bool
+
+    /// Get supported capabilities
+    fn get_capabilities(self) -> Vec<SisCapability>
+
+    /// Get delta/changes since a given time (if supported)
+    async fn fetch_deltas(
+        self,
+        since: DateTime,
+        entity_types: Vec<SisEntityType>
+    ) -> Result<SisDelta, SisError>
+
+    /// Check if delta sync is supported
+    fn supports_delta_sync(self) -> bool
+}
+
+/// Fetch options for pagination and filtering
+pub type FetchOptions {
+    limit: Option<u32>,
+    offset: Option<u32>,
+    since: Option<DateTime>,
+    status_filter: Option<Vec<String>>,
+    include_inactive: bool,
+    sort_by: Option<String>,
+    sort_order: SortOrder,
+}
+
+impl FetchOptions {
+    pub fn default() -> Self {
+        FetchOptions {
+            limit: None,
+            offset: None,
+            since: None,
+            status_filter: None,
+            include_inactive: false,
+            sort_by: None,
+            sort_order: SortOrder::Ascending,
+        }
+    }
+
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn with_offset(mut self, offset: u32) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn since(mut self, since: DateTime) -> Self {
+        self.since = Some(since);
+        self
+    }
+
+    pub fn include_inactive(mut self) -> Self {
+        self.include_inactive = true;
+        self
+    }
+}
+
+/// Sort order
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+/// SIS Entity types
+pub enum SisEntityType {
+    User,
+    Course,
+    Class,
+    Enrollment,
+    Term,
+    Grade,
+    Organization,
+}
+
+impl SisEntityType {
+    pub fn to_string(self) -> String {
+        match self {
+            SisEntityType::User => "users".to_string(),
+            SisEntityType::Course => "courses".to_string(),
+            SisEntityType::Class => "classes".to_string(),
+            SisEntityType::Enrollment => "enrollments".to_string(),
+            SisEntityType::Term => "terms".to_string(),
+            SisEntityType::Grade => "grades".to_string(),
+            SisEntityType::Organization => "orgs".to_string(),
+        }
+    }
+}
+
+/// SIS Provider capabilities
+pub enum SisCapability {
+    Users,
+    Courses,
+    Classes,
+    Enrollments,
+    Terms,
+    Demographics,
+    GradePassback,
+    DeltaSync,
+    Realtime,
+    BulkOperations,
+}
+
+impl SisCapability {
+    pub fn to_string(self) -> String {
+        match self {
+            SisCapability::Users => "users".to_string(),
+            SisCapability::Courses => "courses".to_string(),
+            SisCapability::Classes => "classes".to_string(),
+            SisCapability::Enrollments => "enrollments".to_string(),
+            SisCapability::Terms => "terms".to_string(),
+            SisCapability::Demographics => "demographics".to_string(),
+            SisCapability::GradePassback => "gradePassback".to_string(),
+            SisCapability::DeltaSync => "deltaSync".to_string(),
+            SisCapability::Realtime => "realtime".to_string(),
+            SisCapability::BulkOperations => "bulk".to_string(),
+        }
+    }
+}
+
+/// Delta/change response
+pub type SisDelta {
+    since: DateTime,
+    until: DateTime,
+    users: Vec<SisDeltaItem<SisUser>>,
+    courses: Vec<SisDeltaItem<SisCourse>>,
+    classes: Vec<SisDeltaItem<SisClass>>,
+    enrollments: Vec<SisDeltaItem<SisEnrollment>>,
+}
+
+/// Delta item with operation type
+pub type SisDeltaItem<T> {
+    operation: DeltaOperation,
+    entity: T,
+    modified_at: DateTime,
+}
+
+/// Delta operation type
+pub enum DeltaOperation {
+    Create,
+    Update,
+    Delete,
+}
+
+/// Grade push result
+pub type GradePushResult {
+    success: bool,
+    grades_pushed: u32,
+    grades_failed: u32,
+    errors: Vec<GradePushError>,
+}
+
+/// Grade push error
+pub type GradePushError {
+    grade_id: String,
+    user_id: String,
+    class_id: String,
+    error_code: String,
+    message: String,
+}
+
+/// Paginated response wrapper
+pub type PaginatedResponse<T> {
+    data: Vec<T>,
+    total: u32,
+    offset: u32,
+    limit: u32,
+    has_more: bool,
+}
+
+impl<T> PaginatedResponse<T> {
+    pub fn new(data: Vec<T>, total: u32, offset: u32, limit: u32) -> Self {
+        let has_more = offset + (data.len() as u32) < total;
+        PaginatedResponse {
+            data: data,
+            total: total,
+            offset: offset,
+            limit: limit,
+            has_more: has_more,
+        }
+    }
+}
+
+/// Base SIS client for HTTP-based providers
+pub actor BaseSisClient {
+    base_url: String,
+    api_key: Option<String>,
+    oauth_config: Option<SisOAuthConfig>,
+    access_token: Option<String>,
+    token_expires_at: Option<DateTime>,
+    http_client: std::http::Client,
+
+    pub fn new(base_url: String) -> Self {
+        BaseSisClient {
+            base_url: base_url,
+            api_key: None,
+            oauth_config: None,
+            access_token: None,
+            token_expires_at: None,
+            http_client: std::http::Client::new(),
+        }
+    }
+
+    pub fn with_api_key(mut self, api_key: String) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    pub fn with_oauth(mut self, config: SisOAuthConfig) -> Self {
+        self.oauth_config = Some(config);
+        self
+    }
+
+    /// Ensure we have a valid access token
+    async fn ensure_token(mut self) -> Result<String, SisError> {
+        // Check if we have a valid token
+        if let Some(ref token) = self.access_token {
+            if let Some(expires_at) = self.token_expires_at {
+                if DateTime::now() < expires_at - Duration::minutes(5) {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        // Need to get a new token
+        if let Some(ref oauth) = self.oauth_config {
+            self.refresh_token().await
+        } else if let Some(ref api_key) = self.api_key {
+            Ok(api_key.clone())
+        } else {
+            Err(SisError::AuthenticationError {
+                message: "No authentication configured".to_string()
+            })
+        }
+    }
+
+    /// Refresh OAuth token
+    async fn refresh_token(mut self) -> Result<String, SisError> {
+        let oauth = self.oauth_config.as_ref().ok_or(
+            SisError::ConfigurationError {
+                message: "OAuth not configured".to_string()
+            }
+        )?;
+
+        let mut form_data = vec![
+            ("grant_type", "client_credentials".to_string()),
+            ("client_id", oauth.client_id.clone()),
+            ("client_secret", oauth.client_secret.clone()),
+        ];
+
+        if let Some(ref scope) = oauth.scope {
+            form_data.push(("scope", scope.clone()));
+        }
+
+        let response = self.http_client.post(&oauth.token_url)
+            .form(&form_data)
+            .send()
+            .await
+            .map_err(|e| SisError::ConnectionError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(SisError::AuthenticationError {
+                message: format!("Token request failed: {}", response.status())
+            });
+        }
+
+        let json: std::json::JsonValue = response.json().await
+            .map_err(|e| SisError::ParseError {
+                entity: "token".to_string(),
+                details: e.to_string()
+            })?;
+
+        let token = json["access_token"].as_str()
+            .ok_or(SisError::ParseError {
+                entity: "token".to_string(),
+                details: "Missing access_token".to_string()
+            })?
+            .to_string();
+
+        let expires_in = json["expires_in"].as_i64().unwrap_or(3600);
+        self.access_token = Some(token.clone());
+        self.token_expires_at = Some(DateTime::now() + Duration::seconds(expires_in));
+
+        Ok(token)
+    }
+
+    /// Make authenticated GET request
+    pub async fn get(mut self, path: &str) -> Result<std::json::JsonValue, SisError> {
+        let token = self.ensure_token().await?;
+        let url = format!("{}{}", self.base_url, path);
+
+        let response = self.http_client.get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| SisError::ConnectionError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make authenticated POST request
+    pub async fn post(
+        mut self,
+        path: &str,
+        body: std::json::JsonValue
+    ) -> Result<std::json::JsonValue, SisError> {
+        let token = self.ensure_token().await?;
+        let url = format!("{}{}", self.base_url, path);
+
+        let response = self.http_client.post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SisError::ConnectionError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make authenticated PUT request
+    pub async fn put(
+        mut self,
+        path: &str,
+        body: std::json::JsonValue
+    ) -> Result<std::json::JsonValue, SisError> {
+        let token = self.ensure_token().await?;
+        let url = format!("{}{}", self.base_url, path);
+
+        let response = self.http_client.put(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SisError::ConnectionError { message: e.to_string() })?;
+
+        self.handle_response(response).await
+    }
+
+    /// Make authenticated DELETE request
+    pub async fn delete(mut self, path: &str) -> Result<(), SisError> {
+        let token = self.ensure_token().await?;
+        let url = format!("{}{}", self.base_url, path);
+
+        let response = self.http_client.delete(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| SisError::ConnectionError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(SisError::ApiError {
+                status: status,
+                message: body
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Handle HTTP response
+    async fn handle_response(
+        self,
+        response: std::http::Response
+    ) -> Result<std::json::JsonValue, SisError> {
+        let status = response.status().as_u16();
+
+        if status == 429 {
+            let retry_after = response.headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|s| Duration::seconds(s as i64));
+
+            return Err(SisError::RateLimitError { retry_after: retry_after });
+        }
+
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SisError::ApiError {
+                status: status,
+                message: body
+            });
+        }
+
+        response.json().await
+            .map_err(|e| SisError::ParseError {
+                entity: "response".to_string(),
+                details: e.to_string()
+            })
+    }
+
+    /// Paginate through all results
+    pub async fn paginate<T, F>(
+        mut self,
+        path: &str,
+        parser: F
+    ) -> Result<Vec<T>, SisError>
+    where
+        F: Fn(std::json::JsonValue) -> Result<Vec<T>, SisError>
+    {
+        let mut all_items = Vec::new();
+        let mut offset = 0;
+        let limit = 100;
+
+        loop {
+            let url = format!("{}?limit={}&offset={}", path, limit, offset);
+            let response = self.get(&url).await?;
+
+            let items = parser(response.clone())?;
+            let count = items.len();
+            all_items.extend(items);
+
+            // Check if there are more pages
+            let has_more = response["hasMore"].as_bool().unwrap_or(false)
+                || count == limit as usize;
+
+            if !has_more || count == 0 {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        Ok(all_items)
+    }
+}
+
+/// Entity mapper for transforming SIS data
+pub trait EntityMapper<S, T> {
+    fn map(self, source: S, mappings: &SisFieldMappings) -> Result<T, SisError>;
+}
+
+/// User mapper implementation
+pub actor UserMapper {}
+
+impl EntityMapper<std::json::JsonValue, SisUser> for UserMapper {
+    fn map(
+        self,
+        source: std::json::JsonValue,
+        mappings: &SisFieldMappings
+    ) -> Result<SisUser, SisError> {
+        let source_id = get_json_field(&source, &mappings.user_id)
+            .ok_or(SisError::ParseError {
+                entity: "user".to_string(),
+                details: "Missing source ID".to_string()
+            })?;
+
+        let email = get_json_field(&source, &mappings.user_email)
+            .ok_or(SisError::ParseError {
+                entity: "user".to_string(),
+                details: "Missing email".to_string()
+            })?;
+
+        let first_name = get_json_field(&source, &mappings.user_first_name)
+            .unwrap_or_default();
+
+        let last_name = get_json_field(&source, &mappings.user_last_name)
+            .unwrap_or_default();
+
+        let role = mappings.user_role.as_ref()
+            .and_then(|field| get_json_field(&source, field))
+            .map(|r| SisRole::from_string(&r))
+            .unwrap_or(SisRole::Student);
+
+        let status = mappings.user_status.as_ref()
+            .and_then(|field| get_json_field(&source, field))
+            .map(|s| SisUserStatus::from_string(&s))
+            .unwrap_or(SisUserStatus::Active);
+
+        let grade_levels = mappings.user_grade_level.as_ref()
+            .and_then(|field| source.pointer(&json_pointer(field)))
+            .map(|v| match v {
+                std::json::JsonValue::Array(arr) =>
+                    arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+                std::json::JsonValue::String(s) =>
+                    vec![s.clone()],
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+
+        Ok(SisUser {
+            source_id: source_id,
+            email: email,
+            first_name: first_name,
+            last_name: last_name,
+            username: None,
+            role: role,
+            grade_levels: grade_levels,
+            status: status,
+            phone: None,
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+/// Course mapper implementation
+pub actor CourseMapper {}
+
+impl EntityMapper<std::json::JsonValue, SisCourse> for CourseMapper {
+    fn map(
+        self,
+        source: std::json::JsonValue,
+        mappings: &SisFieldMappings
+    ) -> Result<SisCourse, SisError> {
+        let source_id = get_json_field(&source, &mappings.course_id)
+            .ok_or(SisError::ParseError {
+                entity: "course".to_string(),
+                details: "Missing source ID".to_string()
+            })?;
+
+        let code = get_json_field(&source, &mappings.course_code)
+            .unwrap_or(source_id.clone());
+
+        let name = get_json_field(&source, &mappings.course_name)
+            .ok_or(SisError::ParseError {
+                entity: "course".to_string(),
+                details: "Missing course name".to_string()
+            })?;
+
+        let description = mappings.course_description.as_ref()
+            .and_then(|field| get_json_field(&source, field));
+
+        let status = mappings.course_status.as_ref()
+            .and_then(|field| get_json_field(&source, field))
+            .map(|s| SisCourseStatus::from_string(&s))
+            .unwrap_or(SisCourseStatus::Active);
+
+        let term_ids = mappings.course_term.as_ref()
+            .and_then(|field| source.pointer(&json_pointer(field)))
+            .map(|v| match v {
+                std::json::JsonValue::Array(arr) =>
+                    arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+                std::json::JsonValue::String(s) =>
+                    vec![s.clone()],
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+
+        Ok(SisCourse {
+            source_id: source_id,
+            code: code,
+            name: name,
+            description: description,
+            term_ids: term_ids,
+            status: status,
+            subject_codes: Vec::new(),
+            grade_levels: Vec::new(),
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+/// Enrollment mapper implementation
+pub actor EnrollmentMapper {}
+
+impl EntityMapper<std::json::JsonValue, SisEnrollment> for EnrollmentMapper {
+    fn map(
+        self,
+        source: std::json::JsonValue,
+        mappings: &SisFieldMappings
+    ) -> Result<SisEnrollment, SisError> {
+        let user_id = get_json_field(&source, &mappings.enrollment_user_id)
+            .ok_or(SisError::ParseError {
+                entity: "enrollment".to_string(),
+                details: "Missing user ID".to_string()
+            })?;
+
+        let class_id = get_json_field(&source, &mappings.enrollment_course_id)
+            .ok_or(SisError::ParseError {
+                entity: "enrollment".to_string(),
+                details: "Missing class ID".to_string()
+            })?;
+
+        let role = get_json_field(&source, &mappings.enrollment_role)
+            .map(|r| SisRole::from_string(&r))
+            .unwrap_or(SisRole::Student);
+
+        let status = mappings.enrollment_status.as_ref()
+            .and_then(|field| get_json_field(&source, field))
+            .map(|s| SisEnrollmentStatus::from_string(&s))
+            .unwrap_or(SisEnrollmentStatus::Active);
+
+        let begin_date = mappings.enrollment_start_date.as_ref()
+            .and_then(|field| get_json_field(&source, field))
+            .and_then(|s| DateTime::parse_iso8601(&s).ok());
+
+        let end_date = mappings.enrollment_end_date.as_ref()
+            .and_then(|field| get_json_field(&source, field))
+            .and_then(|s| DateTime::parse_iso8601(&s).ok());
+
+        let source_id = format!("{}_{}", user_id, class_id);
+
+        Ok(SisEnrollment {
+            source_id: source_id,
+            user_id: user_id,
+            class_id: class_id,
+            role: role,
+            status: status,
+            begin_date: begin_date,
+            end_date: end_date,
+            primary: true,
+        })
+    }
+}
+
+/// Helper function to get nested JSON field
+fn get_json_field(json: &std::json::JsonValue, field: &str) -> Option<String> {
+    let pointer = json_pointer(field);
+    json.pointer(&pointer)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Convert field path to JSON pointer
+fn json_pointer(field: &str) -> String {
+    format!("/{}", field.replace(".", "/"))
+}

@@ -1,0 +1,1127 @@
+// =============================================================================
+// INTELLIGO LMS - Learner Dashboard
+// =============================================================================
+// Personalized learner dashboard providing course progress, upcoming deadlines,
+// recent activity, AI recommendations, achievements, and quick access to
+// enrolled courses following Aether CMS patterns.
+// =============================================================================
+
+module intelligo::learner::dashboard
+
+use intelligo::core::types::*
+use intelligo::entities::enrollment::{Enrollment, EnrollmentStatus}
+use intelligo::entities::course::{Course, CourseBundle}
+use intelligo::entities::progress::{Progress, CompletionStatus}
+use intelligo::entities::grade::{Grade}
+use intelligo::entities::assessment::{Assessment}
+use intelligo::ai::hives::learning_path_hive::{ContentRecommendation, ProgressReport}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// Dashboard Configuration
+// =============================================================================
+
+/// Learner dashboard configuration
+pub struct LearnerDashboardConfig {
+    /// Show AI recommendations
+    show_recommendations: bool,
+    /// Number of recommendations to show
+    recommendation_count: i32,
+    /// Show achievements section
+    show_achievements: bool,
+    /// Show leaderboard
+    show_leaderboard: bool,
+    /// Show calendar
+    show_calendar: bool,
+    /// Recent activity count
+    recent_activity_count: i32,
+    /// Upcoming deadlines days ahead
+    deadline_lookahead_days: i32,
+    /// Enable gamification features
+    gamification_enabled: bool,
+    /// Show study streak
+    show_study_streak: bool,
+}
+
+impl Default for LearnerDashboardConfig {
+    fn default() -> Self {
+        LearnerDashboardConfig {
+            show_recommendations: true,
+            recommendation_count: 5,
+            show_achievements: true,
+            show_leaderboard: false,
+            show_calendar: true,
+            recent_activity_count: 10,
+            deadline_lookahead_days: 14,
+            gamification_enabled: true,
+            show_study_streak: true,
+        }
+    }
+}
+
+// =============================================================================
+// Dashboard Data Types
+// =============================================================================
+
+/// Complete learner dashboard data
+pub struct LearnerDashboardData {
+    /// Student info
+    student: StudentInfo,
+    /// Overall progress summary
+    progress_summary: ProgressSummary,
+    /// Enrolled courses with progress
+    courses: List<CourseProgress>,
+    /// Upcoming deadlines
+    deadlines: List<UpcomingDeadline>,
+    /// Recent activity
+    recent_activity: List<ActivityItem>,
+    /// AI-powered recommendations
+    recommendations: List<ContentRecommendation>,
+    /// Achievements and badges
+    achievements: AchievementsData,
+    /// Study streak
+    streak: StudyStreak,
+    /// Notifications
+    notifications: List<DashboardNotification>,
+    /// Quick stats
+    stats: LearnerStats,
+    /// Calendar events
+    calendar_events: List<CalendarEvent>,
+    /// Generated at
+    generated_at: DateTime,
+}
+
+/// Student information
+pub struct StudentInfo {
+    id: StudentId,
+    name: String,
+    email: String,
+    avatar_url: Option<String>,
+    enrolled_since: DateTime,
+    last_activity: Option<DateTime>,
+}
+
+/// Overall progress summary
+pub struct ProgressSummary {
+    /// Total courses enrolled
+    total_courses: i32,
+    /// Completed courses
+    completed_courses: i32,
+    /// In-progress courses
+    active_courses: i32,
+    /// Overall completion percentage
+    overall_completion: f32,
+    /// Total learning hours
+    total_hours: f32,
+    /// This week's learning hours
+    week_hours: f32,
+    /// Certificates earned
+    certificates_earned: i32,
+    /// Current level (gamification)
+    level: LearnerLevel,
+    /// XP points
+    xp_points: i64,
+}
+
+/// Learner level (gamification)
+pub struct LearnerLevel {
+    level: i32,
+    name: String,
+    xp_current: i64,
+    xp_next_level: i64,
+    progress_percent: f32,
+}
+
+/// Course with progress information
+pub struct CourseProgress {
+    /// Course details
+    course_id: CourseId,
+    course_name: String,
+    course_description: Option<String>,
+    course_image: Option<String>,
+    instructor_name: Option<String>,
+    /// Enrollment details
+    enrollment_id: EnrollmentId,
+    enrolled_at: DateTime,
+    enrollment_status: EnrollmentStatus,
+    /// Progress details
+    progress_percent: f32,
+    completion_status: CompletionStatus,
+    last_accessed: Option<DateTime>,
+    /// Module progress
+    modules_completed: i32,
+    modules_total: i32,
+    /// Lesson progress
+    lessons_completed: i32,
+    lessons_total: i32,
+    /// Assessment progress
+    assessments_completed: i32,
+    assessments_total: i32,
+    /// Current grade
+    current_grade: Option<GradeDisplay>,
+    /// Time spent
+    time_spent_hours: f32,
+    /// Estimated time remaining
+    estimated_remaining_hours: f32,
+    /// Next action
+    next_action: Option<NextAction>,
+    /// Due date (if instructor-led)
+    due_date: Option<DateTime>,
+    /// Resume URL
+    resume_url: String,
+}
+
+/// Grade display information
+pub struct GradeDisplay {
+    score: f32,
+    max_score: f32,
+    percentage: f32,
+    letter_grade: Option<String>,
+    grade_status: GradeStatus,
+}
+
+/// Grade status
+pub enum GradeStatus {
+    Passing,
+    AtRisk,
+    Failing,
+    NotYetGraded,
+}
+
+/// Next action for the learner
+pub struct NextAction {
+    action_type: NextActionType,
+    title: String,
+    description: Option<String>,
+    url: String,
+    priority: ActionPriority,
+    due_date: Option<DateTime>,
+}
+
+/// Type of next action
+pub enum NextActionType {
+    ContinueLesson,
+    StartLesson,
+    TakeAssessment,
+    ViewFeedback,
+    CompleteAssignment,
+    JoinSession,
+    ReviewMaterial,
+}
+
+/// Action priority
+pub enum ActionPriority {
+    Low,
+    Normal,
+    High,
+    Urgent,
+}
+
+/// Upcoming deadline
+pub struct UpcomingDeadline {
+    id: String,
+    title: String,
+    description: Option<String>,
+    deadline_type: DeadlineType,
+    course_id: CourseId,
+    course_name: String,
+    due_date: DateTime,
+    time_remaining: Duration,
+    status: DeadlineStatus,
+    url: String,
+}
+
+/// Deadline type
+pub enum DeadlineType {
+    Assignment,
+    Quiz,
+    Exam,
+    Project,
+    Discussion,
+    CourseEnd,
+    EnrollmentExpiry,
+}
+
+/// Deadline status
+pub enum DeadlineStatus {
+    Upcoming,
+    DueSoon,
+    Overdue,
+    Completed,
+}
+
+/// Recent activity item
+pub struct ActivityItem {
+    id: String,
+    activity_type: ActivityType,
+    title: String,
+    description: Option<String>,
+    course_id: Option<CourseId>,
+    course_name: Option<String>,
+    timestamp: DateTime,
+    icon: String,
+    url: Option<String>,
+    metadata: Map<String, String>,
+}
+
+/// Activity type
+pub enum ActivityType {
+    LessonCompleted,
+    LessonStarted,
+    AssessmentSubmitted,
+    AssessmentGraded,
+    BadgeEarned,
+    CertificateEarned,
+    CourseEnrolled,
+    CourseCompleted,
+    DiscussionPost,
+    FileUploaded,
+    SessionAttended,
+    XpEarned,
+    LevelUp,
+    StreakAchieved,
+}
+
+/// Achievements data
+pub struct AchievementsData {
+    /// Recently earned badges
+    recent_badges: List<Badge>,
+    /// Total badges earned
+    total_badges: i32,
+    /// Available badges
+    available_badges: i32,
+    /// Certificates earned
+    certificates: List<Certificate>,
+    /// Milestones
+    milestones: List<Milestone>,
+    /// Next achievement (closest to earning)
+    next_achievement: Option<NextAchievement>,
+}
+
+/// Badge
+pub struct Badge {
+    id: String,
+    name: String,
+    description: String,
+    icon_url: String,
+    category: BadgeCategory,
+    earned_at: DateTime,
+    rarity: BadgeRarity,
+}
+
+/// Badge category
+pub enum BadgeCategory {
+    Completion,
+    Performance,
+    Engagement,
+    Streak,
+    Social,
+    Special,
+}
+
+/// Badge rarity
+pub enum BadgeRarity {
+    Common,
+    Uncommon,
+    Rare,
+    Epic,
+    Legendary,
+}
+
+/// Certificate
+pub struct Certificate {
+    id: String,
+    course_id: CourseId,
+    course_name: String,
+    issued_at: DateTime,
+    certificate_url: String,
+    verification_code: String,
+}
+
+/// Milestone
+pub struct Milestone {
+    id: String,
+    name: String,
+    description: String,
+    achieved: bool,
+    achieved_at: Option<DateTime>,
+    progress: f32,
+    target: String,
+}
+
+/// Next achievement to earn
+pub struct NextAchievement {
+    name: String,
+    description: String,
+    icon_url: String,
+    progress: f32,
+    requirements_remaining: String,
+}
+
+/// Study streak
+pub struct StudyStreak {
+    /// Current streak in days
+    current_streak: i32,
+    /// Longest streak ever
+    longest_streak: i32,
+    /// Streak freeze available
+    freeze_available: bool,
+    /// Days studied this week
+    days_this_week: i32,
+    /// Goal (days per week)
+    weekly_goal: i32,
+    /// Streak history (last 30 days)
+    history: List<StreakDay>,
+}
+
+/// Single day in streak history
+pub struct StreakDay {
+    date: DateTime,
+    studied: bool,
+    minutes: i32,
+}
+
+/// Dashboard notification
+pub struct DashboardNotification {
+    id: String,
+    notification_type: NotificationType,
+    title: String,
+    message: String,
+    priority: NotificationPriority,
+    created_at: DateTime,
+    read: bool,
+    action_url: Option<String>,
+    action_label: Option<String>,
+}
+
+/// Notification type
+pub enum NotificationType {
+    Announcement,
+    DeadlineReminder,
+    GradePosted,
+    FeedbackReceived,
+    NewContent,
+    Achievement,
+    SystemMessage,
+    InstructorMessage,
+}
+
+/// Notification priority
+pub enum NotificationPriority {
+    Low,
+    Normal,
+    High,
+}
+
+/// Learner stats
+pub struct LearnerStats {
+    /// Total time spent learning
+    total_time_hours: f32,
+    /// Time this week
+    week_time_hours: f32,
+    /// Time today
+    today_time_minutes: i32,
+    /// Average session length
+    avg_session_minutes: i32,
+    /// Lessons completed
+    lessons_completed: i32,
+    /// Assessments taken
+    assessments_taken: i32,
+    /// Average assessment score
+    avg_assessment_score: f32,
+    /// Rank in cohort (if applicable)
+    cohort_rank: Option<i32>,
+    /// Cohort size
+    cohort_size: Option<i32>,
+}
+
+/// Calendar event
+pub struct CalendarEvent {
+    id: String,
+    title: String,
+    description: Option<String>,
+    event_type: CalendarEventType,
+    start_time: DateTime,
+    end_time: Option<DateTime>,
+    course_id: Option<CourseId>,
+    course_name: Option<String>,
+    location: Option<String>,
+    url: Option<String>,
+    is_all_day: bool,
+}
+
+/// Calendar event type
+pub enum CalendarEventType {
+    Deadline,
+    LiveSession,
+    ExamWindow,
+    OfficeHours,
+    Reminder,
+    CourseStart,
+    CourseEnd,
+}
+
+// =============================================================================
+// Dashboard Widget System
+// =============================================================================
+
+/// Dashboard widget configuration
+pub struct DashboardWidget {
+    id: String,
+    widget_type: WidgetType,
+    title: String,
+    position: WidgetPosition,
+    size: WidgetSize,
+    visible: bool,
+    collapsed: bool,
+    settings: Map<String, String>,
+}
+
+/// Widget type
+pub enum WidgetType {
+    ProgressOverview,
+    CourseList,
+    Deadlines,
+    RecentActivity,
+    Recommendations,
+    Achievements,
+    Streak,
+    Calendar,
+    Stats,
+    Notifications,
+    QuickActions,
+    Leaderboard,
+    Goals,
+    StudyTimer,
+}
+
+/// Widget position
+pub struct WidgetPosition {
+    row: i32,
+    column: i32,
+}
+
+/// Widget size
+pub enum WidgetSize {
+    Small,
+    Medium,
+    Large,
+    Full,
+}
+
+/// Dashboard layout
+pub struct DashboardLayout {
+    student_id: StudentId,
+    widgets: List<DashboardWidget>,
+    theme: DashboardTheme,
+    updated_at: DateTime,
+}
+
+/// Dashboard theme
+pub enum DashboardTheme {
+    Default,
+    Compact,
+    Expanded,
+    Focus,
+}
+
+// =============================================================================
+// Dashboard Actor
+// =============================================================================
+
+/// Learner dashboard actor
+pub actor LearnerDashboardActor {
+    var config: LearnerDashboardConfig = LearnerDashboardConfig::default()
+
+    /// Dashboard data cache (student_id -> data)
+    var dashboard_cache: Map<StudentId, CachedDashboard> = Map::new()
+
+    /// Custom layouts (student_id -> layout)
+    var layouts: Map<StudentId, DashboardLayout> = Map::new()
+
+    /// Study session tracking
+    var active_sessions: Map<StudentId, StudySession> = Map::new()
+
+    /// Cache TTL
+    var cache_ttl: Duration = Duration::minutes(5)
+
+    pub fn new() -> Self {
+        LearnerDashboardActor {
+            config: LearnerDashboardConfig::default(),
+            dashboard_cache: Map::new(),
+            layouts: Map::new(),
+            active_sessions: Map::new(),
+            cache_ttl: Duration::minutes(5),
+        }
+    }
+
+    /// Get complete dashboard data
+    pub receive GetDashboard(
+        student_id: StudentId,
+        tenant_id: TenantId,
+        force_refresh: bool
+    ) -> Result<LearnerDashboardData, LmsError> {
+        // Check cache
+        if !force_refresh {
+            if let Some(cached) = self.dashboard_cache.get(&student_id) {
+                if cached.expires_at > DateTime::now() {
+                    return Ok(cached.data.clone());
+                }
+            }
+        }
+
+        // Build fresh dashboard
+        let dashboard = self.build_dashboard(&student_id, &tenant_id).await?;
+
+        // Cache the result
+        self.dashboard_cache.insert(student_id.clone(), CachedDashboard {
+            data: dashboard.clone(),
+            expires_at: DateTime::now() + self.cache_ttl,
+        });
+
+        Ok(dashboard)
+    }
+
+    /// Get enrolled courses with progress
+    pub receive GetCourses(
+        student_id: StudentId,
+        tenant_id: TenantId,
+        filter: Option<CourseFilter>
+    ) -> Result<List<CourseProgress>, LmsError> {
+        self.fetch_courses(&student_id, &tenant_id, filter).await
+    }
+
+    /// Get upcoming deadlines
+    pub receive GetDeadlines(
+        student_id: StudentId,
+        tenant_id: TenantId,
+        days_ahead: Option<i32>
+    ) -> Result<List<UpcomingDeadline>, LmsError> {
+        let lookahead = days_ahead.unwrap_or(self.config.deadline_lookahead_days);
+        self.fetch_deadlines(&student_id, &tenant_id, lookahead).await
+    }
+
+    /// Get recent activity
+    pub receive GetActivity(
+        student_id: StudentId,
+        tenant_id: TenantId,
+        limit: Option<i32>
+    ) -> Result<List<ActivityItem>, LmsError> {
+        let count = limit.unwrap_or(self.config.recent_activity_count);
+        self.fetch_activity(&student_id, &tenant_id, count).await
+    }
+
+    /// Get AI recommendations
+    pub receive GetRecommendations(
+        student_id: StudentId,
+        tenant_id: TenantId
+    ) -> Result<List<ContentRecommendation>, LmsError> {
+        self.fetch_recommendations(&student_id, &tenant_id).await
+    }
+
+    /// Get achievements
+    pub receive GetAchievements(
+        student_id: StudentId,
+        tenant_id: TenantId
+    ) -> Result<AchievementsData, LmsError> {
+        self.fetch_achievements(&student_id, &tenant_id).await
+    }
+
+    /// Get study streak
+    pub receive GetStreak(student_id: StudentId) -> Result<StudyStreak, LmsError> {
+        self.fetch_streak(&student_id).await
+    }
+
+    /// Start study session (for time tracking)
+    pub receive StartStudySession(
+        student_id: StudentId,
+        course_id: Option<CourseId>,
+        lesson_id: Option<LessonId>
+    ) -> Result<String, LmsError> {
+        let session_id = generate_uuid();
+
+        let session = StudySession {
+            id: session_id.clone(),
+            student_id: student_id.clone(),
+            course_id,
+            lesson_id,
+            started_at: DateTime::now(),
+            last_activity: DateTime::now(),
+            total_seconds: 0,
+            paused: false,
+        };
+
+        self.active_sessions.insert(student_id, session);
+
+        checkpoint();
+        Ok(session_id)
+    }
+
+    /// End study session
+    pub receive EndStudySession(
+        student_id: StudentId
+    ) -> Result<StudySessionSummary, LmsError> {
+        let session = self.active_sessions.remove(&student_id)
+            .ok_or(LmsError::NotFound {
+                entity_type: "StudySession".to_string(),
+                id: student_id.clone()
+            })?;
+
+        let duration = DateTime::now() - session.started_at;
+        let total_seconds = duration.as_secs() as i32;
+
+        // Update streak if studied enough (5+ minutes)
+        if total_seconds >= 300 {
+            self.update_streak(&student_id).await;
+        }
+
+        // Record activity
+        self.record_study_activity(&session, total_seconds).await;
+
+        // Invalidate cache
+        self.dashboard_cache.remove(&student_id);
+
+        checkpoint();
+        Ok(StudySessionSummary {
+            session_id: session.id,
+            duration_seconds: total_seconds,
+            xp_earned: self.calculate_xp(total_seconds),
+        })
+    }
+
+    /// Update study session activity (heartbeat)
+    pub receive UpdateSessionActivity(student_id: StudentId) {
+        if let Some(session) = self.active_sessions.get_mut(&student_id) {
+            session.last_activity = DateTime::now();
+        }
+        checkpoint();
+    }
+
+    /// Get/set dashboard layout
+    pub receive GetLayout(student_id: StudentId) -> Option<DashboardLayout> {
+        self.layouts.get(&student_id).cloned()
+    }
+
+    pub receive SaveLayout(
+        student_id: StudentId,
+        layout: DashboardLayout
+    ) -> Result<(), LmsError> {
+        self.layouts.insert(student_id, layout);
+        checkpoint();
+        Ok(())
+    }
+
+    /// Get calendar events
+    pub receive GetCalendarEvents(
+        student_id: StudentId,
+        tenant_id: TenantId,
+        start_date: DateTime,
+        end_date: DateTime
+    ) -> Result<List<CalendarEvent>, LmsError> {
+        self.fetch_calendar_events(&student_id, &tenant_id, start_date, end_date).await
+    }
+
+    /// Mark notification as read
+    pub receive MarkNotificationRead(
+        student_id: StudentId,
+        notification_id: String
+    ) -> Result<(), LmsError> {
+        // In production, this would update the notification in the database
+        // Invalidate cache
+        self.dashboard_cache.remove(&student_id);
+        checkpoint();
+        Ok(())
+    }
+
+    // =========================================================================
+    // Private Methods
+    // =========================================================================
+
+    async fn build_dashboard(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId
+    ) -> Result<LearnerDashboardData, LmsError> {
+        // Fetch all data in parallel
+        let (
+            student,
+            courses,
+            deadlines,
+            activity,
+            recommendations,
+            achievements,
+            streak,
+            notifications,
+            stats,
+            calendar
+        ) = tokio::join!(
+            self.fetch_student_info(student_id, tenant_id),
+            self.fetch_courses(student_id, tenant_id, None),
+            self.fetch_deadlines(student_id, tenant_id, self.config.deadline_lookahead_days),
+            self.fetch_activity(student_id, tenant_id, self.config.recent_activity_count),
+            self.fetch_recommendations(student_id, tenant_id),
+            self.fetch_achievements(student_id, tenant_id),
+            self.fetch_streak(student_id),
+            self.fetch_notifications(student_id, tenant_id),
+            self.fetch_stats(student_id, tenant_id),
+            self.fetch_calendar_events(
+                student_id,
+                tenant_id,
+                DateTime::now(),
+                DateTime::now() + Duration::days(30)
+            )
+        );
+
+        // Calculate progress summary
+        let progress_summary = self.calculate_progress_summary(&courses?)?;
+
+        Ok(LearnerDashboardData {
+            student: student?,
+            progress_summary,
+            courses: courses?,
+            deadlines: deadlines?,
+            recent_activity: activity?,
+            recommendations: recommendations.unwrap_or_default(),
+            achievements: achievements?,
+            streak: streak?,
+            notifications: notifications?,
+            stats: stats?,
+            calendar_events: calendar?,
+            generated_at: DateTime::now(),
+        })
+    }
+
+    async fn fetch_student_info(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId
+    ) -> Result<StudentInfo, LmsError> {
+        // In production, query from user service
+        Ok(StudentInfo {
+            id: student_id.clone(),
+            name: "Student".to_string(),
+            email: "student@example.com".to_string(),
+            avatar_url: None,
+            enrolled_since: DateTime::now() - Duration::days(30),
+            last_activity: Some(DateTime::now()),
+        })
+    }
+
+    async fn fetch_courses(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId,
+        filter: Option<CourseFilter>
+    ) -> Result<List<CourseProgress>, LmsError> {
+        // In production, query enrollments and progress from storage
+        // For now, return empty list
+        Ok(vec![])
+    }
+
+    async fn fetch_deadlines(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId,
+        days_ahead: i32
+    ) -> Result<List<UpcomingDeadline>, LmsError> {
+        // In production, query from assessment and assignment storage
+        Ok(vec![])
+    }
+
+    async fn fetch_activity(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId,
+        limit: i32
+    ) -> Result<List<ActivityItem>, LmsError> {
+        // In production, query from activity log
+        Ok(vec![])
+    }
+
+    async fn fetch_recommendations(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId
+    ) -> Result<List<ContentRecommendation>, LmsError> {
+        // In production, call LearningPathHive
+        Ok(vec![])
+    }
+
+    async fn fetch_achievements(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId
+    ) -> Result<AchievementsData, LmsError> {
+        Ok(AchievementsData {
+            recent_badges: vec![],
+            total_badges: 0,
+            available_badges: 20,
+            certificates: vec![],
+            milestones: vec![],
+            next_achievement: None,
+        })
+    }
+
+    async fn fetch_streak(
+        &self,
+        student_id: &StudentId
+    ) -> Result<StudyStreak, LmsError> {
+        // In production, query from progress storage
+        Ok(StudyStreak {
+            current_streak: 0,
+            longest_streak: 0,
+            freeze_available: true,
+            days_this_week: 0,
+            weekly_goal: 5,
+            history: vec![],
+        })
+    }
+
+    async fn fetch_notifications(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId
+    ) -> Result<List<DashboardNotification>, LmsError> {
+        // In production, query from notifications service
+        Ok(vec![])
+    }
+
+    async fn fetch_stats(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId
+    ) -> Result<LearnerStats, LmsError> {
+        Ok(LearnerStats {
+            total_time_hours: 0.0,
+            week_time_hours: 0.0,
+            today_time_minutes: 0,
+            avg_session_minutes: 0,
+            lessons_completed: 0,
+            assessments_taken: 0,
+            avg_assessment_score: 0.0,
+            cohort_rank: None,
+            cohort_size: None,
+        })
+    }
+
+    async fn fetch_calendar_events(
+        &self,
+        student_id: &StudentId,
+        tenant_id: &TenantId,
+        start_date: DateTime,
+        end_date: DateTime
+    ) -> Result<List<CalendarEvent>, LmsError> {
+        // In production, aggregate from courses, sessions, deadlines
+        Ok(vec![])
+    }
+
+    fn calculate_progress_summary(
+        &self,
+        courses: &List<CourseProgress>
+    ) -> Result<ProgressSummary, LmsError> {
+        let total_courses = courses.len() as i32;
+        let completed_courses = courses.iter()
+            .filter(|c| c.completion_status == CompletionStatus::Completed)
+            .count() as i32;
+        let active_courses = total_courses - completed_courses;
+
+        let overall_completion = if total_courses > 0 {
+            courses.iter().map(|c| c.progress_percent).sum::<f32>() / total_courses as f32
+        } else {
+            0.0
+        };
+
+        let total_hours: f32 = courses.iter()
+            .map(|c| c.time_spent_hours)
+            .sum();
+
+        Ok(ProgressSummary {
+            total_courses,
+            completed_courses,
+            active_courses,
+            overall_completion,
+            total_hours,
+            week_hours: 0.0, // Would calculate from session data
+            certificates_earned: completed_courses, // Simplified
+            level: LearnerLevel {
+                level: 1,
+                name: "Beginner".to_string(),
+                xp_current: 0,
+                xp_next_level: 100,
+                progress_percent: 0.0,
+            },
+            xp_points: 0,
+        })
+    }
+
+    async fn update_streak(&self, student_id: &StudentId) {
+        // In production, update streak in storage
+    }
+
+    async fn record_study_activity(&self, session: &StudySession, total_seconds: i32) {
+        // In production, record to activity log
+    }
+
+    fn calculate_xp(&self, total_seconds: i32) -> i64 {
+        // 1 XP per minute studied
+        (total_seconds / 60) as i64
+    }
+}
+
+// =============================================================================
+// Supporting Types
+// =============================================================================
+
+/// Cached dashboard data
+struct CachedDashboard {
+    data: LearnerDashboardData,
+    expires_at: DateTime,
+}
+
+/// Active study session
+struct StudySession {
+    id: String,
+    student_id: StudentId,
+    course_id: Option<CourseId>,
+    lesson_id: Option<LessonId>,
+    started_at: DateTime,
+    last_activity: DateTime,
+    total_seconds: i32,
+    paused: bool,
+}
+
+/// Study session summary
+pub struct StudySessionSummary {
+    session_id: String,
+    duration_seconds: i32,
+    xp_earned: i64,
+}
+
+/// Course filter
+pub struct CourseFilter {
+    status: Option<EnrollmentStatus>,
+    completion: Option<CompletionStatus>,
+    search: Option<String>,
+    sort_by: Option<CourseSortBy>,
+}
+
+/// Course sort options
+pub enum CourseSortBy {
+    LastAccessed,
+    Progress,
+    DueDate,
+    Name,
+    EnrollmentDate,
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// HTML Template Helpers
+// =============================================================================
+
+/// Render progress bar HTML
+pub fn render_progress_bar(percent: f32, size: &str, color: &str) -> String {
+    let clamped = percent.max(0.0).min(100.0);
+    format!(
+        r#"<div class="progress progress-{size}">
+            <div class="progress-bar bg-{color}" role="progressbar"
+                 style="width: {clamped}%;" aria-valuenow="{clamped}"
+                 aria-valuemin="0" aria-valuemax="100">
+                {clamped:.0}%
+            </div>
+        </div>"#,
+        size = size,
+        color = color,
+        clamped = clamped
+    )
+}
+
+/// Render deadline status badge
+pub fn render_deadline_badge(status: &DeadlineStatus) -> String {
+    let (class, text) = match status {
+        DeadlineStatus::Upcoming => ("badge-info", "Upcoming"),
+        DeadlineStatus::DueSoon => ("badge-warning", "Due Soon"),
+        DeadlineStatus::Overdue => ("badge-danger", "Overdue"),
+        DeadlineStatus::Completed => ("badge-success", "Completed"),
+    };
+    format!(r#"<span class="badge {}">{}</span>"#, class, text)
+}
+
+/// Format duration for display
+pub fn format_duration(duration: Duration) -> String {
+    let total_hours = duration.as_secs() / 3600;
+    let days = total_hours / 24;
+    let hours = total_hours % 24;
+
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h", hours)
+    } else {
+        let minutes = (duration.as_secs() % 3600) / 60;
+        format!("{}m", minutes)
+    }
+}
+
+/// Get activity icon
+pub fn get_activity_icon(activity_type: &ActivityType) -> &str {
+    match activity_type {
+        ActivityType::LessonCompleted => "check-circle",
+        ActivityType::LessonStarted => "play-circle",
+        ActivityType::AssessmentSubmitted => "file-text",
+        ActivityType::AssessmentGraded => "award",
+        ActivityType::BadgeEarned => "star",
+        ActivityType::CertificateEarned => "award",
+        ActivityType::CourseEnrolled => "book-open",
+        ActivityType::CourseCompleted => "flag",
+        ActivityType::DiscussionPost => "message-square",
+        ActivityType::FileUploaded => "upload",
+        ActivityType::SessionAttended => "video",
+        ActivityType::XpEarned => "zap",
+        ActivityType::LevelUp => "trending-up",
+        ActivityType::StreakAchieved => "flame",
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_dashboard_actor_creation() {
+        let actor = LearnerDashboardActor::new();
+        assert!(actor.dashboard_cache.is_empty());
+    }
+
+    #[test]
+    fn test_progress_bar_render() {
+        let html = render_progress_bar(75.5, "sm", "primary");
+        assert!(html.contains("75%"));
+        assert!(html.contains("bg-primary"));
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(Duration::hours(25)), "1d 1h");
+        assert_eq!(format_duration(Duration::hours(5)), "5h");
+        assert_eq!(format_duration(Duration::minutes(30)), "30m");
+    }
+
+    #[test]
+    fn test_deadline_status() {
+        let badge = render_deadline_badge(&DeadlineStatus::Overdue);
+        assert!(badge.contains("badge-danger"));
+    }
+}

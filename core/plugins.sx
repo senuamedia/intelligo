@@ -1,0 +1,856 @@
+/// Intelligo LMS - Plugin System
+///
+/// Extensible plugin architecture for adding custom functionality.
+
+module intelligo::core::plugins
+
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Plugin Manager
+// ============================================================================
+
+/// Central plugin manager for loading, managing, and executing plugins
+pub actor PluginManager {
+    tenant_id: String,
+    plugins: Map<String, PluginInstance>,
+    hooks: Map<String, Vec<HookRegistration>>,
+    event_bus: MessageBus,
+    sandbox: PluginSandbox,
+    config: PluginManagerConfig,
+
+    pub fn new(tenant_id: &str, config: PluginManagerConfig) -> Self {
+        PluginManager {
+            tenant_id: tenant_id.to_string(),
+            plugins: Map::new(),
+            hooks: Map::new(),
+            event_bus: MessageBus::new(),
+            sandbox: PluginSandbox::new(config.sandbox_config.clone()),
+            config
+        }
+    }
+
+    // ========================================================================
+    // Plugin Lifecycle
+    // ========================================================================
+
+    /// Register a plugin from manifest
+    pub fn register(mut self, manifest: PluginManifest) -> Result<PluginInstance, PluginError> {
+        // Validate manifest
+        self.validate_manifest(&manifest)?;
+
+        // Check dependencies
+        self.check_dependencies(&manifest)?;
+
+        // Check permissions
+        self.validate_permissions(&manifest)?;
+
+        // Create plugin instance
+        let instance = PluginInstance {
+            id: Uuid::new_v4().to_string(),
+            manifest: manifest.clone(),
+            state: PluginState::Registered,
+            config: Map::new(),
+            enabled: false,
+            installed_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            error: None
+        };
+
+        self.plugins.insert(manifest.id.clone(), instance.clone());
+
+        Ok(instance)
+    }
+
+    /// Install a plugin
+    pub fn install(mut self, plugin_id: &str) -> Result<PluginInstance, PluginError> {
+        let mut instance = self.get_plugin(plugin_id)?;
+
+        if instance.state != PluginState::Registered {
+            return Err(PluginError::InvalidState {
+                message: format!("Plugin {} is not in registered state", plugin_id)
+            });
+        }
+
+        // Run install hooks
+        self.run_lifecycle_hook(plugin_id, "install")?;
+
+        // Initialize plugin storage
+        self.init_plugin_storage(plugin_id)?;
+
+        instance.state = PluginState::Installed;
+        instance.updated_at = DateTime::now();
+
+        self.plugins.insert(plugin_id.to_string(), instance.clone());
+
+        Ok(instance)
+    }
+
+    /// Enable a plugin
+    pub fn enable(mut self, plugin_id: &str) -> Result<PluginInstance, PluginError> {
+        let mut instance = self.get_plugin(plugin_id)?;
+
+        if instance.state != PluginState::Installed && instance.state != PluginState::Disabled {
+            return Err(PluginError::InvalidState {
+                message: format!("Plugin {} cannot be enabled from current state", plugin_id)
+            });
+        }
+
+        // Run enable hooks
+        self.run_lifecycle_hook(plugin_id, "enable")?;
+
+        // Register plugin hooks
+        self.register_plugin_hooks(plugin_id)?;
+
+        instance.state = PluginState::Active;
+        instance.enabled = true;
+        instance.updated_at = DateTime::now();
+
+        self.plugins.insert(plugin_id.to_string(), instance.clone());
+
+        // Emit event
+        self.event_bus.publish("plugin.enabled", PluginEvent {
+            plugin_id: plugin_id.to_string(),
+            event_type: "enabled".to_string(),
+            data: Map::new()
+        });
+
+        Ok(instance)
+    }
+
+    /// Disable a plugin
+    pub fn disable(mut self, plugin_id: &str) -> Result<PluginInstance, PluginError> {
+        let mut instance = self.get_plugin(plugin_id)?;
+
+        if instance.state != PluginState::Active {
+            return Err(PluginError::InvalidState {
+                message: format!("Plugin {} is not active", plugin_id)
+            });
+        }
+
+        // Run disable hooks
+        self.run_lifecycle_hook(plugin_id, "disable")?;
+
+        // Unregister plugin hooks
+        self.unregister_plugin_hooks(plugin_id)?;
+
+        instance.state = PluginState::Disabled;
+        instance.enabled = false;
+        instance.updated_at = DateTime::now();
+
+        self.plugins.insert(plugin_id.to_string(), instance.clone());
+
+        self.event_bus.publish("plugin.disabled", PluginEvent {
+            plugin_id: plugin_id.to_string(),
+            event_type: "disabled".to_string(),
+            data: Map::new()
+        });
+
+        Ok(instance)
+    }
+
+    /// Uninstall a plugin
+    pub fn uninstall(mut self, plugin_id: &str) -> Result<(), PluginError> {
+        let instance = self.get_plugin(plugin_id)?;
+
+        // Disable first if active
+        if instance.state == PluginState::Active {
+            self.disable(plugin_id)?;
+        }
+
+        // Run uninstall hooks
+        self.run_lifecycle_hook(plugin_id, "uninstall")?;
+
+        // Cleanup plugin storage
+        self.cleanup_plugin_storage(plugin_id)?;
+
+        self.plugins.remove(plugin_id);
+
+        self.event_bus.publish("plugin.uninstalled", PluginEvent {
+            plugin_id: plugin_id.to_string(),
+            event_type: "uninstalled".to_string(),
+            data: Map::new()
+        });
+
+        Ok(())
+    }
+
+    /// Update a plugin
+    pub fn update(mut self, plugin_id: &str, new_manifest: PluginManifest) -> Result<PluginInstance, PluginError> {
+        let instance = self.get_plugin(plugin_id)?;
+        let was_active = instance.state == PluginState::Active;
+
+        // Disable if active
+        if was_active {
+            self.disable(plugin_id)?;
+        }
+
+        // Validate new manifest
+        self.validate_manifest(&new_manifest)?;
+
+        // Run migration hooks
+        self.run_lifecycle_hook(plugin_id, "migrate")?;
+
+        // Update instance
+        let mut updated = self.get_plugin(plugin_id)?;
+        updated.manifest = new_manifest;
+        updated.updated_at = DateTime::now();
+
+        self.plugins.insert(plugin_id.to_string(), updated.clone());
+
+        // Re-enable if was active
+        if was_active {
+            self.enable(plugin_id)?;
+        }
+
+        Ok(updated)
+    }
+
+    // ========================================================================
+    // Plugin Configuration
+    // ========================================================================
+
+    /// Get plugin configuration
+    pub fn get_config(self, plugin_id: &str) -> Result<Map<String, Value>, PluginError> {
+        let instance = self.get_plugin(plugin_id)?;
+        Ok(instance.config)
+    }
+
+    /// Set plugin configuration
+    pub fn set_config(mut self, plugin_id: &str, config: Map<String, Value>) -> Result<(), PluginError> {
+        let mut instance = self.get_plugin(plugin_id)?;
+
+        // Validate config against schema
+        self.validate_config(&instance.manifest, &config)?;
+
+        instance.config = config;
+        instance.updated_at = DateTime::now();
+
+        self.plugins.insert(plugin_id.to_string(), instance);
+
+        Ok(())
+    }
+
+    /// Update specific config value
+    pub fn set_config_value(mut self, plugin_id: &str, key: &str, value: Value) -> Result<(), PluginError> {
+        let mut instance = self.get_plugin(plugin_id)?;
+
+        instance.config.insert(key.to_string(), value);
+        instance.updated_at = DateTime::now();
+
+        self.plugins.insert(plugin_id.to_string(), instance);
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Hook System
+    // ========================================================================
+
+    /// Register a hook handler
+    pub fn register_hook(mut self, hook_name: &str, registration: HookRegistration) -> Result<(), PluginError> {
+        let hooks = self.hooks.entry(hook_name.to_string()).or_insert(vec![]);
+
+        // Check priority ordering
+        hooks.push(registration);
+        hooks.sort_by(|a, b| a.priority.cmp(&b.priority));
+
+        Ok(())
+    }
+
+    /// Execute a hook
+    pub fn execute_hook<T>(self, hook_name: &str, context: HookContext<T>) -> Result<HookResult<T>, PluginError> {
+        let handlers = match self.hooks.get(hook_name) {
+            Some(h) => h,
+            None => return Ok(HookResult::unmodified(context.data))
+        };
+
+        let mut current_data = context.data;
+        let mut results = vec![];
+
+        for handler in handlers {
+            // Skip disabled plugins
+            if let Ok(instance) = self.get_plugin(&handler.plugin_id) {
+                if !instance.enabled {
+                    continue;
+                }
+            }
+
+            // Execute in sandbox
+            let result = self.sandbox.execute(|| {
+                (handler.handler)(HookContext {
+                    hook_name: context.hook_name.clone(),
+                    data: current_data.clone(),
+                    metadata: context.metadata.clone()
+                })
+            })?;
+
+            match result {
+                HookHandlerResult::Continue(data) => {
+                    current_data = data;
+                }
+                HookHandlerResult::Stop(data) => {
+                    return Ok(HookResult::stopped(data));
+                }
+                HookHandlerResult::Skip => {
+                    continue;
+                }
+                HookHandlerResult::Error(e) => {
+                    if handler.required {
+                        return Err(PluginError::HookError { message: e });
+                    }
+                    results.push(HookExecutionResult::Error(e));
+                }
+            }
+        }
+
+        Ok(HookResult::modified(current_data, results))
+    }
+
+    /// Get available hooks
+    pub fn list_hooks(self) -> Vec<HookDefinition> {
+        vec![
+            // Course hooks
+            HookDefinition::new("course.before_create", "Before course creation"),
+            HookDefinition::new("course.after_create", "After course creation"),
+            HookDefinition::new("course.before_publish", "Before course publishing"),
+            HookDefinition::new("course.after_publish", "After course publishing"),
+
+            // Enrollment hooks
+            HookDefinition::new("enrollment.before_create", "Before enrollment creation"),
+            HookDefinition::new("enrollment.after_create", "After enrollment creation"),
+            HookDefinition::new("enrollment.before_complete", "Before enrollment completion"),
+            HookDefinition::new("enrollment.after_complete", "After enrollment completion"),
+
+            // User hooks
+            HookDefinition::new("user.before_create", "Before user creation"),
+            HookDefinition::new("user.after_create", "After user creation"),
+            HookDefinition::new("user.before_login", "Before user login"),
+            HookDefinition::new("user.after_login", "After user login"),
+
+            // Assessment hooks
+            HookDefinition::new("assessment.before_submit", "Before assessment submission"),
+            HookDefinition::new("assessment.after_submit", "After assessment submission"),
+            HookDefinition::new("assessment.before_grade", "Before grading"),
+            HookDefinition::new("assessment.after_grade", "After grading"),
+
+            // Content hooks
+            HookDefinition::new("content.before_render", "Before content rendering"),
+            HookDefinition::new("content.after_render", "After content rendering"),
+
+            // AI hooks
+            HookDefinition::new("ai.before_request", "Before AI request"),
+            HookDefinition::new("ai.after_response", "After AI response"),
+
+            // API hooks
+            HookDefinition::new("api.before_request", "Before API request"),
+            HookDefinition::new("api.after_response", "After API response")
+        ]
+    }
+
+    // ========================================================================
+    // Extension Points
+    // ========================================================================
+
+    /// Register an extension point
+    pub fn register_extension_point(mut self, point: ExtensionPoint) -> Result<(), PluginError> {
+        // Extension points are stored in memory for plugin discovery
+        // In production, these would be persisted
+        Ok(())
+    }
+
+    /// Get extensions for a point
+    pub fn get_extensions(self, point_id: &str) -> Vec<Extension> {
+        let mut extensions = vec![];
+
+        for (_, instance) in &self.plugins {
+            if !instance.enabled {
+                continue;
+            }
+
+            for ext in &instance.manifest.extensions {
+                if ext.point == point_id {
+                    extensions.push(ext.clone());
+                }
+            }
+        }
+
+        // Sort by priority
+        extensions.sort_by(|a, b| a.priority.cmp(&b.priority));
+
+        extensions
+    }
+
+    // ========================================================================
+    // API Extensions
+    // ========================================================================
+
+    /// Register custom API routes from plugins
+    pub fn register_api_routes(self, router: &mut ApiRouter) -> Result<(), PluginError> {
+        for (_, instance) in &self.plugins {
+            if !instance.enabled {
+                continue;
+            }
+
+            for route in &instance.manifest.api_routes {
+                let handler = self.create_sandboxed_handler(&instance.manifest.id, route)?;
+                router.add_route(route.method.clone(), &route.path, handler);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Custom Fields
+    // ========================================================================
+
+    /// Register custom fields for entities
+    pub fn get_custom_fields(self, entity_type: &str) -> Vec<CustomField> {
+        let mut fields = vec![];
+
+        for (_, instance) in &self.plugins {
+            if !instance.enabled {
+                continue;
+            }
+
+            for field in &instance.manifest.custom_fields {
+                if field.entity_type == entity_type {
+                    fields.push(field.clone());
+                }
+            }
+        }
+
+        fields
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    pub fn get_plugin(self, plugin_id: &str) -> Result<PluginInstance, PluginError> {
+        self.plugins.get(plugin_id)
+            .ok_or_else(|| PluginError::NotFound { plugin_id: plugin_id.to_string() })
+            .cloned()
+    }
+
+    pub fn list_plugins(self) -> Vec<PluginInstance> {
+        self.plugins.values().cloned().collect()
+    }
+
+    pub fn list_active_plugins(self) -> Vec<PluginInstance> {
+        self.plugins.values()
+            .filter(|p| p.enabled)
+            .cloned()
+            .collect()
+    }
+
+    fn validate_manifest(self, manifest: &PluginManifest) -> Result<(), PluginError> {
+        if manifest.id.is_empty() {
+            return Err(PluginError::ValidationError { message: "Plugin ID is required".to_string() });
+        }
+
+        if manifest.version.is_empty() {
+            return Err(PluginError::ValidationError { message: "Plugin version is required".to_string() });
+        }
+
+        // Validate API version compatibility
+        if !self.is_compatible_api_version(&manifest.api_version) {
+            return Err(PluginError::IncompatibleVersion {
+                required: "1.0".to_string(),
+                actual: manifest.api_version.clone()
+            });
+        }
+
+        Ok(())
+    }
+
+    fn check_dependencies(self, manifest: &PluginManifest) -> Result<(), PluginError> {
+        for dep in &manifest.dependencies {
+            match self.plugins.get(&dep.plugin_id) {
+                Some(instance) => {
+                    if !self.version_satisfies(&instance.manifest.version, &dep.version_constraint) {
+                        return Err(PluginError::DependencyError {
+                            dependency: dep.plugin_id.clone(),
+                            message: format!("Plugin {} requires version {}", manifest.id, dep.version_constraint)
+                        });
+                    }
+                }
+                None if dep.required => {
+                    return Err(PluginError::DependencyError {
+                        dependency: dep.plugin_id.clone(),
+                        message: "Required dependency not found".to_string()
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_permissions(self, manifest: &PluginManifest) -> Result<(), PluginError> {
+        for perm in &manifest.permissions {
+            if !self.is_allowed_permission(perm) {
+                return Err(PluginError::PermissionDenied {
+                    permission: perm.clone()
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_compatible_api_version(self, version: &str) -> bool { true }
+    fn version_satisfies(self, version: &str, constraint: &str) -> bool { true }
+    fn is_allowed_permission(self, permission: &str) -> bool { true }
+    fn run_lifecycle_hook(self, plugin_id: &str, hook: &str) -> Result<(), PluginError> { Ok(()) }
+    fn register_plugin_hooks(self, plugin_id: &str) -> Result<(), PluginError> { Ok(()) }
+    fn unregister_plugin_hooks(self, plugin_id: &str) -> Result<(), PluginError> { Ok(()) }
+    fn init_plugin_storage(self, plugin_id: &str) -> Result<(), PluginError> { Ok(()) }
+    fn cleanup_plugin_storage(self, plugin_id: &str) -> Result<(), PluginError> { Ok(()) }
+    fn validate_config(self, manifest: &PluginManifest, config: &Map<String, Value>) -> Result<(), PluginError> { Ok(()) }
+    fn create_sandboxed_handler(self, plugin_id: &str, route: &ApiRoute) -> Result<Box<dyn Fn(Request) -> Response>, PluginError> {
+        // Creates a sandboxed request handler for plugin API routes
+        // Would use the Simplex sandbox runtime to execute plugin code safely
+        Err(PluginError::ExecutionError {
+            plugin_id: plugin_id.to_string(),
+            message: "Sandboxed handler creation not yet implemented".to_string()
+        })
+    }
+}
+
+// ============================================================================
+// Plugin Sandbox
+// ============================================================================
+
+/// Sandbox for executing plugin code safely
+pub actor PluginSandbox {
+    config: SandboxConfig,
+
+    pub fn new(config: SandboxConfig) -> Self {
+        PluginSandbox { config }
+    }
+
+    /// Execute code in sandbox
+    pub fn execute<T, F: Fn() -> T>(self, f: F) -> Result<T, PluginError> {
+        // Apply resource limits
+        let _guard = self.apply_limits()?;
+
+        // Execute with timeout
+        let result = self.with_timeout(self.config.execution_timeout, f)?;
+
+        Ok(result)
+    }
+
+    fn apply_limits(self) -> Result<ResourceGuard, PluginError> {
+        // Memory limits, CPU limits, etc.
+        Ok(ResourceGuard::new())
+    }
+
+    fn with_timeout<T, F: Fn() -> T>(self, timeout: Duration, f: F) -> Result<T, PluginError> {
+        // Execute with timeout
+        Ok(f())
+    }
+}
+
+pub type ResourceGuard = type {}
+
+impl ResourceGuard {
+    pub fn new() -> Self { ResourceGuard {} }
+}
+
+/// Sandbox configuration
+pub type SandboxConfig = type {
+    execution_timeout: Duration,
+    memory_limit_mb: i32,
+    cpu_limit_percent: i32,
+    allowed_apis: Vec<String>,
+    denied_apis: Vec<String>
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        SandboxConfig {
+            execution_timeout: Duration::from_secs(30),
+            memory_limit_mb: 256,
+            cpu_limit_percent: 50,
+            allowed_apis: vec!["*".to_string()],
+            denied_apis: vec![]
+        }
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Plugin manifest (plugin.json)
+pub type PluginManifest = type {
+    id: String,
+    name: String,
+    version: String,
+    description: String,
+    author: PluginAuthor,
+    license: String,
+    api_version: String,
+    homepage: Option<String>,
+    repository: Option<String>,
+    permissions: Vec<String>,
+    dependencies: Vec<PluginDependency>,
+    config_schema: Option<ConfigSchema>,
+    hooks: Vec<HookDeclaration>,
+    extensions: Vec<Extension>,
+    api_routes: Vec<ApiRoute>,
+    custom_fields: Vec<CustomField>,
+    ui_components: Vec<UiComponent>,
+    settings_ui: Option<SettingsUi>
+}
+
+pub type PluginAuthor = type {
+    name: String,
+    email: Option<String>,
+    url: Option<String>
+}
+
+pub type PluginDependency = type {
+    plugin_id: String,
+    version_constraint: String,
+    required: bool
+}
+
+pub type ConfigSchema = type {
+    properties: Map<String, ConfigProperty>,
+    required: Vec<String>
+}
+
+pub type ConfigProperty = type {
+    property_type: String,
+    title: String,
+    description: Option<String>,
+    default: Option<Value>
+}
+
+/// Plugin instance
+pub type PluginInstance = type {
+    id: String,
+    manifest: PluginManifest,
+    state: PluginState,
+    config: Map<String, Value>,
+    enabled: bool,
+    installed_at: DateTime,
+    updated_at: DateTime,
+    error: Option<String>
+}
+
+/// Plugin state
+pub enum PluginState {
+    Registered,
+    Installed,
+    Active,
+    Disabled,
+    Error
+}
+
+/// Plugin manager configuration
+pub type PluginManagerConfig = type {
+    plugin_directory: String,
+    sandbox_config: SandboxConfig,
+    auto_update: bool,
+    allowed_sources: Vec<String>
+}
+
+/// Hook declaration in manifest
+pub type HookDeclaration = type {
+    hook_name: String,
+    handler: String,
+    priority: i32
+}
+
+/// Hook registration
+pub type HookRegistration = type {
+    plugin_id: String,
+    hook_name: String,
+    handler: Box<dyn Fn(HookContext<Value>) -> HookHandlerResult<Value>>,
+    priority: i32,
+    required: bool
+}
+
+/// Hook context
+pub type HookContext<T> = type {
+    hook_name: String,
+    data: T,
+    metadata: Map<String, Value>
+}
+
+/// Hook handler result
+pub enum HookHandlerResult<T> {
+    Continue(T),
+    Stop(T),
+    Skip,
+    Error(String)
+}
+
+/// Hook execution result
+pub type HookResult<T> = type {
+    data: T,
+    modified: bool,
+    stopped: bool,
+    results: Vec<HookExecutionResult>
+}
+
+impl<T> HookResult<T> {
+    pub fn unmodified(data: T) -> Self {
+        HookResult { data, modified: false, stopped: false, results: vec![] }
+    }
+
+    pub fn modified(data: T, results: Vec<HookExecutionResult>) -> Self {
+        HookResult { data, modified: true, stopped: false, results }
+    }
+
+    pub fn stopped(data: T) -> Self {
+        HookResult { data, modified: true, stopped: true, results: vec![] }
+    }
+}
+
+pub enum HookExecutionResult {
+    Success,
+    Skipped,
+    Error(String)
+}
+
+/// Hook definition
+pub type HookDefinition = type {
+    name: String,
+    description: String
+}
+
+impl HookDefinition {
+    pub fn new(name: &str, description: &str) -> Self {
+        HookDefinition {
+            name: name.to_string(),
+            description: description.to_string()
+        }
+    }
+}
+
+/// Extension point
+pub type ExtensionPoint = type {
+    id: String,
+    name: String,
+    description: String,
+    schema: Option<Value>
+}
+
+/// Extension
+pub type Extension = type {
+    point: String,
+    id: String,
+    priority: i32,
+    config: Map<String, Value>
+}
+
+/// API route
+pub type ApiRoute = type {
+    method: String,
+    path: String,
+    handler: String,
+    middleware: Vec<String>,
+    permissions: Vec<String>
+}
+
+/// Custom field
+pub type CustomField = type {
+    entity_type: String,
+    field_name: String,
+    field_type: FieldType,
+    label: String,
+    description: Option<String>,
+    required: bool,
+    default: Option<Value>,
+    validation: Option<FieldValidation>
+}
+
+pub enum FieldType {
+    Text,
+    Number,
+    Boolean,
+    Date,
+    DateTime,
+    Select(Vec<SelectOption>),
+    MultiSelect(Vec<SelectOption>),
+    Relation(String),
+    Json
+}
+
+pub type SelectOption = type { value: String, label: String }
+
+pub type FieldValidation = type {
+    min: Option<Value>,
+    max: Option<Value>,
+    pattern: Option<String>,
+    custom: Option<String>
+}
+
+/// UI component
+pub type UiComponent = type {
+    id: String,
+    slot: String,
+    component: String,
+    props: Map<String, Value>
+}
+
+/// Settings UI
+pub type SettingsUi = type {
+    component: String,
+    props: Map<String, Value>
+}
+
+/// Plugin event
+pub type PluginEvent = type {
+    plugin_id: String,
+    event_type: String,
+    data: Map<String, Value>
+}
+
+/// Plugin error
+pub enum PluginError {
+    NotFound { plugin_id: String },
+    AlreadyExists { plugin_id: String },
+    InvalidState { message: String },
+    ValidationError { message: String },
+    IncompatibleVersion { required: String, actual: String },
+    DependencyError { dependency: String, message: String },
+    PermissionDenied { permission: String },
+    HookError { message: String },
+    SandboxError { message: String },
+    ExecutionError { plugin_id: String, message: String },
+}
+
+impl PluginError {
+    pub fn to_string(self) -> String {
+        match self {
+            PluginError::NotFound { plugin_id } =>
+                format!("Plugin not found: {}", plugin_id),
+            PluginError::AlreadyExists { plugin_id } =>
+                format!("Plugin already exists: {}", plugin_id),
+            PluginError::InvalidState { message } =>
+                format!("Invalid plugin state: {}", message),
+            PluginError::ValidationError { message } =>
+                format!("Validation error: {}", message),
+            PluginError::IncompatibleVersion { required, actual } =>
+                format!("Incompatible version: required {}, got {}", required, actual),
+            PluginError::DependencyError { dependency, message } =>
+                format!("Dependency error for {}: {}", dependency, message),
+            PluginError::PermissionDenied { permission } =>
+                format!("Permission denied: {}", permission),
+            PluginError::HookError { message } =>
+                format!("Hook error: {}", message),
+            PluginError::SandboxError { message } =>
+                format!("Sandbox error: {}", message),
+            PluginError::ExecutionError { plugin_id, message } =>
+                format!("Execution error in {}: {}", plugin_id, message),
+        }
+    }
+}

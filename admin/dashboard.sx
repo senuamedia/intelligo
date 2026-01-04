@@ -1,0 +1,836 @@
+/// Intelligo LMS - Admin Dashboard
+///
+/// Main admin dashboard with real-time metrics, analytics widgets,
+/// and quick access to key administrative functions.
+
+module intelligo::admin::dashboard
+
+use intelligo::core::types::*
+use intelligo::admin::core::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// DASHBOARD METRICS
+// =============================================================================
+
+/// Real-time dashboard metrics
+type DashboardMetrics {
+    /// Active users right now
+    active_users_now: i32,
+
+    /// Active users today
+    active_users_today: i32,
+
+    /// Total enrollments
+    total_enrollments: i32,
+
+    /// New enrollments today
+    new_enrollments_today: i32,
+
+    /// Course completions today
+    completions_today: i32,
+
+    /// Pending submissions for grading
+    pending_grading: i32,
+
+    /// Average completion rate
+    avg_completion_rate: f32,
+
+    /// Revenue today (if payments enabled)
+    revenue_today: Option<MoneyAmount>,
+
+    /// Revenue this month
+    revenue_month: Option<MoneyAmount>,
+
+    /// At-risk students count
+    at_risk_students: i32
+}
+
+/// Money amount with currency
+type MoneyAmount {
+    amount: f32,
+    currency: String
+}
+
+/// Metrics trend comparison
+type MetricsTrend {
+    /// Enrollment trend vs previous period
+    enrollment_trend: TrendData,
+
+    /// Completion trend
+    completion_trend: TrendData,
+
+    /// Engagement trend
+    engagement_trend: TrendData,
+
+    /// Revenue trend (if applicable)
+    revenue_trend: Option<TrendData>
+}
+
+/// Trend data for a metric
+type TrendData {
+    current_value: f32,
+    previous_value: f32,
+    change_percent: f32,
+    direction: TrendDirection
+}
+
+// =============================================================================
+// DASHBOARD DATA
+// =============================================================================
+
+/// Complete dashboard data
+type DashboardData {
+    /// Key metrics
+    metrics: DashboardMetrics,
+
+    /// Trend comparisons
+    trends: MetricsTrend,
+
+    /// Enrollment chart data (last 30 days)
+    enrollment_chart: TimeSeriesData,
+
+    /// Completion chart data
+    completion_chart: TimeSeriesData,
+
+    /// Activity by hour
+    hourly_activity: TimeSeriesData,
+
+    /// Top courses by enrollment
+    top_courses: List<CourseStats>,
+
+    /// Recent activity feed
+    recent_activity: List<ActivityItem>,
+
+    /// Pending tasks
+    pending_tasks: List<PendingTask>,
+
+    /// System alerts
+    alerts: List<Alert>,
+
+    /// Quick stats by content type
+    content_stats: ContentStats
+}
+
+/// Time series data for charts
+type TimeSeriesData {
+    labels: List<String>,
+    datasets: List<TimeSeriesDataset>
+}
+
+/// Time series dataset
+type TimeSeriesDataset {
+    label: String,
+    data: List<f32>,
+    color: String
+}
+
+/// Course statistics for dashboard
+type CourseStats {
+    course_id: CourseId,
+    title: String,
+    enrollments: i32,
+    completions: i32,
+    completion_rate: f32,
+    avg_score: Option<f32>,
+    trend: TrendDirection
+}
+
+/// Pending task for admin
+type PendingTask {
+    id: String,
+    task_type: PendingTaskType,
+    title: String,
+    description: String,
+    count: i32,
+    priority: TaskPriority,
+    action_url: String
+}
+
+/// Type of pending task
+enum PendingTaskType {
+    GradingRequired,
+    EnrollmentApproval,
+    ContentReview,
+    UserApproval,
+    ReportReady,
+    SystemAlert
+}
+
+/// Task priority
+enum TaskPriority {
+    Low,
+    Medium,
+    High,
+    Urgent
+}
+
+/// Content statistics
+type ContentStats {
+    total_courses: i32,
+    published_courses: i32,
+    draft_courses: i32,
+    total_lessons: i32,
+    total_assessments: i32,
+    scorm_packages: i32,
+    storage_used_gb: f32
+}
+
+// =============================================================================
+// DASHBOARD WIDGETS
+// =============================================================================
+
+/// Widget configuration for dashboard
+type WidgetConfig {
+    /// Widget ID
+    id: String,
+
+    /// Grid position
+    position: GridPosition,
+
+    /// Widget settings
+    settings: Map<String, Dynamic>
+}
+
+/// Grid position
+type GridPosition {
+    row: i32,
+    col: i32,
+    row_span: i32,
+    col_span: i32
+}
+
+/// Available dashboard widgets
+enum DashboardWidgetType {
+    /// Active users stat
+    ActiveUsers,
+
+    /// Enrollments overview
+    EnrollmentsOverview,
+
+    /// Enrollment chart
+    EnrollmentChart,
+
+    /// Completion chart
+    CompletionChart,
+
+    /// Revenue summary
+    RevenueSummary,
+
+    /// Top courses list
+    TopCourses,
+
+    /// Recent activity feed
+    RecentActivity,
+
+    /// Pending tasks
+    PendingTasks,
+
+    /// At-risk students
+    AtRiskStudents,
+
+    /// System health
+    SystemHealth,
+
+    /// Quick actions
+    QuickActions,
+
+    /// Calendar/upcoming
+    UpcomingEvents,
+
+    /// Custom widget
+    Custom { component: String }
+}
+
+// =============================================================================
+// DASHBOARD ACTOR
+// =============================================================================
+
+/// Dashboard data actor
+actor DashboardActor {
+    state {
+        /// Cached metrics (refreshed periodically)
+        metrics_cache: Map<TenantId, CachedMetrics>,
+
+        /// Widget configurations per user
+        user_widgets: Map<UserId, List<WidgetConfig>>
+    }
+
+    /// Initialize dashboard actor
+    fn init() -> DashboardActor {
+        DashboardActor {
+            state: DashboardActorState {
+                metrics_cache: Map::new(),
+                user_widgets: Map::new()
+            }
+        }
+    }
+
+    /// Get dashboard data for a tenant
+    fn get_dashboard(&self, tenant_id: &TenantId, user_id: &UserId) -> DashboardData {
+        // Get or compute metrics
+        let metrics = self.get_metrics(tenant_id);
+        let trends = self.compute_trends(tenant_id);
+
+        DashboardData {
+            metrics,
+            trends,
+            enrollment_chart: self.get_enrollment_chart(tenant_id, 30),
+            completion_chart: self.get_completion_chart(tenant_id, 30),
+            hourly_activity: self.get_hourly_activity(tenant_id),
+            top_courses: self.get_top_courses(tenant_id, 5),
+            recent_activity: self.get_recent_activity(tenant_id, 10),
+            pending_tasks: self.get_pending_tasks(tenant_id, user_id),
+            alerts: self.get_system_alerts(tenant_id),
+            content_stats: self.get_content_stats(tenant_id)
+        }
+    }
+
+    /// Get real-time metrics
+    fn get_metrics(&self, tenant_id: &TenantId) -> DashboardMetrics {
+        // Check cache first
+        if let Some(cached) = self.state.metrics_cache.get(tenant_id) {
+            if cached.expires_at > DateTime::now() {
+                return cached.metrics.clone()
+            }
+        }
+
+        // Compute fresh metrics (would query database)
+        self.compute_metrics(tenant_id)
+    }
+
+    /// Compute metrics from data
+    fn compute_metrics(&self, tenant_id: &TenantId) -> DashboardMetrics {
+        // In production, these would be database queries
+        DashboardMetrics {
+            active_users_now: 0,
+            active_users_today: 0,
+            total_enrollments: 0,
+            new_enrollments_today: 0,
+            completions_today: 0,
+            pending_grading: 0,
+            avg_completion_rate: 0.0,
+            revenue_today: None,
+            revenue_month: None,
+            at_risk_students: 0
+        }
+    }
+
+    /// Compute trend comparisons
+    fn compute_trends(&self, tenant_id: &TenantId) -> MetricsTrend {
+        MetricsTrend {
+            enrollment_trend: TrendData {
+                current_value: 0.0,
+                previous_value: 0.0,
+                change_percent: 0.0,
+                direction: TrendDirection::Flat
+            },
+            completion_trend: TrendData {
+                current_value: 0.0,
+                previous_value: 0.0,
+                change_percent: 0.0,
+                direction: TrendDirection::Flat
+            },
+            engagement_trend: TrendData {
+                current_value: 0.0,
+                previous_value: 0.0,
+                change_percent: 0.0,
+                direction: TrendDirection::Flat
+            },
+            revenue_trend: None
+        }
+    }
+
+    /// Get enrollment chart data
+    fn get_enrollment_chart(&self, tenant_id: &TenantId, days: i32) -> TimeSeriesData {
+        // Generate date labels
+        let mut labels = vec![];
+        let mut data = vec![];
+        let now = DateTime::now();
+
+        for i in (0..days).rev() {
+            let date = now - Duration::days(i as i64);
+            labels.push(date.format("%b %d"));
+            data.push(0.0); // Would be actual enrollment count
+        }
+
+        TimeSeriesData {
+            labels,
+            datasets: vec![
+                TimeSeriesDataset {
+                    label: "New Enrollments".to_string(),
+                    data,
+                    color: "#3B82F6".to_string()
+                }
+            ]
+        }
+    }
+
+    /// Get completion chart data
+    fn get_completion_chart(&self, tenant_id: &TenantId, days: i32) -> TimeSeriesData {
+        let mut labels = vec![];
+        let mut completions = vec![];
+        let mut starts = vec![];
+        let now = DateTime::now();
+
+        for i in (0..days).rev() {
+            let date = now - Duration::days(i as i64);
+            labels.push(date.format("%b %d"));
+            completions.push(0.0);
+            starts.push(0.0);
+        }
+
+        TimeSeriesData {
+            labels,
+            datasets: vec![
+                TimeSeriesDataset {
+                    label: "Course Starts".to_string(),
+                    data: starts,
+                    color: "#10B981".to_string()
+                },
+                TimeSeriesDataset {
+                    label: "Course Completions".to_string(),
+                    data: completions,
+                    color: "#8B5CF6".to_string()
+                }
+            ]
+        }
+    }
+
+    /// Get hourly activity breakdown
+    fn get_hourly_activity(&self, tenant_id: &TenantId) -> TimeSeriesData {
+        let labels: Vec<String> = (0..24).map(|h| format!("{}:00", h)).collect();
+        let data: Vec<f32> = (0..24).map(|_| 0.0).collect();
+
+        TimeSeriesData {
+            labels,
+            datasets: vec![
+                TimeSeriesDataset {
+                    label: "Active Users".to_string(),
+                    data,
+                    color: "#F59E0B".to_string()
+                }
+            ]
+        }
+    }
+
+    /// Get top courses by enrollment
+    fn get_top_courses(&self, tenant_id: &TenantId, limit: i32) -> List<CourseStats> {
+        // Would query database
+        vec![]
+    }
+
+    /// Get recent activity
+    fn get_recent_activity(&self, tenant_id: &TenantId, limit: i32) -> List<ActivityItem> {
+        // Would query activity log
+        vec![]
+    }
+
+    /// Get pending tasks for user
+    fn get_pending_tasks(&self, tenant_id: &TenantId, user_id: &UserId) -> List<PendingTask> {
+        let mut tasks = vec![];
+
+        // Check for pending grading
+        let pending_grading = self.count_pending_grading(tenant_id, user_id);
+        if pending_grading > 0 {
+            tasks.push(PendingTask {
+                id: "grading".to_string(),
+                task_type: PendingTaskType::GradingRequired,
+                title: "Submissions Awaiting Grading".to_string(),
+                description: format!("{} submissions need your review", pending_grading),
+                count: pending_grading,
+                priority: if pending_grading > 10 { TaskPriority::High } else { TaskPriority::Medium },
+                action_url: "/admin/gradebook/pending".to_string()
+            });
+        }
+
+        // Check for enrollment approvals
+        let pending_enrollments = self.count_pending_enrollments(tenant_id);
+        if pending_enrollments > 0 {
+            tasks.push(PendingTask {
+                id: "enrollments".to_string(),
+                task_type: PendingTaskType::EnrollmentApproval,
+                title: "Enrollment Requests".to_string(),
+                description: format!("{} enrollment requests pending approval", pending_enrollments),
+                count: pending_enrollments,
+                priority: TaskPriority::Medium,
+                action_url: "/admin/enrollments/pending".to_string()
+            });
+        }
+
+        tasks
+    }
+
+    /// Get system alerts
+    fn get_system_alerts(&self, tenant_id: &TenantId) -> List<Alert> {
+        // Would check for various system conditions
+        vec![]
+    }
+
+    /// Get content statistics
+    fn get_content_stats(&self, tenant_id: &TenantId) -> ContentStats {
+        ContentStats {
+            total_courses: 0,
+            published_courses: 0,
+            draft_courses: 0,
+            total_lessons: 0,
+            total_assessments: 0,
+            scorm_packages: 0,
+            storage_used_gb: 0.0
+        }
+    }
+
+    /// Count pending grading items
+    fn count_pending_grading(&self, tenant_id: &TenantId, user_id: &UserId) -> i32 {
+        0 // Would query submissions
+    }
+
+    /// Count pending enrollment requests
+    fn count_pending_enrollments(&self, tenant_id: &TenantId) -> i32 {
+        0 // Would query enrollments
+    }
+
+    /// Get widget configuration for user
+    fn get_widget_config(&self, user_id: &UserId) -> List<WidgetConfig> {
+        self.state.user_widgets
+            .get(user_id)
+            .cloned()
+            .unwrap_or_else(|| self.default_widget_config())
+    }
+
+    /// Save widget configuration
+    fn save_widget_config(&mut self, user_id: UserId, config: List<WidgetConfig>) {
+        self.state.user_widgets.insert(user_id, config);
+    }
+
+    /// Default widget configuration
+    fn default_widget_config(&self) -> List<WidgetConfig> {
+        vec![
+            // Row 1: Key stats
+            WidgetConfig {
+                id: "active_users".to_string(),
+                position: GridPosition { row: 0, col: 0, row_span: 1, col_span: 3 },
+                settings: Map::new()
+            },
+            WidgetConfig {
+                id: "enrollments".to_string(),
+                position: GridPosition { row: 0, col: 3, row_span: 1, col_span: 3 },
+                settings: Map::new()
+            },
+            WidgetConfig {
+                id: "completions".to_string(),
+                position: GridPosition { row: 0, col: 6, row_span: 1, col_span: 3 },
+                settings: Map::new()
+            },
+            WidgetConfig {
+                id: "pending_grading".to_string(),
+                position: GridPosition { row: 0, col: 9, row_span: 1, col_span: 3 },
+                settings: Map::new()
+            },
+            // Row 2: Charts
+            WidgetConfig {
+                id: "enrollment_chart".to_string(),
+                position: GridPosition { row: 1, col: 0, row_span: 2, col_span: 8 },
+                settings: Map::new()
+            },
+            WidgetConfig {
+                id: "pending_tasks".to_string(),
+                position: GridPosition { row: 1, col: 8, row_span: 2, col_span: 4 },
+                settings: Map::new()
+            },
+            // Row 3: Activity and courses
+            WidgetConfig {
+                id: "recent_activity".to_string(),
+                position: GridPosition { row: 3, col: 0, row_span: 2, col_span: 6 },
+                settings: Map::new()
+            },
+            WidgetConfig {
+                id: "top_courses".to_string(),
+                position: GridPosition { row: 3, col: 6, row_span: 2, col_span: 6 },
+                settings: Map::new()
+            }
+        ]
+    }
+
+    /// Refresh metrics cache
+    fn refresh_cache(&mut self, tenant_id: TenantId) {
+        let metrics = self.compute_metrics(&tenant_id);
+        self.state.metrics_cache.insert(tenant_id, CachedMetrics {
+            metrics,
+            expires_at: DateTime::now() + Duration::minutes(5)
+        });
+    }
+}
+
+/// Cached metrics with expiry
+type CachedMetrics {
+    metrics: DashboardMetrics,
+    expires_at: DateTime
+}
+
+// =============================================================================
+// INSTRUCTOR DASHBOARD
+// =============================================================================
+
+/// Instructor-specific dashboard
+type InstructorDashboard {
+    /// Courses taught
+    my_courses: List<InstructorCourseStats>,
+
+    /// Students across all courses
+    total_students: i32,
+
+    /// Pending grading count
+    pending_grading: i32,
+
+    /// Recent submissions
+    recent_submissions: List<SubmissionSummary>,
+
+    /// Office hours today
+    office_hours_today: Option<OfficeHoursInfo>,
+
+    /// Upcoming deadlines
+    upcoming_deadlines: List<DeadlineInfo>,
+
+    /// At-risk students in my courses
+    at_risk_students: List<AtRiskStudent>,
+
+    /// Quick actions for instructor
+    quick_actions: List<QuickAction>
+}
+
+/// Course stats for instructor
+type InstructorCourseStats {
+    course_id: CourseId,
+    title: String,
+    enrolled: i32,
+    active_this_week: i32,
+    avg_progress: f32,
+    pending_submissions: i32
+}
+
+/// Submission summary
+type SubmissionSummary {
+    id: SubmissionId,
+    student_name: String,
+    assessment_title: String,
+    course_title: String,
+    submitted_at: DateTime,
+    status: SubmissionStatus
+}
+
+/// Office hours info
+type OfficeHoursInfo {
+    start_time: String,
+    end_time: String,
+    location: Option<String>,
+    meeting_url: Option<String>
+}
+
+/// Deadline info
+type DeadlineInfo {
+    assessment_id: AssessmentId,
+    title: String,
+    course_title: String,
+    due_date: DateTime,
+    submissions_count: i32,
+    expected_count: i32
+}
+
+/// At-risk student info
+type AtRiskStudent {
+    user_id: UserId,
+    name: String,
+    course_title: String,
+    risk_level: RiskLevel,
+    last_activity: Option<DateTime>,
+    concerns: List<String>
+}
+
+// =============================================================================
+// STUDENT DASHBOARD
+// =============================================================================
+
+/// Student dashboard data
+type StudentDashboard {
+    /// Enrolled courses
+    my_courses: List<StudentCourseProgress>,
+
+    /// Overall progress
+    overall_progress: f32,
+
+    /// Upcoming deadlines
+    upcoming_deadlines: List<StudentDeadline>,
+
+    /// Recent grades
+    recent_grades: List<RecentGrade>,
+
+    /// Achievements/badges
+    achievements: List<Achievement>,
+
+    /// Certificates earned
+    certificates: List<CertificateSummary>,
+
+    /// AI tutor suggestions
+    learning_suggestions: List<LearningSuggestion>,
+
+    /// Continue learning
+    continue_learning: Option<ContinueLearning>
+}
+
+/// Student course progress
+type StudentCourseProgress {
+    course_id: CourseId,
+    title: String,
+    thumbnail: Option<String>,
+    progress_percent: f32,
+    current_module: Option<String>,
+    next_deadline: Option<DateTime>,
+    grade: Option<String>
+}
+
+/// Student deadline
+type StudentDeadline {
+    assessment_id: AssessmentId,
+    title: String,
+    course_title: String,
+    due_date: DateTime,
+    is_submitted: Bool,
+    is_overdue: Bool
+}
+
+/// Recent grade
+type RecentGrade {
+    assessment_id: AssessmentId,
+    title: String,
+    course_title: String,
+    score: f32,
+    max_score: f32,
+    grade: Option<String>,
+    graded_at: DateTime,
+    feedback: Option<String>
+}
+
+/// Achievement/badge
+type Achievement {
+    id: BadgeId,
+    name: String,
+    description: String,
+    icon: String,
+    earned_at: DateTime
+}
+
+/// Certificate summary
+type CertificateSummary {
+    id: CertificateId,
+    course_title: String,
+    issued_at: DateTime,
+    verification_url: String
+}
+
+/// AI learning suggestion
+type LearningSuggestion {
+    suggestion_type: SuggestionType,
+    title: String,
+    description: String,
+    action_url: String,
+    priority: i32
+}
+
+/// Suggestion type
+enum SuggestionType {
+    ReviewMaterial,
+    PracticeQuiz,
+    SkillGap,
+    NextLesson,
+    PeerDiscussion
+}
+
+/// Continue learning prompt
+type ContinueLearning {
+    course_id: CourseId,
+    course_title: String,
+    lesson_id: LessonId,
+    lesson_title: String,
+    progress_percent: f32,
+    time_left_minutes: Option<i32>
+}
+
+// =============================================================================
+// DASHBOARD BUILDER
+// =============================================================================
+
+/// Build dashboard based on user role
+fn build_dashboard(
+    context: &AccessContext,
+    tenant_id: &TenantId,
+    dashboard_actor: &DashboardActor
+) -> DashboardResult {
+    if context.has_role("administrator") || context.has_role("tenant_admin") {
+        DashboardResult::Admin(dashboard_actor.get_dashboard(tenant_id, &context.user_id))
+    } else if context.has_role("teacher") || context.has_role("instructor") {
+        DashboardResult::Instructor(build_instructor_dashboard(context, tenant_id))
+    } else {
+        DashboardResult::Student(build_student_dashboard(context, tenant_id))
+    }
+}
+
+/// Dashboard result by role
+enum DashboardResult {
+    Admin(DashboardData),
+    Instructor(InstructorDashboard),
+    Student(StudentDashboard)
+}
+
+/// Build instructor dashboard
+fn build_instructor_dashboard(context: &AccessContext, tenant_id: &TenantId) -> InstructorDashboard {
+    // Would query instructor-specific data
+    InstructorDashboard {
+        my_courses: vec![],
+        total_students: 0,
+        pending_grading: 0,
+        recent_submissions: vec![],
+        office_hours_today: None,
+        upcoming_deadlines: vec![],
+        at_risk_students: vec![],
+        quick_actions: vec![
+            QuickAction {
+                id: "grade".to_string(),
+                label: "Grade Submissions".to_string(),
+                icon: "check-circle".to_string(),
+                path: "/instructor/grading".to_string(),
+                permission: None
+            },
+            QuickAction {
+                id: "announce".to_string(),
+                label: "Post Announcement".to_string(),
+                icon: "megaphone".to_string(),
+                path: "/instructor/announcements/new".to_string(),
+                permission: None
+            },
+            QuickAction {
+                id: "quiz".to_string(),
+                label: "Create Quiz".to_string(),
+                icon: "clipboard-list".to_string(),
+                path: "/instructor/assessments/new".to_string(),
+                permission: None
+            }
+        ]
+    }
+}
+
+/// Build student dashboard
+fn build_student_dashboard(context: &AccessContext, tenant_id: &TenantId) -> StudentDashboard {
+    // Would query student-specific data
+    StudentDashboard {
+        my_courses: vec![],
+        overall_progress: 0.0,
+        upcoming_deadlines: vec![],
+        recent_grades: vec![],
+        achievements: vec![],
+        certificates: vec![],
+        learning_suggestions: vec![],
+        continue_learning: None
+    }
+}

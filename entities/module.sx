@@ -1,0 +1,389 @@
+/// Intelligo LMS - Module Entity
+///
+/// Modules are containers for lessons within a course.
+/// They provide structure and can have unlock conditions.
+
+module intelligo::entities::module
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// MODULE ENTITY
+// =============================================================================
+
+/// A module is a grouping of lessons within a course
+type Module {
+    /// Unique identifier
+    id: ModuleId,
+
+    /// UUID for external references
+    uuid: String,
+
+    /// Parent course
+    course_id: CourseId,
+
+    /// Tenant for multi-tenancy
+    tenant_id: TenantId,
+
+    // =========================================================================
+    // Core Fields
+    // =========================================================================
+
+    /// Module title
+    title: String,
+
+    /// Module description
+    description: Option<String>,
+
+    /// Module overview (shown at start)
+    overview: Option<String>,
+
+    // =========================================================================
+    // Structure
+    // =========================================================================
+
+    /// Ordered list of lesson IDs
+    lessons: List<LessonId>,
+
+    /// Position within course (0-indexed)
+    position: i32,
+
+    // =========================================================================
+    // Unlock Conditions
+    // =========================================================================
+
+    /// How this module unlocks
+    unlock_type: UnlockType,
+
+    /// Specific unlock conditions
+    unlock_conditions: List<UnlockCondition>,
+
+    // =========================================================================
+    // Timing
+    // =========================================================================
+
+    /// When this module becomes available
+    available_from: Option<DateTime>,
+
+    /// When this module is no longer available
+    available_until: Option<DateTime>,
+
+    /// Estimated duration in minutes
+    estimated_duration_minutes: Option<i32>,
+
+    // =========================================================================
+    // Learning Objectives
+    // =========================================================================
+
+    /// Learning objectives for this module
+    learning_objectives: List<LearningObjective>,
+
+    /// Competencies taught in this module
+    competencies: List<CompetencyId>,
+
+    // =========================================================================
+    // Completion
+    // =========================================================================
+
+    /// What percentage of lessons must be completed
+    completion_threshold: f32,
+
+    /// Whether all assessments must be passed
+    require_assessments_passed: Bool,
+
+    // =========================================================================
+    // Status
+    // =========================================================================
+
+    /// Module status
+    status: EntityStatus,
+
+    // =========================================================================
+    // Timestamps
+    // =========================================================================
+
+    /// When created
+    created_at: DateTime,
+
+    /// When last updated
+    updated_at: DateTime
+}
+
+// =============================================================================
+// UNLOCK CONDITIONS
+// =============================================================================
+
+/// A condition for unlocking content
+type UnlockCondition {
+    /// Type of condition
+    condition_type: UnlockConditionType,
+
+    /// Target ID (module, lesson, assessment, etc.)
+    target_id: Option<String>,
+
+    /// Threshold value (for score conditions)
+    threshold: Option<f32>,
+
+    /// Comparison operator
+    operator: Option<ConditionOperator>
+}
+
+/// Type of unlock condition
+enum UnlockConditionType {
+    /// Previous module must be complete
+    CompletePreviousModule,
+
+    /// Specific lesson must be complete
+    CompleteLesson { lesson_id: LessonId },
+
+    /// Specific assessment must reach score
+    AchieveScore { assessment_id: AssessmentId, min_score: f32 },
+
+    /// Available on specific date
+    OnDate { date: DateTime },
+
+    /// Specific competency must be mastered
+    MasterCompetency { competency_id: CompetencyId },
+
+    /// User must have specific role
+    HasRole { role: CourseRole },
+
+    /// Custom condition via callback
+    Custom { callback: String, params: Map<String, Dynamic> }
+}
+
+/// Comparison operators for conditions
+enum ConditionOperator {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual
+}
+
+// =============================================================================
+// LEARNING OBJECTIVE
+// =============================================================================
+
+/// A learning objective for a module or lesson
+type LearningObjective {
+    /// Unique identifier
+    id: LearningObjectiveId,
+
+    /// Full objective statement
+    description: String,
+
+    /// Short name/title
+    name: String,
+
+    /// Bloom's taxonomy level
+    bloom_level: BloomLevel,
+
+    /// Action verb used
+    action_verb: String,
+
+    /// How this is measured
+    measurement: Option<String>,
+
+    /// Related competencies
+    competencies: List<CompetencyId>,
+
+    /// Is this objective required?
+    required: Bool
+}
+
+// =============================================================================
+// MODULE SUMMARY
+// =============================================================================
+
+/// Summary statistics for a module
+type ModuleSummary {
+    module_id: ModuleId,
+    title: String,
+    lesson_count: i32,
+    assessment_count: i32,
+    estimated_duration_minutes: i32,
+    is_unlocked: Bool,
+    completion_percentage: f32
+}
+
+// =============================================================================
+// INPUT TYPES
+// =============================================================================
+
+/// Input for creating a module
+type CreateModuleInput {
+    course_id: CourseId,
+    title: String,
+    description: Option<String>,
+    position: Option<i32>,
+    unlock_type: Option<UnlockType>,
+    learning_objectives: Option<List<LearningObjective>>
+}
+
+/// Input for updating a module
+type UpdateModuleInput {
+    title: Option<String>,
+    description: Option<String>,
+    overview: Option<String>,
+    position: Option<i32>,
+    unlock_type: Option<UnlockType>,
+    unlock_conditions: Option<List<UnlockCondition>>,
+    available_from: Option<DateTime>,
+    available_until: Option<DateTime>,
+    estimated_duration_minutes: Option<i32>,
+    learning_objectives: Option<List<LearningObjective>>,
+    competencies: Option<List<CompetencyId>>,
+    completion_threshold: Option<f32>,
+    require_assessments_passed: Option<Bool>,
+    status: Option<EntityStatus>
+}
+
+// =============================================================================
+// DEFAULT IMPLEMENTATIONS
+// =============================================================================
+
+impl Module {
+    /// Create a new module with defaults
+    fn new(
+        course_id: CourseId,
+        tenant_id: TenantId,
+        title: String,
+        position: i32
+    ) -> Module {
+        let now = DateTime::now();
+        Module {
+            id: generate_module_id(),
+            uuid: generate_uuid(),
+            course_id,
+            tenant_id,
+            title,
+            description: None,
+            overview: None,
+            lessons: vec![],
+            position,
+            unlock_type: UnlockType::Always,
+            unlock_conditions: vec![],
+            available_from: None,
+            available_until: None,
+            estimated_duration_minutes: None,
+            learning_objectives: vec![],
+            competencies: vec![],
+            completion_threshold: 1.0, // 100% by default
+            require_assessments_passed: false,
+            status: EntityStatus::Draft,
+            created_at: now,
+            updated_at: now
+        }
+    }
+
+    /// Check if module is available to a student
+    fn is_available(&self) -> Bool {
+        let now = DateTime::now();
+
+        if let Some(from) = &self.available_from {
+            if now < *from {
+                return false
+            }
+        }
+
+        if let Some(until) = &self.available_until {
+            if now > *until {
+                return false
+            }
+        }
+
+        self.status == EntityStatus::Published
+    }
+
+    /// Get lesson count
+    fn lesson_count(&self) -> i32 {
+        self.lessons.len() as i32
+    }
+
+    /// Calculate estimated duration from lessons
+    fn calculate_duration(&self, lessons: &List<Lesson>) -> i32 {
+        lessons.iter()
+            .filter(|l| self.lessons.contains(&l.id))
+            .filter_map(|l| l.estimated_duration_minutes)
+            .sum()
+    }
+}
+
+impl UnlockCondition {
+    /// Create a "complete previous module" condition
+    fn complete_previous() -> UnlockCondition {
+        UnlockCondition {
+            condition_type: UnlockConditionType::CompletePreviousModule,
+            target_id: None,
+            threshold: None,
+            operator: None
+        }
+    }
+
+    /// Create a "complete lesson" condition
+    fn complete_lesson(lesson_id: LessonId) -> UnlockCondition {
+        UnlockCondition {
+            condition_type: UnlockConditionType::CompleteLesson { lesson_id: lesson_id.clone() },
+            target_id: Some(lesson_id),
+            threshold: None,
+            operator: None
+        }
+    }
+
+    /// Create an "achieve score" condition
+    fn achieve_score(assessment_id: AssessmentId, min_score: f32) -> UnlockCondition {
+        UnlockCondition {
+            condition_type: UnlockConditionType::AchieveScore {
+                assessment_id: assessment_id.clone(),
+                min_score
+            },
+            target_id: Some(assessment_id),
+            threshold: Some(min_score),
+            operator: Some(ConditionOperator::GreaterThanOrEqual)
+        }
+    }
+
+    /// Create an "on date" condition
+    fn on_date(date: DateTime) -> UnlockCondition {
+        UnlockCondition {
+            condition_type: UnlockConditionType::OnDate { date },
+            target_id: None,
+            threshold: None,
+            operator: None
+        }
+    }
+}
+
+impl LearningObjective {
+    /// Create a new learning objective
+    fn new(name: String, description: String, bloom_level: BloomLevel) -> LearningObjective {
+        LearningObjective {
+            id: format!("lo_{}", generate_uuid()),
+            name,
+            description,
+            bloom_level,
+            action_verb: bloom_level.default_verb(),
+            measurement: None,
+            competencies: vec![],
+            required: true
+        }
+    }
+}
+
+impl BloomLevel {
+    /// Get default action verb for Bloom's level
+    fn default_verb(&self) -> String {
+        match self {
+            BloomLevel::Remember => "identify".to_string(),
+            BloomLevel::Understand => "explain".to_string(),
+            BloomLevel::Apply => "apply".to_string(),
+            BloomLevel::Analyze => "analyze".to_string(),
+            BloomLevel::Evaluate => "evaluate".to_string(),
+            BloomLevel::Create => "create".to_string()
+        }
+    }
+}

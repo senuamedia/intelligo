@@ -1,0 +1,840 @@
+/// Intelligo LMS - UI Component Library
+///
+/// Comprehensive component system with theming support.
+
+module intelligo::themes::components
+
+use intelligo::themes::core::*
+
+// ============================================================================
+// Component Registry
+// ============================================================================
+
+/// Central registry for all UI components
+pub actor ComponentRegistry {
+    components: Map<String, ComponentDefinition>,
+    variants: Map<String, Vec<ComponentVariant>>,
+    slots: Map<String, Vec<SlotRegistration>>,
+
+    pub fn new() -> Self {
+        let mut registry = ComponentRegistry {
+            components: Map::new(),
+            variants: Map::new(),
+            slots: Map::new()
+        };
+
+        // Register built-in components
+        registry.register_builtin_components();
+
+        registry
+    }
+
+    fn register_builtin_components(mut self) {
+        // Layout components
+        self.register(ComponentDefinition::layout("Container", "container"));
+        self.register(ComponentDefinition::layout("Grid", "grid"));
+        self.register(ComponentDefinition::layout("Flex", "flex"));
+        self.register(ComponentDefinition::layout("Stack", "stack"));
+        self.register(ComponentDefinition::layout("Sidebar", "sidebar"));
+        self.register(ComponentDefinition::layout("Header", "header"));
+        self.register(ComponentDefinition::layout("Footer", "footer"));
+
+        // Form components
+        self.register(ComponentDefinition::form("Button", "button"));
+        self.register(ComponentDefinition::form("Input", "input"));
+        self.register(ComponentDefinition::form("Textarea", "textarea"));
+        self.register(ComponentDefinition::form("Select", "select"));
+        self.register(ComponentDefinition::form("Checkbox", "checkbox"));
+        self.register(ComponentDefinition::form("Radio", "radio"));
+        self.register(ComponentDefinition::form("Switch", "switch"));
+        self.register(ComponentDefinition::form("Slider", "slider"));
+        self.register(ComponentDefinition::form("DatePicker", "datepicker"));
+        self.register(ComponentDefinition::form("TimePicker", "timepicker"));
+        self.register(ComponentDefinition::form("FileUpload", "file-upload"));
+        self.register(ComponentDefinition::form("RichTextEditor", "rich-text-editor"));
+
+        // Display components
+        self.register(ComponentDefinition::display("Card", "card"));
+        self.register(ComponentDefinition::display("Badge", "badge"));
+        self.register(ComponentDefinition::display("Avatar", "avatar"));
+        self.register(ComponentDefinition::display("Icon", "icon"));
+        self.register(ComponentDefinition::display("Image", "image"));
+        self.register(ComponentDefinition::display("Video", "video"));
+        self.register(ComponentDefinition::display("Progress", "progress"));
+        self.register(ComponentDefinition::display("Spinner", "spinner"));
+        self.register(ComponentDefinition::display("Skeleton", "skeleton"));
+        self.register(ComponentDefinition::display("Tag", "tag"));
+        self.register(ComponentDefinition::display("Chip", "chip"));
+
+        // Navigation components
+        self.register(ComponentDefinition::navigation("Navbar", "navbar"));
+        self.register(ComponentDefinition::navigation("Breadcrumb", "breadcrumb"));
+        self.register(ComponentDefinition::navigation("Tabs", "tabs"));
+        self.register(ComponentDefinition::navigation("Menu", "menu"));
+        self.register(ComponentDefinition::navigation("Dropdown", "dropdown"));
+        self.register(ComponentDefinition::navigation("Pagination", "pagination"));
+        self.register(ComponentDefinition::navigation("Stepper", "stepper"));
+
+        // Feedback components
+        self.register(ComponentDefinition::feedback("Alert", "alert"));
+        self.register(ComponentDefinition::feedback("Toast", "toast"));
+        self.register(ComponentDefinition::feedback("Notification", "notification"));
+        self.register(ComponentDefinition::feedback("Modal", "modal"));
+        self.register(ComponentDefinition::feedback("Dialog", "dialog"));
+        self.register(ComponentDefinition::feedback("Drawer", "drawer"));
+        self.register(ComponentDefinition::feedback("Popover", "popover"));
+        self.register(ComponentDefinition::feedback("Tooltip", "tooltip"));
+
+        // Data components
+        self.register(ComponentDefinition::data("Table", "table"));
+        self.register(ComponentDefinition::data("DataGrid", "data-grid"));
+        self.register(ComponentDefinition::data("List", "list"));
+        self.register(ComponentDefinition::data("Tree", "tree"));
+        self.register(ComponentDefinition::data("Timeline", "timeline"));
+        self.register(ComponentDefinition::data("Calendar", "calendar"));
+        self.register(ComponentDefinition::data("Chart", "chart"));
+        self.register(ComponentDefinition::data("Stats", "stats"));
+
+        // LMS-specific components
+        self.register(ComponentDefinition::lms("CourseCard", "course-card"));
+        self.register(ComponentDefinition::lms("LessonPlayer", "lesson-player"));
+        self.register(ComponentDefinition::lms("ProgressRing", "progress-ring"));
+        self.register(ComponentDefinition::lms("QuizQuestion", "quiz-question"));
+        self.register(ComponentDefinition::lms("Certificate", "certificate"));
+        self.register(ComponentDefinition::lms("Leaderboard", "leaderboard"));
+        self.register(ComponentDefinition::lms("DiscussionThread", "discussion-thread"));
+        self.register(ComponentDefinition::lms("ActivityFeed", "activity-feed"));
+    }
+
+    /// Register a component
+    pub fn register(mut self, component: ComponentDefinition) {
+        self.components.insert(component.id.clone(), component);
+    }
+
+    /// Get a component definition
+    pub fn get(self, id: &str) -> Option<ComponentDefinition> {
+        self.components.get(id).cloned()
+    }
+
+    /// List all components
+    pub fn list(self) -> Vec<ComponentDefinition> {
+        self.components.values().cloned().collect()
+    }
+
+    /// List components by category
+    pub fn list_by_category(self, category: ComponentCategory) -> Vec<ComponentDefinition> {
+        self.components.values()
+            .filter(|c| c.category == category)
+            .cloned()
+            .collect()
+    }
+
+    /// Register a component variant
+    pub fn register_variant(mut self, component_id: &str, variant: ComponentVariant) {
+        let variants = self.variants.entry(component_id.to_string()).or_insert(vec![]);
+        variants.push(variant);
+    }
+
+    /// Get variants for a component
+    pub fn get_variants(self, component_id: &str) -> Vec<ComponentVariant> {
+        self.variants.get(component_id).cloned().unwrap_or_default()
+    }
+
+    /// Register a slot extension
+    pub fn register_slot(mut self, slot_id: &str, registration: SlotRegistration) {
+        let slots = self.slots.entry(slot_id.to_string()).or_insert(vec![]);
+        slots.push(registration);
+        slots.sort_by(|a, b| a.priority.cmp(&b.priority));
+    }
+
+    /// Get slot extensions
+    pub fn get_slot_extensions(self, slot_id: &str) -> Vec<SlotRegistration> {
+        self.slots.get(slot_id).cloned().unwrap_or_default()
+    }
+}
+
+// ============================================================================
+// Component Definitions
+// ============================================================================
+
+/// Component definition
+pub type ComponentDefinition = type {
+    id: String,
+    name: String,
+    category: ComponentCategory,
+    description: String,
+    props: Vec<PropDefinition>,
+    slots: Vec<SlotDefinition>,
+    events: Vec<EventDefinition>,
+    styles: ComponentStyles,
+    accessibility: AccessibilitySpec
+}
+
+impl ComponentDefinition {
+    pub fn new(id: &str, name: &str, category: ComponentCategory) -> Self {
+        ComponentDefinition {
+            id: id.to_string(),
+            name: name.to_string(),
+            category,
+            description: String::new(),
+            props: vec![],
+            slots: vec![],
+            events: vec![],
+            styles: ComponentStyles::default(),
+            accessibility: AccessibilitySpec::default()
+        }
+    }
+
+    pub fn layout(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Layout)
+    }
+
+    pub fn form(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Form)
+    }
+
+    pub fn display(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Display)
+    }
+
+    pub fn navigation(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Navigation)
+    }
+
+    pub fn feedback(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Feedback)
+    }
+
+    pub fn data(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Data)
+    }
+
+    pub fn lms(name: &str, id: &str) -> Self {
+        Self::new(id, name, ComponentCategory::Lms)
+    }
+}
+
+/// Component category
+pub enum ComponentCategory {
+    Layout,
+    Form,
+    Display,
+    Navigation,
+    Feedback,
+    Data,
+    Lms,
+    Custom
+}
+
+/// Property definition
+pub type PropDefinition = type {
+    name: String,
+    prop_type: PropType,
+    required: bool,
+    default: Option<Value>,
+    description: String,
+    validation: Option<PropValidation>
+}
+
+pub enum PropType {
+    String,
+    Number,
+    Boolean,
+    Enum(Vec<String>),
+    Object(Map<String, PropType>),
+    Array(Box<PropType>),
+    Component,
+    Function
+}
+
+pub type PropValidation = type {
+    min: Option<Value>,
+    max: Option<Value>,
+    pattern: Option<String>
+}
+
+/// Slot definition
+pub type SlotDefinition = type {
+    name: String,
+    description: String,
+    required: bool,
+    multiple: bool
+}
+
+/// Event definition
+pub type EventDefinition = type {
+    name: String,
+    description: String,
+    payload: Option<PropType>
+}
+
+/// Component variant
+pub type ComponentVariant = type {
+    name: String,
+    description: String,
+    props: Map<String, Value>,
+    styles: Map<String, String>
+}
+
+/// Slot registration (for plugins to extend components)
+pub type SlotRegistration = type {
+    plugin_id: String,
+    component_id: String,
+    slot_id: String,
+    priority: i32,
+    condition: Option<String>
+}
+
+// ============================================================================
+// Component Styles
+// ============================================================================
+
+/// Component styles specification
+pub type ComponentStyles = type {
+    base: StyleSpec,
+    variants: Map<String, StyleSpec>,
+    sizes: Map<String, StyleSpec>,
+    states: Map<String, StyleSpec>,
+    dark_mode: Option<StyleSpec>
+}
+
+impl Default for ComponentStyles {
+    fn default() -> Self {
+        ComponentStyles {
+            base: StyleSpec::default(),
+            variants: Map::new(),
+            sizes: Map::new(),
+            states: Map::new(),
+            dark_mode: None
+        }
+    }
+}
+
+/// Style specification
+pub type StyleSpec = type {
+    // Layout
+    display: Option<String>,
+    position: Option<String>,
+    width: Option<String>,
+    height: Option<String>,
+    min_width: Option<String>,
+    max_width: Option<String>,
+    min_height: Option<String>,
+    max_height: Option<String>,
+
+    // Spacing
+    padding: Option<String>,
+    padding_x: Option<String>,
+    padding_y: Option<String>,
+    margin: Option<String>,
+    margin_x: Option<String>,
+    margin_y: Option<String>,
+    gap: Option<String>,
+
+    // Flexbox/Grid
+    flex: Option<String>,
+    flex_direction: Option<String>,
+    align_items: Option<String>,
+    justify_content: Option<String>,
+    grid_template_columns: Option<String>,
+    grid_template_rows: Option<String>,
+
+    // Typography
+    font_family: Option<String>,
+    font_size: Option<String>,
+    font_weight: Option<String>,
+    line_height: Option<String>,
+    text_align: Option<String>,
+    text_transform: Option<String>,
+    letter_spacing: Option<String>,
+
+    // Colors
+    color: Option<String>,
+    background: Option<String>,
+    background_color: Option<String>,
+    border_color: Option<String>,
+
+    // Borders
+    border: Option<String>,
+    border_width: Option<String>,
+    border_style: Option<String>,
+    border_radius: Option<String>,
+
+    // Effects
+    box_shadow: Option<String>,
+    opacity: Option<String>,
+    transform: Option<String>,
+    transition: Option<String>,
+
+    // Other
+    cursor: Option<String>,
+    overflow: Option<String>,
+    z_index: Option<String>,
+
+    // Custom properties
+    custom: Map<String, String>
+}
+
+impl Default for StyleSpec {
+    fn default() -> Self {
+        StyleSpec {
+            display: None, position: None, width: None, height: None,
+            min_width: None, max_width: None, min_height: None, max_height: None,
+            padding: None, padding_x: None, padding_y: None,
+            margin: None, margin_x: None, margin_y: None, gap: None,
+            flex: None, flex_direction: None, align_items: None, justify_content: None,
+            grid_template_columns: None, grid_template_rows: None,
+            font_family: None, font_size: None, font_weight: None,
+            line_height: None, text_align: None, text_transform: None, letter_spacing: None,
+            color: None, background: None, background_color: None, border_color: None,
+            border: None, border_width: None, border_style: None, border_radius: None,
+            box_shadow: None, opacity: None, transform: None, transition: None,
+            cursor: None, overflow: None, z_index: None,
+            custom: Map::new()
+        }
+    }
+}
+
+impl StyleSpec {
+    /// Generate CSS from style spec
+    pub fn to_css(self) -> String {
+        let mut css = String::new();
+
+        if let Some(v) = self.display { css.push_str(&format!("display: {};\n", v)); }
+        if let Some(v) = self.position { css.push_str(&format!("position: {};\n", v)); }
+        if let Some(v) = self.width { css.push_str(&format!("width: {};\n", v)); }
+        if let Some(v) = self.height { css.push_str(&format!("height: {};\n", v)); }
+        if let Some(v) = self.padding { css.push_str(&format!("padding: {};\n", v)); }
+        if let Some(v) = self.margin { css.push_str(&format!("margin: {};\n", v)); }
+        if let Some(v) = self.gap { css.push_str(&format!("gap: {};\n", v)); }
+        if let Some(v) = self.flex { css.push_str(&format!("flex: {};\n", v)); }
+        if let Some(v) = self.flex_direction { css.push_str(&format!("flex-direction: {};\n", v)); }
+        if let Some(v) = self.align_items { css.push_str(&format!("align-items: {};\n", v)); }
+        if let Some(v) = self.justify_content { css.push_str(&format!("justify-content: {};\n", v)); }
+        if let Some(v) = self.font_family { css.push_str(&format!("font-family: {};\n", v)); }
+        if let Some(v) = self.font_size { css.push_str(&format!("font-size: {};\n", v)); }
+        if let Some(v) = self.font_weight { css.push_str(&format!("font-weight: {};\n", v)); }
+        if let Some(v) = self.line_height { css.push_str(&format!("line-height: {};\n", v)); }
+        if let Some(v) = self.color { css.push_str(&format!("color: {};\n", v)); }
+        if let Some(v) = self.background { css.push_str(&format!("background: {};\n", v)); }
+        if let Some(v) = self.background_color { css.push_str(&format!("background-color: {};\n", v)); }
+        if let Some(v) = self.border { css.push_str(&format!("border: {};\n", v)); }
+        if let Some(v) = self.border_radius { css.push_str(&format!("border-radius: {};\n", v)); }
+        if let Some(v) = self.box_shadow { css.push_str(&format!("box-shadow: {};\n", v)); }
+        if let Some(v) = self.transition { css.push_str(&format!("transition: {};\n", v)); }
+        if let Some(v) = self.cursor { css.push_str(&format!("cursor: {};\n", v)); }
+
+        for (key, value) in self.custom {
+            css.push_str(&format!("{}: {};\n", key, value));
+        }
+
+        css
+    }
+}
+
+// ============================================================================
+// Accessibility
+// ============================================================================
+
+/// Accessibility specification
+pub type AccessibilitySpec = type {
+    role: Option<AriaRole>,
+    label: Option<String>,
+    described_by: Option<String>,
+    controls: Option<String>,
+    expanded: Option<bool>,
+    selected: Option<bool>,
+    hidden: Option<bool>,
+    live: Option<AriaLive>,
+    keyboard_navigation: bool,
+    focus_trap: bool,
+    screen_reader_only: bool
+}
+
+impl Default for AccessibilitySpec {
+    fn default() -> Self {
+        AccessibilitySpec {
+            role: None,
+            label: None,
+            described_by: None,
+            controls: None,
+            expanded: None,
+            selected: None,
+            hidden: None,
+            live: None,
+            keyboard_navigation: true,
+            focus_trap: false,
+            screen_reader_only: false
+        }
+    }
+}
+
+pub enum AriaRole {
+    Alert,
+    AlertDialog,
+    Button,
+    Checkbox,
+    Dialog,
+    Grid,
+    Link,
+    Listbox,
+    Menu,
+    Menuitem,
+    Navigation,
+    Progressbar,
+    Radio,
+    Slider,
+    Tab,
+    Tabpanel,
+    Textbox,
+    Tree,
+    Custom(String)
+}
+
+pub enum AriaLive {
+    Off,
+    Polite,
+    Assertive
+}
+
+// ============================================================================
+// Design Tokens
+// ============================================================================
+
+/// Design token system
+pub actor DesignTokens {
+    colors: Map<String, String>,
+    spacing: Map<String, String>,
+    typography: Map<String, TypographyToken>,
+    shadows: Map<String, String>,
+    borders: Map<String, String>,
+    breakpoints: Map<String, String>,
+    z_indices: Map<String, i32>,
+    transitions: Map<String, String>,
+
+    pub fn new() -> Self {
+        let mut tokens = DesignTokens {
+            colors: Map::new(),
+            spacing: Map::new(),
+            typography: Map::new(),
+            shadows: Map::new(),
+            borders: Map::new(),
+            breakpoints: Map::new(),
+            z_indices: Map::new(),
+            transitions: Map::new()
+        };
+
+        tokens.init_default_tokens();
+        tokens
+    }
+
+    fn init_default_tokens(mut self) {
+        // Colors
+        self.colors.insert("primary".to_string(), "#1a73e8".to_string());
+        self.colors.insert("primary-light".to_string(), "#4285f4".to_string());
+        self.colors.insert("primary-dark".to_string(), "#1557b0".to_string());
+        self.colors.insert("secondary".to_string(), "#5f6368".to_string());
+        self.colors.insert("success".to_string(), "#34a853".to_string());
+        self.colors.insert("warning".to_string(), "#fbbc04".to_string());
+        self.colors.insert("error".to_string(), "#ea4335".to_string());
+        self.colors.insert("info".to_string(), "#4285f4".to_string());
+
+        self.colors.insert("background".to_string(), "#ffffff".to_string());
+        self.colors.insert("surface".to_string(), "#f8f9fa".to_string());
+        self.colors.insert("text-primary".to_string(), "#202124".to_string());
+        self.colors.insert("text-secondary".to_string(), "#5f6368".to_string());
+        self.colors.insert("text-disabled".to_string(), "#9aa0a6".to_string());
+        self.colors.insert("border".to_string(), "#dadce0".to_string());
+
+        // Spacing scale
+        self.spacing.insert("0".to_string(), "0".to_string());
+        self.spacing.insert("1".to_string(), "0.25rem".to_string());
+        self.spacing.insert("2".to_string(), "0.5rem".to_string());
+        self.spacing.insert("3".to_string(), "0.75rem".to_string());
+        self.spacing.insert("4".to_string(), "1rem".to_string());
+        self.spacing.insert("5".to_string(), "1.25rem".to_string());
+        self.spacing.insert("6".to_string(), "1.5rem".to_string());
+        self.spacing.insert("8".to_string(), "2rem".to_string());
+        self.spacing.insert("10".to_string(), "2.5rem".to_string());
+        self.spacing.insert("12".to_string(), "3rem".to_string());
+        self.spacing.insert("16".to_string(), "4rem".to_string());
+        self.spacing.insert("20".to_string(), "5rem".to_string());
+        self.spacing.insert("24".to_string(), "6rem".to_string());
+
+        // Typography
+        self.typography.insert("h1".to_string(), TypographyToken {
+            font_size: "2.5rem".to_string(),
+            font_weight: "700".to_string(),
+            line_height: "1.2".to_string(),
+            letter_spacing: "-0.02em".to_string()
+        });
+        self.typography.insert("h2".to_string(), TypographyToken {
+            font_size: "2rem".to_string(),
+            font_weight: "700".to_string(),
+            line_height: "1.25".to_string(),
+            letter_spacing: "-0.01em".to_string()
+        });
+        self.typography.insert("h3".to_string(), TypographyToken {
+            font_size: "1.5rem".to_string(),
+            font_weight: "600".to_string(),
+            line_height: "1.3".to_string(),
+            letter_spacing: "0".to_string()
+        });
+        self.typography.insert("body".to_string(), TypographyToken {
+            font_size: "1rem".to_string(),
+            font_weight: "400".to_string(),
+            line_height: "1.5".to_string(),
+            letter_spacing: "0".to_string()
+        });
+        self.typography.insert("small".to_string(), TypographyToken {
+            font_size: "0.875rem".to_string(),
+            font_weight: "400".to_string(),
+            line_height: "1.4".to_string(),
+            letter_spacing: "0".to_string()
+        });
+
+        // Shadows
+        self.shadows.insert("sm".to_string(), "0 1px 2px rgba(0,0,0,0.05)".to_string());
+        self.shadows.insert("md".to_string(), "0 4px 6px rgba(0,0,0,0.1)".to_string());
+        self.shadows.insert("lg".to_string(), "0 10px 15px rgba(0,0,0,0.1)".to_string());
+        self.shadows.insert("xl".to_string(), "0 20px 25px rgba(0,0,0,0.15)".to_string());
+
+        // Borders
+        self.borders.insert("none".to_string(), "none".to_string());
+        self.borders.insert("thin".to_string(), "1px solid var(--color-border)".to_string());
+        self.borders.insert("medium".to_string(), "2px solid var(--color-border)".to_string());
+        self.borders.insert("thick".to_string(), "4px solid var(--color-border)".to_string());
+
+        // Border radius
+        self.borders.insert("radius-none".to_string(), "0".to_string());
+        self.borders.insert("radius-sm".to_string(), "0.125rem".to_string());
+        self.borders.insert("radius-md".to_string(), "0.375rem".to_string());
+        self.borders.insert("radius-lg".to_string(), "0.5rem".to_string());
+        self.borders.insert("radius-xl".to_string(), "1rem".to_string());
+        self.borders.insert("radius-full".to_string(), "9999px".to_string());
+
+        // Breakpoints
+        self.breakpoints.insert("sm".to_string(), "640px".to_string());
+        self.breakpoints.insert("md".to_string(), "768px".to_string());
+        self.breakpoints.insert("lg".to_string(), "1024px".to_string());
+        self.breakpoints.insert("xl".to_string(), "1280px".to_string());
+        self.breakpoints.insert("2xl".to_string(), "1536px".to_string());
+
+        // Z-index scale
+        self.z_indices.insert("base".to_string(), 0);
+        self.z_indices.insert("dropdown".to_string(), 1000);
+        self.z_indices.insert("sticky".to_string(), 1020);
+        self.z_indices.insert("fixed".to_string(), 1030);
+        self.z_indices.insert("modal-backdrop".to_string(), 1040);
+        self.z_indices.insert("modal".to_string(), 1050);
+        self.z_indices.insert("popover".to_string(), 1060);
+        self.z_indices.insert("tooltip".to_string(), 1070);
+
+        // Transitions
+        self.transitions.insert("fast".to_string(), "150ms ease".to_string());
+        self.transitions.insert("normal".to_string(), "200ms ease".to_string());
+        self.transitions.insert("slow".to_string(), "300ms ease".to_string());
+    }
+
+    /// Generate CSS custom properties
+    pub fn to_css_vars(self) -> String {
+        let mut css = ":root {\n".to_string();
+
+        for (name, value) in &self.colors {
+            css.push_str(&format!("  --color-{}: {};\n", name, value));
+        }
+
+        for (name, value) in &self.spacing {
+            css.push_str(&format!("  --spacing-{}: {};\n", name, value));
+        }
+
+        for (name, token) in &self.typography {
+            css.push_str(&format!("  --font-size-{}: {};\n", name, token.font_size));
+            css.push_str(&format!("  --font-weight-{}: {};\n", name, token.font_weight));
+            css.push_str(&format!("  --line-height-{}: {};\n", name, token.line_height));
+        }
+
+        for (name, value) in &self.shadows {
+            css.push_str(&format!("  --shadow-{}: {};\n", name, value));
+        }
+
+        for (name, value) in &self.borders {
+            css.push_str(&format!("  --border-{}: {};\n", name, value));
+        }
+
+        for (name, value) in &self.breakpoints {
+            css.push_str(&format!("  --breakpoint-{}: {};\n", name, value));
+        }
+
+        for (name, value) in &self.z_indices {
+            css.push_str(&format!("  --z-{}: {};\n", name, value));
+        }
+
+        for (name, value) in &self.transitions {
+            css.push_str(&format!("  --transition-{}: {};\n", name, value));
+        }
+
+        css.push_str("}\n");
+        css
+    }
+
+    /// Get a color token
+    pub fn color(self, name: &str) -> Option<String> {
+        self.colors.get(name).cloned()
+    }
+
+    /// Get a spacing token
+    pub fn spacing(self, name: &str) -> Option<String> {
+        self.spacing.get(name).cloned()
+    }
+
+    /// Set a token
+    pub fn set_color(mut self, name: &str, value: &str) {
+        self.colors.insert(name.to_string(), value.to_string());
+    }
+}
+
+pub type TypographyToken = type {
+    font_size: String,
+    font_weight: String,
+    line_height: String,
+    letter_spacing: String
+}
+
+// ============================================================================
+// Widget System
+// ============================================================================
+
+/// Widget definition for dashboards
+pub type WidgetDefinition = type {
+    id: String,
+    name: String,
+    description: String,
+    category: WidgetCategory,
+    component: String,
+    default_config: Map<String, Value>,
+    config_schema: Map<String, PropDefinition>,
+    min_width: i32,
+    min_height: i32,
+    max_width: Option<i32>,
+    max_height: Option<i32>,
+    resizable: bool,
+    draggable: bool
+}
+
+pub enum WidgetCategory {
+    Analytics,
+    Progress,
+    Activity,
+    Compliance,
+    Social,
+    Custom
+}
+
+/// Widget instance (placed on a dashboard)
+pub type WidgetInstance = type {
+    id: String,
+    widget_id: String,
+    config: Map<String, Value>,
+    position: WidgetPosition,
+    size: WidgetSize
+}
+
+pub type WidgetPosition = type {
+    x: i32,
+    y: i32
+}
+
+pub type WidgetSize = type {
+    width: i32,
+    height: i32
+}
+
+/// Dashboard layout
+pub type DashboardLayout = type {
+    id: String,
+    name: String,
+    columns: i32,
+    row_height: i32,
+    widgets: Vec<WidgetInstance>,
+    is_default: bool
+}
+
+// ============================================================================
+// Layout System
+// ============================================================================
+
+/// Page layout definition
+pub type PageLayout = type {
+    id: String,
+    name: String,
+    regions: Vec<LayoutRegion>,
+    responsive: ResponsiveConfig
+}
+
+pub type LayoutRegion = type {
+    id: String,
+    name: String,
+    slot_id: String,
+    styles: StyleSpec
+}
+
+pub type ResponsiveConfig = type {
+    breakpoints: Map<String, LayoutOverride>
+}
+
+pub type LayoutOverride = type {
+    hidden_regions: Vec<String>,
+    style_overrides: Map<String, StyleSpec>
+}
+
+// ============================================================================
+// Icon System
+// ============================================================================
+
+/// Icon set
+pub type IconSet = type {
+    name: String,
+    prefix: String,
+    icons: Map<String, IconDefinition>
+}
+
+pub type IconDefinition = type {
+    name: String,
+    svg: String,
+    aliases: Vec<String>,
+    categories: Vec<String>
+}
+
+/// Icon registry
+pub actor IconRegistry {
+    icon_sets: Map<String, IconSet>,
+
+    pub fn new() -> Self {
+        IconRegistry { icon_sets: Map::new() }
+    }
+
+    pub fn register_set(mut self, set: IconSet) {
+        self.icon_sets.insert(set.name.clone(), set);
+    }
+
+    pub fn get_icon(self, set_name: &str, icon_name: &str) -> Option<IconDefinition> {
+        self.icon_sets.get(set_name)
+            .and_then(|set| set.icons.get(icon_name))
+            .cloned()
+    }
+
+    pub fn search_icons(self, query: &str) -> Vec<(String, IconDefinition)> {
+        let mut results = vec![];
+
+        for (set_name, set) in &self.icon_sets {
+            for (icon_name, icon) in &set.icons {
+                if icon_name.contains(query) || icon.aliases.iter().any(|a| a.contains(query)) {
+                    results.push((format!("{}:{}", set_name, icon_name), icon.clone()));
+                }
+            }
+        }
+
+        results
+    }
+}

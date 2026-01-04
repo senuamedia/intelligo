@@ -1,0 +1,1580 @@
+/// Intelligo LMS - Frontend Components
+///
+/// Reusable UI component library for server-side rendering with hydration support.
+/// Components render static HTML and can be progressively enhanced with JavaScript.
+
+module intelligo::frontend::components
+
+use intelligo::frontend::*
+use intelligo::core::*
+use intelligo::runtime::*
+
+// ============================================================================
+// Component Registry
+// ============================================================================
+
+/// Central registry for all frontend components
+pub actor ComponentRegistry {
+    components: Map<String, ComponentDefinition>,
+    templates: Map<String, String>,
+}
+
+impl ComponentRegistry {
+    pub fn new() -> Self {
+        let mut registry = ComponentRegistry {
+            components: Map::new(),
+            templates: Map::new(),
+        };
+
+        // Register built-in components
+        registry.register_builtin_components();
+        registry
+    }
+
+    /// Register a component
+    pub fn register(mut self, name: &str, def: ComponentDefinition) {
+        self.components.insert(name.to_string(), def);
+    }
+
+    /// Get component by name
+    pub fn get(self, name: &str) -> Option<ComponentDefinition> {
+        self.components.get(name).cloned()
+    }
+
+    /// Render a component to HTML
+    pub fn render(self, name: &str, props: &Map<String, Value>, ctx: &RenderContext) -> Result<String, FrontendError> {
+        let def = self.get(name).ok_or_else(|| {
+            FrontendError::RenderError { message: format!("Component not found: {}", name) }
+        })?;
+
+        (def.render)(props, ctx)
+    }
+
+    /// Register all built-in components
+    fn register_builtin_components(mut self) {
+        // Navigation
+        self.register("navbar", navbar_component());
+        self.register("sidebar", sidebar_component());
+        self.register("breadcrumb", breadcrumb_component());
+        self.register("tabs", tabs_component());
+        self.register("pagination", pagination_component());
+
+        // Content
+        self.register("card", card_component());
+        self.register("modal", modal_component());
+        self.register("accordion", accordion_component());
+        self.register("alert", alert_component());
+        self.register("badge", badge_component());
+
+        // Forms
+        self.register("button", button_component());
+        self.register("input", input_component());
+        self.register("select", select_component());
+        self.register("checkbox", checkbox_component());
+        self.register("radio", radio_component());
+        self.register("textarea", textarea_component());
+        self.register("file-upload", file_upload_component());
+
+        // LMS-specific
+        self.register("course-card", course_card_component());
+        self.register("lesson-player", lesson_player_component());
+        self.register("quiz-widget", quiz_widget_component());
+        self.register("progress-ring", progress_ring_component());
+        self.register("grade-display", grade_display_component());
+        self.register("certificate-badge", certificate_badge_component());
+
+        // Interactive
+        self.register("dropdown", dropdown_component());
+        self.register("search-bar", search_bar_component());
+        self.register("notification-bell", notification_bell_component());
+        self.register("user-avatar", user_avatar_component());
+        self.register("auth-widget", auth_widget_component());
+
+        // Media
+        self.register("video-player", video_player_component());
+        self.register("audio-player", audio_player_component());
+        self.register("image-gallery", image_gallery_component());
+        self.register("pdf-viewer", pdf_viewer_component());
+    }
+}
+
+/// Component definition
+pub type ComponentDefinition = type {
+    name: String,
+    hydration: HydrationStrategy,
+    dependencies: Vec<String>,
+    render: fn(&Map<String, Value>, &RenderContext) -> Result<String, FrontendError>,
+}
+
+/// Render context for components
+pub type RenderContext = type {
+    user: UserContext,
+    theme: String,
+    locale: String,
+    csp_nonce: String,
+    cdn_base: String,
+}
+
+impl RenderContext {
+    pub fn default() -> Self {
+        RenderContext {
+            user: UserContext::anonymous(),
+            theme: "light".to_string(),
+            locale: "en".to_string(),
+            csp_nonce: "".to_string(),
+            cdn_base: "".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// Navigation Components
+// ============================================================================
+
+fn navbar_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "navbar".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec!["dropdown".to_string()],
+        render: |props, ctx| {
+            let brand = props.get_str("brand").unwrap_or("Intelligo");
+            let links = props.get_array("links").unwrap_or_default();
+
+            let mut html = format!(r#"
+<nav class="navbar" role="navigation" aria-label="main navigation">
+  <div class="navbar-brand">
+    <a class="navbar-item" href="/">{}</a>
+    <button class="navbar-burger" aria-label="menu" aria-expanded="false" data-target="navMenu">
+      <span aria-hidden="true"></span>
+      <span aria-hidden="true"></span>
+      <span aria-hidden="true"></span>
+    </button>
+  </div>
+  <div id="navMenu" class="navbar-menu">
+    <div class="navbar-start">
+"#, html_escape(brand));
+
+            for link in links {
+                if let Some(obj) = link.as_object() {
+                    let href = obj.get_str("href").unwrap_or("#");
+                    let text = obj.get_str("text").unwrap_or("Link");
+                    let active = obj.get_bool("active").unwrap_or(false);
+                    let class = if active { "navbar-item is-active" } else { "navbar-item" };
+                    html.push_str(&format!(r#"      <a class="{}" href="{}">{}</a>
+"#, class, html_escape(href), html_escape(text)));
+                }
+            }
+
+            html.push_str(r#"    </div>
+    <div class="navbar-end">
+      <div class="navbar-item" data-component="auth-widget"></div>
+    </div>
+  </div>
+</nav>
+"#);
+
+            Ok(html)
+        },
+    }
+}
+
+fn sidebar_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "sidebar".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let items = props.get_array("items").unwrap_or_default();
+            let collapsed = props.get_bool("collapsed").unwrap_or(false);
+
+            let class = if collapsed { "sidebar is-collapsed" } else { "sidebar" };
+
+            let mut html = format!(r#"<aside class="{}" data-component="sidebar">
+  <ul class="sidebar-menu">
+"#, class);
+
+            for item in items {
+                if let Some(obj) = item.as_object() {
+                    let href = obj.get_str("href").unwrap_or("#");
+                    let text = obj.get_str("text").unwrap_or("Item");
+                    let icon = obj.get_str("icon").unwrap_or("circle");
+                    let active = obj.get_bool("active").unwrap_or(false);
+                    let class = if active { "is-active" } else { "" };
+
+                    html.push_str(&format!(r#"    <li class="{}">
+      <a href="{}">
+        <span class="icon"><i class="fas fa-{}"></i></span>
+        <span class="text">{}</span>
+      </a>
+    </li>
+"#, class, html_escape(href), html_escape(icon), html_escape(text)));
+                }
+            }
+
+            html.push_str("  </ul>\n</aside>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn breadcrumb_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "breadcrumb".to_string(),
+        hydration: HydrationStrategy::Lazy, // Static, no hydration needed
+        dependencies: vec![],
+        render: |props, ctx| {
+            let items = props.get_array("items").unwrap_or_default();
+
+            let mut html = String::from(r#"<nav class="breadcrumb" aria-label="breadcrumbs">
+  <ul>
+"#);
+
+            for (i, item) in items.iter().enumerate() {
+                if let Some(obj) = item.as_object() {
+                    let href = obj.get_str("href");
+                    let text = obj.get_str("text").unwrap_or("Item");
+                    let is_last = i == items.len() - 1;
+
+                    if is_last {
+                        html.push_str(&format!(r#"    <li class="is-active"><a href="#" aria-current="page">{}</a></li>
+"#, html_escape(text)));
+                    } else if let Some(h) = href {
+                        html.push_str(&format!(r#"    <li><a href="{}">{}</a></li>
+"#, html_escape(h), html_escape(text)));
+                    }
+                }
+            }
+
+            html.push_str("  </ul>\n</nav>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn tabs_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "tabs".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let tabs = props.get_array("tabs").unwrap_or_default();
+            let active_id = props.get_str("active").unwrap_or("");
+
+            let mut html = String::from(r#"<div class="tabs-container" data-component="tabs">
+  <div class="tabs">
+    <ul>
+"#);
+
+            for tab in &tabs {
+                if let Some(obj) = tab.as_object() {
+                    let id = obj.get_str("id").unwrap_or("");
+                    let label = obj.get_str("label").unwrap_or("Tab");
+                    let class = if id == active_id { "is-active" } else { "" };
+
+                    html.push_str(&format!(r#"      <li class="{}"><a data-tab="{}">{}</a></li>
+"#, class, html_escape(id), html_escape(label)));
+                }
+            }
+
+            html.push_str("    </ul>\n  </div>\n");
+
+            // Tab content panels
+            for tab in &tabs {
+                if let Some(obj) = tab.as_object() {
+                    let id = obj.get_str("id").unwrap_or("");
+                    let content = obj.get_str("content").unwrap_or("");
+                    let hidden = if id == active_id { "" } else { "hidden" };
+
+                    html.push_str(&format!(r#"  <div class="tab-content" data-tab-content="{}" {}>
+    {}
+  </div>
+"#, html_escape(id), hidden, content));
+                }
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn pagination_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "pagination".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let current = props.get_i32("current").unwrap_or(1);
+            let total = props.get_i32("total").unwrap_or(1);
+            let base_url = props.get_str("base_url").unwrap_or("?page=");
+
+            let mut html = String::from(r#"<nav class="pagination" role="navigation" aria-label="pagination">
+"#);
+
+            // Previous link
+            if current > 1 {
+                html.push_str(&format!(r#"  <a class="pagination-previous" href="{}{}">Previous</a>
+"#, base_url, current - 1));
+            } else {
+                html.push_str(r#"  <a class="pagination-previous" disabled>Previous</a>
+"#);
+            }
+
+            // Next link
+            if current < total {
+                html.push_str(&format!(r#"  <a class="pagination-next" href="{}{}">Next</a>
+"#, base_url, current + 1));
+            } else {
+                html.push_str(r#"  <a class="pagination-next" disabled>Next</a>
+"#);
+            }
+
+            // Page numbers
+            html.push_str("  <ul class=\"pagination-list\">\n");
+
+            let start = std::cmp::max(1, current - 2);
+            let end = std::cmp::min(total, current + 2);
+
+            if start > 1 {
+                html.push_str(&format!(r#"    <li><a class="pagination-link" href="{}1">1</a></li>
+"#, base_url));
+                if start > 2 {
+                    html.push_str("    <li><span class=\"pagination-ellipsis\">&hellip;</span></li>\n");
+                }
+            }
+
+            for page in start..=end {
+                let class = if page == current {
+                    "pagination-link is-current"
+                } else {
+                    "pagination-link"
+                };
+                html.push_str(&format!(r#"    <li><a class="{}" href="{}{}">{}</a></li>
+"#, class, base_url, page, page));
+            }
+
+            if end < total {
+                if end < total - 1 {
+                    html.push_str("    <li><span class=\"pagination-ellipsis\">&hellip;</span></li>\n");
+                }
+                html.push_str(&format!(r#"    <li><a class="pagination-link" href="{}{}">{}</a></li>
+"#, base_url, total, total));
+            }
+
+            html.push_str("  </ul>\n</nav>\n");
+            Ok(html)
+        },
+    }
+}
+
+// ============================================================================
+// Content Components
+// ============================================================================
+
+fn card_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "card".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let title = props.get_str("title");
+            let image = props.get_str("image");
+            let content = props.get_str("content").unwrap_or("");
+            let footer = props.get_str("footer");
+
+            let mut html = String::from("<div class=\"card\">\n");
+
+            if let Some(img) = image {
+                html.push_str(&format!(r#"  <div class="card-image">
+    <figure class="image">
+      <img src="{}" alt="" loading="lazy">
+    </figure>
+  </div>
+"#, html_escape(img)));
+            }
+
+            html.push_str("  <div class=\"card-content\">\n");
+
+            if let Some(t) = title {
+                html.push_str(&format!("    <p class=\"title is-4\">{}</p>\n", html_escape(t)));
+            }
+
+            html.push_str(&format!("    <div class=\"content\">{}</div>\n", content));
+            html.push_str("  </div>\n");
+
+            if let Some(f) = footer {
+                html.push_str(&format!("  <footer class=\"card-footer\">{}</footer>\n", f));
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn modal_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "modal".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let id = props.get_str("id").unwrap_or("modal");
+            let title = props.get_str("title").unwrap_or("Modal");
+            let content = props.get_str("content").unwrap_or("");
+            let show_footer = props.get_bool("show_footer").unwrap_or(true);
+
+            let mut html = format!(r#"<div id="{}" class="modal" data-component="modal">
+  <div class="modal-background"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">{}</p>
+      <button class="delete" aria-label="close" data-modal-close></button>
+    </header>
+    <section class="modal-card-body">
+      {}
+    </section>
+"#, html_escape(id), html_escape(title), content);
+
+            if show_footer {
+                html.push_str(r#"    <footer class="modal-card-foot">
+      <button class="button is-success" data-modal-confirm>Confirm</button>
+      <button class="button" data-modal-close>Cancel</button>
+    </footer>
+"#);
+            }
+
+            html.push_str("  </div>\n</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn accordion_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "accordion".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let items = props.get_array("items").unwrap_or_default();
+
+            let mut html = String::from(r#"<div class="accordion" data-component="accordion">
+"#);
+
+            for (i, item) in items.iter().enumerate() {
+                if let Some(obj) = item.as_object() {
+                    let title = obj.get_str("title").unwrap_or("Section");
+                    let content = obj.get_str("content").unwrap_or("");
+                    let open = obj.get_bool("open").unwrap_or(i == 0);
+
+                    let open_attr = if open { "open" } else { "" };
+
+                    html.push_str(&format!(r#"  <details {} class="accordion-item">
+    <summary class="accordion-header">{}</summary>
+    <div class="accordion-content">
+      {}
+    </div>
+  </details>
+"#, open_attr, html_escape(title), content));
+                }
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn alert_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "alert".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let message = props.get_str("message").unwrap_or("");
+            let variant = props.get_str("variant").unwrap_or("info"); // info, success, warning, danger
+            let dismissible = props.get_bool("dismissible").unwrap_or(false);
+
+            let class = format!("notification is-{}", variant);
+
+            let mut html = format!(r#"<div class="{}" role="alert">
+"#, class);
+
+            if dismissible {
+                html.push_str("  <button class=\"delete\" data-dismiss=\"alert\"></button>\n");
+            }
+
+            html.push_str(&format!("  {}\n</div>\n", html_escape(message)));
+            Ok(html)
+        },
+    }
+}
+
+fn badge_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "badge".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let text = props.get_str("text").unwrap_or("");
+            let variant = props.get_str("variant").unwrap_or("primary");
+            let size = props.get_str("size").unwrap_or("normal");
+
+            let size_class = match size {
+                "small" => "is-small",
+                "medium" => "is-medium",
+                "large" => "is-large",
+                _ => "",
+            };
+
+            Ok(format!(r#"<span class="tag is-{} {}">{}</span>"#,
+                variant, size_class, html_escape(text)))
+        },
+    }
+}
+
+// ============================================================================
+// Form Components
+// ============================================================================
+
+fn button_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "button".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let text = props.get_str("text").unwrap_or("Button");
+            let variant = props.get_str("variant").unwrap_or("primary");
+            let size = props.get_str("size").unwrap_or("normal");
+            let disabled = props.get_bool("disabled").unwrap_or(false);
+            let loading = props.get_bool("loading").unwrap_or(false);
+            let icon = props.get_str("icon");
+            let href = props.get_str("href");
+            let button_type = props.get_str("type").unwrap_or("button");
+
+            let mut classes = vec![format!("button is-{}", variant)];
+
+            match size {
+                "small" => classes.push("is-small".to_string()),
+                "medium" => classes.push("is-medium".to_string()),
+                "large" => classes.push("is-large".to_string()),
+                _ => {}
+            }
+
+            if loading {
+                classes.push("is-loading".to_string());
+            }
+
+            let class_str = classes.join(" ");
+            let disabled_attr = if disabled { "disabled" } else { "" };
+
+            let mut html = String::new();
+
+            if let Some(h) = href {
+                html.push_str(&format!(r#"<a href="{}" class="{}" {}>"#,
+                    html_escape(h), class_str, disabled_attr));
+            } else {
+                html.push_str(&format!(r#"<button type="{}" class="{}" {} data-component="button">"#,
+                    button_type, class_str, disabled_attr));
+            }
+
+            if let Some(i) = icon {
+                html.push_str(&format!(r#"<span class="icon"><i class="fas fa-{}"></i></span>"#,
+                    html_escape(i)));
+            }
+
+            html.push_str(&format!("<span>{}</span>", html_escape(text)));
+
+            if href.is_some() {
+                html.push_str("</a>");
+            } else {
+                html.push_str("</button>");
+            }
+
+            Ok(html)
+        },
+    }
+}
+
+fn input_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "input".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let name = props.get_str("name").unwrap_or("input");
+            let label = props.get_str("label");
+            let input_type = props.get_str("type").unwrap_or("text");
+            let placeholder = props.get_str("placeholder").unwrap_or("");
+            let value = props.get_str("value").unwrap_or("");
+            let required = props.get_bool("required").unwrap_or(false);
+            let disabled = props.get_bool("disabled").unwrap_or(false);
+            let error = props.get_str("error");
+            let help = props.get_str("help");
+
+            let mut html = String::from("<div class=\"field\">\n");
+
+            if let Some(l) = label {
+                html.push_str(&format!("  <label class=\"label\" for=\"{}\">{}</label>\n",
+                    html_escape(name), html_escape(l)));
+            }
+
+            let mut input_class = "input".to_string();
+            if error.is_some() {
+                input_class.push_str(" is-danger");
+            }
+
+            let required_attr = if required { "required" } else { "" };
+            let disabled_attr = if disabled { "disabled" } else { "" };
+
+            html.push_str(&format!(r#"  <div class="control">
+    <input class="{}" type="{}" name="{}" id="{}" placeholder="{}" value="{}" {} {}>
+  </div>
+"#, input_class, input_type, html_escape(name), html_escape(name),
+    html_escape(placeholder), html_escape(value), required_attr, disabled_attr));
+
+            if let Some(e) = error {
+                html.push_str(&format!("  <p class=\"help is-danger\">{}</p>\n", html_escape(e)));
+            } else if let Some(h) = help {
+                html.push_str(&format!("  <p class=\"help\">{}</p>\n", html_escape(h)));
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn select_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "select".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let name = props.get_str("name").unwrap_or("select");
+            let label = props.get_str("label");
+            let options = props.get_array("options").unwrap_or_default();
+            let selected = props.get_str("selected").unwrap_or("");
+            let required = props.get_bool("required").unwrap_or(false);
+            let placeholder = props.get_str("placeholder");
+
+            let mut html = String::from("<div class=\"field\">\n");
+
+            if let Some(l) = label {
+                html.push_str(&format!("  <label class=\"label\" for=\"{}\">{}</label>\n",
+                    html_escape(name), html_escape(l)));
+            }
+
+            let required_attr = if required { "required" } else { "" };
+
+            html.push_str(&format!(r#"  <div class="control">
+    <div class="select">
+      <select name="{}" id="{}" {}>
+"#, html_escape(name), html_escape(name), required_attr));
+
+            if let Some(p) = placeholder {
+                html.push_str(&format!("        <option value=\"\">{}</option>\n", html_escape(p)));
+            }
+
+            for option in options {
+                if let Some(obj) = option.as_object() {
+                    let value = obj.get_str("value").unwrap_or("");
+                    let text = obj.get_str("text").unwrap_or(value);
+                    let is_selected = value == selected;
+                    let selected_attr = if is_selected { "selected" } else { "" };
+
+                    html.push_str(&format!("        <option value=\"{}\" {}>{}</option>\n",
+                        html_escape(value), selected_attr, html_escape(text)));
+                }
+            }
+
+            html.push_str("      </select>\n    </div>\n  </div>\n</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn checkbox_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "checkbox".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let name = props.get_str("name").unwrap_or("checkbox");
+            let label = props.get_str("label").unwrap_or("");
+            let checked = props.get_bool("checked").unwrap_or(false);
+            let disabled = props.get_bool("disabled").unwrap_or(false);
+
+            let checked_attr = if checked { "checked" } else { "" };
+            let disabled_attr = if disabled { "disabled" } else { "" };
+
+            Ok(format!(r#"<label class="checkbox">
+  <input type="checkbox" name="{}" {} {}>
+  {}
+</label>
+"#, html_escape(name), checked_attr, disabled_attr, html_escape(label)))
+        },
+    }
+}
+
+fn radio_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "radio".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let name = props.get_str("name").unwrap_or("radio");
+            let options = props.get_array("options").unwrap_or_default();
+            let selected = props.get_str("selected").unwrap_or("");
+
+            let mut html = String::from("<div class=\"control\">\n");
+
+            for option in options {
+                if let Some(obj) = option.as_object() {
+                    let value = obj.get_str("value").unwrap_or("");
+                    let label = obj.get_str("label").unwrap_or(value);
+                    let checked = value == selected;
+                    let checked_attr = if checked { "checked" } else { "" };
+
+                    html.push_str(&format!(r#"  <label class="radio">
+    <input type="radio" name="{}" value="{}" {}>
+    {}
+  </label>
+"#, html_escape(name), html_escape(value), checked_attr, html_escape(label)));
+                }
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn textarea_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "textarea".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let name = props.get_str("name").unwrap_or("textarea");
+            let label = props.get_str("label");
+            let placeholder = props.get_str("placeholder").unwrap_or("");
+            let value = props.get_str("value").unwrap_or("");
+            let rows = props.get_i32("rows").unwrap_or(4);
+            let required = props.get_bool("required").unwrap_or(false);
+
+            let mut html = String::from("<div class=\"field\">\n");
+
+            if let Some(l) = label {
+                html.push_str(&format!("  <label class=\"label\" for=\"{}\">{}</label>\n",
+                    html_escape(name), html_escape(l)));
+            }
+
+            let required_attr = if required { "required" } else { "" };
+
+            html.push_str(&format!(r#"  <div class="control">
+    <textarea class="textarea" name="{}" id="{}" placeholder="{}" rows="{}" {}>{}</textarea>
+  </div>
+</div>
+"#, html_escape(name), html_escape(name), html_escape(placeholder), rows, required_attr, html_escape(value)));
+
+            Ok(html)
+        },
+    }
+}
+
+fn file_upload_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "file-upload".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let name = props.get_str("name").unwrap_or("file");
+            let label = props.get_str("label").unwrap_or("Choose a file...");
+            let accept = props.get_str("accept").unwrap_or("*/*");
+            let multiple = props.get_bool("multiple").unwrap_or(false);
+
+            let multiple_attr = if multiple { "multiple" } else { "" };
+
+            Ok(format!(r#"<div class="file has-name" data-component="file-upload">
+  <label class="file-label">
+    <input class="file-input" type="file" name="{}" accept="{}" {}>
+    <span class="file-cta">
+      <span class="file-icon"><i class="fas fa-upload"></i></span>
+      <span class="file-label">{}</span>
+    </span>
+    <span class="file-name">No file selected</span>
+  </label>
+</div>
+"#, html_escape(name), html_escape(accept), multiple_attr, html_escape(label)))
+        },
+    }
+}
+
+// ============================================================================
+// LMS-Specific Components
+// ============================================================================
+
+fn course_card_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "course-card".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec!["progress-ring".to_string()],
+        render: |props, ctx| {
+            let id = props.get_str("id").unwrap_or("");
+            let title = props.get_str("title").unwrap_or("Course");
+            let description = props.get_str("description").unwrap_or("");
+            let thumbnail = props.get_str("thumbnail");
+            let instructor = props.get_str("instructor").unwrap_or("");
+            let progress = props.get_i32("progress").unwrap_or(0);
+            let duration = props.get_str("duration").unwrap_or("");
+            let enrolled = props.get_bool("enrolled").unwrap_or(false);
+
+            let mut html = format!(r#"<article class="card course-card" data-course-id="{}">
+"#, html_escape(id));
+
+            if let Some(thumb) = thumbnail {
+                html.push_str(&format!(r#"  <div class="card-image">
+    <figure class="image is-16by9">
+      <img src="{}" alt="{}" loading="lazy">
+    </figure>
+  </div>
+"#, html_escape(thumb), html_escape(title)));
+            }
+
+            html.push_str(&format!(r#"  <div class="card-content">
+    <h3 class="title is-5">{}</h3>
+    <p class="subtitle is-6">{}</p>
+    <p class="content">{}</p>
+    <div class="level is-mobile">
+      <div class="level-left">
+        <span class="icon-text">
+          <span class="icon"><i class="fas fa-clock"></i></span>
+          <span>{}</span>
+        </span>
+      </div>
+"#, html_escape(title), html_escape(instructor), html_escape(description), html_escape(duration)));
+
+            if enrolled && progress > 0 {
+                html.push_str(&format!(r#"      <div class="level-right">
+        <div class="progress-ring" data-progress="{}"></div>
+      </div>
+"#, progress));
+            }
+
+            html.push_str("    </div>\n  </div>\n");
+
+            // Card footer with action
+            if enrolled {
+                html.push_str(&format!(r#"  <footer class="card-footer">
+    <a href="/courses/{}" class="card-footer-item">Continue Learning</a>
+  </footer>
+"#, html_escape(id)));
+            } else {
+                html.push_str(&format!(r#"  <footer class="card-footer">
+    <a href="/courses/{}" class="card-footer-item">View Course</a>
+    <a href="/courses/{}/enroll" class="card-footer-item">Enroll</a>
+  </footer>
+"#, html_escape(id), html_escape(id)));
+            }
+
+            html.push_str("</article>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn lesson_player_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "lesson-player".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec!["video-player".to_string()],
+        render: |props, ctx| {
+            let lesson_id = props.get_str("lesson_id").unwrap_or("");
+            let title = props.get_str("title").unwrap_or("Lesson");
+            let content_type = props.get_str("content_type").unwrap_or("video");
+            let content_url = props.get_str("content_url").unwrap_or("");
+            let transcript = props.get_str("transcript");
+
+            let mut html = format!(r#"<div class="lesson-player" data-component="lesson-player" data-lesson-id="{}">
+  <header class="lesson-header">
+    <h2 class="title is-4">{}</h2>
+  </header>
+  <div class="lesson-content">
+"#, html_escape(lesson_id), html_escape(title));
+
+            match content_type {
+                "video" => {
+                    html.push_str(&format!(r#"    <div class="video-container" data-component="video-player">
+      <video controls preload="metadata">
+        <source src="{}" type="video/mp4">
+        Your browser does not support video playback.
+      </video>
+    </div>
+"#, html_escape(content_url)));
+                }
+                "audio" => {
+                    html.push_str(&format!(r#"    <div class="audio-container">
+      <audio controls preload="metadata">
+        <source src="{}" type="audio/mpeg">
+        Your browser does not support audio playback.
+      </audio>
+    </div>
+"#, html_escape(content_url)));
+                }
+                "document" | "pdf" => {
+                    html.push_str(&format!(r#"    <div class="document-container">
+      <iframe src="{}" title="Document viewer"></iframe>
+    </div>
+"#, html_escape(content_url)));
+                }
+                _ => {
+                    html.push_str(&format!(r#"    <div class="content-container">
+      <a href="{}" class="button is-primary">View Content</a>
+    </div>
+"#, html_escape(content_url)));
+                }
+            }
+
+            if let Some(trans) = transcript {
+                html.push_str(&format!(r#"    <details class="transcript">
+      <summary>Transcript</summary>
+      <div class="transcript-content">{}</div>
+    </details>
+"#, html_escape(trans)));
+            }
+
+            html.push_str("  </div>\n</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn quiz_widget_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "quiz-widget".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let quiz_id = props.get_str("quiz_id").unwrap_or("");
+            let title = props.get_str("title").unwrap_or("Quiz");
+            let questions = props.get_array("questions").unwrap_or_default();
+            let time_limit = props.get_i32("time_limit");
+
+            let mut html = format!(r#"<div class="quiz-widget" data-component="quiz-widget" data-quiz-id="{}">
+  <form class="quiz-form" method="post">
+    <header class="quiz-header">
+      <h3 class="title is-5">{}</h3>
+"#, html_escape(quiz_id), html_escape(title));
+
+            if let Some(limit) = time_limit {
+                html.push_str(&format!(r#"      <div class="quiz-timer" data-time-limit="{}">
+        <span class="icon"><i class="fas fa-clock"></i></span>
+        <span class="timer-display">{:02}:{:02}</span>
+      </div>
+"#, limit, limit / 60, limit % 60));
+            }
+
+            html.push_str("    </header>\n    <div class=\"quiz-questions\">\n");
+
+            for (i, question) in questions.iter().enumerate() {
+                if let Some(obj) = question.as_object() {
+                    let q_id = obj.get_str("id").unwrap_or("");
+                    let q_text = obj.get_str("text").unwrap_or("");
+                    let q_type = obj.get_str("type").unwrap_or("multiple_choice");
+                    let options = obj.get_array("options").unwrap_or_default();
+
+                    html.push_str(&format!(r#"      <div class="quiz-question" data-question-id="{}">
+        <p class="question-text"><strong>{}.</strong> {}</p>
+        <div class="question-options">
+"#, html_escape(q_id), i + 1, html_escape(q_text)));
+
+                    for option in options {
+                        if let Some(opt) = option.as_object() {
+                            let opt_id = opt.get_str("id").unwrap_or("");
+                            let opt_text = opt.get_str("text").unwrap_or("");
+
+                            let input_type = if q_type == "multiple_answer" { "checkbox" } else { "radio" };
+
+                            html.push_str(&format!(r#"          <label class="{}">
+            <input type="{}" name="q_{}" value="{}">
+            <span>{}</span>
+          </label>
+"#, input_type, input_type, html_escape(q_id), html_escape(opt_id), html_escape(opt_text)));
+                        }
+                    }
+
+                    html.push_str("        </div>\n      </div>\n");
+                }
+            }
+
+            html.push_str(r#"    </div>
+    <footer class="quiz-footer">
+      <button type="submit" class="button is-primary">Submit Quiz</button>
+    </footer>
+  </form>
+</div>
+"#);
+            Ok(html)
+        },
+    }
+}
+
+fn progress_ring_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "progress-ring".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let progress = props.get_i32("progress").unwrap_or(0);
+            let size = props.get_i32("size").unwrap_or(48);
+            let stroke = props.get_i32("stroke").unwrap_or(4);
+
+            let radius = (size - stroke) / 2;
+            let circumference = 2.0 * 3.14159 * radius as f64;
+            let offset = circumference - (progress as f64 / 100.0 * circumference);
+
+            Ok(format!(r#"<svg class="progress-ring" width="{}" height="{}" data-progress="{}">
+  <circle class="progress-ring-bg" stroke="#e0e0e0" stroke-width="{}" fill="transparent" r="{}" cx="{}" cy="{}"/>
+  <circle class="progress-ring-fg" stroke="#3273dc" stroke-width="{}" fill="transparent" r="{}" cx="{}" cy="{}"
+    stroke-dasharray="{} {}" stroke-dashoffset="{}" transform="rotate(-90 {} {})"/>
+  <text x="50%" y="50%" text-anchor="middle" dy=".3em" class="progress-text">{}%</text>
+</svg>
+"#, size, size, progress, stroke, radius, size/2, size/2, stroke, radius, size/2, size/2,
+    circumference, circumference, offset, size/2, size/2, progress))
+        },
+    }
+}
+
+fn grade_display_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "grade-display".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let score = props.get_f64("score").unwrap_or(0.0);
+            let max_score = props.get_f64("max_score").unwrap_or(100.0);
+            let show_percentage = props.get_bool("show_percentage").unwrap_or(true);
+            let letter_grade = props.get_str("letter_grade");
+
+            let percentage = (score / max_score * 100.0).round() as i32;
+
+            let grade_class = if percentage >= 90 { "is-success" }
+                else if percentage >= 80 { "is-info" }
+                else if percentage >= 70 { "is-warning" }
+                else { "is-danger" };
+
+            let mut html = format!(r#"<div class="grade-display {}">
+  <span class="grade-score">{:.1}/{:.1}</span>
+"#, grade_class, score, max_score);
+
+            if show_percentage {
+                html.push_str(&format!("  <span class=\"grade-percentage\">({}%)</span>\n", percentage));
+            }
+
+            if let Some(letter) = letter_grade {
+                html.push_str(&format!("  <span class=\"grade-letter\">{}</span>\n", html_escape(letter)));
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn certificate_badge_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "certificate-badge".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let title = props.get_str("title").unwrap_or("Certificate");
+            let course_name = props.get_str("course_name").unwrap_or("");
+            let issued_date = props.get_str("issued_date").unwrap_or("");
+            let certificate_url = props.get_str("certificate_url");
+            let badge_image = props.get_str("badge_image");
+
+            let mut html = String::from("<div class=\"certificate-badge\">\n");
+
+            if let Some(img) = badge_image {
+                html.push_str(&format!(r#"  <figure class="badge-image">
+    <img src="{}" alt="Certificate badge">
+  </figure>
+"#, html_escape(img)));
+            } else {
+                html.push_str(r#"  <figure class="badge-image badge-default">
+    <i class="fas fa-award"></i>
+  </figure>
+"#);
+            }
+
+            html.push_str(&format!(r#"  <div class="badge-info">
+    <h4 class="badge-title">{}</h4>
+    <p class="badge-course">{}</p>
+    <p class="badge-date">Issued: {}</p>
+"#, html_escape(title), html_escape(course_name), html_escape(issued_date)));
+
+            if let Some(url) = certificate_url {
+                html.push_str(&format!(r#"    <a href="{}" class="button is-small is-link" target="_blank">View Certificate</a>
+"#, html_escape(url)));
+            }
+
+            html.push_str("  </div>\n</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+// ============================================================================
+// Interactive Components
+// ============================================================================
+
+fn dropdown_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "dropdown".to_string(),
+        hydration: HydrationStrategy::Interaction,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let trigger = props.get_str("trigger").unwrap_or("Dropdown");
+            let items = props.get_array("items").unwrap_or_default();
+            let align = props.get_str("align").unwrap_or("left");
+
+            let align_class = if align == "right" { "is-right" } else { "" };
+
+            let mut html = format!(r#"<div class="dropdown {}" data-component="dropdown">
+  <div class="dropdown-trigger">
+    <button class="button" aria-haspopup="true" aria-controls="dropdown-menu">
+      <span>{}</span>
+      <span class="icon is-small"><i class="fas fa-angle-down" aria-hidden="true"></i></span>
+    </button>
+  </div>
+  <div class="dropdown-menu" role="menu">
+    <div class="dropdown-content">
+"#, align_class, html_escape(trigger));
+
+            for item in items {
+                if let Some(obj) = item.as_object() {
+                    let item_type = obj.get_str("type").unwrap_or("item");
+
+                    match item_type {
+                        "divider" => {
+                            html.push_str("      <hr class=\"dropdown-divider\">\n");
+                        }
+                        _ => {
+                            let href = obj.get_str("href").unwrap_or("#");
+                            let text = obj.get_str("text").unwrap_or("Item");
+                            let icon = obj.get_str("icon");
+
+                            html.push_str(&format!("      <a href=\"{}\" class=\"dropdown-item\">", html_escape(href)));
+
+                            if let Some(i) = icon {
+                                html.push_str(&format!("<span class=\"icon\"><i class=\"fas fa-{}\"></i></span> ", html_escape(i)));
+                            }
+
+                            html.push_str(&format!("{}</a>\n", html_escape(text)));
+                        }
+                    }
+                }
+            }
+
+            html.push_str("    </div>\n  </div>\n</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn search_bar_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "search-bar".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let placeholder = props.get_str("placeholder").unwrap_or("Search...");
+            let action = props.get_str("action").unwrap_or("/search");
+            let query = props.get_str("query").unwrap_or("");
+            let autofocus = props.get_bool("autofocus").unwrap_or(false);
+
+            let autofocus_attr = if autofocus { "autofocus" } else { "" };
+
+            Ok(format!(r#"<form class="search-bar" action="{}" method="get" data-component="search-bar">
+  <div class="control has-icons-left has-icons-right">
+    <input class="input" type="search" name="q" placeholder="{}" value="{}" {} autocomplete="off">
+    <span class="icon is-left"><i class="fas fa-search"></i></span>
+    <span class="icon is-right is-clickable" data-clear-search><i class="fas fa-times"></i></span>
+  </div>
+  <div class="search-results" hidden></div>
+</form>
+"#, html_escape(action), html_escape(placeholder), html_escape(query), autofocus_attr))
+        },
+    }
+}
+
+fn notification_bell_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "notification-bell".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec!["dropdown".to_string()],
+        render: |props, ctx| {
+            let count = props.get_i32("count").unwrap_or(0);
+            let notifications = props.get_array("notifications").unwrap_or_default();
+
+            let badge = if count > 0 {
+                format!(r#"<span class="badge is-danger">{}</span>"#, count)
+            } else {
+                String::new()
+            };
+
+            let mut html = format!(r#"<div class="notification-bell" data-component="notification-bell">
+  <button class="button is-ghost" aria-label="Notifications">
+    <span class="icon"><i class="fas fa-bell"></i></span>
+    {}
+  </button>
+  <div class="notification-dropdown" hidden>
+    <div class="dropdown-content">
+"#, badge);
+
+            if notifications.is_empty() {
+                html.push_str("      <p class=\"dropdown-item has-text-grey\">No new notifications</p>\n");
+            } else {
+                for notif in notifications {
+                    if let Some(obj) = notif.as_object() {
+                        let title = obj.get_str("title").unwrap_or("");
+                        let message = obj.get_str("message").unwrap_or("");
+                        let time = obj.get_str("time").unwrap_or("");
+                        let read = obj.get_bool("read").unwrap_or(false);
+                        let href = obj.get_str("href").unwrap_or("#");
+
+                        let class = if read { "dropdown-item notification-item" } else { "dropdown-item notification-item is-unread" };
+
+                        html.push_str(&format!(r#"      <a href="{}" class="{}">
+        <strong>{}</strong>
+        <p>{}</p>
+        <small class="has-text-grey">{}</small>
+      </a>
+"#, html_escape(href), class, html_escape(title), html_escape(message), html_escape(time)));
+                    }
+                }
+
+                html.push_str("      <hr class=\"dropdown-divider\">\n");
+                html.push_str("      <a href=\"/notifications\" class=\"dropdown-item has-text-centered\">View all</a>\n");
+            }
+
+            html.push_str("    </div>\n  </div>\n</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn user_avatar_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "user-avatar".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let src = props.get_str("src");
+            let name = props.get_str("name").unwrap_or("User");
+            let size = props.get_i32("size").unwrap_or(48);
+            let link = props.get_str("link");
+
+            let initials: String = name.split_whitespace()
+                .take(2)
+                .filter_map(|word| word.chars().next())
+                .map(|c| c.to_uppercase().to_string())
+                .collect();
+
+            let content = if let Some(url) = src {
+                format!(r#"<img src="{}" alt="{}" width="{}" height="{}" loading="lazy">"#,
+                    html_escape(url), html_escape(name), size, size)
+            } else {
+                format!(r#"<span class="avatar-initials" style="width:{}px;height:{}px;line-height:{}px">{}</span>"#,
+                    size, size, size, initials)
+            };
+
+            if let Some(href) = link {
+                Ok(format!(r#"<a href="{}" class="user-avatar" title="{}">{}</a>"#,
+                    html_escape(href), html_escape(name), content))
+            } else {
+                Ok(format!(r#"<figure class="user-avatar" title="{}">{}</figure>"#,
+                    html_escape(name), content))
+            }
+        },
+    }
+}
+
+fn auth_widget_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "auth-widget".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec!["dropdown".to_string(), "user-avatar".to_string()],
+        render: |props, ctx| {
+            if ctx.user.authenticated {
+                let name = ctx.user.display_name.as_deref().unwrap_or("User");
+                let avatar = ctx.user.avatar_url.as_deref();
+
+                let avatar_html = if let Some(url) = avatar {
+                    format!(r#"<img src="{}" alt="" class="avatar-img">"#, html_escape(url))
+                } else {
+                    let initials: String = name.split_whitespace()
+                        .take(2)
+                        .filter_map(|word| word.chars().next())
+                        .map(|c| c.to_uppercase().to_string())
+                        .collect();
+                    format!(r#"<span class="avatar-initials">{}</span>"#, initials)
+                };
+
+                Ok(format!(r#"<div class="auth-widget is-authenticated" data-component="auth-widget">
+  <div class="dropdown is-right">
+    <div class="dropdown-trigger">
+      <button class="button is-ghost" aria-haspopup="true">
+        <span class="user-avatar">{}</span>
+        <span class="user-name">{}</span>
+        <span class="icon is-small"><i class="fas fa-angle-down"></i></span>
+      </button>
+    </div>
+    <div class="dropdown-menu" role="menu">
+      <div class="dropdown-content">
+        <a href="/profile" class="dropdown-item"><i class="fas fa-user"></i> Profile</a>
+        <a href="/settings" class="dropdown-item"><i class="fas fa-cog"></i> Settings</a>
+        <hr class="dropdown-divider">
+        <a href="/logout" class="dropdown-item"><i class="fas fa-sign-out-alt"></i> Logout</a>
+      </div>
+    </div>
+  </div>
+</div>
+"#, avatar_html, html_escape(name)))
+            } else {
+                Ok(r#"<div class="auth-widget" data-component="auth-widget">
+  <a href="/login" class="button is-light">Log in</a>
+  <a href="/register" class="button is-primary">Sign up</a>
+</div>
+"#.to_string())
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Media Components
+// ============================================================================
+
+fn video_player_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "video-player".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let src = props.get_str("src").unwrap_or("");
+            let poster = props.get_str("poster");
+            let autoplay = props.get_bool("autoplay").unwrap_or(false);
+            let muted = props.get_bool("muted").unwrap_or(false);
+            let loop_video = props.get_bool("loop").unwrap_or(false);
+            let captions = props.get_str("captions");
+
+            let mut attrs = vec!["controls", "preload=\"metadata\""];
+            if autoplay { attrs.push("autoplay"); }
+            if muted { attrs.push("muted"); }
+            if loop_video { attrs.push("loop"); }
+
+            let poster_attr = poster.map(|p| format!("poster=\"{}\"", html_escape(p))).unwrap_or_default();
+
+            let mut html = format!(r#"<div class="video-player" data-component="video-player">
+  <video {} {} playsinline>
+    <source src="{}" type="video/mp4">
+"#, attrs.join(" "), poster_attr, html_escape(src));
+
+            if let Some(cap) = captions {
+                html.push_str(&format!("    <track kind=\"captions\" src=\"{}\" srclang=\"en\" label=\"English\">\n", html_escape(cap)));
+            }
+
+            html.push_str(r#"    Your browser does not support video playback.
+  </video>
+  <div class="video-controls">
+    <button class="play-pause" aria-label="Play/Pause"><i class="fas fa-play"></i></button>
+    <div class="progress-bar"><div class="progress-fill"></div></div>
+    <span class="time-display">0:00 / 0:00</span>
+    <button class="volume-toggle" aria-label="Mute/Unmute"><i class="fas fa-volume-up"></i></button>
+    <input type="range" class="volume-slider" min="0" max="1" step="0.1" value="1">
+    <button class="fullscreen-toggle" aria-label="Fullscreen"><i class="fas fa-expand"></i></button>
+  </div>
+</div>
+"#);
+            Ok(html)
+        },
+    }
+}
+
+fn audio_player_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "audio-player".to_string(),
+        hydration: HydrationStrategy::Eager,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let src = props.get_str("src").unwrap_or("");
+            let title = props.get_str("title").unwrap_or("Audio");
+
+            Ok(format!(r#"<div class="audio-player" data-component="audio-player">
+  <audio preload="metadata">
+    <source src="{}" type="audio/mpeg">
+  </audio>
+  <div class="audio-info">
+    <span class="audio-title">{}</span>
+  </div>
+  <div class="audio-controls">
+    <button class="play-pause" aria-label="Play/Pause"><i class="fas fa-play"></i></button>
+    <div class="progress-bar"><div class="progress-fill"></div></div>
+    <span class="time-display">0:00</span>
+  </div>
+</div>
+"#, html_escape(src), html_escape(title)))
+        },
+    }
+}
+
+fn image_gallery_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "image-gallery".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let images = props.get_array("images").unwrap_or_default();
+            let columns = props.get_i32("columns").unwrap_or(3);
+
+            let mut html = format!(r#"<div class="image-gallery columns is-multiline" data-component="image-gallery" data-columns="{}">
+"#, columns);
+
+            let col_class = format!("is-{}", 12 / columns);
+
+            for image in images {
+                if let Some(obj) = image.as_object() {
+                    let src = obj.get_str("src").unwrap_or("");
+                    let alt = obj.get_str("alt").unwrap_or("");
+                    let caption = obj.get_str("caption");
+
+                    html.push_str(&format!(r#"  <div class="column {}">
+    <figure class="image gallery-item">
+      <img src="{}" alt="{}" loading="lazy">
+"#, col_class, html_escape(src), html_escape(alt)));
+
+                    if let Some(cap) = caption {
+                        html.push_str(&format!("      <figcaption>{}</figcaption>\n", html_escape(cap)));
+                    }
+
+                    html.push_str("    </figure>\n  </div>\n");
+                }
+            }
+
+            html.push_str("</div>\n");
+            Ok(html)
+        },
+    }
+}
+
+fn pdf_viewer_component() -> ComponentDefinition {
+    ComponentDefinition {
+        name: "pdf-viewer".to_string(),
+        hydration: HydrationStrategy::Lazy,
+        dependencies: vec![],
+        render: |props, ctx| {
+            let src = props.get_str("src").unwrap_or("");
+            let height = props.get_i32("height").unwrap_or(600);
+            let download = props.get_bool("download").unwrap_or(true);
+
+            let mut html = format!(r#"<div class="pdf-viewer" data-component="pdf-viewer">
+  <div class="pdf-toolbar">
+"#);
+
+            if download {
+                html.push_str(&format!("    <a href=\"{}\" download class=\"button is-small\"><i class=\"fas fa-download\"></i> Download</a>\n", html_escape(src)));
+            }
+
+            html.push_str(&format!(r#"  </div>
+  <iframe src="{}" width="100%" height="{}" title="PDF Viewer"></iframe>
+</div>
+"#, html_escape(src), height));
+            Ok(html)
+        },
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// HTML escape for safe rendering
+fn html_escape(s: &str) -> String {
+    s.replace("&", "&amp;")
+     .replace("<", "&lt;")
+     .replace(">", "&gt;")
+     .replace("\"", "&quot;")
+     .replace("'", "&#39;")
+}
+
+// ============================================================================
+// Value Extension Helpers
+// ============================================================================
+
+impl Value {
+    fn get_str(&self, key: &str) -> Option<&str> {
+        self.as_object()?.get(key)?.as_str()
+    }
+
+    fn get_i32(&self, key: &str) -> Option<i32> {
+        self.as_object()?.get(key)?.as_i64().map(|n| n as i32)
+    }
+
+    fn get_f64(&self, key: &str) -> Option<f64> {
+        self.as_object()?.get(key)?.as_f64()
+    }
+
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        self.as_object()?.get(key)?.as_bool()
+    }
+
+    fn get_array(&self, key: &str) -> Option<Vec<Value>> {
+        self.as_object()?.get(key)?.as_array().cloned()
+    }
+}
+
+impl Map<String, Value> {
+    fn get_str(&self, key: &str) -> Option<&str> {
+        self.get(key)?.as_str()
+    }
+
+    fn get_i32(&self, key: &str) -> Option<i32> {
+        self.get(key)?.as_i64().map(|n| n as i32)
+    }
+
+    fn get_f64(&self, key: &str) -> Option<f64> {
+        self.get(key)?.as_f64()
+    }
+
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        self.get(key)?.as_bool()
+    }
+
+    fn get_array(&self, key: &str) -> Option<Vec<Value>> {
+        self.get(key)?.as_array().cloned()
+    }
+}
+
+// ============================================================================
+// UserContext Extension
+// ============================================================================
+
+impl UserContext {
+    pub fn anonymous() -> Self {
+        UserContext {
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            role: UserRole::Anonymous,
+            permissions: vec![],
+            tenant_id: "".to_string(),
+            tenant_name: "".to_string(),
+            session_id: None,
+            authenticated: false,
+            preferences: UserPreferences::default(),
+            feature_flags: Map::new(),
+        }
+    }
+}

@@ -1,0 +1,1767 @@
+/// Intelligo LMS - SCORM 2004 Sequencing Engine
+///
+/// Implementation of SCORM 2004 Sequencing and Navigation (SN) specification.
+/// Provides activity tree management, sequencing rules, rollup rules,
+/// and navigation behavior processing.
+
+module intelligo::compliance::scorm::sequencing
+
+use intelligo::core::types::*
+use intelligo::compliance::scorm::scorm2004::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for an activity
+type ActivityId = String
+
+/// Unique identifier for an objective
+type ObjectiveId = String
+
+/// Unique identifier for a sequencing rule
+type RuleId = String
+
+// =============================================================================
+// ACTIVITY TREE STRUCTURE
+// =============================================================================
+
+/// An activity in the activity tree
+type Activity {
+    /// Unique identifier
+    id: ActivityId,
+
+    /// Title for display
+    title: String,
+
+    /// Parent activity (None for root)
+    parent_id: Option<ActivityId>,
+
+    /// Child activities (ordered)
+    children: List<ActivityId>,
+
+    /// Is this a leaf activity (SCO/Asset)?
+    is_leaf: Bool,
+
+    /// Associated SCO identifier (for leaf activities)
+    sco_id: Option<String>,
+
+    /// Launch URL for SCO
+    launch_url: Option<String>,
+
+    /// Sequencing definition
+    sequencing: SequencingDefinition,
+
+    /// Tracking data for this activity
+    tracking: ActivityTracking,
+
+    /// Is activity visible in navigation
+    is_visible: Bool,
+
+    /// Is activity available for delivery
+    is_available: Bool
+}
+
+impl Activity {
+    fn new(id: ActivityId, title: String) -> Activity {
+        Activity {
+            id,
+            title,
+            parent_id: None,
+            children: vec![],
+            is_leaf: true,
+            sco_id: None,
+            launch_url: None,
+            sequencing: SequencingDefinition::default(),
+            tracking: ActivityTracking::new(),
+            is_visible: true,
+            is_available: true
+        }
+    }
+
+    /// Check if this is a cluster (has children)
+    fn is_cluster(&self) -> Bool {
+        !self.children.is_empty()
+    }
+}
+
+/// Activity tracking data
+type ActivityTracking {
+    /// Attempt count
+    attempt_count: i32,
+
+    /// Is currently active
+    is_active: Bool,
+
+    /// Is currently suspended
+    is_suspended: Bool,
+
+    /// Objective progress information
+    objectives: Map<ObjectiveId, ObjectiveProgress>,
+
+    /// Activity progress status
+    progress_status: Bool,
+
+    /// Activity absolute duration
+    attempt_absolute_duration: Option<Duration>,
+
+    /// Activity experienced duration
+    attempt_experienced_duration: Option<Duration>,
+
+    /// Attempt completion amount (0-1)
+    attempt_completion_amount: Option<f32>
+}
+
+impl ActivityTracking {
+    fn new() -> ActivityTracking {
+        ActivityTracking {
+            attempt_count: 0,
+            is_active: false,
+            is_suspended: false,
+            objectives: Map::new(),
+            progress_status: false,
+            attempt_absolute_duration: None,
+            attempt_experienced_duration: None,
+            attempt_completion_amount: None
+        }
+    }
+}
+
+/// Objective progress information
+type ObjectiveProgress {
+    /// Objective ID
+    id: ObjectiveId,
+
+    /// Is this the primary objective
+    is_primary: Bool,
+
+    /// Progress status (has measure been set)
+    progress_status: Bool,
+
+    /// Satisfaction status (true = satisfied/passed)
+    satisfied_status: Option<Bool>,
+
+    /// Normalized measure (0-1)
+    measure: Option<f32>,
+
+    /// Completion status
+    completion_status: Option<Bool>,
+
+    /// Completion amount (0-1)
+    completion_amount: Option<f32>
+}
+
+impl ObjectiveProgress {
+    fn new(id: ObjectiveId, is_primary: Bool) -> ObjectiveProgress {
+        ObjectiveProgress {
+            id,
+            is_primary,
+            progress_status: false,
+            satisfied_status: None,
+            measure: None,
+            completion_status: None,
+            completion_amount: None
+        }
+    }
+}
+
+// =============================================================================
+// SEQUENCING DEFINITION
+// =============================================================================
+
+/// Sequencing definition for an activity
+type SequencingDefinition {
+    /// Control mode
+    control_mode: ControlMode,
+
+    /// Sequencing rules
+    sequencing_rules: SequencingRules,
+
+    /// Limit conditions
+    limit_conditions: LimitConditions,
+
+    /// Rollup rules
+    rollup_rules: RollupRules,
+
+    /// Objectives
+    objectives: List<Objective>,
+
+    /// Delivery controls
+    delivery_controls: DeliveryControls,
+
+    /// Constrain choice
+    constrain_choice: Bool,
+
+    /// Prevent activation
+    prevent_activation: Bool,
+
+    /// Randomization controls
+    randomization_controls: RandomizationControls
+}
+
+impl SequencingDefinition {
+    fn default() -> SequencingDefinition {
+        SequencingDefinition {
+            control_mode: ControlMode::default(),
+            sequencing_rules: SequencingRules::default(),
+            limit_conditions: LimitConditions::default(),
+            rollup_rules: RollupRules::default(),
+            objectives: vec![],
+            delivery_controls: DeliveryControls::default(),
+            constrain_choice: false,
+            prevent_activation: false,
+            randomization_controls: RandomizationControls::default()
+        }
+    }
+}
+
+/// Control mode settings
+type ControlMode {
+    /// Allow child activities to be chosen directly
+    choice: Bool,
+
+    /// Allow flow-based (Continue/Previous) navigation
+    flow: Bool,
+
+    /// Forward only navigation
+    forward_only: Bool,
+
+    /// Use current attempt objective info for children
+    use_current_attempt_objective_info: Bool,
+
+    /// Use current attempt progress info for children
+    use_current_attempt_progress_info: Bool,
+
+    /// Choice exit (allows exit during choice navigation)
+    choice_exit: Bool
+}
+
+impl ControlMode {
+    fn default() -> ControlMode {
+        ControlMode {
+            choice: true,
+            flow: false,
+            forward_only: false,
+            use_current_attempt_objective_info: true,
+            use_current_attempt_progress_info: true,
+            choice_exit: true
+        }
+    }
+}
+
+/// Delivery controls
+type DeliveryControls {
+    /// Tracked (whether tracking model is used)
+    tracked: Bool,
+
+    /// Completion set by content
+    completion_set_by_content: Bool,
+
+    /// Objective set by content
+    objective_set_by_content: Bool
+}
+
+impl DeliveryControls {
+    fn default() -> DeliveryControls {
+        DeliveryControls {
+            tracked: true,
+            completion_set_by_content: false,
+            objective_set_by_content: false
+        }
+    }
+}
+
+/// Randomization controls
+type RandomizationControls {
+    /// Randomize children
+    randomize_children: Bool,
+
+    /// Randomization timing
+    randomization_timing: RandomizationTiming,
+
+    /// Select count (number of children to select, 0 = all)
+    select_count: i32,
+
+    /// Selection timing
+    selection_timing: SelectionTiming,
+
+    /// Reorder on each attempt
+    reorder_on_each_new_attempt: Bool
+}
+
+impl RandomizationControls {
+    fn default() -> RandomizationControls {
+        RandomizationControls {
+            randomize_children: false,
+            randomization_timing: RandomizationTiming::Never,
+            select_count: 0,
+            selection_timing: SelectionTiming::Never,
+            reorder_on_each_new_attempt: false
+        }
+    }
+}
+
+/// Randomization timing
+enum RandomizationTiming {
+    Never,
+    Once,
+    OnEachNewAttempt
+}
+
+/// Selection timing
+enum SelectionTiming {
+    Never,
+    Once,
+    OnEachNewAttempt
+}
+
+/// Limit conditions
+type LimitConditions {
+    /// Attempt limit
+    attempt_limit: Option<i32>,
+
+    /// Attempt absolute duration limit
+    attempt_absolute_duration_limit: Option<Duration>,
+
+    /// Attempt experienced duration limit
+    attempt_experienced_duration_limit: Option<Duration>,
+
+    /// Begin time limit
+    begin_time_limit: Option<DateTime>,
+
+    /// End time limit
+    end_time_limit: Option<DateTime>
+}
+
+impl LimitConditions {
+    fn default() -> LimitConditions {
+        LimitConditions {
+            attempt_limit: None,
+            attempt_absolute_duration_limit: None,
+            attempt_experienced_duration_limit: None,
+            begin_time_limit: None,
+            end_time_limit: None
+        }
+    }
+}
+
+/// An objective definition
+type Objective {
+    /// Objective ID
+    id: ObjectiveId,
+
+    /// Is this the primary objective
+    is_primary: Bool,
+
+    /// Satisfied by measure
+    satisfied_by_measure: Bool,
+
+    /// Minimum satisfied measure (-1 to 1)
+    min_normalized_measure: f32,
+
+    /// Objective maps (global objectives)
+    maps: List<ObjectiveMap>
+}
+
+impl Objective {
+    fn new(id: ObjectiveId, is_primary: Bool) -> Objective {
+        Objective {
+            id,
+            is_primary,
+            satisfied_by_measure: false,
+            min_normalized_measure: 1.0,
+            maps: vec![]
+        }
+    }
+}
+
+/// Objective map for global objectives
+type ObjectiveMap {
+    /// Target objective ID (global)
+    target_objective_id: ObjectiveId,
+
+    /// Read satisfied status from global
+    read_satisfied_status: Bool,
+
+    /// Read normalized measure from global
+    read_normalized_measure: Bool,
+
+    /// Write satisfied status to global
+    write_satisfied_status: Bool,
+
+    /// Write normalized measure to global
+    write_normalized_measure: Bool
+}
+
+// =============================================================================
+// SEQUENCING RULES
+// =============================================================================
+
+/// Collection of sequencing rules
+type SequencingRules {
+    /// Pre-condition rules
+    pre_condition_rules: List<SequencingRule>,
+
+    /// Post-condition rules
+    post_condition_rules: List<SequencingRule>,
+
+    /// Exit condition rules
+    exit_condition_rules: List<SequencingRule>
+}
+
+impl SequencingRules {
+    fn default() -> SequencingRules {
+        SequencingRules {
+            pre_condition_rules: vec![],
+            post_condition_rules: vec![],
+            exit_condition_rules: vec![]
+        }
+    }
+}
+
+/// A sequencing rule
+type SequencingRule {
+    /// Rule ID
+    id: RuleId,
+
+    /// Conditions for this rule
+    conditions: RuleConditions,
+
+    /// Action to take
+    action: RuleAction
+}
+
+/// Rule conditions
+type RuleConditions {
+    /// Condition combination mode
+    condition_combination: ConditionCombination,
+
+    /// Individual conditions
+    conditions: List<RuleCondition>
+}
+
+/// How to combine conditions
+enum ConditionCombination {
+    All,
+    Any
+}
+
+/// A single rule condition
+type RuleCondition {
+    /// Referenced objective (if any)
+    referenced_objective: Option<ObjectiveId>,
+
+    /// Measure threshold (for measure conditions)
+    measure_threshold: Option<f32>,
+
+    /// Condition type
+    condition: ConditionType,
+
+    /// Negate the condition
+    negate: Bool
+}
+
+/// Condition types
+enum ConditionType {
+    /// Objective satisfied
+    Satisfied,
+    /// Objective status known
+    ObjectiveStatusKnown,
+    /// Objective measure known
+    ObjectiveMeasureKnown,
+    /// Objective measure greater than threshold
+    ObjectiveMeasureGreaterThan,
+    /// Objective measure less than threshold
+    ObjectiveMeasureLessThan,
+    /// Activity completed
+    Completed,
+    /// Activity progress known
+    ActivityProgressKnown,
+    /// Activity attempted
+    Attempted,
+    /// Attempt limit exceeded
+    AttemptLimitExceeded,
+    /// Time limit exceeded
+    TimeLimitExceeded,
+    /// Outside available time range
+    OutsideAvailableTimeRange,
+    /// Always true
+    Always
+}
+
+/// Rule action types
+enum RuleAction {
+    // Pre-condition actions
+    Skip,
+    Disabled,
+    HiddenFromChoice,
+    StopForwardTraversal,
+
+    // Post-condition actions
+    ExitParent,
+    ExitAll,
+    Retry,
+    RetryAll,
+    Continue,
+    Previous,
+
+    // Exit condition actions
+    Exit
+}
+
+// =============================================================================
+// ROLLUP RULES
+// =============================================================================
+
+/// Rollup rules definition
+type RollupRules {
+    /// Rollup objective satisfied
+    rollup_objective_satisfied: Bool,
+
+    /// Rollup objective measure weight
+    rollup_objective_measure_weight: f32,
+
+    /// Rollup progress completion
+    rollup_progress_completion: Bool,
+
+    /// Custom rollup rules
+    rules: List<RollupRule>,
+
+    /// Objective measure weight
+    objective_measure_weight: f32,
+
+    /// Require for satisfied
+    require_for_satisfied: RollupConsideration,
+
+    /// Require for not satisfied
+    require_for_not_satisfied: RollupConsideration,
+
+    /// Require for completed
+    require_for_completed: RollupConsideration,
+
+    /// Require for incomplete
+    require_for_incomplete: RollupConsideration
+}
+
+impl RollupRules {
+    fn default() -> RollupRules {
+        RollupRules {
+            rollup_objective_satisfied: true,
+            rollup_objective_measure_weight: 1.0,
+            rollup_progress_completion: true,
+            rules: vec![],
+            objective_measure_weight: 1.0,
+            require_for_satisfied: RollupConsideration::Always,
+            require_for_not_satisfied: RollupConsideration::Always,
+            require_for_completed: RollupConsideration::Always,
+            require_for_incomplete: RollupConsideration::Always
+        }
+    }
+}
+
+/// Rollup consideration
+enum RollupConsideration {
+    Always,
+    IfAttempted,
+    IfNotSkipped,
+    IfNotSuspended
+}
+
+/// A rollup rule
+type RollupRule {
+    /// Child activity set
+    child_activity_set: ChildActivitySet,
+
+    /// Minimum count (for count-based)
+    minimum_count: Option<i32>,
+
+    /// Minimum percent (for percent-based)
+    minimum_percent: Option<f32>,
+
+    /// Conditions
+    conditions: RuleConditions,
+
+    /// Rollup action
+    action: RollupAction
+}
+
+/// Child activity set for rollup
+enum ChildActivitySet {
+    All,
+    Any,
+    None,
+    AtLeastCount,
+    AtLeastPercent
+}
+
+/// Rollup action
+enum RollupAction {
+    Satisfied,
+    NotSatisfied,
+    Completed,
+    Incomplete
+}
+
+// =============================================================================
+// NAVIGATION REQUESTS
+// =============================================================================
+
+/// Navigation request types
+enum NavigationRequest {
+    /// Start the content
+    Start,
+    /// Resume suspended attempt
+    ResumeAll,
+    /// Continue to next activity
+    Continue,
+    /// Go to previous activity
+    Previous,
+    /// Choose a specific activity
+    Choice { target: ActivityId },
+    /// Jump to a specific activity
+    Jump { target: ActivityId },
+    /// Exit current activity
+    Exit,
+    /// Exit all activities
+    ExitAll,
+    /// Suspend all activities
+    SuspendAll,
+    /// Abandon current activity
+    Abandon,
+    /// Abandon all activities
+    AbandonAll,
+    /// No navigation
+    None
+}
+
+/// Navigation request result
+type NavigationResult {
+    /// Was the request valid
+    valid: Bool,
+
+    /// Activity to deliver (if any)
+    delivery_activity: Option<ActivityId>,
+
+    /// Exception (if invalid)
+    exception: Option<NavigationException>,
+
+    /// Termination request (if applicable)
+    termination_request: Option<TerminationRequest>
+}
+
+impl NavigationResult {
+    fn success(activity: ActivityId) -> NavigationResult {
+        NavigationResult {
+            valid: true,
+            delivery_activity: Some(activity),
+            exception: None,
+            termination_request: None
+        }
+    }
+
+    fn failure(exception: NavigationException) -> NavigationResult {
+        NavigationResult {
+            valid: false,
+            delivery_activity: None,
+            exception: Some(exception),
+            termination_request: None
+        }
+    }
+
+    fn no_delivery() -> NavigationResult {
+        NavigationResult {
+            valid: true,
+            delivery_activity: None,
+            exception: None,
+            termination_request: None
+        }
+    }
+}
+
+/// Navigation exceptions
+enum NavigationException {
+    /// No activity to deliver
+    NoActivityToDeliver,
+    /// Navigation blocked
+    NavigationBlocked,
+    /// Choice exit not allowed
+    ChoiceExitNotAllowed,
+    /// Choice not available
+    ChoiceNotAvailable,
+    /// Target activity not found
+    TargetNotFound,
+    /// Already at target
+    AlreadyAtTarget,
+    /// Forward only violation
+    ForwardOnlyViolation,
+    /// Cannot continue
+    CannotContinue,
+    /// Cannot go previous
+    CannotGoPrevious,
+    /// No valid sequencing rule
+    NoValidSequencingRule,
+    /// Sequencing blocked
+    SequencingBlocked
+}
+
+/// Termination request types
+enum TerminationRequest {
+    Exit,
+    ExitParent,
+    ExitAll,
+    SuspendAll,
+    AbandonAll,
+    Abandon,
+    None
+}
+
+// =============================================================================
+// SEQUENCING ENGINE STATE
+// =============================================================================
+
+/// Sequencing engine state
+type SequencingState {
+    /// Activity tree (root and all activities)
+    activities: Map<ActivityId, Activity>,
+
+    /// Root activity ID
+    root_id: ActivityId,
+
+    /// Currently active activity
+    current_activity: Option<ActivityId>,
+
+    /// Suspended activity
+    suspended_activity: Option<ActivityId>,
+
+    /// Global objectives (shared across attempts)
+    global_objectives: Map<ObjectiveId, ObjectiveProgress>,
+
+    /// Attempt in progress
+    attempt_in_progress: Bool
+}
+
+impl SequencingState {
+    fn new(root_id: ActivityId) -> SequencingState {
+        SequencingState {
+            activities: Map::new(),
+            root_id,
+            current_activity: None,
+            suspended_activity: None,
+            global_objectives: Map::new(),
+            attempt_in_progress: false
+        }
+    }
+
+    /// Get an activity by ID
+    fn get_activity(&self, id: &ActivityId) -> Option<&Activity> {
+        self.activities.get(id)
+    }
+
+    /// Get mutable activity by ID
+    fn get_activity_mut(&mut self, id: &ActivityId) -> Option<&mut Activity> {
+        self.activities.get_mut(id)
+    }
+
+    /// Get root activity
+    fn get_root(&self) -> Option<&Activity> {
+        self.activities.get(&self.root_id)
+    }
+
+    /// Get parent of an activity
+    fn get_parent(&self, id: &ActivityId) -> Option<&Activity> {
+        self.get_activity(id)
+            .and_then(|a| a.parent_id.as_ref())
+            .and_then(|pid| self.get_activity(pid))
+    }
+
+    /// Get children of an activity
+    fn get_children(&self, id: &ActivityId) -> Vec<&Activity> {
+        self.get_activity(id)
+            .map(|a| {
+                a.children.iter()
+                    .filter_map(|cid| self.get_activity(cid))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get ancestor chain (from activity to root)
+    fn get_ancestors(&self, id: &ActivityId) -> Vec<ActivityId> {
+        let mut ancestors = vec![];
+        let mut current = id.clone();
+
+        while let Some(activity) = self.get_activity(&current) {
+            if let Some(parent_id) = &activity.parent_id {
+                ancestors.push(parent_id.clone());
+                current = parent_id.clone();
+            } else {
+                break;
+            }
+        }
+
+        ancestors
+    }
+
+    /// Check if activity is descendant of another
+    fn is_descendant(&self, activity_id: &ActivityId, ancestor_id: &ActivityId) -> Bool {
+        self.get_ancestors(activity_id).contains(ancestor_id)
+    }
+}
+
+// =============================================================================
+// SEQUENCING ENGINE MESSAGES
+// =============================================================================
+
+/// Messages for SequencingEngine actor
+enum SequencingMessage {
+    /// Initialize with activity tree
+    Initialize {
+        state: SequencingState,
+        reply_to: Actor<Bool>
+    },
+
+    /// Process navigation request
+    ProcessNavigation {
+        request: NavigationRequest,
+        reply_to: Actor<NavigationResult>
+    },
+
+    /// Get current activity
+    GetCurrentActivity {
+        reply_to: Actor<Option<ActivityId>>
+    },
+
+    /// Get available navigation options
+    GetAvailableNavigation {
+        reply_to: Actor<AvailableNavigation>
+    },
+
+    /// Update activity tracking data
+    UpdateTracking {
+        activity_id: ActivityId,
+        tracking: ActivityTracking,
+        reply_to: Actor<Bool>
+    },
+
+    /// Process rollup for an activity
+    ProcessRollup {
+        activity_id: ActivityId,
+        reply_to: Actor<Bool>
+    },
+
+    /// Get activity tree
+    GetActivityTree {
+        reply_to: Actor<SequencingState>
+    },
+
+    /// Check if navigation is valid
+    CheckNavigationValid {
+        request: NavigationRequest,
+        reply_to: Actor<Bool>
+    }
+}
+
+/// Available navigation options
+type AvailableNavigation {
+    /// Can continue to next activity
+    can_continue: Bool,
+
+    /// Can go to previous activity
+    can_previous: Bool,
+
+    /// Available choice targets
+    choice_targets: List<ActivityId>,
+
+    /// Available jump targets
+    jump_targets: List<ActivityId>,
+
+    /// Can exit
+    can_exit: Bool,
+
+    /// Can suspend
+    can_suspend: Bool
+}
+
+impl AvailableNavigation {
+    fn none() -> AvailableNavigation {
+        AvailableNavigation {
+            can_continue: false,
+            can_previous: false,
+            choice_targets: vec![],
+            jump_targets: vec![],
+            can_exit: false,
+            can_suspend: false
+        }
+    }
+}
+
+// =============================================================================
+// SEQUENCING ENGINE ACTOR
+// =============================================================================
+
+/// Sequencing engine actor
+actor SequencingEngine {
+    state: SequencingState,
+
+    /// Initialize the engine
+    fn init() -> SequencingEngine {
+        SequencingEngine {
+            state: SequencingState::new("root".to_string())
+        }
+    }
+
+    /// Handle messages
+    fn receive(&mut self, msg: SequencingMessage) {
+        match msg {
+            SequencingMessage::Initialize { state, reply_to } => {
+                self.state = state;
+                reply_to.send(true);
+            },
+
+            SequencingMessage::ProcessNavigation { request, reply_to } => {
+                let result = self.process_navigation(request);
+                reply_to.send(result);
+            },
+
+            SequencingMessage::GetCurrentActivity { reply_to } => {
+                reply_to.send(self.state.current_activity.clone());
+            },
+
+            SequencingMessage::GetAvailableNavigation { reply_to } => {
+                let nav = self.get_available_navigation();
+                reply_to.send(nav);
+            },
+
+            SequencingMessage::UpdateTracking { activity_id, tracking, reply_to } => {
+                let success = self.update_tracking(&activity_id, tracking);
+                reply_to.send(success);
+            },
+
+            SequencingMessage::ProcessRollup { activity_id, reply_to } => {
+                let success = self.process_rollup(&activity_id);
+                reply_to.send(success);
+            },
+
+            SequencingMessage::GetActivityTree { reply_to } => {
+                reply_to.send(self.state.clone());
+            },
+
+            SequencingMessage::CheckNavigationValid { request, reply_to } => {
+                let valid = self.check_navigation_valid(&request);
+                reply_to.send(valid);
+            }
+        }
+    }
+
+    // =========================================================================
+    // NAVIGATION PROCESSING
+    // =========================================================================
+
+    /// Process a navigation request
+    fn process_navigation(&mut self, request: NavigationRequest) -> NavigationResult {
+        match request {
+            NavigationRequest::Start => self.process_start(),
+            NavigationRequest::ResumeAll => self.process_resume_all(),
+            NavigationRequest::Continue => self.process_continue(),
+            NavigationRequest::Previous => self.process_previous(),
+            NavigationRequest::Choice { target } => self.process_choice(&target),
+            NavigationRequest::Jump { target } => self.process_jump(&target),
+            NavigationRequest::Exit => self.process_exit(),
+            NavigationRequest::ExitAll => self.process_exit_all(),
+            NavigationRequest::SuspendAll => self.process_suspend_all(),
+            NavigationRequest::Abandon => self.process_abandon(),
+            NavigationRequest::AbandonAll => self.process_abandon_all(),
+            NavigationRequest::None => NavigationResult::no_delivery()
+        }
+    }
+
+    /// Process start request
+    fn process_start(&mut self) -> NavigationResult {
+        // Start must not have an active activity
+        if self.state.current_activity.is_some() {
+            return NavigationResult::failure(NavigationException::NavigationBlocked)
+        }
+
+        // Find first available leaf
+        if let Some(first_leaf) = self.find_first_available_leaf(&self.state.root_id.clone()) {
+            self.state.current_activity = Some(first_leaf.clone());
+            self.state.attempt_in_progress = true;
+            NavigationResult::success(first_leaf)
+        } else {
+            NavigationResult::failure(NavigationException::NoActivityToDeliver)
+        }
+    }
+
+    /// Process resume all request
+    fn process_resume_all(&mut self) -> NavigationResult {
+        if let Some(suspended) = self.state.suspended_activity.take() {
+            self.state.current_activity = Some(suspended.clone());
+            self.state.attempt_in_progress = true;
+            NavigationResult::success(suspended)
+        } else {
+            NavigationResult::failure(NavigationException::NoActivityToDeliver)
+        }
+    }
+
+    /// Process continue request (flow to next activity)
+    fn process_continue(&mut self) -> NavigationResult {
+        let current = match &self.state.current_activity {
+            Some(c) => c.clone(),
+            None => return NavigationResult::failure(NavigationException::CannotContinue)
+        };
+
+        // Find next activity in flow
+        if let Some(next) = self.find_next_activity(&current) {
+            // Check pre-conditions
+            if self.check_pre_conditions(&next) {
+                self.state.current_activity = Some(next.clone());
+                NavigationResult::success(next)
+            } else {
+                // Skip this activity and continue looking
+                self.state.current_activity = Some(next.clone());
+                self.process_continue()
+            }
+        } else {
+            NavigationResult::failure(NavigationException::CannotContinue)
+        }
+    }
+
+    /// Process previous request (flow to previous activity)
+    fn process_previous(&mut self) -> NavigationResult {
+        let current = match &self.state.current_activity {
+            Some(c) => c.clone(),
+            None => return NavigationResult::failure(NavigationException::CannotGoPrevious)
+        };
+
+        // Check forward-only restriction
+        if let Some(activity) = self.state.get_activity(&current) {
+            if let Some(parent) = activity.parent_id.as_ref().and_then(|p| self.state.get_activity(p)) {
+                if parent.sequencing.control_mode.forward_only {
+                    return NavigationResult::failure(NavigationException::ForwardOnlyViolation)
+                }
+            }
+        }
+
+        // Find previous activity in flow
+        if let Some(prev) = self.find_previous_activity(&current) {
+            if self.check_pre_conditions(&prev) {
+                self.state.current_activity = Some(prev.clone());
+                NavigationResult::success(prev)
+            } else {
+                self.state.current_activity = Some(prev.clone());
+                self.process_previous()
+            }
+        } else {
+            NavigationResult::failure(NavigationException::CannotGoPrevious)
+        }
+    }
+
+    /// Process choice request (direct navigation to activity)
+    fn process_choice(&mut self, target: &ActivityId) -> NavigationResult {
+        // Check if target exists
+        if self.state.get_activity(target).is_none() {
+            return NavigationResult::failure(NavigationException::TargetNotFound)
+        }
+
+        // Check if already at target
+        if self.state.current_activity.as_ref() == Some(target) {
+            return NavigationResult::failure(NavigationException::AlreadyAtTarget)
+        }
+
+        // Check if choice is allowed
+        if !self.is_choice_available(target) {
+            return NavigationResult::failure(NavigationException::ChoiceNotAvailable)
+        }
+
+        // Check choice exit
+        if let Some(current) = &self.state.current_activity {
+            if !self.can_choice_exit(current, target) {
+                return NavigationResult::failure(NavigationException::ChoiceExitNotAllowed)
+            }
+        }
+
+        // Find deliverable activity (might need to traverse into target)
+        if let Some(delivery) = self.find_deliverable_activity(target) {
+            if self.check_pre_conditions(&delivery) {
+                self.state.current_activity = Some(delivery.clone());
+                NavigationResult::success(delivery)
+            } else {
+                NavigationResult::failure(NavigationException::SequencingBlocked)
+            }
+        } else {
+            NavigationResult::failure(NavigationException::NoActivityToDeliver)
+        }
+    }
+
+    /// Process jump request
+    fn process_jump(&mut self, target: &ActivityId) -> NavigationResult {
+        // Jump is similar to choice but doesn't check choice availability
+        if self.state.get_activity(target).is_none() {
+            return NavigationResult::failure(NavigationException::TargetNotFound)
+        }
+
+        if let Some(delivery) = self.find_deliverable_activity(target) {
+            if self.check_pre_conditions(&delivery) {
+                self.state.current_activity = Some(delivery.clone());
+                NavigationResult::success(delivery)
+            } else {
+                NavigationResult::failure(NavigationException::SequencingBlocked)
+            }
+        } else {
+            NavigationResult::failure(NavigationException::NoActivityToDeliver)
+        }
+    }
+
+    /// Process exit request
+    fn process_exit(&mut self) -> NavigationResult {
+        if let Some(current) = self.state.current_activity.take() {
+            // Process post-condition rules
+            if let Some(activity) = self.state.get_activity(&current) {
+                let post_action = self.evaluate_post_conditions(&current);
+                match post_action {
+                    Some(RuleAction::Continue) => return self.process_continue(),
+                    Some(RuleAction::Previous) => return self.process_previous(),
+                    Some(RuleAction::ExitParent) => {
+                        // Move to parent and exit
+                        if let Some(parent_id) = activity.parent_id.clone() {
+                            self.state.current_activity = Some(parent_id);
+                            return self.process_exit()
+                        }
+                    },
+                    Some(RuleAction::ExitAll) => return self.process_exit_all(),
+                    _ => {}
+                }
+            }
+
+            // Process rollup
+            self.process_rollup(&current);
+
+            NavigationResult::no_delivery()
+        } else {
+            NavigationResult::failure(NavigationException::NavigationBlocked)
+        }
+    }
+
+    /// Process exit all request
+    fn process_exit_all(&mut self) -> NavigationResult {
+        // Exit all activities
+        if let Some(current) = &self.state.current_activity {
+            // Rollup from current to root
+            let ancestors = self.state.get_ancestors(current);
+            self.process_rollup(current);
+            for ancestor in ancestors {
+                self.process_rollup(&ancestor);
+            }
+        }
+
+        self.state.current_activity = None;
+        self.state.attempt_in_progress = false;
+
+        NavigationResult::no_delivery()
+    }
+
+    /// Process suspend all request
+    fn process_suspend_all(&mut self) -> NavigationResult {
+        if let Some(current) = self.state.current_activity.take() {
+            // Mark as suspended
+            if let Some(activity) = self.state.get_activity_mut(&current) {
+                activity.tracking.is_suspended = true;
+            }
+
+            self.state.suspended_activity = Some(current);
+            self.state.attempt_in_progress = false;
+        }
+
+        NavigationResult::no_delivery()
+    }
+
+    /// Process abandon request
+    fn process_abandon(&mut self) -> NavigationResult {
+        // Abandon current activity without rollup
+        self.state.current_activity = None;
+        NavigationResult::no_delivery()
+    }
+
+    /// Process abandon all request
+    fn process_abandon_all(&mut self) -> NavigationResult {
+        // Abandon all without rollup
+        self.state.current_activity = None;
+        self.state.attempt_in_progress = false;
+        NavigationResult::no_delivery()
+    }
+
+    // =========================================================================
+    // SEQUENCING HELPERS
+    // =========================================================================
+
+    /// Find first available leaf activity
+    fn find_first_available_leaf(&self, activity_id: &ActivityId) -> Option<ActivityId> {
+        let activity = self.state.get_activity(activity_id)?;
+
+        if activity.is_leaf {
+            if self.check_pre_conditions(activity_id) {
+                return Some(activity_id.clone())
+            } else {
+                return None
+            }
+        }
+
+        // Traverse children
+        for child_id in &activity.children {
+            if let Some(leaf) = self.find_first_available_leaf(child_id) {
+                return Some(leaf)
+            }
+        }
+
+        None
+    }
+
+    /// Find next activity in flow
+    fn find_next_activity(&self, current: &ActivityId) -> Option<ActivityId> {
+        let activity = self.state.get_activity(current)?;
+
+        // Get parent
+        let parent = activity.parent_id.as_ref().and_then(|p| self.state.get_activity(p))?;
+
+        // Check flow is enabled
+        if !parent.sequencing.control_mode.flow {
+            return None
+        }
+
+        // Find position in parent's children
+        let position = parent.children.iter().position(|c| c == current)?;
+
+        // Try next sibling
+        if position + 1 < parent.children.len() {
+            let next_sibling = &parent.children[position + 1];
+            return self.find_deliverable_activity(next_sibling)
+        }
+
+        // If no more siblings, go to parent's next (recursive)
+        if let Some(parent_id) = &activity.parent_id {
+            return self.find_next_activity(parent_id)
+        }
+
+        None
+    }
+
+    /// Find previous activity in flow
+    fn find_previous_activity(&self, current: &ActivityId) -> Option<ActivityId> {
+        let activity = self.state.get_activity(current)?;
+        let parent = activity.parent_id.as_ref().and_then(|p| self.state.get_activity(p))?;
+
+        if !parent.sequencing.control_mode.flow {
+            return None
+        }
+
+        let position = parent.children.iter().position(|c| c == current)?;
+
+        if position > 0 {
+            let prev_sibling = &parent.children[position - 1];
+            return self.find_last_leaf(prev_sibling)
+        }
+
+        if let Some(parent_id) = &activity.parent_id {
+            return self.find_previous_activity(parent_id)
+        }
+
+        None
+    }
+
+    /// Find last leaf in an activity subtree
+    fn find_last_leaf(&self, activity_id: &ActivityId) -> Option<ActivityId> {
+        let activity = self.state.get_activity(activity_id)?;
+
+        if activity.is_leaf {
+            return Some(activity_id.clone())
+        }
+
+        // Traverse children in reverse
+        for child_id in activity.children.iter().rev() {
+            if let Some(leaf) = self.find_last_leaf(child_id) {
+                return Some(leaf)
+            }
+        }
+
+        None
+    }
+
+    /// Find deliverable activity (first leaf in subtree)
+    fn find_deliverable_activity(&self, activity_id: &ActivityId) -> Option<ActivityId> {
+        let activity = self.state.get_activity(activity_id)?;
+
+        if activity.is_leaf {
+            return Some(activity_id.clone())
+        }
+
+        self.find_first_available_leaf(activity_id)
+    }
+
+    /// Check if choice navigation is available for target
+    fn is_choice_available(&self, target: &ActivityId) -> Bool {
+        let activity = match self.state.get_activity(target) {
+            Some(a) => a,
+            None => return false
+        };
+
+        // Check if hidden from choice
+        for rule in &activity.sequencing.sequencing_rules.pre_condition_rules {
+            if matches!(rule.action, RuleAction::HiddenFromChoice) {
+                if self.evaluate_rule_conditions(&rule.conditions, target) {
+                    return false
+                }
+            }
+        }
+
+        // Check parent's choice mode
+        if let Some(parent_id) = &activity.parent_id {
+            if let Some(parent) = self.state.get_activity(parent_id) {
+                if !parent.sequencing.control_mode.choice {
+                    return false
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Check if choice exit is allowed
+    fn can_choice_exit(&self, current: &ActivityId, target: &ActivityId) -> Bool {
+        // Find common ancestor
+        let current_ancestors = self.state.get_ancestors(current);
+
+        // Check choiceExit on current and ancestors up to common ancestor
+        if let Some(activity) = self.state.get_activity(current) {
+            if let Some(parent_id) = &activity.parent_id {
+                if let Some(parent) = self.state.get_activity(parent_id) {
+                    if !parent.sequencing.control_mode.choice_exit {
+                        // Check if target is in same subtree
+                        if !self.state.is_descendant(target, parent_id) {
+                            return false
+                        }
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Check pre-conditions for an activity
+    fn check_pre_conditions(&self, activity_id: &ActivityId) -> Bool {
+        let activity = match self.state.get_activity(activity_id) {
+            Some(a) => a,
+            None => return false
+        };
+
+        for rule in &activity.sequencing.sequencing_rules.pre_condition_rules {
+            if self.evaluate_rule_conditions(&rule.conditions, activity_id) {
+                match rule.action {
+                    RuleAction::Skip |
+                    RuleAction::Disabled |
+                    RuleAction::HiddenFromChoice |
+                    RuleAction::StopForwardTraversal => return false,
+                    _ => {}
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Evaluate post-conditions for an activity
+    fn evaluate_post_conditions(&self, activity_id: &ActivityId) -> Option<RuleAction> {
+        let activity = self.state.get_activity(activity_id)?;
+
+        for rule in &activity.sequencing.sequencing_rules.post_condition_rules {
+            if self.evaluate_rule_conditions(&rule.conditions, activity_id) {
+                return Some(rule.action.clone())
+            }
+        }
+
+        None
+    }
+
+    /// Evaluate rule conditions
+    fn evaluate_rule_conditions(&self, conditions: &RuleConditions, activity_id: &ActivityId) -> Bool {
+        let results: Vec<Bool> = conditions.conditions.iter()
+            .map(|c| self.evaluate_condition(c, activity_id))
+            .collect();
+
+        match conditions.condition_combination {
+            ConditionCombination::All => results.iter().all(|&r| r),
+            ConditionCombination::Any => results.iter().any(|&r| r)
+        }
+    }
+
+    /// Evaluate a single condition
+    fn evaluate_condition(&self, condition: &RuleCondition, activity_id: &ActivityId) -> Bool {
+        let activity = match self.state.get_activity(activity_id) {
+            Some(a) => a,
+            None => return false
+        };
+
+        let result = match condition.condition {
+            ConditionType::Satisfied => {
+                if let Some(obj_id) = &condition.referenced_objective {
+                    activity.tracking.objectives.get(obj_id)
+                        .and_then(|o| o.satisfied_status)
+                        .unwrap_or(false)
+                } else {
+                    // Primary objective
+                    activity.tracking.objectives.values()
+                        .find(|o| o.is_primary)
+                        .and_then(|o| o.satisfied_status)
+                        .unwrap_or(false)
+                }
+            },
+            ConditionType::ObjectiveStatusKnown => {
+                if let Some(obj_id) = &condition.referenced_objective {
+                    activity.tracking.objectives.get(obj_id)
+                        .map(|o| o.satisfied_status.is_some())
+                        .unwrap_or(false)
+                } else {
+                    activity.tracking.objectives.values()
+                        .find(|o| o.is_primary)
+                        .map(|o| o.satisfied_status.is_some())
+                        .unwrap_or(false)
+                }
+            },
+            ConditionType::ObjectiveMeasureKnown => {
+                if let Some(obj_id) = &condition.referenced_objective {
+                    activity.tracking.objectives.get(obj_id)
+                        .map(|o| o.measure.is_some())
+                        .unwrap_or(false)
+                } else {
+                    activity.tracking.objectives.values()
+                        .find(|o| o.is_primary)
+                        .map(|o| o.measure.is_some())
+                        .unwrap_or(false)
+                }
+            },
+            ConditionType::ObjectiveMeasureGreaterThan => {
+                let threshold = condition.measure_threshold.unwrap_or(0.0);
+                if let Some(obj_id) = &condition.referenced_objective {
+                    activity.tracking.objectives.get(obj_id)
+                        .and_then(|o| o.measure)
+                        .map(|m| m > threshold)
+                        .unwrap_or(false)
+                } else {
+                    activity.tracking.objectives.values()
+                        .find(|o| o.is_primary)
+                        .and_then(|o| o.measure)
+                        .map(|m| m > threshold)
+                        .unwrap_or(false)
+                }
+            },
+            ConditionType::ObjectiveMeasureLessThan => {
+                let threshold = condition.measure_threshold.unwrap_or(0.0);
+                if let Some(obj_id) = &condition.referenced_objective {
+                    activity.tracking.objectives.get(obj_id)
+                        .and_then(|o| o.measure)
+                        .map(|m| m < threshold)
+                        .unwrap_or(false)
+                } else {
+                    activity.tracking.objectives.values()
+                        .find(|o| o.is_primary)
+                        .and_then(|o| o.measure)
+                        .map(|m| m < threshold)
+                        .unwrap_or(false)
+                }
+            },
+            ConditionType::Completed => activity.tracking.progress_status,
+            ConditionType::ActivityProgressKnown => activity.tracking.attempt_completion_amount.is_some(),
+            ConditionType::Attempted => activity.tracking.attempt_count > 0,
+            ConditionType::AttemptLimitExceeded => {
+                if let Some(limit) = activity.sequencing.limit_conditions.attempt_limit {
+                    activity.tracking.attempt_count >= limit
+                } else {
+                    false
+                }
+            },
+            ConditionType::TimeLimitExceeded => {
+                // Check if time limit has been exceeded for the activity
+                if let Some(activity_id) = &condition.referenced_activity {
+                    // Get the activity's time limit configuration
+                    if let Some(activity) = self.get_activity(activity_id) {
+                        if let Some(time_limit) = activity.time_limit {
+                            // Get the learner's accumulated time on this activity
+                            if let Some(tracking) = self.state.tracking_data.get(activity_id) {
+                                let session_time = tracking.session_time.unwrap_or(Duration::zero());
+                                let total_time = tracking.total_time.unwrap_or(Duration::zero());
+
+                                // Check against time limit (convert from ISO 8601 duration)
+                                let limit_duration = parse_iso8601_duration(&time_limit)
+                                    .unwrap_or(Duration::max_value());
+
+                                return total_time + session_time > limit_duration;
+                            }
+                        }
+                    }
+                }
+                false
+            },
+            ConditionType::OutsideAvailableTimeRange => {
+                // Check if current time is outside the activity's available time range
+                if let Some(activity_id) = &condition.referenced_activity {
+                    if let Some(activity) = self.get_activity(activity_id) {
+                        let now = DateTime::now();
+
+                        // Check begin time limit
+                        if let Some(begin_time) = &activity.begin_time_limit {
+                            if let Ok(begin) = DateTime::parse_iso8601(begin_time) {
+                                if now < begin {
+                                    return true; // Before available window
+                                }
+                            }
+                        }
+
+                        // Check end time limit
+                        if let Some(end_time) = &activity.end_time_limit {
+                            if let Ok(end) = DateTime::parse_iso8601(end_time) {
+                                if now > end {
+                                    return true; // After available window
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            },
+            ConditionType::Always => true
+        };
+
+        if condition.negate { !result } else { result }
+    }
+
+    /// Check if navigation request is valid
+    fn check_navigation_valid(&self, request: &NavigationRequest) -> Bool {
+        match request {
+            NavigationRequest::Start => self.state.current_activity.is_none(),
+            NavigationRequest::ResumeAll => self.state.suspended_activity.is_some(),
+            NavigationRequest::Continue => {
+                self.state.current_activity.as_ref()
+                    .and_then(|c| self.find_next_activity(c))
+                    .is_some()
+            },
+            NavigationRequest::Previous => {
+                self.state.current_activity.as_ref()
+                    .and_then(|c| self.find_previous_activity(c))
+                    .is_some()
+            },
+            NavigationRequest::Choice { target } => self.is_choice_available(target),
+            NavigationRequest::Jump { target } => self.state.get_activity(target).is_some(),
+            NavigationRequest::Exit |
+            NavigationRequest::ExitAll |
+            NavigationRequest::SuspendAll |
+            NavigationRequest::Abandon |
+            NavigationRequest::AbandonAll => self.state.current_activity.is_some(),
+            NavigationRequest::None => true
+        }
+    }
+
+    /// Get available navigation options
+    fn get_available_navigation(&self) -> AvailableNavigation {
+        let mut nav = AvailableNavigation::none();
+
+        if let Some(current) = &self.state.current_activity {
+            nav.can_continue = self.find_next_activity(current).is_some();
+            nav.can_previous = self.find_previous_activity(current).is_some();
+            nav.can_exit = true;
+            nav.can_suspend = true;
+
+            // Get choice targets
+            nav.choice_targets = self.get_available_choice_targets(current);
+        }
+
+        nav
+    }
+
+    /// Get available choice targets
+    fn get_available_choice_targets(&self, current: &ActivityId) -> Vec<ActivityId> {
+        let mut targets = vec![];
+
+        // Get all activities and check if choice is available
+        for (id, _) in &self.state.activities {
+            if id != current && self.is_choice_available(id) {
+                targets.push(id.clone());
+            }
+        }
+
+        targets
+    }
+
+    // =========================================================================
+    // ROLLUP PROCESSING
+    // =========================================================================
+
+    /// Process rollup for an activity
+    fn process_rollup(&mut self, activity_id: &ActivityId) -> Bool {
+        let ancestors = self.state.get_ancestors(activity_id);
+
+        // Rollup from activity to root
+        for ancestor_id in ancestors {
+            self.rollup_activity(&ancestor_id);
+        }
+
+        true
+    }
+
+    /// Rollup a single activity based on its children
+    fn rollup_activity(&mut self, activity_id: &ActivityId) {
+        let activity = match self.state.get_activity(activity_id) {
+            Some(a) => a.clone(),
+            None => return
+        };
+
+        if activity.is_leaf {
+            return // Leaves don't rollup
+        }
+
+        let children: Vec<Activity> = activity.children.iter()
+            .filter_map(|cid| self.state.get_activity(cid).cloned())
+            .collect();
+
+        if children.is_empty() {
+            return
+        }
+
+        // Rollup satisfaction
+        let satisfaction = self.rollup_satisfaction(&activity, &children);
+
+        // Rollup completion
+        let completion = self.rollup_completion(&activity, &children);
+
+        // Update activity tracking
+        if let Some(act) = self.state.get_activity_mut(activity_id) {
+            // Update primary objective satisfaction
+            if let Some(primary_obj) = act.tracking.objectives.values_mut().find(|o| o.is_primary) {
+                primary_obj.satisfied_status = satisfaction;
+            }
+
+            // Update progress status
+            act.tracking.progress_status = completion.unwrap_or(false);
+        }
+    }
+
+    /// Rollup satisfaction status
+    fn rollup_satisfaction(&self, activity: &Activity, children: &Vec<Activity>) -> Option<Bool> {
+        let rules = &activity.sequencing.rollup_rules;
+
+        // Check custom rollup rules first
+        for rule in &rules.rules {
+            if matches!(rule.action, RollupAction::Satisfied | RollupAction::NotSatisfied) {
+                if self.evaluate_rollup_rule(rule, children) {
+                    return Some(matches!(rule.action, RollupAction::Satisfied))
+                }
+            }
+        }
+
+        // Default rollup: all children satisfied
+        let all_satisfied = children.iter().all(|c| {
+            c.tracking.objectives.values()
+                .find(|o| o.is_primary)
+                .and_then(|o| o.satisfied_status)
+                .unwrap_or(false)
+        });
+
+        if all_satisfied {
+            Some(true)
+        } else {
+            let any_not_satisfied = children.iter().any(|c| {
+                c.tracking.objectives.values()
+                    .find(|o| o.is_primary)
+                    .and_then(|o| o.satisfied_status)
+                    .map(|s| !s)
+                    .unwrap_or(false)
+            });
+
+            if any_not_satisfied {
+                Some(false)
+            } else {
+                None // Unknown
+            }
+        }
+    }
+
+    /// Rollup completion status
+    fn rollup_completion(&self, activity: &Activity, children: &Vec<Activity>) -> Option<Bool> {
+        let rules = &activity.sequencing.rollup_rules;
+
+        // Check custom rollup rules first
+        for rule in &rules.rules {
+            if matches!(rule.action, RollupAction::Completed | RollupAction::Incomplete) {
+                if self.evaluate_rollup_rule(rule, children) {
+                    return Some(matches!(rule.action, RollupAction::Completed))
+                }
+            }
+        }
+
+        // Default rollup: all children completed
+        let all_completed = children.iter().all(|c| c.tracking.progress_status);
+
+        if all_completed {
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    /// Evaluate a rollup rule
+    fn evaluate_rollup_rule(&self, rule: &RollupRule, children: &Vec<Activity>) -> Bool {
+        let matching_children: Vec<&Activity> = children.iter()
+            .filter(|c| {
+                rule.conditions.conditions.iter()
+                    .all(|cond| self.evaluate_condition(cond, &c.id))
+            })
+            .collect();
+
+        match rule.child_activity_set {
+            ChildActivitySet::All => matching_children.len() == children.len(),
+            ChildActivitySet::Any => !matching_children.is_empty(),
+            ChildActivitySet::None => matching_children.is_empty(),
+            ChildActivitySet::AtLeastCount => {
+                matching_children.len() >= rule.minimum_count.unwrap_or(0) as usize
+            },
+            ChildActivitySet::AtLeastPercent => {
+                let percent = (matching_children.len() as f32 / children.len() as f32) * 100.0;
+                percent >= rule.minimum_percent.unwrap_or(0.0)
+            }
+        }
+    }
+
+    /// Update tracking data for an activity
+    fn update_tracking(&mut self, activity_id: &ActivityId, tracking: ActivityTracking) -> Bool {
+        if let Some(activity) = self.state.get_activity_mut(activity_id) {
+            activity.tracking = tracking;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Create a sequencing engine
+fn create_sequencing_engine() -> SequencingEngine {
+    SequencingEngine::init()
+}
+
+/// Build an activity tree from manifest data
+fn build_activity_tree(
+    root_id: ActivityId,
+    activities: Vec<Activity>
+) -> SequencingState {
+    let mut state = SequencingState::new(root_id);
+
+    for activity in activities {
+        state.activities.insert(activity.id.clone(), activity);
+    }
+
+    state
+}

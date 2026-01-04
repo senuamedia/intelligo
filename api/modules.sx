@@ -1,0 +1,1165 @@
+/// Intelligo LMS - Modules API
+///
+/// This module provides module management endpoints:
+/// - Module CRUD operations
+/// - Module ordering and visibility
+/// - Module content management
+
+module intelligo::api::modules
+
+use intelligo::core::types::*
+use intelligo::core::security::{Permission, check_permission}
+use intelligo::core::storage::Database
+use intelligo::api::middleware::*
+use intelligo::entities::module::*
+
+use modulus::http::{Router, Request, Response, StatusCode}
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List}
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
+/// Build the modules router
+pub fn router(db: Database) -> Router {
+    Router::new()
+        // Module CRUD
+        .get("/", move |req| list_modules(req, db.clone()))
+        .get("/:module_id", move |req| get_module(req, db.clone()))
+        .post("/", move |req| create_module(req, db.clone()))
+        .patch("/:module_id", move |req| update_module(req, db.clone()))
+        .delete("/:module_id", move |req| delete_module(req, db.clone()))
+
+        // Module publishing
+        .post("/:module_id/publish", move |req| publish_module(req, db.clone()))
+        .post("/:module_id/unpublish", move |req| unpublish_module(req, db.clone()))
+
+        // Module lessons
+        .get("/:module_id/lessons", move |req| get_module_lessons(req, db.clone()))
+        .post("/:module_id/lessons", move |req| add_lesson_to_module(req, db.clone()))
+        .put("/:module_id/lessons/order", move |req| reorder_lessons(req, db.clone()))
+
+        // Module assessments
+        .get("/:module_id/assessments", move |req| get_module_assessments(req, db.clone()))
+        .post("/:module_id/assessments", move |req| add_assessment_to_module(req, db.clone()))
+
+        // Module prerequisites
+        .get("/:module_id/prerequisites", move |req| get_prerequisites(req, db.clone()))
+        .put("/:module_id/prerequisites", move |req| update_prerequisites(req, db.clone()))
+
+        // Module progress (for student)
+        .get("/:module_id/progress", move |req| get_module_progress(req, db.clone()))
+
+        // Bulk operations
+        .post("/bulk/publish", move |req| bulk_publish_modules(req, db.clone()))
+        .post("/bulk/delete", move |req| bulk_delete_modules(req, db.clone()))
+
+        // Duplication
+        .post("/:module_id/duplicate", move |req| duplicate_module(req, db.clone()))
+}
+
+// =============================================================================
+// REQUEST/RESPONSE TYPES
+// =============================================================================
+
+/// Module response type
+type ModuleResponse {
+    id: ModuleId,
+    course_id: CourseId,
+    title: String,
+    description: Option<String>,
+    position: i32,
+    is_published: Bool,
+    unlock_at: Option<DateTime>,
+    lock_at: Option<DateTime>,
+    require_sequential: Bool,
+    prerequisites: List<PrerequisiteInfo>,
+    lesson_count: i32,
+    assessment_count: i32,
+    duration_minutes: i32,
+    completion_type: ModuleCompletionType,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+/// Module list item
+type ModuleListItem {
+    id: ModuleId,
+    course_id: CourseId,
+    title: String,
+    position: i32,
+    is_published: Bool,
+    lesson_count: i32,
+    assessment_count: i32
+}
+
+/// Prerequisite info
+type PrerequisiteInfo {
+    module_id: ModuleId,
+    title: String,
+    requirement_type: PrerequisiteType
+}
+
+/// Create module request
+type CreateModuleRequest {
+    course_id: CourseId,
+    title: String,
+    description: Option<String>,
+    position: Option<i32>,
+    unlock_at: Option<DateTime>,
+    lock_at: Option<DateTime>,
+    require_sequential: Option<Bool>,
+    completion_type: Option<ModuleCompletionType>
+}
+
+/// Update module request
+type UpdateModuleRequest {
+    title: Option<String>,
+    description: Option<String>,
+    position: Option<i32>,
+    unlock_at: Option<DateTime>,
+    lock_at: Option<DateTime>,
+    require_sequential: Option<Bool>,
+    completion_type: Option<ModuleCompletionType>
+}
+
+/// Module completion type
+enum ModuleCompletionType {
+    /// All items must be completed
+    All,
+    /// Specific items must be completed
+    Required,
+    /// Any subset of items
+    Any { minimum: i32 },
+    /// No completion tracking
+    None
+}
+
+/// Prerequisite type
+enum PrerequisiteType {
+    /// Must complete the prerequisite module
+    Complete,
+    /// Must view the prerequisite module
+    View,
+    /// Must score above threshold on prerequisite
+    Score { minimum: f32 }
+}
+
+/// Module progress response
+type ModuleProgressResponse {
+    module_id: ModuleId,
+    enrollment_id: EnrollmentId,
+    percentage: f32,
+    is_completed: Bool,
+    completed_at: Option<DateTime>,
+    items_completed: i32,
+    total_items: i32,
+    lesson_progress: List<LessonProgressItem>,
+    assessment_progress: List<AssessmentProgressItem>,
+    time_spent_seconds: i64
+}
+
+/// Lesson progress item
+type LessonProgressItem {
+    lesson_id: LessonId,
+    title: String,
+    is_completed: Bool,
+    completed_at: Option<DateTime>,
+    time_spent_seconds: i64
+}
+
+/// Assessment progress item
+type AssessmentProgressItem {
+    assessment_id: AssessmentId,
+    title: String,
+    is_completed: Bool,
+    score: Option<f32>,
+    max_score: f32,
+    attempts: i32
+}
+
+// =============================================================================
+// LIST MODULES
+// =============================================================================
+
+/// List modules
+async fn list_modules(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let pagination = PaginationParams::from_request(&req);
+    let course_id = req.query_param("course_id");
+
+    let (modules, total) = if let Some(cid) = course_id {
+        // Verify course access
+        verify_course_access(&db, &cid, &ctx).await?;
+
+        db.modules()
+            .find_by_course(&cid)
+            .await
+            .map(|m| (m.clone(), m.len() as i64))
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    } else {
+        ctx.require_permission(Permission::ViewAllCourses)?;
+
+        db.modules()
+            .list_all(ctx.tenant_id().as_ref(), pagination.limit(), pagination.offset())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+                trace_id: ctx.trace_id.clone()
+            })?
+    };
+
+    let items: List<ModuleListItem> = modules.iter().map(|m| ModuleListItem {
+        id: m.id.clone(),
+        course_id: m.course_id.clone(),
+        title: m.title.clone(),
+        position: m.position,
+        is_published: m.is_published,
+        lesson_count: 0, // Would be populated
+        assessment_count: 0
+    }).collect();
+
+    let meta = pagination.to_meta(total);
+    Ok(Response::json(ApiResponse::paginated(items, meta, &ctx)))
+}
+
+// =============================================================================
+// GET MODULE
+// =============================================================================
+
+/// Get a specific module
+async fn get_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = db.modules()
+        .find_by_id(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id.clone()
+        })?;
+
+    // Verify course access
+    verify_course_access(&db, &module.course_id, &ctx).await?;
+
+    // Check if module is visible (published or user can edit)
+    if !module.is_published && !can_edit_course_content(&db, &module.course_id, &ctx).await {
+        return Err(ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id
+        })
+    }
+
+    let response = module_to_response(&db, &module).await;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// CREATE MODULE
+// =============================================================================
+
+/// Create a new module
+async fn create_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let body: CreateModuleRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Verify course edit access
+    verify_course_edit_access(&db, &body.course_id, &ctx).await?;
+
+    // Validate
+    if body.title.is_empty() {
+        return Err(ApiError::ValidationError {
+            field: "title".to_string(),
+            message: "Module title is required".to_string(),
+            errors: vec![]
+        })
+    }
+
+    // Get next position if not specified
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.modules()
+            .get_next_position(&body.course_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let module = db.modules()
+        .create(CreateModuleInput {
+            course_id: body.course_id,
+            title: body.title,
+            description: body.description,
+            position,
+            unlock_at: body.unlock_at,
+            lock_at: body.lock_at,
+            require_sequential: body.require_sequential.unwrap_or(false),
+            completion_type: body.completion_type.unwrap_or(ModuleCompletionType::All),
+            tenant_id: ctx.tenant_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = module_to_response(&db, &module).await;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// UPDATE MODULE
+// =============================================================================
+
+/// Update a module
+async fn update_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = db.modules()
+        .find_by_id(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id.clone()
+        })?;
+
+    // Verify course edit access
+    verify_course_edit_access(&db, &module.course_id, &ctx).await?;
+
+    let body: UpdateModuleRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let updated = db.modules()
+        .update(&module_id, UpdateModuleInput {
+            title: body.title,
+            description: body.description,
+            position: body.position,
+            unlock_at: body.unlock_at,
+            lock_at: body.lock_at,
+            require_sequential: body.require_sequential,
+            completion_type: body.completion_type
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = module_to_response(&db, &updated).await;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx)))
+}
+
+// =============================================================================
+// DELETE MODULE
+// =============================================================================
+
+/// Delete a module
+async fn delete_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = db.modules()
+        .find_by_id(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id.clone()
+        })?;
+
+    // Verify course edit access
+    verify_course_edit_access(&db, &module.course_id, &ctx).await?;
+
+    // Check for content
+    let lesson_count = db.lessons()
+        .count_by_module(&module_id)
+        .await
+        .unwrap_or(0);
+
+    let assessment_count = db.assessments()
+        .count_by_module(&module_id)
+        .await
+        .unwrap_or(0);
+
+    if lesson_count > 0 || assessment_count > 0 {
+        let force = req.query_param("force").map(|v| v == "true").unwrap_or(false);
+        if !force {
+            return Err(ApiError::Conflict {
+                message: format!("Module has {} lessons and {} assessments. Use ?force=true to delete.", lesson_count, assessment_count)
+            })
+        }
+
+        // Delete all content
+        db.lessons().delete_by_module(&module_id).await.ok();
+        db.assessments().delete_by_module(&module_id).await.ok();
+    }
+
+    db.modules()
+        .delete(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Module deleted".to_string()))
+    ])))
+}
+
+// =============================================================================
+// PUBLISH/UNPUBLISH
+// =============================================================================
+
+/// Publish a module
+async fn publish_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = get_editable_module(&db, &module_id, &ctx).await?;
+
+    db.modules()
+        .publish(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Module published".to_string()))
+    ])))
+}
+
+/// Unpublish a module
+async fn unpublish_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let _ = get_editable_module(&db, &module_id, &ctx).await?;
+
+    db.modules()
+        .unpublish(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Module unpublished".to_string()))
+    ])))
+}
+
+// =============================================================================
+// MODULE LESSONS
+// =============================================================================
+
+/// Get module lessons
+async fn get_module_lessons(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = get_viewable_module(&db, &module_id, &ctx).await?;
+
+    let lessons = db.lessons()
+        .find_by_module(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    // Filter unpublished if not editor
+    let can_edit = can_edit_course_content(&db, &module.course_id, &ctx).await;
+    let filtered: List<_> = if can_edit {
+        lessons
+    } else {
+        lessons.into_iter().filter(|l| l.is_published).collect()
+    };
+
+    Ok(Response::json(ApiResponse::success(filtered, &ctx)))
+}
+
+/// Add lesson to module
+async fn add_lesson_to_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = get_editable_module(&db, &module_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct AddLessonRequest {
+        title: String,
+        lesson_type: String,
+        description: Option<String>,
+        duration_minutes: Option<i32>,
+        position: Option<i32>
+    }
+
+    let body: AddLessonRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.lessons()
+            .get_next_position(&module_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let lesson = db.lessons()
+        .create(CreateLessonInput {
+            module_id: module_id.clone(),
+            course_id: module.course_id.clone(),
+            title: body.title,
+            lesson_type: parse_lesson_type(&body.lesson_type)?,
+            description: body.description,
+            duration_minutes: body.duration_minutes,
+            position,
+            tenant_id: ctx.tenant_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(lesson, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+/// Reorder lessons
+async fn reorder_lessons(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let _ = get_editable_module(&db, &module_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct ReorderRequest {
+        lesson_ids: List<LessonId>
+    }
+
+    let body: ReorderRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    for (position, lesson_id) in body.lesson_ids.iter().enumerate() {
+        db.lessons()
+            .update_position(lesson_id, position as i32)
+            .await
+            .ok();
+    }
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Lessons reordered".to_string()))
+    ])))
+}
+
+// =============================================================================
+// MODULE ASSESSMENTS
+// =============================================================================
+
+/// Get module assessments
+async fn get_module_assessments(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = get_viewable_module(&db, &module_id, &ctx).await?;
+
+    let assessments = db.assessments()
+        .find_by_module(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let can_edit = can_edit_course_content(&db, &module.course_id, &ctx).await;
+    let filtered: List<_> = if can_edit {
+        assessments
+    } else {
+        assessments.into_iter().filter(|a| a.is_published).collect()
+    };
+
+    Ok(Response::json(ApiResponse::success(filtered, &ctx)))
+}
+
+/// Add assessment to module
+async fn add_assessment_to_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = get_editable_module(&db, &module_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct AddAssessmentRequest {
+        title: String,
+        assessment_type: String,
+        description: Option<String>,
+        max_points: Option<f32>,
+        due_date: Option<DateTime>,
+        position: Option<i32>
+    }
+
+    let body: AddAssessmentRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let position = if let Some(pos) = body.position {
+        pos
+    } else {
+        db.assessments()
+            .get_next_position(&module_id)
+            .await
+            .unwrap_or(0)
+    };
+
+    let assessment = db.assessments()
+        .create(CreateAssessmentInput {
+            module_id: module_id.clone(),
+            course_id: module.course_id.clone(),
+            title: body.title,
+            assessment_type: parse_assessment_type(&body.assessment_type)?,
+            description: body.description,
+            max_points: body.max_points.unwrap_or(100.0),
+            due_date: body.due_date,
+            position,
+            tenant_id: ctx.tenant_id()
+        })
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(assessment, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// PREREQUISITES
+// =============================================================================
+
+/// Get module prerequisites
+async fn get_prerequisites(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let _ = get_viewable_module(&db, &module_id, &ctx).await?;
+
+    let prerequisites = db.module_prerequisites()
+        .find_by_module(&module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(prerequisites, &ctx)))
+}
+
+/// Update module prerequisites
+async fn update_prerequisites(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let _ = get_editable_module(&db, &module_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct UpdatePrerequisitesRequest {
+        prerequisites: List<PrerequisiteInput>
+    }
+
+    #[derive(Deserialize)]
+    struct PrerequisiteInput {
+        module_id: ModuleId,
+        requirement_type: PrerequisiteType
+    }
+
+    let body: UpdatePrerequisitesRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    // Validate no circular dependencies
+    for prereq in &body.prerequisites {
+        if prereq.module_id == module_id {
+            return Err(ApiError::ValidationError {
+                field: "prerequisites".to_string(),
+                message: "Module cannot be its own prerequisite".to_string(),
+                errors: vec![]
+            })
+        }
+    }
+
+    // Replace prerequisites
+    db.module_prerequisites()
+        .replace(&module_id, &body.prerequisites)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(Map::from([
+        ("message".to_string(), Dynamic::String("Prerequisites updated".to_string()))
+    ])))
+}
+
+// =============================================================================
+// MODULE PROGRESS
+// =============================================================================
+
+/// Get module progress for current user
+async fn get_module_progress(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let user_id = ctx.user_id().ok_or_else(|| ApiError::Unauthorized {
+        message: "Authentication required".to_string()
+    })?;
+
+    let module = get_viewable_module(&db, &module_id, &ctx).await?;
+
+    // Get enrollment
+    let enrollment = db.enrollments()
+        .find_by_user_and_course(&user_id, &module.course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::Forbidden {
+            message: "Not enrolled in this course".to_string(),
+            required_permission: None
+        })?;
+
+    let progress = db.progress()
+        .get_module_progress(&enrollment.id, &module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    Ok(Response::json(ApiResponse::success(progress, &ctx)))
+}
+
+// =============================================================================
+// BULK OPERATIONS
+// =============================================================================
+
+/// Bulk publish modules
+async fn bulk_publish_modules(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    #[derive(Deserialize)]
+    struct BulkPublishRequest {
+        module_ids: List<ModuleId>
+    }
+
+    let body: BulkPublishRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let mut published = 0;
+    let mut errors = vec![];
+
+    for module_id in body.module_ids {
+        match get_editable_module(&db, &module_id, &ctx).await {
+            Ok(_) => {
+                match db.modules().publish(&module_id).await {
+                    Ok(_) => published += 1,
+                    Err(e) => errors.push(Map::from([
+                        ("module_id".to_string(), Dynamic::String(module_id)),
+                        ("error".to_string(), Dynamic::String(e.to_string()))
+                    ]))
+                }
+            },
+            Err(e) => errors.push(Map::from([
+                ("module_id".to_string(), Dynamic::String(module_id)),
+                ("error".to_string(), Dynamic::String(format!("{:?}", e)))
+            ]))
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("published".to_string(), Dynamic::Int(published)),
+        ("errors".to_string(), Dynamic::List(errors.into_iter().map(Dynamic::Map).collect()))
+    ])))
+}
+
+/// Bulk delete modules
+async fn bulk_delete_modules(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    #[derive(Deserialize)]
+    struct BulkDeleteRequest {
+        module_ids: List<ModuleId>,
+        force: Option<Bool>
+    }
+
+    let body: BulkDeleteRequest = req.json().await.map_err(|e| ApiError::BadRequest {
+        message: format!("Invalid request body: {}", e)
+    })?;
+
+    let force = body.force.unwrap_or(false);
+    let mut deleted = 0;
+    let mut errors = vec![];
+
+    for module_id in body.module_ids {
+        match get_editable_module(&db, &module_id, &ctx).await {
+            Ok(_) => {
+                if force {
+                    db.lessons().delete_by_module(&module_id).await.ok();
+                    db.assessments().delete_by_module(&module_id).await.ok();
+                }
+
+                match db.modules().delete(&module_id).await {
+                    Ok(_) => deleted += 1,
+                    Err(e) => errors.push(Map::from([
+                        ("module_id".to_string(), Dynamic::String(module_id)),
+                        ("error".to_string(), Dynamic::String(e.to_string()))
+                    ]))
+                }
+            },
+            Err(e) => errors.push(Map::from([
+                ("module_id".to_string(), Dynamic::String(module_id)),
+                ("error".to_string(), Dynamic::String(format!("{:?}", e)))
+            ]))
+        }
+    }
+
+    Ok(Response::json(Map::from([
+        ("deleted".to_string(), Dynamic::Int(deleted)),
+        ("errors".to_string(), Dynamic::List(errors.into_iter().map(Dynamic::Map).collect()))
+    ])))
+}
+
+// =============================================================================
+// DUPLICATION
+// =============================================================================
+
+/// Duplicate a module
+async fn duplicate_module(req: Request, db: Database) -> Result<Response, ApiError> {
+    let ctx = RequestContext::from_request(&req);
+
+    let module_id = req.param("module_id").ok_or_else(|| ApiError::BadRequest {
+        message: "Module ID required".to_string()
+    })?;
+
+    let module = get_editable_module(&db, &module_id, &ctx).await?;
+
+    #[derive(Deserialize)]
+    struct DuplicateRequest {
+        new_title: Option<String>,
+        target_course_id: Option<CourseId>,
+        include_content: Option<Bool>
+    }
+
+    let body: DuplicateRequest = req.json().await.unwrap_or(DuplicateRequest {
+        new_title: None,
+        target_course_id: None,
+        include_content: Some(true)
+    });
+
+    // Verify target course access if different
+    let target_course = body.target_course_id.clone().unwrap_or(module.course_id.clone());
+    if target_course != module.course_id {
+        verify_course_edit_access(&db, &target_course, &ctx).await?;
+    }
+
+    let new_module = db.modules()
+        .duplicate(
+            &module_id,
+            body.new_title.as_deref(),
+            Some(&target_course),
+            body.include_content.unwrap_or(true)
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    let response = module_to_response(&db, &new_module).await;
+
+    Ok(Response::json(ApiResponse::success(response, &ctx))
+        .with_status(StatusCode::CREATED))
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+async fn module_to_response(db: &Database, module: &Module) -> ModuleResponse {
+    let lesson_count = db.lessons()
+        .count_by_module(&module.id)
+        .await
+        .unwrap_or(0) as i32;
+
+    let assessment_count = db.assessments()
+        .count_by_module(&module.id)
+        .await
+        .unwrap_or(0) as i32;
+
+    let duration_minutes = db.lessons()
+        .total_duration_by_module(&module.id)
+        .await
+        .unwrap_or(0);
+
+    ModuleResponse {
+        id: module.id.clone(),
+        course_id: module.course_id.clone(),
+        title: module.title.clone(),
+        description: module.description.clone(),
+        position: module.position,
+        is_published: module.is_published,
+        unlock_at: module.unlock_at,
+        lock_at: module.lock_at,
+        require_sequential: module.require_sequential,
+        prerequisites: vec![],
+        lesson_count,
+        assessment_count,
+        duration_minutes,
+        completion_type: module.completion_type.clone(),
+        created_at: module.created_at,
+        updated_at: module.updated_at
+    }
+}
+
+async fn verify_course_access(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Result<(), ApiError> {
+    if ctx.has_permission(Permission::ViewAllCourses) {
+        return Ok(())
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrolled = db.enrollments()
+            .is_enrolled(&user_id, course_id)
+            .await
+            .unwrap_or(false);
+
+        if enrolled {
+            return Ok(())
+        }
+    }
+
+    // Check if course is public
+    let course = db.courses()
+        .find_by_id(course_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?;
+
+    if let Some(c) = course {
+        if c.visibility == CourseVisibility::Public && c.status == CourseStatus::Published {
+            return Ok(())
+        }
+    }
+
+    Err(ApiError::Forbidden {
+        message: "Access denied".to_string(),
+        required_permission: None
+    })
+}
+
+async fn verify_course_edit_access(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Result<(), ApiError> {
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return Ok(())
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, course_id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            if e.can_edit_content() {
+                return Ok(())
+            }
+        }
+    }
+
+    Err(ApiError::Forbidden {
+        message: "You don't have permission to edit this course".to_string(),
+        required_permission: Some("EditCourses".to_string())
+    })
+}
+
+async fn can_edit_course_content(db: &Database, course_id: &CourseId, ctx: &RequestContext) -> Bool {
+    if ctx.has_permission(Permission::EditAllCourses) {
+        return true
+    }
+
+    if let Some(user_id) = ctx.user_id() {
+        let enrollment = db.enrollments()
+            .find_by_user_and_course(&user_id, course_id)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(e) = enrollment {
+            return e.can_edit_content()
+        }
+    }
+
+    false
+}
+
+async fn get_viewable_module(db: &Database, module_id: &str, ctx: &RequestContext) -> Result<Module, ApiError> {
+    let module = db.modules()
+        .find_by_id(module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id.to_string()
+        })?;
+
+    verify_course_access(db, &module.course_id, ctx).await?;
+
+    if !module.is_published && !can_edit_course_content(db, &module.course_id, ctx).await {
+        return Err(ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id.to_string()
+        })
+    }
+
+    Ok(module)
+}
+
+async fn get_editable_module(db: &Database, module_id: &str, ctx: &RequestContext) -> Result<Module, ApiError> {
+    let module = db.modules()
+        .find_by_id(module_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+            trace_id: ctx.trace_id.clone()
+        })?
+        .ok_or_else(|| ApiError::NotFound {
+            resource: "Module".to_string(),
+            id: module_id.to_string()
+        })?;
+
+    verify_course_edit_access(db, &module.course_id, ctx).await?;
+
+    Ok(module)
+}
+
+fn parse_lesson_type(s: &str) -> Result<LessonType, ApiError> {
+    match s.to_lowercase().as_str() {
+        "video" => Ok(LessonType::Video),
+        "text" | "article" => Ok(LessonType::Text),
+        "document" | "pdf" => Ok(LessonType::Document),
+        "presentation" => Ok(LessonType::Presentation),
+        "interactive" => Ok(LessonType::Interactive),
+        "external" => Ok(LessonType::External),
+        "audio" => Ok(LessonType::Audio),
+        "live" => Ok(LessonType::Live),
+        _ => Err(ApiError::ValidationError {
+            field: "lesson_type".to_string(),
+            message: format!("Unknown lesson type: {}", s),
+            errors: vec![]
+        })
+    }
+}
+
+fn parse_assessment_type(s: &str) -> Result<AssessmentType, ApiError> {
+    match s.to_lowercase().as_str() {
+        "quiz" => Ok(AssessmentType::Quiz),
+        "exam" => Ok(AssessmentType::Exam),
+        "assignment" => Ok(AssessmentType::Assignment),
+        "discussion" => Ok(AssessmentType::Discussion),
+        "project" => Ok(AssessmentType::Project),
+        "survey" => Ok(AssessmentType::Survey),
+        _ => Err(ApiError::ValidationError {
+            field: "assessment_type".to_string(),
+            message: format!("Unknown assessment type: {}", s),
+            errors: vec![]
+        })
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+pub use router;
+pub use ModuleResponse;
+pub use ModuleListItem;
+pub use ModuleProgressResponse;

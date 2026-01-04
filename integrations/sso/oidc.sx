@@ -1,0 +1,1070 @@
+// OpenID Connect SSO Implementation for Intelligo LMS
+// Supports Authorization Code flow with PKCE, token handling, and userinfo
+
+module intelligo::integrations::sso::oidc
+
+use intelligo::integrations::sso::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::crypto::{Sha256, Base64Url, random_bytes}
+use std::http::Client as HttpClient
+use std::json::{Json, JsonValue}
+use std::jwt::{Jwt, JwtHeader, JwtClaims, JwkSet}
+use std::uuid::Uuid
+
+/// OIDC Configuration
+pub type OidcConfig {
+    // Client credentials
+    client_id: String,
+    client_secret: Option<String>,
+
+    // Endpoints (can be auto-discovered)
+    issuer: String,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    userinfo_endpoint: Option<String>,
+    jwks_uri: Option<String>,
+    end_session_endpoint: Option<String>,
+
+    // Redirect URIs
+    redirect_uri: String,
+    post_logout_redirect_uri: Option<String>,
+
+    // Scopes and claims
+    scopes: Vec<String>,
+    additional_claims: Vec<String>,
+
+    // Security settings
+    use_pkce: bool,
+    require_nonce: bool,
+    response_type: OidcResponseType,
+    response_mode: Option<OidcResponseMode>,
+
+    // Token settings
+    token_signing_alg: Option<String>,
+    id_token_signing_alg: Option<String>,
+
+    // Attribute mappings
+    attribute_mappings: OidcAttributeMappings,
+
+    // Timing
+    clock_skew_tolerance: Duration,
+}
+
+/// OIDC Response types
+pub enum OidcResponseType {
+    Code,
+    IdToken,
+    CodeIdToken,
+    Token,
+    TokenIdToken,
+}
+
+impl OidcResponseType {
+    pub fn to_string(self) -> String {
+        match self {
+            OidcResponseType::Code => "code".to_string(),
+            OidcResponseType::IdToken => "id_token".to_string(),
+            OidcResponseType::CodeIdToken => "code id_token".to_string(),
+            OidcResponseType::Token => "token".to_string(),
+            OidcResponseType::TokenIdToken => "token id_token".to_string(),
+        }
+    }
+}
+
+/// OIDC Response modes
+pub enum OidcResponseMode {
+    Query,
+    Fragment,
+    FormPost,
+}
+
+impl OidcResponseMode {
+    pub fn to_string(self) -> String {
+        match self {
+            OidcResponseMode::Query => "query".to_string(),
+            OidcResponseMode::Fragment => "fragment".to_string(),
+            OidcResponseMode::FormPost => "form_post".to_string(),
+        }
+    }
+}
+
+/// OIDC attribute mappings
+pub type OidcAttributeMappings {
+    subject: String,
+    email: String,
+    email_verified: Option<String>,
+    name: Option<String>,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    preferred_username: Option<String>,
+    picture: Option<String>,
+    groups: Option<String>,
+    roles: Option<String>,
+    custom: HashMap<String, String>,
+}
+
+impl OidcAttributeMappings {
+    pub fn default() -> Self {
+        OidcAttributeMappings {
+            subject: "sub".to_string(),
+            email: "email".to_string(),
+            email_verified: Some("email_verified".to_string()),
+            name: Some("name".to_string()),
+            given_name: Some("given_name".to_string()),
+            family_name: Some("family_name".to_string()),
+            preferred_username: Some("preferred_username".to_string()),
+            picture: Some("picture".to_string()),
+            groups: Some("groups".to_string()),
+            roles: Some("roles".to_string()),
+            custom: HashMap::new(),
+        }
+    }
+}
+
+/// OIDC Discovery document
+pub type OidcDiscoveryDocument {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    userinfo_endpoint: Option<String>,
+    jwks_uri: String,
+    end_session_endpoint: Option<String>,
+    registration_endpoint: Option<String>,
+    scopes_supported: Vec<String>,
+    response_types_supported: Vec<String>,
+    response_modes_supported: Vec<String>,
+    grant_types_supported: Vec<String>,
+    subject_types_supported: Vec<String>,
+    id_token_signing_alg_values_supported: Vec<String>,
+    token_endpoint_auth_methods_supported: Vec<String>,
+    claims_supported: Vec<String>,
+    code_challenge_methods_supported: Vec<String>,
+}
+
+/// OIDC Token response
+pub type OidcTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    scope: Option<String>,
+}
+
+/// OIDC ID Token claims
+pub type OidcIdTokenClaims {
+    iss: String,
+    sub: String,
+    aud: Vec<String>,
+    exp: i64,
+    iat: i64,
+    auth_time: Option<i64>,
+    nonce: Option<String>,
+    acr: Option<String>,
+    amr: Option<Vec<String>>,
+    azp: Option<String>,
+
+    // Standard claims
+    name: Option<String>,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    middle_name: Option<String>,
+    nickname: Option<String>,
+    preferred_username: Option<String>,
+    profile: Option<String>,
+    picture: Option<String>,
+    website: Option<String>,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    gender: Option<String>,
+    birthdate: Option<String>,
+    zoneinfo: Option<String>,
+    locale: Option<String>,
+    phone_number: Option<String>,
+    phone_number_verified: Option<bool>,
+    address: Option<OidcAddressClaim>,
+    updated_at: Option<i64>,
+
+    // Additional claims
+    groups: Option<Vec<String>>,
+    roles: Option<Vec<String>>,
+
+    // Raw claims for custom mapping
+    raw_claims: HashMap<String, JsonValue>,
+}
+
+/// OIDC Address claim
+pub type OidcAddressClaim {
+    formatted: Option<String>,
+    street_address: Option<String>,
+    locality: Option<String>,
+    region: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+}
+
+/// OIDC Userinfo response
+pub type OidcUserinfo {
+    sub: String,
+    name: Option<String>,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    preferred_username: Option<String>,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    picture: Option<String>,
+    groups: Option<Vec<String>>,
+    roles: Option<Vec<String>>,
+    raw_claims: HashMap<String, JsonValue>,
+}
+
+/// PKCE challenge
+pub type PkceChallenge {
+    code_verifier: String,
+    code_challenge: String,
+    code_challenge_method: String,
+}
+
+impl PkceChallenge {
+    pub fn generate() -> Self {
+        // Generate 32 random bytes for verifier
+        let verifier_bytes = random_bytes(32);
+        let code_verifier = Base64Url::encode(verifier_bytes);
+
+        // Create S256 challenge
+        let challenge_bytes = Sha256::hash(code_verifier.as_bytes());
+        let code_challenge = Base64Url::encode(challenge_bytes);
+
+        PkceChallenge {
+            code_verifier: code_verifier,
+            code_challenge: code_challenge,
+            code_challenge_method: "S256".to_string(),
+        }
+    }
+}
+
+/// OIDC pending auth request
+type OidcPendingRequest {
+    state: String,
+    nonce: Option<String>,
+    pkce: Option<PkceChallenge>,
+    return_url: String,
+    created_at: DateTime,
+}
+
+/// OIDC Provider implementation
+pub actor OidcProvider {
+    provider_id: String,
+    config: OidcConfig,
+    discovery: Option<OidcDiscoveryDocument>,
+    jwks: Option<JwkSet>,
+    pending_requests: HashMap<String, OidcPendingRequest>,
+    http_client: HttpClient,
+
+    pub fn new(provider_id: String, config: OidcConfig) -> Self {
+        OidcProvider {
+            provider_id: provider_id,
+            config: config,
+            discovery: None,
+            jwks: None,
+            pending_requests: HashMap::new(),
+            http_client: HttpClient::new(),
+        }
+    }
+
+    /// Initialize provider with discovery
+    pub async fn initialize(mut self) -> Result<(), SsoError> {
+        // Fetch discovery document
+        let discovery = self.fetch_discovery().await?;
+        self.discovery = Some(discovery.clone());
+
+        // Fetch JWKS
+        let jwks = self.fetch_jwks(discovery.jwks_uri).await?;
+        self.jwks = Some(jwks);
+
+        Ok(())
+    }
+
+    /// Fetch OIDC discovery document
+    async fn fetch_discovery(self) -> Result<OidcDiscoveryDocument, SsoError> {
+        let discovery_url = format!("{}/.well-known/openid-configuration", self.config.issuer);
+
+        let response = self.http_client.get(&discovery_url)
+            .send()
+            .await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(SsoError::NetworkError {
+                message: format!("Discovery failed: {}", response.status())
+            });
+        }
+
+        let json: JsonValue = response.json().await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        Ok(OidcDiscoveryDocument {
+            issuer: json["issuer"].as_str().unwrap_or_default().to_string(),
+            authorization_endpoint: json["authorization_endpoint"].as_str().unwrap_or_default().to_string(),
+            token_endpoint: json["token_endpoint"].as_str().unwrap_or_default().to_string(),
+            userinfo_endpoint: json["userinfo_endpoint"].as_str().map(|s| s.to_string()),
+            jwks_uri: json["jwks_uri"].as_str().unwrap_or_default().to_string(),
+            end_session_endpoint: json["end_session_endpoint"].as_str().map(|s| s.to_string()),
+            registration_endpoint: json["registration_endpoint"].as_str().map(|s| s.to_string()),
+            scopes_supported: json["scopes_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            response_types_supported: json["response_types_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            response_modes_supported: json["response_modes_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            grant_types_supported: json["grant_types_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            subject_types_supported: json["subject_types_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            id_token_signing_alg_values_supported: json["id_token_signing_alg_values_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            token_endpoint_auth_methods_supported: json["token_endpoint_auth_methods_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            claims_supported: json["claims_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            code_challenge_methods_supported: json["code_challenge_methods_supported"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Fetch JWKS
+    async fn fetch_jwks(self, jwks_uri: String) -> Result<JwkSet, SsoError> {
+        let response = self.http_client.get(&jwks_uri)
+            .send()
+            .await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(SsoError::NetworkError {
+                message: format!("JWKS fetch failed: {}", response.status())
+            });
+        }
+
+        let json: JsonValue = response.json().await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        JwkSet::from_json(json)
+            .map_err(|e| SsoError::ConfigurationError {
+                message: format!("Invalid JWKS: {}", e)
+            })
+    }
+
+    /// Get authorization endpoint
+    fn get_authorization_endpoint(self) -> String {
+        self.config.authorization_endpoint.clone()
+            .or_else(|| self.discovery.as_ref().map(|d| d.authorization_endpoint.clone()))
+            .unwrap_or_else(|| format!("{}/authorize", self.config.issuer))
+    }
+
+    /// Get token endpoint
+    fn get_token_endpoint(self) -> String {
+        self.config.token_endpoint.clone()
+            .or_else(|| self.discovery.as_ref().map(|d| d.token_endpoint.clone()))
+            .unwrap_or_else(|| format!("{}/oauth/token", self.config.issuer))
+    }
+
+    /// Get userinfo endpoint
+    fn get_userinfo_endpoint(self) -> Option<String> {
+        self.config.userinfo_endpoint.clone()
+            .or_else(|| self.discovery.as_ref().and_then(|d| d.userinfo_endpoint.clone()))
+    }
+
+    /// Get end session endpoint
+    fn get_end_session_endpoint(self) -> Option<String> {
+        self.discovery.as_ref().and_then(|d| d.end_session_endpoint.clone())
+    }
+
+    /// Build authorization URL
+    fn build_auth_url(mut self, return_url: String) -> Result<(String, OidcPendingRequest), SsoError> {
+        let state = generate_random_string(32);
+        let nonce = if self.config.require_nonce {
+            Some(generate_random_string(32))
+        } else {
+            None
+        };
+
+        let pkce = if self.config.use_pkce {
+            Some(PkceChallenge::generate())
+        } else {
+            None
+        };
+
+        let scopes = if self.config.scopes.is_empty() {
+            vec!["openid".to_string(), "profile".to_string(), "email".to_string()]
+        } else {
+            self.config.scopes.clone()
+        };
+
+        let mut params = vec![
+            format!("response_type={}", url_encode(self.config.response_type.to_string())),
+            format!("client_id={}", url_encode(self.config.client_id.clone())),
+            format!("redirect_uri={}", url_encode(self.config.redirect_uri.clone())),
+            format!("scope={}", url_encode(scopes.join(" "))),
+            format!("state={}", url_encode(state.clone())),
+        ];
+
+        if let Some(ref n) = nonce {
+            params.push(format!("nonce={}", url_encode(n.clone())));
+        }
+
+        if let Some(ref p) = pkce {
+            params.push(format!("code_challenge={}", url_encode(p.code_challenge.clone())));
+            params.push(format!("code_challenge_method={}", url_encode(p.code_challenge_method.clone())));
+        }
+
+        if let Some(ref mode) = self.config.response_mode {
+            params.push(format!("response_mode={}", url_encode(mode.to_string())));
+        }
+
+        let auth_endpoint = self.get_authorization_endpoint();
+        let separator = if auth_endpoint.contains('?') { "&" } else { "?" };
+        let auth_url = format!("{}{}{}", auth_endpoint, separator, params.join("&"));
+
+        let pending = OidcPendingRequest {
+            state: state.clone(),
+            nonce: nonce,
+            pkce: pkce,
+            return_url: return_url,
+            created_at: DateTime::now(),
+        };
+
+        self.pending_requests.insert(state, pending.clone());
+
+        Ok((auth_url, pending))
+    }
+
+    /// Exchange authorization code for tokens
+    async fn exchange_code(
+        self,
+        code: String,
+        pkce_verifier: Option<String>
+    ) -> Result<OidcTokenResponse, SsoError> {
+        let token_endpoint = self.get_token_endpoint();
+
+        let mut params = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code),
+            ("redirect_uri", self.config.redirect_uri.clone()),
+            ("client_id", self.config.client_id.clone()),
+        ];
+
+        if let Some(ref secret) = self.config.client_secret {
+            params.push(("client_secret", secret.clone()));
+        }
+
+        if let Some(verifier) = pkce_verifier {
+            params.push(("code_verifier", verifier));
+        }
+
+        let response = self.http_client.post(&token_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(SsoError::AuthenticationFailed {
+                message: format!("Token exchange failed: {}", error_text)
+            });
+        }
+
+        let json: JsonValue = response.json().await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        // Check for error response
+        if let Some(error) = json["error"].as_str() {
+            let description = json["error_description"].as_str().unwrap_or(error);
+            return Err(SsoError::AuthenticationFailed {
+                message: description.to_string()
+            });
+        }
+
+        Ok(OidcTokenResponse {
+            access_token: json["access_token"].as_str().unwrap_or_default().to_string(),
+            token_type: json["token_type"].as_str().unwrap_or("Bearer").to_string(),
+            expires_in: json["expires_in"].as_i64(),
+            refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+            id_token: json["id_token"].as_str().map(|s| s.to_string()),
+            scope: json["scope"].as_str().map(|s| s.to_string()),
+        })
+    }
+
+    /// Validate and parse ID token
+    fn validate_id_token(
+        self,
+        id_token: String,
+        expected_nonce: Option<String>
+    ) -> Result<OidcIdTokenClaims, SsoError> {
+        // Parse JWT without verification first to get header
+        let jwt = Jwt::parse(&id_token)
+            .map_err(|e| SsoError::InvalidAssertion { details: format!("Invalid JWT: {}", e) })?;
+
+        // Get key from JWKS
+        let kid = jwt.header.kid.as_ref();
+        let jwks = self.jwks.as_ref().ok_or(
+            SsoError::ConfigurationError { message: "JWKS not loaded".to_string() }
+        )?;
+
+        let key = match kid {
+            Some(k) => jwks.find_key(k),
+            None => jwks.keys.first(),
+        }.ok_or(
+            SsoError::InvalidSignature
+        )?;
+
+        // Verify signature
+        if !jwt.verify(key) {
+            return Err(SsoError::InvalidSignature);
+        }
+
+        // Parse claims
+        let claims = &jwt.claims;
+        let now = DateTime::now().timestamp();
+
+        // Validate issuer
+        let iss = claims["iss"].as_str().ok_or(
+            SsoError::InvalidAssertion { details: "Missing iss claim".to_string() }
+        )?;
+        if iss != self.config.issuer {
+            return Err(SsoError::InvalidAssertion {
+                details: format!("Issuer mismatch: expected {}, got {}", self.config.issuer, iss)
+            });
+        }
+
+        // Validate audience
+        let aud = match &claims["aud"] {
+            JsonValue::String(s) => vec![s.clone()],
+            JsonValue::Array(a) => a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => return Err(SsoError::InvalidAssertion { details: "Invalid aud claim".to_string() }),
+        };
+        if !aud.contains(&self.config.client_id) {
+            return Err(SsoError::InvalidAssertion {
+                details: "Client ID not in audience".to_string()
+            });
+        }
+
+        // Validate expiration
+        let exp = claims["exp"].as_i64().ok_or(
+            SsoError::InvalidAssertion { details: "Missing exp claim".to_string() }
+        )?;
+        let skew = self.config.clock_skew_tolerance.as_secs() as i64;
+        if now > exp + skew {
+            return Err(SsoError::TokenExpired);
+        }
+
+        // Validate iat
+        let iat = claims["iat"].as_i64().ok_or(
+            SsoError::InvalidAssertion { details: "Missing iat claim".to_string() }
+        )?;
+        if now < iat - skew {
+            return Err(SsoError::InvalidAssertion {
+                details: "Token issued in the future".to_string()
+            });
+        }
+
+        // Validate nonce if expected
+        if let Some(expected) = expected_nonce {
+            let token_nonce = claims["nonce"].as_str();
+            if token_nonce != Some(&expected) {
+                return Err(SsoError::InvalidAssertion {
+                    details: "Nonce mismatch".to_string()
+                });
+            }
+        }
+
+        // Validate azp if multiple audiences
+        if aud.len() > 1 {
+            let azp = claims["azp"].as_str();
+            if azp != Some(&self.config.client_id) {
+                return Err(SsoError::InvalidAssertion {
+                    details: "azp does not match client_id".to_string()
+                });
+            }
+        }
+
+        // Extract all claims
+        let sub = claims["sub"].as_str().unwrap_or_default().to_string();
+
+        Ok(OidcIdTokenClaims {
+            iss: iss.to_string(),
+            sub: sub,
+            aud: aud,
+            exp: exp,
+            iat: iat,
+            auth_time: claims["auth_time"].as_i64(),
+            nonce: claims["nonce"].as_str().map(|s| s.to_string()),
+            acr: claims["acr"].as_str().map(|s| s.to_string()),
+            amr: claims["amr"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+            azp: claims["azp"].as_str().map(|s| s.to_string()),
+            name: claims["name"].as_str().map(|s| s.to_string()),
+            given_name: claims["given_name"].as_str().map(|s| s.to_string()),
+            family_name: claims["family_name"].as_str().map(|s| s.to_string()),
+            middle_name: claims["middle_name"].as_str().map(|s| s.to_string()),
+            nickname: claims["nickname"].as_str().map(|s| s.to_string()),
+            preferred_username: claims["preferred_username"].as_str().map(|s| s.to_string()),
+            profile: claims["profile"].as_str().map(|s| s.to_string()),
+            picture: claims["picture"].as_str().map(|s| s.to_string()),
+            website: claims["website"].as_str().map(|s| s.to_string()),
+            email: claims["email"].as_str().map(|s| s.to_string()),
+            email_verified: claims["email_verified"].as_bool(),
+            gender: claims["gender"].as_str().map(|s| s.to_string()),
+            birthdate: claims["birthdate"].as_str().map(|s| s.to_string()),
+            zoneinfo: claims["zoneinfo"].as_str().map(|s| s.to_string()),
+            locale: claims["locale"].as_str().map(|s| s.to_string()),
+            phone_number: claims["phone_number"].as_str().map(|s| s.to_string()),
+            phone_number_verified: claims["phone_number_verified"].as_bool(),
+            address: claims["address"].as_object().map(|a| OidcAddressClaim {
+                formatted: a.get("formatted").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                street_address: a.get("street_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                locality: a.get("locality").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                region: a.get("region").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                postal_code: a.get("postal_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                country: a.get("country").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            }),
+            updated_at: claims["updated_at"].as_i64(),
+            groups: claims["groups"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+            roles: claims["roles"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+            raw_claims: claims.as_object()
+                .map(|o| o.clone())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Fetch userinfo from endpoint
+    async fn fetch_userinfo(self, access_token: String) -> Result<OidcUserinfo, SsoError> {
+        let userinfo_endpoint = self.get_userinfo_endpoint().ok_or(
+            SsoError::ConfigurationError { message: "No userinfo endpoint".to_string() }
+        )?;
+
+        let response = self.http_client.get(&userinfo_endpoint)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            return Err(SsoError::AuthenticationFailed {
+                message: format!("Userinfo request failed: {}", response.status())
+            });
+        }
+
+        let json: JsonValue = response.json().await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        Ok(OidcUserinfo {
+            sub: json["sub"].as_str().unwrap_or_default().to_string(),
+            name: json["name"].as_str().map(|s| s.to_string()),
+            given_name: json["given_name"].as_str().map(|s| s.to_string()),
+            family_name: json["family_name"].as_str().map(|s| s.to_string()),
+            preferred_username: json["preferred_username"].as_str().map(|s| s.to_string()),
+            email: json["email"].as_str().map(|s| s.to_string()),
+            email_verified: json["email_verified"].as_bool(),
+            picture: json["picture"].as_str().map(|s| s.to_string()),
+            groups: json["groups"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+            roles: json["roles"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+            raw_claims: json.as_object()
+                .map(|o| o.clone())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Extract attributes from ID token claims
+    fn extract_attributes(self, claims: &OidcIdTokenClaims) -> HashMap<String, String> {
+        let mut attributes = HashMap::new();
+        let mappings = &self.config.attribute_mappings;
+
+        // Standard mappings
+        if let Some(ref email) = claims.email {
+            attributes.insert("email".to_string(), email.clone());
+        }
+        if let Some(ref name) = claims.name {
+            attributes.insert("display_name".to_string(), name.clone());
+        }
+        if let Some(ref given_name) = claims.given_name {
+            attributes.insert("first_name".to_string(), given_name.clone());
+        }
+        if let Some(ref family_name) = claims.family_name {
+            attributes.insert("last_name".to_string(), family_name.clone());
+        }
+        if let Some(ref username) = claims.preferred_username {
+            attributes.insert("username".to_string(), username.clone());
+        }
+        if let Some(ref picture) = claims.picture {
+            attributes.insert("picture".to_string(), picture.clone());
+        }
+
+        // Custom mappings
+        for (claim_name, attr_name) in &mappings.custom {
+            if let Some(value) = claims.raw_claims.get(claim_name) {
+                if let Some(s) = value.as_str() {
+                    attributes.insert(attr_name.clone(), s.to_string());
+                }
+            }
+        }
+
+        attributes
+    }
+
+    /// Build logout URL
+    fn build_logout_url(self, id_token_hint: Option<String>, return_url: String) -> Option<String> {
+        let end_session_endpoint = self.get_end_session_endpoint()?;
+
+        let mut params = vec![
+            format!("post_logout_redirect_uri={}",
+                url_encode(self.config.post_logout_redirect_uri.clone().unwrap_or(return_url)))
+        ];
+
+        if let Some(hint) = id_token_hint {
+            params.push(format!("id_token_hint={}", url_encode(hint)));
+        }
+
+        params.push(format!("client_id={}", url_encode(self.config.client_id.clone())));
+
+        let separator = if end_session_endpoint.contains('?') { "&" } else { "?" };
+        Some(format!("{}{}{}", end_session_endpoint, separator, params.join("&")))
+    }
+
+    /// Refresh access token
+    pub async fn refresh_token(self, refresh_token: String) -> Result<OidcTokenResponse, SsoError> {
+        let token_endpoint = self.get_token_endpoint();
+
+        let mut params = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token),
+            ("client_id", self.config.client_id.clone()),
+        ];
+
+        if let Some(ref secret) = self.config.client_secret {
+            params.push(("client_secret", secret.clone()));
+        }
+
+        let response = self.http_client.post(&token_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(SsoError::AuthenticationFailed {
+                message: format!("Token refresh failed: {}", error_text)
+            });
+        }
+
+        let json: JsonValue = response.json().await
+            .map_err(|e| SsoError::NetworkError { message: e.to_string() })?;
+
+        Ok(OidcTokenResponse {
+            access_token: json["access_token"].as_str().unwrap_or_default().to_string(),
+            token_type: json["token_type"].as_str().unwrap_or("Bearer").to_string(),
+            expires_in: json["expires_in"].as_i64(),
+            refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
+            id_token: json["id_token"].as_str().map(|s| s.to_string()),
+            scope: json["scope"].as_str().map(|s| s.to_string()),
+        })
+    }
+}
+
+impl SsoProvider for OidcProvider {
+    fn get_config(self) -> SsoConfig {
+        SsoConfig {
+            provider_id: self.provider_id.clone(),
+            provider_type: SsoProviderType::Oidc,
+            display_name: "OpenID Connect".to_string(),
+            enabled: true,
+            organization_id: None,
+            saml_config: None,
+            oidc_config: Some(self.config.clone()),
+            ldap_config: None,
+            auto_provision_users: true,
+            default_role: None,
+            attribute_mappings: HashMap::new(),
+            allowed_domains: Vec::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    async fn initiate_auth(mut self, return_url: String) -> Result<SsoAuthRequest, SsoError> {
+        // Ensure we have discovery document
+        if self.discovery.is_none() {
+            self.initialize().await?;
+        }
+
+        let (auth_url, pending) = self.build_auth_url(return_url)?;
+
+        Ok(SsoAuthRequest {
+            redirect_url: auth_url,
+            state: pending.state,
+            nonce: pending.nonce,
+            relay_state: None,
+        })
+    }
+
+    async fn process_callback(mut self, request: SsoCallbackRequest) -> Result<SsoAuthResult, SsoError> {
+        // Check for error response
+        if let Some(error) = request.error {
+            return Err(SsoError::AuthenticationFailed {
+                message: request.error_description.unwrap_or(error)
+            });
+        }
+
+        // Validate state and get pending request
+        let state = request.state.ok_or(
+            SsoError::InvalidAssertion { details: "Missing state parameter".to_string() }
+        )?;
+
+        let pending = self.pending_requests.remove(&state).ok_or(
+            SsoError::InvalidAssertion { details: "Invalid or expired state".to_string() }
+        )?;
+
+        // Exchange code for tokens
+        let code = request.code.ok_or(
+            SsoError::InvalidAssertion { details: "Missing authorization code".to_string() }
+        )?;
+
+        let pkce_verifier = pending.pkce.map(|p| p.code_verifier);
+        let token_response = self.exchange_code(code, pkce_verifier).await?;
+
+        // Validate ID token if present
+        let id_token_claims = if let Some(ref id_token) = token_response.id_token {
+            Some(self.validate_id_token(id_token.clone(), pending.nonce)?)
+        } else {
+            None
+        };
+
+        // Fetch userinfo if we have access token and no ID token claims
+        let userinfo = if id_token_claims.is_none() || self.get_userinfo_endpoint().is_some() {
+            Some(self.fetch_userinfo(token_response.access_token.clone()).await?)
+        } else {
+            None
+        };
+
+        // Extract user information
+        let (email, display_name, groups, attributes) = if let Some(ref claims) = id_token_claims {
+            let attrs = self.extract_attributes(claims);
+            (
+                claims.email.clone(),
+                claims.name.clone(),
+                claims.groups.clone().unwrap_or_default(),
+                attrs,
+            )
+        } else if let Some(ref info) = userinfo {
+            let mut attrs = HashMap::new();
+            if let Some(ref e) = info.email {
+                attrs.insert("email".to_string(), e.clone());
+            }
+            if let Some(ref n) = info.name {
+                attrs.insert("display_name".to_string(), n.clone());
+            }
+            (
+                info.email.clone(),
+                info.name.clone(),
+                info.groups.clone().unwrap_or_default(),
+                attrs,
+            )
+        } else {
+            return Err(SsoError::AuthenticationFailed {
+                message: "Could not get user information".to_string()
+            });
+        };
+
+        Ok(SsoAuthResult {
+            success: true,
+            user_id: None,
+            email: email,
+            display_name: display_name,
+            attributes: attributes,
+            groups: groups,
+            session_token: None,
+            provider_id: self.provider_id.clone(),
+            provider_type: SsoProviderType::Oidc,
+            is_new_user: false,
+            error: None,
+        })
+    }
+
+    async fn validate_session(self, session_id: Uuid) -> Result<SsoSession, SsoError> {
+        Err(SsoError::SessionError {
+            message: "Session validation should be done through SsoManager".to_string()
+        })
+    }
+
+    async fn terminate_session(self, session_id: Uuid) -> Result<(), SsoError> {
+        Ok(())
+    }
+
+    fn get_logout_url(self, session_id: Uuid, return_url: String) -> Option<String> {
+        self.build_logout_url(None, return_url)
+    }
+}
+
+/// Generate random string for state/nonce
+fn generate_random_string(length: usize) -> String {
+    let bytes = random_bytes(length);
+    Base64Url::encode(bytes)
+}
+
+/// URL encode helper
+fn url_encode(s: String) -> String {
+    s.chars().map(|c| {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        }
+    }).collect()
+}
+
+/// Create OIDC config from well-known providers
+pub mod providers {
+    use super::*;
+
+    pub fn azure_ad(tenant_id: String, client_id: String, client_secret: Option<String>) -> OidcConfig {
+        OidcConfig {
+            client_id: client_id,
+            client_secret: client_secret,
+            issuer: format!("https://login.microsoftonline.com/{}/v2.0", tenant_id),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: None,
+            end_session_endpoint: None,
+            redirect_uri: "".to_string(), // Must be set by caller
+            post_logout_redirect_uri: None,
+            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            additional_claims: Vec::new(),
+            use_pkce: true,
+            require_nonce: true,
+            response_type: OidcResponseType::Code,
+            response_mode: None,
+            token_signing_alg: None,
+            id_token_signing_alg: Some("RS256".to_string()),
+            attribute_mappings: OidcAttributeMappings::default(),
+            clock_skew_tolerance: Duration::minutes(5),
+        }
+    }
+
+    pub fn google(client_id: String, client_secret: String) -> OidcConfig {
+        OidcConfig {
+            client_id: client_id,
+            client_secret: Some(client_secret),
+            issuer: "https://accounts.google.com".to_string(),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: None,
+            end_session_endpoint: None,
+            redirect_uri: "".to_string(),
+            post_logout_redirect_uri: None,
+            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            additional_claims: Vec::new(),
+            use_pkce: true,
+            require_nonce: true,
+            response_type: OidcResponseType::Code,
+            response_mode: None,
+            token_signing_alg: None,
+            id_token_signing_alg: Some("RS256".to_string()),
+            attribute_mappings: OidcAttributeMappings::default(),
+            clock_skew_tolerance: Duration::minutes(5),
+        }
+    }
+
+    pub fn okta(domain: String, client_id: String, client_secret: Option<String>) -> OidcConfig {
+        OidcConfig {
+            client_id: client_id,
+            client_secret: client_secret,
+            issuer: format!("https://{}", domain),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: None,
+            end_session_endpoint: None,
+            redirect_uri: "".to_string(),
+            post_logout_redirect_uri: None,
+            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string(), "groups".to_string()],
+            additional_claims: Vec::new(),
+            use_pkce: true,
+            require_nonce: true,
+            response_type: OidcResponseType::Code,
+            response_mode: None,
+            token_signing_alg: None,
+            id_token_signing_alg: Some("RS256".to_string()),
+            attribute_mappings: OidcAttributeMappings::default(),
+            clock_skew_tolerance: Duration::minutes(5),
+        }
+    }
+
+    pub fn auth0(domain: String, client_id: String, client_secret: Option<String>) -> OidcConfig {
+        OidcConfig {
+            client_id: client_id,
+            client_secret: client_secret,
+            issuer: format!("https://{}/", domain),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: None,
+            end_session_endpoint: None,
+            redirect_uri: "".to_string(),
+            post_logout_redirect_uri: None,
+            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            additional_claims: Vec::new(),
+            use_pkce: true,
+            require_nonce: true,
+            response_type: OidcResponseType::Code,
+            response_mode: None,
+            token_signing_alg: None,
+            id_token_signing_alg: Some("RS256".to_string()),
+            attribute_mappings: OidcAttributeMappings::default(),
+            clock_skew_tolerance: Duration::minutes(5),
+        }
+    }
+
+    pub fn keycloak(base_url: String, realm: String, client_id: String, client_secret: Option<String>) -> OidcConfig {
+        OidcConfig {
+            client_id: client_id,
+            client_secret: client_secret,
+            issuer: format!("{}/realms/{}", base_url, realm),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: None,
+            end_session_endpoint: None,
+            redirect_uri: "".to_string(),
+            post_logout_redirect_uri: None,
+            scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            additional_claims: Vec::new(),
+            use_pkce: true,
+            require_nonce: true,
+            response_type: OidcResponseType::Code,
+            response_mode: None,
+            token_signing_alg: None,
+            id_token_signing_alg: Some("RS256".to_string()),
+            attribute_mappings: OidcAttributeMappings::default(),
+            clock_skew_tolerance: Duration::minutes(5),
+        }
+    }
+}

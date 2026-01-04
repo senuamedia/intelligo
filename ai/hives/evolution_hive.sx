@@ -1,0 +1,828 @@
+/// Intelligo LMS - Evolution Hive
+///
+/// Handles adaptive learning evolution, A/B testing of learning strategies,
+/// content optimization based on outcomes, and continuous improvement of AI models.
+
+module intelligo::ai::hives::evolution
+
+use std::collections::{Map, List}
+use std::sync::{Arc, RwLock}
+use std::time::{DateTime, Duration}
+
+// =============================================================================
+// EVOLUTION HIVE
+// =============================================================================
+
+/// Actor that manages evolution and adaptation of learning experiences
+pub actor EvolutionHive {
+    experiments: Arc<RwLock<Map<String, Experiment>>>,
+    strategies: Arc<RwLock<Map<String, LearningStrategy>>>,
+    adaptations: Arc<RwLock<List<AdaptationRecord>>>,
+    config: EvolutionConfig
+}
+
+/// Configuration for the evolution hive
+pub type EvolutionConfig {
+    min_sample_size: i32,
+    significance_threshold: f64,
+    adaptation_cooldown: Duration,
+    max_concurrent_experiments: i32,
+    auto_promote_threshold: f64
+}
+
+impl Default for EvolutionConfig {
+    fn default() -> EvolutionConfig {
+        EvolutionConfig {
+            min_sample_size: 100,
+            significance_threshold: 0.95,
+            adaptation_cooldown: Duration::from_secs(86400), // 24 hours
+            max_concurrent_experiments: 10,
+            auto_promote_threshold: 0.10 // 10% improvement
+        }
+    }
+}
+
+impl EvolutionHive {
+    pub fn new() -> EvolutionHive {
+        EvolutionHive::with_config(EvolutionConfig::default())
+    }
+
+    pub fn with_config(config: EvolutionConfig) -> EvolutionHive {
+        EvolutionHive {
+            experiments: Arc::new(RwLock::new(Map::new())),
+            strategies: Arc::new(RwLock::new(Map::new())),
+            adaptations: Arc::new(RwLock::new(vec![])),
+            config
+        }
+    }
+
+    // =========================================================================
+    // A/B TESTING
+    // =========================================================================
+
+    /// Create a new A/B experiment
+    pub async fn create_experiment(&mut self, request: CreateExperimentRequest) -> Result<Experiment, String> {
+        // Check concurrent experiment limit
+        let active_count = self.experiments.read().unwrap()
+            .values()
+            .filter(|e| e.status == ExperimentStatus::Running)
+            .count();
+
+        if active_count >= self.config.max_concurrent_experiments as usize {
+            return Err("Maximum concurrent experiments reached".to_string());
+        }
+
+        let experiment = Experiment {
+            id: generate_id("exp"),
+            name: request.name,
+            description: request.description,
+            hypothesis: request.hypothesis,
+            experiment_type: request.experiment_type,
+            variants: request.variants,
+            metrics: request.metrics,
+            target_audience: request.target_audience,
+            traffic_allocation: request.traffic_allocation.unwrap_or(0.5),
+            status: ExperimentStatus::Draft,
+            results: None,
+            created_at: DateTime::now(),
+            started_at: None,
+            ended_at: None
+        };
+
+        self.experiments.write().unwrap().insert(experiment.id.clone(), experiment.clone());
+        Ok(experiment)
+    }
+
+    /// Start an experiment
+    pub async fn start_experiment(&mut self, experiment_id: &str) -> Result<Experiment, String> {
+        let mut experiments = self.experiments.write().unwrap();
+        let experiment = experiments.get_mut(experiment_id)
+            .ok_or("Experiment not found")?;
+
+        if experiment.status != ExperimentStatus::Draft {
+            return Err("Can only start experiments in draft status".to_string());
+        }
+
+        experiment.status = ExperimentStatus::Running;
+        experiment.started_at = Some(DateTime::now());
+
+        Ok(experiment.clone())
+    }
+
+    /// Assign user to experiment variant
+    pub async fn assign_variant(&self, experiment_id: &str, user_id: &str) -> Result<ExperimentVariant, String> {
+        let experiments = self.experiments.read().unwrap();
+        let experiment = experiments.get(experiment_id)
+            .ok_or("Experiment not found")?;
+
+        if experiment.status != ExperimentStatus::Running {
+            return Err("Experiment is not running".to_string());
+        }
+
+        // Check audience targeting
+        // In production, evaluate target_audience criteria
+
+        // Deterministic assignment based on user_id hash
+        let hash = hash_user(user_id, experiment_id);
+        let threshold = (experiment.traffic_allocation * 100.0) as u64;
+
+        if hash % 100 < threshold {
+            // Assign to treatment
+            let treatment_variants: Vec<_> = experiment.variants.iter()
+                .filter(|v| v.is_control == false)
+                .collect();
+
+            if treatment_variants.is_empty() {
+                return experiment.variants.iter()
+                    .find(|v| v.is_control)
+                    .cloned()
+                    .ok_or("No control variant found".to_string());
+            }
+
+            let variant_index = (hash / 100) as usize % treatment_variants.len();
+            Ok(treatment_variants[variant_index].clone())
+        } else {
+            // Assign to control
+            experiment.variants.iter()
+                .find(|v| v.is_control)
+                .cloned()
+                .ok_or("No control variant found".to_string())
+        }
+    }
+
+    /// Record experiment metric
+    pub async fn record_metric(&mut self, record: ExperimentMetricRecord) -> Result<(), String> {
+        let mut experiments = self.experiments.write().unwrap();
+        let experiment = experiments.get_mut(&record.experiment_id)
+            .ok_or("Experiment not found")?;
+
+        if experiment.status != ExperimentStatus::Running {
+            return Err("Experiment is not running".to_string());
+        }
+
+        // Initialize results if needed
+        if experiment.results.is_none() {
+            experiment.results = Some(ExperimentResults {
+                variant_results: Map::new(),
+                statistical_significance: None,
+                winner: None,
+                improvement: None
+            });
+        }
+
+        // Update variant results
+        if let Some(ref mut results) = experiment.results {
+            let variant_result = results.variant_results
+                .entry(record.variant_id.clone())
+                .or_insert(VariantResult {
+                    variant_id: record.variant_id,
+                    sample_size: 0,
+                    metrics: Map::new()
+                });
+
+            variant_result.sample_size += 1;
+
+            let metric_data = variant_result.metrics
+                .entry(record.metric_name)
+                .or_insert(MetricData {
+                    count: 0,
+                    sum: 0.0,
+                    min: f64::MAX,
+                    max: f64::MIN,
+                    values: vec![]
+                });
+
+            metric_data.count += 1;
+            metric_data.sum += record.value;
+            metric_data.min = metric_data.min.min(record.value);
+            metric_data.max = metric_data.max.max(record.value);
+            metric_data.values.push(record.value);
+        }
+
+        Ok(())
+    }
+
+    /// Analyze experiment results
+    pub async fn analyze_experiment(&self, experiment_id: &str) -> Result<ExperimentAnalysis, String> {
+        let experiments = self.experiments.read().unwrap();
+        let experiment = experiments.get(experiment_id)
+            .ok_or("Experiment not found")?;
+
+        let results = experiment.results.as_ref()
+            .ok_or("No results recorded yet")?;
+
+        let control = experiment.variants.iter()
+            .find(|v| v.is_control)
+            .ok_or("No control variant")?;
+
+        let control_result = results.variant_results.get(&control.id)
+            .ok_or("No control results")?;
+
+        let mut analyses = vec![];
+
+        for variant in &experiment.variants {
+            if variant.is_control {
+                continue;
+            }
+
+            if let Some(variant_result) = results.variant_results.get(&variant.id) {
+                for (metric_name, metric) in experiment.metrics.iter() {
+                    let control_data = control_result.metrics.get(metric_name);
+                    let variant_data = variant_result.metrics.get(metric_name);
+
+                    if let (Some(ctrl), Some(var)) = (control_data, variant_data) {
+                        let control_mean = ctrl.sum / ctrl.count as f64;
+                        let variant_mean = var.sum / var.count as f64;
+                        let improvement = (variant_mean - control_mean) / control_mean;
+
+                        // Simple z-test for statistical significance
+                        let significance = calculate_significance(
+                            control_mean,
+                            ctrl.count,
+                            variant_mean,
+                            var.count
+                        );
+
+                        analyses.push(VariantAnalysis {
+                            variant_id: variant.id.clone(),
+                            metric_name: metric_name.clone(),
+                            control_mean,
+                            variant_mean,
+                            improvement,
+                            statistical_significance: significance,
+                            is_significant: significance >= self.config.significance_threshold,
+                            sample_size: variant_result.sample_size
+                        });
+                    }
+                }
+            }
+        }
+
+        // Determine winner
+        let winner = analyses.iter()
+            .filter(|a| a.is_significant && a.improvement > 0.0)
+            .max_by(|a, b| a.improvement.partial_cmp(&b.improvement).unwrap())
+            .map(|a| a.variant_id.clone());
+
+        Ok(ExperimentAnalysis {
+            experiment_id: experiment_id.to_string(),
+            analyses,
+            recommended_winner: winner,
+            confidence: analyses.iter().map(|a| a.statistical_significance).fold(0.0, f64::max),
+            can_conclude: control_result.sample_size >= self.config.min_sample_size
+        })
+    }
+
+    /// Conclude experiment
+    pub async fn conclude_experiment(&mut self, experiment_id: &str, winner_id: Option<String>) -> Result<Experiment, String> {
+        let mut experiments = self.experiments.write().unwrap();
+        let experiment = experiments.get_mut(experiment_id)
+            .ok_or("Experiment not found")?;
+
+        experiment.status = ExperimentStatus::Concluded;
+        experiment.ended_at = Some(DateTime::now());
+
+        if let Some(ref mut results) = experiment.results {
+            results.winner = winner_id;
+        }
+
+        Ok(experiment.clone())
+    }
+
+    // =========================================================================
+    // LEARNING STRATEGY EVOLUTION
+    // =========================================================================
+
+    /// Register a learning strategy
+    pub async fn register_strategy(&mut self, strategy: LearningStrategy) -> Result<(), String> {
+        self.strategies.write().unwrap().insert(strategy.id.clone(), strategy);
+        Ok(())
+    }
+
+    /// Evolve strategy based on outcomes
+    pub async fn evolve_strategy(&mut self, strategy_id: &str, outcomes: List<LearningOutcome>) -> Result<LearningStrategy, String> {
+        let mut strategies = self.strategies.write().unwrap();
+        let strategy = strategies.get_mut(strategy_id)
+            .ok_or("Strategy not found")?;
+
+        // Analyze outcomes
+        let mut total_score = 0.0;
+        let mut total_completion = 0.0;
+        let mut total_engagement = 0.0;
+        let count = outcomes.len() as f64;
+
+        for outcome in &outcomes {
+            total_score += outcome.score.unwrap_or(0.0);
+            total_completion += if outcome.completed { 1.0 } else { 0.0 };
+            total_engagement += outcome.engagement_score;
+        }
+
+        let avg_score = total_score / count;
+        let completion_rate = total_completion / count;
+        let avg_engagement = total_engagement / count;
+
+        // Update strategy effectiveness
+        strategy.effectiveness_score = (avg_score * 0.4) + (completion_rate * 100.0 * 0.3) + (avg_engagement * 0.3);
+        strategy.sample_size += outcomes.len() as i32;
+        strategy.updated_at = DateTime::now();
+
+        // Evolve parameters based on outcomes
+        let evolved_params = self.evolve_parameters(&strategy.parameters, &outcomes);
+        strategy.parameters = evolved_params;
+
+        // Record adaptation
+        let adaptation = AdaptationRecord {
+            id: generate_id("adapt"),
+            strategy_id: strategy_id.to_string(),
+            adaptation_type: AdaptationType::StrategyEvolution,
+            before_state: Map::new(), // Would capture before state
+            after_state: Map::new(),  // Would capture after state
+            trigger: "outcome_analysis".to_string(),
+            improvement: strategy.effectiveness_score,
+            created_at: DateTime::now()
+        };
+
+        drop(strategies);
+        self.adaptations.write().unwrap().push(adaptation);
+
+        Ok(self.strategies.read().unwrap().get(strategy_id).unwrap().clone())
+    }
+
+    fn evolve_parameters(&self, params: &StrategyParameters, outcomes: &List<LearningOutcome>) -> StrategyParameters {
+        let mut evolved = params.clone();
+
+        // Analyze what worked
+        let high_performers: Vec<_> = outcomes.iter()
+            .filter(|o| o.score.unwrap_or(0.0) >= 80.0)
+            .collect();
+
+        let low_performers: Vec<_> = outcomes.iter()
+            .filter(|o| o.score.unwrap_or(0.0) < 60.0)
+            .collect();
+
+        // Adjust difficulty scaling
+        if high_performers.len() > outcomes.len() * 3 / 4 {
+            // Most learners doing well, increase challenge
+            evolved.difficulty_adjustment = evolved.difficulty_adjustment + 0.1;
+        } else if low_performers.len() > outcomes.len() / 2 {
+            // Many struggling, decrease difficulty
+            evolved.difficulty_adjustment = evolved.difficulty_adjustment - 0.1;
+        }
+
+        // Adjust pacing
+        let avg_time_on_task = outcomes.iter()
+            .filter_map(|o| o.time_spent.map(|d| d.as_secs() as f64))
+            .sum::<f64>() / outcomes.len() as f64;
+
+        if avg_time_on_task > evolved.optimal_session_duration.as_secs() as f64 * 1.5 {
+            // Learners taking too long, break into smaller chunks
+            evolved.content_chunk_size = (evolved.content_chunk_size as f64 * 0.8) as i32;
+        }
+
+        // Adjust repetition
+        let retention_rate = outcomes.iter()
+            .filter(|o| o.retention_score.unwrap_or(0.0) >= 70.0)
+            .count() as f64 / outcomes.len() as f64;
+
+        if retention_rate < 0.7 {
+            evolved.spaced_repetition_factor = evolved.spaced_repetition_factor + 0.1;
+        }
+
+        evolved
+    }
+
+    /// Get best strategy for learner profile
+    pub async fn get_best_strategy(&self, learner_profile: &LearnerProfile) -> Option<LearningStrategy> {
+        let strategies = self.strategies.read().unwrap();
+
+        // Filter applicable strategies
+        let applicable: Vec<_> = strategies.values()
+            .filter(|s| s.is_active && self.strategy_matches_profile(s, learner_profile))
+            .collect();
+
+        // Sort by effectiveness for similar profiles
+        applicable.into_iter()
+            .max_by(|a, b| a.effectiveness_score.partial_cmp(&b.effectiveness_score).unwrap())
+            .cloned()
+    }
+
+    fn strategy_matches_profile(&self, strategy: &LearningStrategy, profile: &LearnerProfile) -> bool {
+        // Check learning style match
+        if let Some(ref preferred_style) = profile.learning_style {
+            if !strategy.target_learning_styles.contains(preferred_style) {
+                return false;
+            }
+        }
+
+        // Check skill level
+        if let Some(ref skill_level) = profile.skill_level {
+            if strategy.min_skill_level > *skill_level || strategy.max_skill_level < *skill_level {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    // =========================================================================
+    // CONTENT OPTIMIZATION
+    // =========================================================================
+
+    /// Suggest content optimizations based on learner interactions
+    pub async fn suggest_optimizations(&self, content_id: &str, interactions: List<ContentInteraction>) -> List<ContentOptimization> {
+        let mut optimizations = vec![];
+
+        // Analyze drop-off points
+        let drop_offs = self.analyze_drop_offs(&interactions);
+        for (position, rate) in drop_offs {
+            if rate > 0.3 { // >30% drop-off
+                optimizations.push(ContentOptimization {
+                    content_id: content_id.to_string(),
+                    optimization_type: OptimizationType::ReduceDropOff,
+                    target_position: Some(position),
+                    suggestion: format!("High drop-off rate ({:.0}%) at position {}. Consider simplifying or adding engagement elements.", rate * 100.0, position),
+                    confidence: rate,
+                    priority: OptimizationPriority::High
+                });
+            }
+        }
+
+        // Analyze engagement patterns
+        let low_engagement = self.find_low_engagement_sections(&interactions);
+        for section in low_engagement {
+            optimizations.push(ContentOptimization {
+                content_id: content_id.to_string(),
+                optimization_type: OptimizationType::IncreaseEngagement,
+                target_position: Some(section.position),
+                suggestion: format!("Low engagement in section '{}'. Consider adding interactive elements or media.", section.name),
+                confidence: 0.7,
+                priority: OptimizationPriority::Medium
+            });
+        }
+
+        // Analyze comprehension issues
+        let comprehension_issues = self.find_comprehension_issues(&interactions);
+        for issue in comprehension_issues {
+            optimizations.push(ContentOptimization {
+                content_id: content_id.to_string(),
+                optimization_type: OptimizationType::ImproveComprehension,
+                target_position: Some(issue.position),
+                suggestion: format!("Comprehension difficulties detected. Consider adding examples or simplifying explanation: {}", issue.topic),
+                confidence: issue.confidence,
+                priority: if issue.confidence > 0.8 { OptimizationPriority::High } else { OptimizationPriority::Medium }
+            });
+        }
+
+        // Sort by priority
+        optimizations.sort_by(|a, b| b.priority.cmp(&a.priority));
+        optimizations
+    }
+
+    fn analyze_drop_offs(&self, interactions: &List<ContentInteraction>) -> List<(i32, f64)> {
+        let mut position_counts: Map<i32, (i32, i32)> = Map::new(); // (reached, dropped)
+
+        for interaction in interactions {
+            for pos in 0..=interaction.furthest_position {
+                let entry = position_counts.entry(pos).or_insert((0, 0));
+                entry.0 += 1; // reached
+            }
+            if !interaction.completed {
+                let entry = position_counts.entry(interaction.furthest_position).or_insert((0, 0));
+                entry.1 += 1; // dropped
+            }
+        }
+
+        position_counts.into_iter()
+            .map(|(pos, (reached, dropped))| (pos, dropped as f64 / reached as f64))
+            .filter(|(_, rate)| *rate > 0.1)
+            .collect()
+    }
+
+    fn find_low_engagement_sections(&self, interactions: &List<ContentInteraction>) -> List<LowEngagementSection> {
+        // Analyze interaction patterns to find low engagement sections
+        vec![] // Simplified implementation
+    }
+
+    fn find_comprehension_issues(&self, interactions: &List<ContentInteraction>) -> List<ComprehensionIssue> {
+        // Analyze quiz results, re-reads, and time spent to find comprehension issues
+        vec![] // Simplified implementation
+    }
+
+    // =========================================================================
+    // ADAPTATION HISTORY
+    // =========================================================================
+
+    /// Get adaptation history
+    pub fn get_adaptations(&self, strategy_id: Option<&str>, limit: usize) -> List<AdaptationRecord> {
+        let adaptations = self.adaptations.read().unwrap();
+        let filtered: Vec<_> = match strategy_id {
+            Some(id) => adaptations.iter()
+                .filter(|a| a.strategy_id == id)
+                .cloned()
+                .collect(),
+            None => adaptations.clone()
+        };
+
+        filtered.into_iter().take(limit).collect()
+    }
+}
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+/// An A/B experiment
+#[derive(Clone)]
+pub type Experiment {
+    id: String,
+    name: String,
+    description: Option<String>,
+    hypothesis: String,
+    experiment_type: ExperimentType,
+    variants: List<ExperimentVariant>,
+    metrics: Map<String, MetricDefinition>,
+    target_audience: Option<AudienceDefinition>,
+    traffic_allocation: f64,
+    status: ExperimentStatus,
+    results: Option<ExperimentResults>,
+    created_at: DateTime,
+    started_at: Option<DateTime>,
+    ended_at: Option<DateTime>
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ExperimentType {
+    ContentVariant,
+    LearningPath,
+    UiUx,
+    Engagement,
+    Assessment
+}
+
+#[derive(Clone, PartialEq)]
+pub enum ExperimentStatus {
+    Draft,
+    Running,
+    Paused,
+    Concluded,
+    Cancelled
+}
+
+#[derive(Clone)]
+pub type ExperimentVariant {
+    id: String,
+    name: String,
+    description: Option<String>,
+    is_control: bool,
+    config: Map<String, String>
+}
+
+#[derive(Clone)]
+pub type MetricDefinition {
+    name: String,
+    metric_type: MetricType,
+    goal: MetricGoal,
+    minimum_detectable_effect: f64
+}
+
+#[derive(Clone)]
+pub enum MetricType {
+    Conversion,
+    Duration,
+    Score,
+    Count,
+    Rate
+}
+
+#[derive(Clone)]
+pub enum MetricGoal {
+    Maximize,
+    Minimize,
+    Target(f64)
+}
+
+#[derive(Clone)]
+pub type AudienceDefinition {
+    segments: List<String>,
+    exclude_segments: List<String>,
+    criteria: Map<String, String>
+}
+
+#[derive(Clone)]
+pub type ExperimentResults {
+    variant_results: Map<String, VariantResult>,
+    statistical_significance: Option<f64>,
+    winner: Option<String>,
+    improvement: Option<f64>
+}
+
+#[derive(Clone)]
+pub type VariantResult {
+    variant_id: String,
+    sample_size: i32,
+    metrics: Map<String, MetricData>
+}
+
+#[derive(Clone)]
+pub type MetricData {
+    count: i32,
+    sum: f64,
+    min: f64,
+    max: f64,
+    values: List<f64>
+}
+
+/// Learning strategy
+#[derive(Clone)]
+pub type LearningStrategy {
+    id: String,
+    name: String,
+    description: String,
+    parameters: StrategyParameters,
+    target_learning_styles: List<String>,
+    min_skill_level: f64,
+    max_skill_level: f64,
+    effectiveness_score: f64,
+    sample_size: i32,
+    is_active: bool,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+#[derive(Clone)]
+pub type StrategyParameters {
+    difficulty_adjustment: f64,
+    content_chunk_size: i32,
+    optimal_session_duration: Duration,
+    spaced_repetition_factor: f64,
+    interactivity_level: f64,
+    feedback_frequency: f64
+}
+
+/// Learning outcome for analysis
+#[derive(Clone)]
+pub type LearningOutcome {
+    learner_id: String,
+    content_id: String,
+    score: Option<f64>,
+    completed: bool,
+    engagement_score: f64,
+    time_spent: Option<Duration>,
+    retention_score: Option<f64>,
+    timestamp: DateTime
+}
+
+/// Learner profile for strategy matching
+pub type LearnerProfile {
+    learner_id: String,
+    learning_style: Option<String>,
+    skill_level: Option<f64>,
+    preferences: Map<String, String>
+}
+
+/// Adaptation record
+#[derive(Clone)]
+pub type AdaptationRecord {
+    id: String,
+    strategy_id: String,
+    adaptation_type: AdaptationType,
+    before_state: Map<String, String>,
+    after_state: Map<String, String>,
+    trigger: String,
+    improvement: f64,
+    created_at: DateTime
+}
+
+#[derive(Clone)]
+pub enum AdaptationType {
+    StrategyEvolution,
+    ContentOptimization,
+    DifficultyAdjustment,
+    PacingChange
+}
+
+/// Content interaction
+#[derive(Clone)]
+pub type ContentInteraction {
+    learner_id: String,
+    content_id: String,
+    furthest_position: i32,
+    completed: bool,
+    time_spent: Duration,
+    interactions: List<InteractionEvent>
+}
+
+#[derive(Clone)]
+pub type InteractionEvent {
+    event_type: String,
+    position: i32,
+    timestamp: DateTime
+}
+
+/// Content optimization suggestion
+pub type ContentOptimization {
+    content_id: String,
+    optimization_type: OptimizationType,
+    target_position: Option<i32>,
+    suggestion: String,
+    confidence: f64,
+    priority: OptimizationPriority
+}
+
+#[derive(Clone)]
+pub enum OptimizationType {
+    ReduceDropOff,
+    IncreaseEngagement,
+    ImproveComprehension,
+    OptimizePacing,
+    AddInteractivity
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OptimizationPriority {
+    Low,
+    Medium,
+    High,
+    Critical
+}
+
+type LowEngagementSection {
+    position: i32,
+    name: String
+}
+
+type ComprehensionIssue {
+    position: i32,
+    topic: String,
+    confidence: f64
+}
+
+/// Request types
+pub type CreateExperimentRequest {
+    name: String,
+    description: Option<String>,
+    hypothesis: String,
+    experiment_type: ExperimentType,
+    variants: List<ExperimentVariant>,
+    metrics: Map<String, MetricDefinition>,
+    target_audience: Option<AudienceDefinition>,
+    traffic_allocation: Option<f64>
+}
+
+pub type ExperimentMetricRecord {
+    experiment_id: String,
+    variant_id: String,
+    user_id: String,
+    metric_name: String,
+    value: f64,
+    timestamp: DateTime
+}
+
+/// Analysis results
+pub type ExperimentAnalysis {
+    experiment_id: String,
+    analyses: List<VariantAnalysis>,
+    recommended_winner: Option<String>,
+    confidence: f64,
+    can_conclude: bool
+}
+
+pub type VariantAnalysis {
+    variant_id: String,
+    metric_name: String,
+    control_mean: f64,
+    variant_mean: f64,
+    improvement: f64,
+    statistical_significance: f64,
+    is_significant: bool,
+    sample_size: i32
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+fn generate_id(prefix: &str) -> String {
+    use std::time::SystemTime;
+    format!("{}_{:x}", prefix, SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos())
+}
+
+fn hash_user(user_id: &str, experiment_id: &str) -> u64 {
+    let combined = format!("{}:{}", user_id, experiment_id);
+    combined.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+}
+
+fn calculate_significance(control_mean: f64, control_n: i32, variant_mean: f64, variant_n: i32) -> f64 {
+    // Simplified z-test calculation
+    // In production, use proper statistical library
+    let pooled_std = ((control_mean.powi(2) / control_n as f64) + (variant_mean.powi(2) / variant_n as f64)).sqrt();
+    if pooled_std == 0.0 {
+        return 0.0;
+    }
+    let z = (variant_mean - control_mean).abs() / pooled_std;
+    // Convert z-score to confidence (simplified)
+    (1.0 - (-z * 0.5).exp()).min(0.999)
+}

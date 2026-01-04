@@ -1,0 +1,20 @@
+/// Intelligo LMS - SCORM Module
+///
+/// Exports SCORM 1.2 and SCORM 2004 compliance implementations.
+
+module intelligo::compliance::scorm
+
+pub use intelligo::compliance::scorm::scorm12::*
+pub use intelligo::compliance::scorm::scorm2004::*
+pub use intelligo::compliance::scorm::parser::*
+pub use intelligo::compliance::scorm::sequencing::*
+
+// Re-export commonly used types
+pub use Scorm12Runtime
+pub use Scorm12Cmi
+pub use Scorm2004Runtime
+pub use Scorm2004Cmi
+pub use ScormParser
+pub use ScormManifest
+pub use Scorm2004Sequencer
+pub use SequencingActivity

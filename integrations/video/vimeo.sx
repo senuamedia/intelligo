@@ -1,0 +1,920 @@
+// Vimeo Integration for Intelligo LMS
+// Supports Vimeo Pro/OTT with advanced features
+
+module intelligo::integrations::video::vimeo
+
+use intelligo::integrations::video::*
+use intelligo::core::types::*
+use std::collections::HashMap
+use std::time::{DateTime, Duration}
+use std::json::{Json, JsonValue}
+
+/// Vimeo-specific configuration
+pub type VimeoConfig {
+    access_token: String,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    user_id: Option<String>,
+
+    // Embed settings
+    show_title: bool,
+    show_byline: bool,
+    show_portrait: bool,
+    show_speed: bool,
+    dnt: bool, // Do not track
+    transparent: bool,
+    responsive: bool,
+
+    // Privacy settings
+    default_privacy: VimeoPrivacy,
+    default_embed_privacy: VimeoEmbedPrivacy,
+    allowed_domains: Vec<String>,
+}
+
+impl VimeoConfig {
+    pub fn new(access_token: String) -> Self {
+        VimeoConfig {
+            access_token: access_token,
+            client_id: None,
+            client_secret: None,
+            user_id: None,
+            show_title: true,
+            show_byline: false,
+            show_portrait: false,
+            show_speed: true,
+            dnt: true,
+            transparent: false,
+            responsive: true,
+            default_privacy: VimeoPrivacy::Unlisted,
+            default_embed_privacy: VimeoEmbedPrivacy::Public,
+            allowed_domains: Vec::new(),
+        }
+    }
+}
+
+/// Vimeo privacy settings
+pub enum VimeoPrivacy {
+    Anybody,
+    Nobody,
+    Contacts,
+    Users,
+    Password,
+    Unlisted,
+    Disable,
+}
+
+impl VimeoPrivacy {
+    pub fn to_string(self) -> String {
+        match self {
+            VimeoPrivacy::Anybody => "anybody".to_string(),
+            VimeoPrivacy::Nobody => "nobody".to_string(),
+            VimeoPrivacy::Contacts => "contacts".to_string(),
+            VimeoPrivacy::Users => "users".to_string(),
+            VimeoPrivacy::Password => "password".to_string(),
+            VimeoPrivacy::Unlisted => "unlisted".to_string(),
+            VimeoPrivacy::Disable => "disable".to_string(),
+        }
+    }
+}
+
+/// Vimeo embed privacy
+pub enum VimeoEmbedPrivacy {
+    Public,
+    Private,
+    Whitelist,
+}
+
+/// Vimeo video response
+pub type VimeoVideoResponse {
+    uri: String,
+    name: String,
+    description: Option<String>,
+    duration: i64,
+    width: u32,
+    height: u32,
+    language: Option<String>,
+    created_time: String,
+    modified_time: String,
+    release_time: Option<String>,
+    content_rating: Vec<String>,
+    license: Option<String>,
+    privacy: VimeoPrivacySettings,
+    pictures: VimeoPictures,
+    embed: VimeoEmbedSettings,
+    stats: Option<VimeoStats>,
+    metadata: VimeoMetadata,
+    user: VimeoUser,
+    files: Option<Vec<VimeoFile>>,
+    download: Option<Vec<VimeoDownload>>,
+}
+
+pub type VimeoPrivacySettings {
+    view: String,
+    embed: String,
+    download: bool,
+    add: bool,
+    comments: String,
+}
+
+pub type VimeoPictures {
+    uri: Option<String>,
+    active: bool,
+    picture_type: String,
+    sizes: Vec<VimeoPictureSize>,
+}
+
+pub type VimeoPictureSize {
+    width: u32,
+    height: u32,
+    link: String,
+    link_with_play_button: Option<String>,
+}
+
+pub type VimeoEmbedSettings {
+    uri: Option<String>,
+    html: Option<String>,
+    buttons: VimeoEmbedButtons,
+    logos: VimeoEmbedLogos,
+    title: VimeoEmbedTitle,
+    playbar: bool,
+    volume: bool,
+    speed: bool,
+    color: String,
+}
+
+pub type VimeoEmbedButtons {
+    like: bool,
+    watchlater: bool,
+    share: bool,
+    embed: bool,
+    hd: bool,
+    fullscreen: bool,
+    scaling: bool,
+}
+
+pub type VimeoEmbedLogos {
+    vimeo: bool,
+    custom: Option<VimeoCustomLogo>,
+}
+
+pub type VimeoCustomLogo {
+    active: bool,
+    link: Option<String>,
+    sticky: bool,
+}
+
+pub type VimeoEmbedTitle {
+    name: String,
+    owner: String,
+    portrait: String,
+}
+
+pub type VimeoStats {
+    plays: u64,
+}
+
+pub type VimeoMetadata {
+    connections: VimeoConnections,
+}
+
+pub type VimeoConnections {
+    comments: VimeoConnection,
+    credits: VimeoConnection,
+    likes: VimeoConnection,
+    pictures: VimeoConnection,
+    texttracks: VimeoConnection,
+    related: Option<VimeoConnection>,
+    recommendations: Option<VimeoConnection>,
+}
+
+pub type VimeoConnection {
+    uri: String,
+    options: Vec<String>,
+    total: u32,
+}
+
+pub type VimeoUser {
+    uri: String,
+    name: String,
+    link: String,
+    pictures: VimeoPictures,
+}
+
+pub type VimeoFile {
+    quality: String,
+    file_type: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    link: String,
+    size: Option<u64>,
+    md5: Option<String>,
+    fps: Option<f64>,
+}
+
+pub type VimeoDownload {
+    quality: String,
+    file_type: String,
+    width: u32,
+    height: u32,
+    size: u64,
+    link: String,
+    expires: String,
+}
+
+/// Vimeo text track (caption)
+pub type VimeoTextTrack {
+    uri: String,
+    active: bool,
+    track_type: String,
+    language: String,
+    name: String,
+    link: String,
+}
+
+/// Vimeo Provider implementation
+pub actor VimeoProvider {
+    config: VideoConfig,
+    vimeo_config: VimeoConfig,
+    client: BaseVideoClient,
+
+    pub fn new(config: VideoConfig) -> Self {
+        let vimeo_cfg = config.vimeo_config.clone()
+            .unwrap_or_else(|| VimeoConfig::new(
+                config.access_token.clone().unwrap_or_default()
+            ));
+
+        let client = BaseVideoClient::new("https://api.vimeo.com".to_string())
+            .with_access_token(vimeo_cfg.access_token.clone());
+
+        VimeoProvider {
+            config: config,
+            vimeo_config: vimeo_cfg,
+            client: client,
+        }
+    }
+
+    /// Extract video ID from Vimeo URL
+    fn parse_video_id(self, url: &str) -> Option<String> {
+        // Handle vimeo.com/ID
+        let parts: Vec<&str> = url.split('/').collect();
+        for part in parts.iter().rev() {
+            // Skip query parameters
+            let clean = part.split('?').next().unwrap_or(*part);
+            let id: String = clean.chars().take_while(|c| c.is_numeric()).collect();
+            if !id.is_empty() && id.len() >= 6 {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Get best thumbnail from pictures
+    fn get_best_thumbnail(self, pictures: &VimeoPictures) -> Option<String> {
+        pictures.sizes.iter()
+            .max_by_key(|s| s.width)
+            .map(|s| s.link.clone())
+    }
+
+    /// Convert Vimeo response to internal Video type
+    fn convert_video(self, vimeo: VimeoVideoResponse) -> Video {
+        let video_id = vimeo.uri.replace("/videos/", "");
+
+        let thumbnail_url = self.get_best_thumbnail(&vimeo.pictures);
+
+        let privacy = match vimeo.privacy.view.as_str() {
+            "anybody" => VideoPrivacy::Public,
+            "unlisted" => VideoPrivacy::Unlisted,
+            "password" => VideoPrivacy::Password,
+            _ => VideoPrivacy::Private,
+        };
+
+        let available_qualities = vimeo.files.as_ref()
+            .map(|files| {
+                let mut qualities = vec![VideoQuality::Auto];
+                for file in files {
+                    match file.quality.as_str() {
+                        "hd" => qualities.push(VideoQuality::HD),
+                        "sd" => qualities.push(VideoQuality::Medium),
+                        "hls" => {},
+                        _ => {}
+                    }
+                }
+                qualities
+            })
+            .unwrap_or(vec![VideoQuality::Auto]);
+
+        Video {
+            id: video_id.clone(),
+            provider_type: VideoProviderType::Vimeo,
+            external_id: video_id.clone(),
+            title: vimeo.name,
+            description: vimeo.description,
+            duration: Duration::seconds(vimeo.duration),
+            thumbnail_url: thumbnail_url,
+            embed_url: format!("https://player.vimeo.com/video/{}", video_id),
+            watch_url: format!("https://vimeo.com/{}", video_id),
+            width: Some(vimeo.width),
+            height: Some(vimeo.height),
+            available_qualities: available_qualities,
+            has_captions: vimeo.metadata.connections.texttracks.total > 0,
+            caption_languages: Vec::new(),
+            status: VideoStatus::Ready,
+            privacy: privacy,
+            created_at: DateTime::parse_iso8601(&vimeo.created_time)
+                .unwrap_or(DateTime::now()),
+            updated_at: DateTime::parse_iso8601(&vimeo.modified_time)
+                .unwrap_or(DateTime::now()),
+            tags: Vec::new(),
+            categories: Vec::new(),
+            custom_fields: HashMap::new(),
+        }
+    }
+
+    /// Build embed URL with options
+    fn build_embed_url(self, video_id: &str, options: &VideoEmbedOptions) -> String {
+        let mut url = format!("https://player.vimeo.com/video/{}", video_id);
+        let mut params = Vec::new();
+
+        // Player options
+        if options.autoplay {
+            params.push("autoplay=1");
+        }
+        if options.muted {
+            params.push("muted=1");
+        }
+        if options.loop_video {
+            params.push("loop=1");
+        }
+        if !options.show_controls {
+            params.push("controls=0");
+        }
+
+        // Start time
+        if let Some(start) = options.start_time {
+            params.push(format!("#t={}s", start.as_secs()));
+        }
+
+        // Vimeo-specific options
+        if !self.vimeo_config.show_title {
+            params.push("title=0".to_string());
+        }
+        if !self.vimeo_config.show_byline {
+            params.push("byline=0".to_string());
+        }
+        if !self.vimeo_config.show_portrait {
+            params.push("portrait=0".to_string());
+        }
+        if self.vimeo_config.show_speed {
+            params.push("speed=1".to_string());
+        }
+        if self.vimeo_config.dnt {
+            params.push("dnt=1".to_string());
+        }
+        if self.vimeo_config.transparent {
+            params.push("transparent=1".to_string());
+        }
+
+        // Captions
+        if options.enable_captions {
+            params.push("texttrack=".to_string() +
+                options.caption_language.as_ref().unwrap_or(&"en".to_string()));
+        }
+
+        // Custom params
+        for (key, value) in &options.custom_params {
+            params.push(format!("{}={}", key, value));
+        }
+
+        if !params.is_empty() {
+            let query_params: Vec<&str> = params.iter()
+                .filter(|p| !p.starts_with('#'))
+                .map(|s| s.as_str())
+                .collect();
+            let hash_params: Vec<&str> = params.iter()
+                .filter(|p| p.starts_with('#'))
+                .map(|s| s.as_str())
+                .collect();
+
+            if !query_params.is_empty() {
+                url = format!("{}?{}", url, query_params.join("&"));
+            }
+            for hash in hash_params {
+                url = format!("{}{}", url, hash);
+            }
+        }
+
+        url
+    }
+}
+
+impl VideoProvider for VimeoProvider {
+    fn get_config(self) -> VideoConfig {
+        self.config.clone()
+    }
+
+    async fn test_connection(mut self) -> Result<VideoConnectionTest, VideoError> {
+        let start = DateTime::now();
+
+        let response = self.client.get("/me").await?;
+        let latency = (DateTime::now() - start).as_millis() as u64;
+
+        let account_name = response["name"].as_str().map(|s| s.to_string());
+
+        Ok(VideoConnectionTest {
+            success: true,
+            message: "Connected to Vimeo API".to_string(),
+            latency_ms: latency,
+            account_name: account_name,
+            quota_remaining: response["upload_quota"]["space"]["free"]
+                .as_u64(),
+        })
+    }
+
+    fn can_handle_url(self, url: &str) -> bool {
+        url.contains("vimeo.com") || url.contains("player.vimeo.com")
+    }
+
+    fn extract_video_id(self, url: &str) -> Result<String, VideoError> {
+        self.parse_video_id(url).ok_or(
+            VideoError::EmbedError {
+                message: "Could not extract Vimeo video ID from URL".to_string()
+            }
+        )
+    }
+
+    async fn get_video(mut self, video_id: String) -> Result<Video, VideoError> {
+        let response = self.client.get(&format!("/videos/{}", video_id)).await?;
+
+        let vimeo_video = parse_vimeo_video(&response)?;
+        Ok(self.convert_video(vimeo_video))
+    }
+
+    async fn list_videos(mut self, options: VideoListOptions) -> Result<VideoList, VideoError> {
+        let path = match self.vimeo_config.user_id {
+            Some(ref user_id) => format!("/users/{}/videos", user_id),
+            None => "/me/videos".to_string(),
+        };
+
+        let sort = match options.sort_by {
+            VideoSortField::Title => "alphabetical",
+            VideoSortField::CreatedAt => "date",
+            VideoSortField::Duration => "duration",
+            VideoSortField::Views => "plays",
+        };
+
+        let direction = match options.sort_order {
+            SortOrder::Ascending => "asc",
+            SortOrder::Descending => "desc",
+        };
+
+        let url = format!(
+            "{}?page={}&per_page={}&sort={}&direction={}",
+            path,
+            (options.offset / options.limit) + 1,
+            options.limit,
+            sort,
+            direction
+        );
+
+        let response = self.client.get(&url).await?;
+
+        let mut videos = Vec::new();
+        if let Some(data) = response["data"].as_array() {
+            for item in data {
+                if let Ok(vimeo_video) = parse_vimeo_video(item) {
+                    videos.push(self.convert_video(vimeo_video));
+                }
+            }
+        }
+
+        let total = response["total"].as_u64().unwrap_or(0) as u32;
+        let per_page = response["per_page"].as_u64().unwrap_or(options.limit as u64) as u32;
+
+        Ok(VideoList {
+            videos: videos,
+            total: total,
+            offset: options.offset,
+            limit: per_page,
+            has_more: response["paging"]["next"].is_string(),
+        })
+    }
+
+    async fn search_videos(
+        mut self,
+        query: String,
+        options: VideoListOptions
+    ) -> Result<VideoList, VideoError> {
+        let url = format!(
+            "/videos?query={}&page={}&per_page={}",
+            url_encode(&query),
+            (options.offset / options.limit) + 1,
+            options.limit
+        );
+
+        let response = self.client.get(&url).await?;
+
+        let mut videos = Vec::new();
+        if let Some(data) = response["data"].as_array() {
+            for item in data {
+                if let Ok(vimeo_video) = parse_vimeo_video(item) {
+                    videos.push(self.convert_video(vimeo_video));
+                }
+            }
+        }
+
+        let total = response["total"].as_u64().unwrap_or(0) as u32;
+
+        Ok(VideoList {
+            videos: videos,
+            total: total,
+            offset: options.offset,
+            limit: options.limit,
+            has_more: response["paging"]["next"].is_string(),
+        })
+    }
+
+    async fn get_embed(
+        self,
+        video_id: String,
+        options: VideoEmbedOptions
+    ) -> Result<VideoEmbed, VideoError> {
+        let iframe_url = self.build_embed_url(&video_id, &options);
+
+        let width = options.width.unwrap_or(640);
+        let height = options.height.unwrap_or(360);
+
+        let html = if options.responsive {
+            generate_responsive_wrapper(
+                format!(
+                    r#"<iframe src="{}" width="100%" height="100%" frameborder="0" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>"#,
+                    iframe_url
+                ),
+                16.0 / 9.0
+            )
+        } else {
+            format!(
+                r#"<iframe src="{}" width="{}" height="{}" frameborder="0" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>"#,
+                iframe_url, width, height
+            )
+        };
+
+        Ok(VideoEmbed {
+            html: html,
+            iframe_url: iframe_url,
+            script_url: Some("https://player.vimeo.com/api/player.js".to_string()),
+            width: width,
+            height: height,
+        })
+    }
+
+    fn get_player_script(self) -> Option<String> {
+        Some("https://player.vimeo.com/api/player.js".to_string())
+    }
+
+    async fn get_analytics(mut self, video_id: String) -> Result<VideoAnalytics, VideoError> {
+        // Vimeo analytics requires a business account
+        let stats_url = format!("/videos/{}/stats", video_id);
+
+        match self.client.get(&stats_url).await {
+            Ok(response) => {
+                let total_views = response["plays"].as_u64().unwrap_or(0);
+
+                Ok(VideoAnalytics {
+                    video_id: video_id,
+                    total_views: total_views,
+                    unique_viewers: 0,
+                    total_watch_time: Duration::zero(),
+                    average_watch_time: Duration::zero(),
+                    completion_rate: 0.0,
+                    engagement_score: 0.0,
+                    heatmap: Vec::new(),
+                    top_dropoff_points: Vec::new(),
+                    device_breakdown: HashMap::new(),
+                    quality_breakdown: HashMap::new(),
+                })
+            },
+            Err(_) => {
+                // Fallback to basic video stats
+                let video = self.get_video(video_id.clone()).await?;
+
+                Ok(VideoAnalytics {
+                    video_id: video_id,
+                    total_views: 0,
+                    unique_viewers: 0,
+                    total_watch_time: Duration::zero(),
+                    average_watch_time: Duration::zero(),
+                    completion_rate: 0.0,
+                    engagement_score: 0.0,
+                    heatmap: Vec::new(),
+                    top_dropoff_points: Vec::new(),
+                    device_breakdown: HashMap::new(),
+                    quality_breakdown: HashMap::new(),
+                })
+            }
+        }
+    }
+
+    async fn get_captions(mut self, video_id: String) -> Result<Vec<VideoCaption>, VideoError> {
+        let url = format!("/videos/{}/texttracks", video_id);
+        let response = self.client.get(&url).await?;
+
+        let mut captions = Vec::new();
+        if let Some(data) = response["data"].as_array() {
+            for item in data {
+                captions.push(VideoCaption {
+                    id: item["uri"].as_str().unwrap_or_default().to_string(),
+                    language: item["language"].as_str().unwrap_or("en").to_string(),
+                    language_name: item["name"].as_str().unwrap_or("").to_string(),
+                    is_auto_generated: item["type"].as_str() == Some("autogenerated"),
+                    format: CaptionFormat::Vtt,
+                    url: item["link"].as_str().map(|s| s.to_string()),
+                    content: None,
+                });
+            }
+        }
+
+        Ok(captions)
+    }
+
+    async fn upload_video(mut self, upload: VideoUpload) -> Result<Video, VideoError> {
+        // Vimeo uses a multi-step upload process
+        // 1. Create upload ticket
+        // 2. Upload file
+        // 3. Complete upload
+
+        let create_body = Json::object([
+            ("upload", Json::object([
+                ("approach", Json::string("tus")),
+                ("size", Json::string(&upload.file_data.as_ref()
+                    .map(|d| d.len().to_string())
+                    .unwrap_or("0".to_string()))),
+            ])),
+            ("name", Json::string(&upload.title)),
+            ("description", Json::string(upload.description.as_ref().unwrap_or(&"".to_string()))),
+            ("privacy", Json::object([
+                ("view", Json::string(&self.vimeo_config.default_privacy.to_string())),
+            ])),
+        ]);
+
+        let response = self.client.post("/me/videos", create_body).await?;
+
+        // Get upload link and video URI
+        let video_uri = response["uri"].as_str()
+            .ok_or(VideoError::UploadError {
+                message: "No video URI in response".to_string()
+            })?
+            .to_string();
+
+        let upload_link = response["upload"]["upload_link"].as_str()
+            .ok_or(VideoError::UploadError {
+                message: "No upload link in response".to_string()
+            })?;
+
+        // Implement TUS upload for file data
+        if let Some(file_data) = &upload.file_data {
+            let file_size = file_data.len();
+            let chunk_size: usize = 128 * 1024 * 1024; // 128MB chunks
+
+            let client = std::http::Client::new();
+
+            // Upload in chunks using TUS protocol
+            let mut offset: usize = 0;
+            while offset < file_size {
+                let end = std::cmp::min(offset + chunk_size, file_size);
+                let chunk = &file_data[offset..end];
+
+                let patch_response = client.patch(upload_link)
+                    .header("Tus-Resumable", "1.0.0")
+                    .header("Upload-Offset", offset.to_string())
+                    .header("Content-Type", "application/offset+octet-stream")
+                    .header("Content-Length", chunk.len().to_string())
+                    .body(chunk.to_vec())
+                    .send()
+                    .await
+                    .map_err(|e| VideoError::NetworkError {
+                        message: format!("TUS upload failed: {}", e)
+                    })?;
+
+                // Check response
+                if !patch_response.status().is_success() {
+                    return Err(VideoError::UploadError {
+                        message: format!("Chunk upload failed: {}", patch_response.status())
+                    });
+                }
+
+                // Get new offset from response
+                let new_offset = patch_response.headers()
+                    .get("Upload-Offset")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(end);
+
+                offset = new_offset;
+
+                // Call progress callback if provided
+                if let Some(ref callback) = upload.progress_callback {
+                    let progress = (offset as f64 / file_size as f64) * 100.0;
+                    callback(progress);
+                }
+            }
+        } else if let Some(file_url) = &upload.file_url {
+            // For URL-based uploads, use pull approach
+            let pull_body = Json::object([
+                ("upload", Json::object([
+                    ("approach", Json::string("pull")),
+                    ("link", Json::string(file_url)),
+                ])),
+                ("name", Json::string(&upload.title)),
+                ("description", Json::string(upload.description.as_ref().unwrap_or(&"".to_string()))),
+            ]);
+
+            let pull_response = self.client.post("/me/videos", pull_body).await?;
+            let pull_uri = pull_response["uri"].as_str()
+                .ok_or(VideoError::UploadError {
+                    message: "No video URI from pull upload".to_string()
+                })?;
+
+            let video_id = pull_uri.replace("/videos/", "");
+            return self.get_video(video_id).await;
+        } else {
+            return Err(VideoError::UploadError {
+                message: "No file data or URL provided".to_string()
+            });
+        }
+
+        // Wait briefly for processing to start, then fetch video
+        std::time::sleep(Duration::seconds(2)).await;
+
+        let video_id = video_uri.replace("/videos/", "");
+        self.get_video(video_id).await
+    }
+
+    async fn delete_video(mut self, video_id: String) -> Result<(), VideoError> {
+        self.client.delete(&format!("/videos/{}", video_id)).await
+    }
+
+    fn get_capabilities(self) -> Vec<VideoCapability> {
+        vec![
+            VideoCapability::Embed,
+            VideoCapability::Upload,
+            VideoCapability::Delete,
+            VideoCapability::Analytics,
+            VideoCapability::Captions,
+            VideoCapability::Privacy,
+            VideoCapability::CustomThumbnail,
+            VideoCapability::PasswordProtection,
+            VideoCapability::DomainRestriction,
+        ]
+    }
+}
+
+/// Parse Vimeo video from JSON
+fn parse_vimeo_video(json: &JsonValue) -> Result<VimeoVideoResponse, VideoError> {
+    Ok(VimeoVideoResponse {
+        uri: json["uri"].as_str().unwrap_or_default().to_string(),
+        name: json["name"].as_str().unwrap_or_default().to_string(),
+        description: json["description"].as_str().map(|s| s.to_string()),
+        duration: json["duration"].as_i64().unwrap_or(0),
+        width: json["width"].as_u64().unwrap_or(1920) as u32,
+        height: json["height"].as_u64().unwrap_or(1080) as u32,
+        language: json["language"].as_str().map(|s| s.to_string()),
+        created_time: json["created_time"].as_str().unwrap_or_default().to_string(),
+        modified_time: json["modified_time"].as_str().unwrap_or_default().to_string(),
+        release_time: json["release_time"].as_str().map(|s| s.to_string()),
+        content_rating: json["content_rating"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        license: json["license"].as_str().map(|s| s.to_string()),
+        privacy: parse_vimeo_privacy(&json["privacy"]),
+        pictures: parse_vimeo_pictures(&json["pictures"]),
+        embed: parse_vimeo_embed(&json["embed"]),
+        stats: parse_vimeo_stats(&json["stats"]),
+        metadata: parse_vimeo_metadata(&json["metadata"]),
+        user: parse_vimeo_user(&json["user"]),
+        files: json["files"].as_array().map(|arr|
+            arr.iter().filter_map(|v| parse_vimeo_file(v)).collect()
+        ),
+        download: None,
+    })
+}
+
+fn parse_vimeo_privacy(json: &JsonValue) -> VimeoPrivacySettings {
+    VimeoPrivacySettings {
+        view: json["view"].as_str().unwrap_or("anybody").to_string(),
+        embed: json["embed"].as_str().unwrap_or("public").to_string(),
+        download: json["download"].as_bool().unwrap_or(false),
+        add: json["add"].as_bool().unwrap_or(true),
+        comments: json["comments"].as_str().unwrap_or("anybody").to_string(),
+    }
+}
+
+fn parse_vimeo_pictures(json: &JsonValue) -> VimeoPictures {
+    VimeoPictures {
+        uri: json["uri"].as_str().map(|s| s.to_string()),
+        active: json["active"].as_bool().unwrap_or(true),
+        picture_type: json["type"].as_str().unwrap_or("default").to_string(),
+        sizes: json["sizes"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| {
+                Some(VimeoPictureSize {
+                    width: v["width"].as_u64()? as u32,
+                    height: v["height"].as_u64()? as u32,
+                    link: v["link"].as_str()?.to_string(),
+                    link_with_play_button: v["link_with_play_button"].as_str().map(|s| s.to_string()),
+                })
+            }).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_vimeo_embed(json: &JsonValue) -> VimeoEmbedSettings {
+    VimeoEmbedSettings {
+        uri: json["uri"].as_str().map(|s| s.to_string()),
+        html: json["html"].as_str().map(|s| s.to_string()),
+        buttons: VimeoEmbedButtons {
+            like: json["buttons"]["like"].as_bool().unwrap_or(true),
+            watchlater: json["buttons"]["watchlater"].as_bool().unwrap_or(true),
+            share: json["buttons"]["share"].as_bool().unwrap_or(true),
+            embed: json["buttons"]["embed"].as_bool().unwrap_or(true),
+            hd: json["buttons"]["hd"].as_bool().unwrap_or(true),
+            fullscreen: json["buttons"]["fullscreen"].as_bool().unwrap_or(true),
+            scaling: json["buttons"]["scaling"].as_bool().unwrap_or(true),
+        },
+        logos: VimeoEmbedLogos {
+            vimeo: json["logos"]["vimeo"].as_bool().unwrap_or(true),
+            custom: None,
+        },
+        title: VimeoEmbedTitle {
+            name: json["title"]["name"].as_str().unwrap_or("show").to_string(),
+            owner: json["title"]["owner"].as_str().unwrap_or("show").to_string(),
+            portrait: json["title"]["portrait"].as_str().unwrap_or("show").to_string(),
+        },
+        playbar: json["playbar"].as_bool().unwrap_or(true),
+        volume: json["volume"].as_bool().unwrap_or(true),
+        speed: json["speed"].as_bool().unwrap_or(true),
+        color: json["color"].as_str().unwrap_or("00adef").to_string(),
+    }
+}
+
+fn parse_vimeo_stats(json: &JsonValue) -> Option<VimeoStats> {
+    if json.is_null() {
+        return None;
+    }
+    Some(VimeoStats {
+        plays: json["plays"].as_u64().unwrap_or(0),
+    })
+}
+
+fn parse_vimeo_metadata(json: &JsonValue) -> VimeoMetadata {
+    VimeoMetadata {
+        connections: VimeoConnections {
+            comments: parse_vimeo_connection(&json["connections"]["comments"]),
+            credits: parse_vimeo_connection(&json["connections"]["credits"]),
+            likes: parse_vimeo_connection(&json["connections"]["likes"]),
+            pictures: parse_vimeo_connection(&json["connections"]["pictures"]),
+            texttracks: parse_vimeo_connection(&json["connections"]["texttracks"]),
+            related: None,
+            recommendations: None,
+        },
+    }
+}
+
+fn parse_vimeo_connection(json: &JsonValue) -> VimeoConnection {
+    VimeoConnection {
+        uri: json["uri"].as_str().unwrap_or_default().to_string(),
+        options: json["options"].as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        total: json["total"].as_u64().unwrap_or(0) as u32,
+    }
+}
+
+fn parse_vimeo_user(json: &JsonValue) -> VimeoUser {
+    VimeoUser {
+        uri: json["uri"].as_str().unwrap_or_default().to_string(),
+        name: json["name"].as_str().unwrap_or_default().to_string(),
+        link: json["link"].as_str().unwrap_or_default().to_string(),
+        pictures: parse_vimeo_pictures(&json["pictures"]),
+    }
+}
+
+fn parse_vimeo_file(json: &JsonValue) -> Option<VimeoFile> {
+    Some(VimeoFile {
+        quality: json["quality"].as_str()?.to_string(),
+        file_type: json["type"].as_str()?.to_string(),
+        width: json["width"].as_u64().map(|n| n as u32),
+        height: json["height"].as_u64().map(|n| n as u32),
+        link: json["link"].as_str()?.to_string(),
+        size: json["size"].as_u64(),
+        md5: json["md5"].as_str().map(|s| s.to_string()),
+        fps: json["fps"].as_f64(),
+    })
+}
+
+fn url_encode(s: &str) -> String {
+    s.chars().map(|c| {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        }
+    }).collect()
+}

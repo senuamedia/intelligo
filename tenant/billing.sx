@@ -1,0 +1,1120 @@
+/// Intelligo LMS - Tenant Billing
+///
+/// Tenant subscription management, usage tracking, invoicing,
+/// and billing integration for multi-tenant deployments.
+
+module intelligo::tenant::billing
+
+use intelligo::tenant::core::*
+use intelligo::core::types::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, List, Set}
+
+// =============================================================================
+// SUBSCRIPTION MANAGEMENT
+// =============================================================================
+
+/// Tenant subscription
+type TenantSubscription {
+    /// Unique identifier
+    id: String,
+
+    /// Tenant ID
+    tenant_id: TenantId,
+
+    /// Current plan
+    plan: SubscriptionPlan,
+
+    /// Subscription status
+    status: SubscriptionStatus,
+
+    /// Billing cycle
+    billing_cycle: BillingCycle,
+
+    /// Current period start
+    current_period_start: DateTime,
+
+    /// Current period end
+    current_period_end: DateTime,
+
+    /// Price per period (in cents)
+    price_cents: i64,
+
+    /// Currency
+    currency: String,
+
+    /// Quantity (e.g., number of seats)
+    quantity: i32,
+
+    /// Discount applied
+    discount: Option<SubscriptionDiscount>,
+
+    /// Trial end date
+    trial_end: Option<DateTime>,
+
+    /// Cancel at period end
+    cancel_at_period_end: Bool,
+
+    /// Cancelled at
+    cancelled_at: Option<DateTime>,
+
+    /// External subscription ID (Stripe, etc.)
+    external_id: Option<String>,
+
+    /// Payment method ID
+    payment_method_id: Option<String>,
+
+    /// Created timestamp
+    created_at: DateTime,
+
+    /// Updated timestamp
+    updated_at: DateTime,
+
+    /// Metadata
+    metadata: Map<String, Dynamic>
+}
+
+impl TenantSubscription {
+    fn is_active(&self) -> Bool {
+        match &self.status {
+            SubscriptionStatus::Active => true,
+            SubscriptionStatus::Trialing => true,
+            SubscriptionStatus::PastDue => true, // Grace period
+            _ => false
+        }
+    }
+
+    fn days_remaining(&self) -> i64 {
+        let now = DateTime::now();
+        if self.current_period_end > now {
+            (self.current_period_end - now).as_days()
+        } else {
+            0
+        }
+    }
+
+    fn is_in_trial(&self) -> Bool {
+        if let Some(trial_end) = &self.trial_end {
+            DateTime::now() < *trial_end
+        } else {
+            false
+        }
+    }
+}
+
+/// Subscription plan
+type SubscriptionPlan {
+    /// Plan ID
+    id: String,
+
+    /// Plan name
+    name: String,
+
+    /// Description
+    description: String,
+
+    /// Tier
+    tier: SubscriptionTier,
+
+    /// Features included
+    features: Set<String>,
+
+    /// Monthly price (cents)
+    monthly_price_cents: i64,
+
+    /// Annual price (cents)
+    annual_price_cents: i64,
+
+    /// Per-user pricing
+    per_user_monthly_cents: Option<i64>,
+
+    /// Included users
+    included_users: i32,
+
+    /// Storage limit (GB)
+    storage_gb: i32,
+
+    /// Course limit
+    course_limit: Option<i32>,
+
+    /// Active user limit
+    active_user_limit: Option<i32>,
+
+    /// Support level
+    support_level: SupportLevel,
+
+    /// Is active for new subscriptions
+    is_active: Bool,
+
+    /// Metadata
+    metadata: Map<String, Dynamic>
+}
+
+impl SubscriptionPlan {
+    /// Calculate price for billing cycle
+    fn price_for_cycle(&self, cycle: &BillingCycle, quantity: i32) -> i64 {
+        let base_price = match cycle {
+            BillingCycle::Monthly => self.monthly_price_cents,
+            BillingCycle::Annual => self.annual_price_cents,
+            BillingCycle::Quarterly => (self.annual_price_cents / 4) as i64,
+            BillingCycle::Custom { months } => {
+                (self.monthly_price_cents * (*months as i64))
+            }
+        };
+
+        // Add per-user pricing if applicable
+        let user_price = if let Some(per_user) = self.per_user_monthly_cents {
+            let extra_users = (quantity - self.included_users).max(0);
+            let months = match cycle {
+                BillingCycle::Monthly => 1,
+                BillingCycle::Quarterly => 3,
+                BillingCycle::Annual => 12,
+                BillingCycle::Custom { months } => *months as i64
+            };
+            per_user * (extra_users as i64) * months
+        } else {
+            0
+        };
+
+        base_price + user_price
+    }
+}
+
+/// Subscription status
+enum SubscriptionStatus {
+    /// Active subscription
+    Active,
+    /// In trial period
+    Trialing,
+    /// Payment past due (grace period)
+    PastDue,
+    /// Subscription cancelled
+    Cancelled,
+    /// Payment failed, subscription suspended
+    Unpaid,
+    /// Subscription expired
+    Expired,
+    /// Subscription paused
+    Paused
+}
+
+impl SubscriptionStatus {
+    fn to_string(&self) -> String {
+        match self {
+            SubscriptionStatus::Active => "active",
+            SubscriptionStatus::Trialing => "trialing",
+            SubscriptionStatus::PastDue => "past_due",
+            SubscriptionStatus::Cancelled => "cancelled",
+            SubscriptionStatus::Unpaid => "unpaid",
+            SubscriptionStatus::Expired => "expired",
+            SubscriptionStatus::Paused => "paused"
+        }.to_string()
+    }
+}
+
+/// Billing cycle
+enum BillingCycle {
+    Monthly,
+    Quarterly,
+    Annual,
+    Custom { months: i32 }
+}
+
+impl BillingCycle {
+    fn to_string(&self) -> String {
+        match self {
+            BillingCycle::Monthly => "monthly",
+            BillingCycle::Quarterly => "quarterly",
+            BillingCycle::Annual => "annual",
+            BillingCycle::Custom { months } => &format!("custom_{}_months", months)
+        }.to_string()
+    }
+
+    fn duration(&self) -> Duration {
+        match self {
+            BillingCycle::Monthly => Duration::days(30),
+            BillingCycle::Quarterly => Duration::days(90),
+            BillingCycle::Annual => Duration::days(365),
+            BillingCycle::Custom { months } => Duration::days((*months as i64) * 30)
+        }
+    }
+}
+
+/// Support level
+enum SupportLevel {
+    Community,
+    Email,
+    Priority,
+    Dedicated { manager_name: Option<String> }
+}
+
+/// Subscription discount
+type SubscriptionDiscount {
+    /// Discount ID
+    id: String,
+
+    /// Discount name
+    name: String,
+
+    /// Discount type
+    discount_type: DiscountType,
+
+    /// Value (percent or amount)
+    value: i64,
+
+    /// Duration in months (None = forever)
+    duration_months: Option<i32>,
+
+    /// Start date
+    start_date: DateTime,
+
+    /// End date
+    end_date: Option<DateTime>
+}
+
+/// Discount type
+enum DiscountType {
+    Percentage,
+    FixedAmount
+}
+
+// =============================================================================
+// USAGE TRACKING
+// =============================================================================
+
+/// Usage record for a tenant
+type UsageRecord {
+    /// Unique identifier
+    id: String,
+
+    /// Tenant ID
+    tenant_id: TenantId,
+
+    /// Usage period start
+    period_start: DateTime,
+
+    /// Usage period end
+    period_end: DateTime,
+
+    /// Usage metrics
+    metrics: UsageMetrics,
+
+    /// Calculated charges (cents)
+    charges_cents: i64,
+
+    /// Finalized
+    finalized: Bool,
+
+    /// Created at
+    created_at: DateTime
+}
+
+/// Usage metrics
+type UsageMetrics {
+    /// Active users count
+    active_users: i64,
+
+    /// Total users
+    total_users: i64,
+
+    /// Courses count
+    courses: i64,
+
+    /// Published courses
+    published_courses: i64,
+
+    /// Storage used (bytes)
+    storage_bytes: i64,
+
+    /// API calls
+    api_calls: i64,
+
+    /// AI tokens used
+    ai_tokens: i64,
+
+    /// Bandwidth used (bytes)
+    bandwidth_bytes: i64,
+
+    /// Email sent
+    emails_sent: i64,
+
+    /// Video minutes transcoded
+    video_minutes: i64,
+
+    /// Custom metrics
+    custom: Map<String, i64>
+}
+
+impl Default for UsageMetrics {
+    fn default() -> Self {
+        UsageMetrics {
+            active_users: 0,
+            total_users: 0,
+            courses: 0,
+            published_courses: 0,
+            storage_bytes: 0,
+            api_calls: 0,
+            ai_tokens: 0,
+            bandwidth_bytes: 0,
+            emails_sent: 0,
+            video_minutes: 0,
+            custom: Map::new()
+        }
+    }
+}
+
+impl UsageMetrics {
+    /// Get storage in GB
+    fn storage_gb(&self) -> f64 {
+        (self.storage_bytes as f64) / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Get bandwidth in GB
+    fn bandwidth_gb(&self) -> f64 {
+        (self.bandwidth_bytes as f64) / (1024.0 * 1024.0 * 1024.0)
+    }
+}
+
+/// Current usage snapshot
+type CurrentUsage {
+    tenant_id: TenantId,
+    period_start: DateTime,
+    metrics: UsageMetrics,
+    limits: UsageLimits,
+    warnings: List<UsageWarning>,
+    last_updated: DateTime
+}
+
+impl CurrentUsage {
+    /// Check if any limit is exceeded
+    fn has_exceeded_limits(&self) -> Bool {
+        self.warnings.iter().any(|w| matches!(w.severity, WarningSeverity::Critical))
+    }
+
+    /// Get percentage of limit used
+    fn percentage_used(&self, metric: &str) -> f64 {
+        let (current, limit) = match metric {
+            "users" => (self.metrics.active_users, self.limits.max_active_users.unwrap_or(i64::MAX)),
+            "storage" => (self.metrics.storage_bytes, self.limits.max_storage_bytes.unwrap_or(i64::MAX)),
+            "courses" => (self.metrics.courses, self.limits.max_courses.unwrap_or(i64::MAX)),
+            "api_calls" => (self.metrics.api_calls, self.limits.max_api_calls.unwrap_or(i64::MAX)),
+            "ai_tokens" => (self.metrics.ai_tokens, self.limits.max_ai_tokens.unwrap_or(i64::MAX)),
+            _ => return 0.0
+        };
+
+        if limit == 0 || limit == i64::MAX {
+            0.0
+        } else {
+            (current as f64 / limit as f64) * 100.0
+        }
+    }
+}
+
+/// Usage limits
+type UsageLimits {
+    max_active_users: Option<i64>,
+    max_total_users: Option<i64>,
+    max_courses: Option<i64>,
+    max_storage_bytes: Option<i64>,
+    max_api_calls: Option<i64>,
+    max_ai_tokens: Option<i64>,
+    max_bandwidth_bytes: Option<i64>,
+    max_emails: Option<i64>,
+    max_video_minutes: Option<i64>
+}
+
+/// Usage warning
+type UsageWarning {
+    metric: String,
+    current: i64,
+    limit: i64,
+    percentage: f64,
+    severity: WarningSeverity,
+    message: String
+}
+
+/// Warning severity
+enum WarningSeverity {
+    Info,      // 50-75%
+    Warning,   // 75-90%
+    Critical   // 90-100%
+}
+
+// =============================================================================
+// INVOICING
+// =============================================================================
+
+/// Invoice
+type Invoice {
+    /// Invoice ID
+    id: String,
+
+    /// Invoice number
+    number: String,
+
+    /// Tenant ID
+    tenant_id: TenantId,
+
+    /// Subscription ID
+    subscription_id: String,
+
+    /// Invoice status
+    status: InvoiceStatus,
+
+    /// Line items
+    line_items: List<InvoiceLineItem>,
+
+    /// Subtotal (cents)
+    subtotal_cents: i64,
+
+    /// Discount amount (cents)
+    discount_cents: i64,
+
+    /// Tax amount (cents)
+    tax_cents: i64,
+
+    /// Total (cents)
+    total_cents: i64,
+
+    /// Currency
+    currency: String,
+
+    /// Period start
+    period_start: DateTime,
+
+    /// Period end
+    period_end: DateTime,
+
+    /// Due date
+    due_date: DateTime,
+
+    /// Paid at
+    paid_at: Option<DateTime>,
+
+    /// Payment method
+    payment_method: Option<String>,
+
+    /// External invoice ID
+    external_id: Option<String>,
+
+    /// Invoice URL
+    invoice_url: Option<String>,
+
+    /// PDF URL
+    pdf_url: Option<String>,
+
+    /// Created at
+    created_at: DateTime,
+
+    /// Notes
+    notes: Option<String>
+}
+
+/// Invoice status
+enum InvoiceStatus {
+    Draft,
+    Open,
+    Paid,
+    Void,
+    Uncollectible
+}
+
+impl InvoiceStatus {
+    fn to_string(&self) -> String {
+        match self {
+            InvoiceStatus::Draft => "draft",
+            InvoiceStatus::Open => "open",
+            InvoiceStatus::Paid => "paid",
+            InvoiceStatus::Void => "void",
+            InvoiceStatus::Uncollectible => "uncollectible"
+        }.to_string()
+    }
+}
+
+/// Invoice line item
+type InvoiceLineItem {
+    id: String,
+    description: String,
+    quantity: i32,
+    unit_price_cents: i64,
+    amount_cents: i64,
+    period_start: Option<DateTime>,
+    period_end: Option<DateTime>,
+    proration: Bool
+}
+
+// =============================================================================
+// BILLING MANAGER
+// =============================================================================
+
+/// Billing management actor
+actor BillingManager {
+    var subscriptions: Map<TenantId, TenantSubscription> = Map::new()
+    var plans: Map<String, SubscriptionPlan> = Map::new()
+    var usage: Map<TenantId, CurrentUsage> = Map::new()
+    var invoices: Map<String, Invoice> = Map::new()
+    var tenant_invoices: Map<TenantId, List<String>> = Map::new()
+
+    fn new() -> Self {
+        BillingManager::default()
+    }
+
+    /// Create subscription
+    receive CreateSubscription(request: CreateSubscriptionRequest) -> Result<TenantSubscription, BillingError> {
+        let plan = self.plans.get(&request.plan_id)
+            .ok_or(BillingError::PlanNotFound { plan_id: request.plan_id.clone() })?
+            .clone();
+
+        let now = DateTime::now();
+        let period_end = now + request.billing_cycle.duration();
+
+        let subscription = TenantSubscription {
+            id: generate_uuid(),
+            tenant_id: request.tenant_id.clone(),
+            plan: plan.clone(),
+            status: if request.trial_days > 0 {
+                SubscriptionStatus::Trialing
+            } else {
+                SubscriptionStatus::Active
+            },
+            billing_cycle: request.billing_cycle.clone(),
+            current_period_start: now,
+            current_period_end: period_end,
+            price_cents: plan.price_for_cycle(&request.billing_cycle, request.quantity),
+            currency: request.currency.clone(),
+            quantity: request.quantity,
+            discount: None,
+            trial_end: if request.trial_days > 0 {
+                Some(now + Duration::days(request.trial_days as i64))
+            } else {
+                None
+            },
+            cancel_at_period_end: false,
+            cancelled_at: None,
+            external_id: None,
+            payment_method_id: request.payment_method_id,
+            created_at: now,
+            updated_at: now,
+            metadata: Map::new()
+        };
+
+        self.subscriptions.insert(request.tenant_id, subscription.clone());
+
+        // Initialize usage tracking
+        self.initialize_usage(&subscription.tenant_id, &plan);
+
+        checkpoint();
+
+        Ok(subscription)
+    }
+
+    /// Get subscription
+    receive GetSubscription(tenant_id: TenantId) -> Option<TenantSubscription> {
+        self.subscriptions.get(&tenant_id).cloned()
+    }
+
+    /// Update subscription (change plan)
+    receive ChangePlan(tenant_id: TenantId, new_plan_id: String, prorate: Bool) -> Result<TenantSubscription, BillingError> {
+        let new_plan = self.plans.get(&new_plan_id)
+            .ok_or(BillingError::PlanNotFound { plan_id: new_plan_id.clone() })?
+            .clone();
+
+        let subscription = self.subscriptions.get_mut(&tenant_id)
+            .ok_or(BillingError::SubscriptionNotFound { tenant_id: tenant_id.clone() })?;
+
+        let old_plan = subscription.plan.clone();
+        let now = DateTime::now();
+
+        // Handle proration if upgrading/downgrading
+        if prorate {
+            let days_remaining = subscription.days_remaining();
+            let total_days = subscription.billing_cycle.duration().as_days();
+
+            if days_remaining > 0 && total_days > 0 {
+                // Calculate proration
+                let old_daily_rate = subscription.price_cents / total_days;
+                let new_daily_rate = new_plan.price_for_cycle(&subscription.billing_cycle, subscription.quantity) / total_days;
+
+                let credit = old_daily_rate * days_remaining;
+                let charge = new_daily_rate * days_remaining;
+
+                // Create proration invoice if needed
+                if charge > credit {
+                    self.create_proration_invoice(&tenant_id, charge - credit, &old_plan, &new_plan);
+                }
+            }
+        }
+
+        subscription.plan = new_plan;
+        subscription.price_cents = subscription.plan.price_for_cycle(
+            &subscription.billing_cycle,
+            subscription.quantity
+        );
+        subscription.updated_at = now;
+
+        // Update usage limits
+        self.update_usage_limits(&tenant_id, &subscription.plan);
+
+        let updated = subscription.clone();
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Cancel subscription
+    receive CancelSubscription(tenant_id: TenantId, cancel_immediately: Bool) -> Result<TenantSubscription, BillingError> {
+        let subscription = self.subscriptions.get_mut(&tenant_id)
+            .ok_or(BillingError::SubscriptionNotFound { tenant_id: tenant_id.clone() })?;
+
+        let now = DateTime::now();
+
+        if cancel_immediately {
+            subscription.status = SubscriptionStatus::Cancelled;
+            subscription.cancelled_at = Some(now);
+        } else {
+            subscription.cancel_at_period_end = true;
+        }
+
+        subscription.updated_at = now;
+
+        let updated = subscription.clone();
+        checkpoint();
+
+        Ok(updated)
+    }
+
+    /// Resume cancelled subscription
+    receive ResumeSubscription(tenant_id: TenantId) -> Result<TenantSubscription, BillingError> {
+        let subscription = self.subscriptions.get_mut(&tenant_id)
+            .ok_or(BillingError::SubscriptionNotFound { tenant_id: tenant_id.clone() })?;
+
+        if subscription.cancel_at_period_end {
+            subscription.cancel_at_period_end = false;
+            subscription.updated_at = DateTime::now();
+
+            let updated = subscription.clone();
+            checkpoint();
+
+            Ok(updated)
+        } else {
+            Err(BillingError::InvalidOperation {
+                message: "Subscription is not pending cancellation".to_string()
+            })
+        }
+    }
+
+    /// Record usage
+    receive RecordUsage(tenant_id: TenantId, metric: String, value: i64) -> Result<(), BillingError> {
+        let usage = self.usage.get_mut(&tenant_id)
+            .ok_or(BillingError::UsageNotFound { tenant_id: tenant_id.clone() })?;
+
+        match metric.as_str() {
+            "active_users" => usage.metrics.active_users = value,
+            "total_users" => usage.metrics.total_users = value,
+            "courses" => usage.metrics.courses = value,
+            "storage_bytes" => usage.metrics.storage_bytes = value,
+            "api_calls" => usage.metrics.api_calls += value,
+            "ai_tokens" => usage.metrics.ai_tokens += value,
+            "bandwidth_bytes" => usage.metrics.bandwidth_bytes += value,
+            "emails_sent" => usage.metrics.emails_sent += value,
+            "video_minutes" => usage.metrics.video_minutes += value,
+            _ => {
+                usage.metrics.custom.entry(metric).or_insert(0);
+                *usage.metrics.custom.get_mut(&metric).unwrap() += value;
+            }
+        }
+
+        usage.last_updated = DateTime::now();
+
+        // Check for warnings
+        self.check_usage_warnings(&tenant_id);
+
+        checkpoint();
+
+        Ok(())
+    }
+
+    /// Get current usage
+    receive GetUsage(tenant_id: TenantId) -> Option<CurrentUsage> {
+        self.usage.get(&tenant_id).cloned()
+    }
+
+    /// Get invoices for tenant
+    receive GetInvoices(tenant_id: TenantId, limit: i32) -> List<Invoice> {
+        self.tenant_invoices.get(&tenant_id)
+            .map(|ids| {
+                ids.iter()
+                    .take(limit as usize)
+                    .filter_map(|id| self.invoices.get(id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get invoice by ID
+    receive GetInvoice(invoice_id: String) -> Option<Invoice> {
+        self.invoices.get(&invoice_id).cloned()
+    }
+
+    /// Create plan
+    receive CreatePlan(plan: SubscriptionPlan) {
+        self.plans.insert(plan.id.clone(), plan);
+        checkpoint();
+    }
+
+    /// List plans
+    receive ListPlans() -> List<SubscriptionPlan> {
+        self.plans.values()
+            .filter(|p| p.is_active)
+            .cloned()
+            .collect()
+    }
+
+    /// Process renewal
+    receive ProcessRenewal(tenant_id: TenantId) -> Result<Invoice, BillingError> {
+        let subscription = self.subscriptions.get_mut(&tenant_id)
+            .ok_or(BillingError::SubscriptionNotFound { tenant_id: tenant_id.clone() })?;
+
+        if !subscription.is_active() {
+            return Err(BillingError::InvalidOperation {
+                message: "Subscription is not active".to_string()
+            });
+        }
+
+        let now = DateTime::now();
+
+        // Check if cancelling at period end
+        if subscription.cancel_at_period_end {
+            subscription.status = SubscriptionStatus::Cancelled;
+            subscription.cancelled_at = Some(now);
+            checkpoint();
+
+            return Err(BillingError::SubscriptionCancelled {
+                tenant_id: tenant_id.clone()
+            });
+        }
+
+        // Create renewal invoice
+        let invoice = self.create_renewal_invoice(&subscription);
+
+        // Update subscription period
+        subscription.current_period_start = subscription.current_period_end;
+        subscription.current_period_end = subscription.current_period_start + subscription.billing_cycle.duration();
+        subscription.updated_at = now;
+
+        // Reset usage for new period
+        self.reset_usage_period(&tenant_id);
+
+        checkpoint();
+
+        Ok(invoice)
+    }
+
+    // Internal methods
+
+    fn initialize_usage(&mut self, tenant_id: &TenantId, plan: &SubscriptionPlan) {
+        let limits = UsageLimits {
+            max_active_users: plan.active_user_limit.map(|l| l as i64),
+            max_total_users: None,
+            max_courses: plan.course_limit.map(|l| l as i64),
+            max_storage_bytes: Some((plan.storage_gb as i64) * 1024 * 1024 * 1024),
+            max_api_calls: None,
+            max_ai_tokens: None,
+            max_bandwidth_bytes: None,
+            max_emails: None,
+            max_video_minutes: None
+        };
+
+        let usage = CurrentUsage {
+            tenant_id: tenant_id.clone(),
+            period_start: DateTime::now(),
+            metrics: UsageMetrics::default(),
+            limits,
+            warnings: vec![],
+            last_updated: DateTime::now()
+        };
+
+        self.usage.insert(tenant_id.clone(), usage);
+    }
+
+    fn update_usage_limits(&mut self, tenant_id: &TenantId, plan: &SubscriptionPlan) {
+        if let Some(usage) = self.usage.get_mut(tenant_id) {
+            usage.limits = UsageLimits {
+                max_active_users: plan.active_user_limit.map(|l| l as i64),
+                max_total_users: None,
+                max_courses: plan.course_limit.map(|l| l as i64),
+                max_storage_bytes: Some((plan.storage_gb as i64) * 1024 * 1024 * 1024),
+                max_api_calls: None,
+                max_ai_tokens: None,
+                max_bandwidth_bytes: None,
+                max_emails: None,
+                max_video_minutes: None
+            };
+
+            self.check_usage_warnings(tenant_id);
+        }
+    }
+
+    fn check_usage_warnings(&mut self, tenant_id: &TenantId) {
+        if let Some(usage) = self.usage.get_mut(tenant_id) {
+            let mut warnings = vec![];
+
+            // Check each metric against limits
+            let checks = vec![
+                ("active_users", usage.metrics.active_users, usage.limits.max_active_users),
+                ("storage", usage.metrics.storage_bytes, usage.limits.max_storage_bytes),
+                ("courses", usage.metrics.courses, usage.limits.max_courses),
+                ("api_calls", usage.metrics.api_calls, usage.limits.max_api_calls),
+                ("ai_tokens", usage.metrics.ai_tokens, usage.limits.max_ai_tokens),
+            ];
+
+            for (metric, current, limit_opt) in checks {
+                if let Some(limit) = limit_opt {
+                    let percentage = (current as f64 / limit as f64) * 100.0;
+
+                    if percentage >= 50.0 {
+                        let severity = if percentage >= 90.0 {
+                            WarningSeverity::Critical
+                        } else if percentage >= 75.0 {
+                            WarningSeverity::Warning
+                        } else {
+                            WarningSeverity::Info
+                        };
+
+                        warnings.push(UsageWarning {
+                            metric: metric.to_string(),
+                            current,
+                            limit,
+                            percentage,
+                            severity,
+                            message: format!("{} at {:.1}% of limit", metric, percentage)
+                        });
+                    }
+                }
+            }
+
+            usage.warnings = warnings;
+        }
+    }
+
+    fn reset_usage_period(&mut self, tenant_id: &TenantId) {
+        if let Some(usage) = self.usage.get_mut(tenant_id) {
+            // Keep cumulative metrics (storage, users) but reset periodic ones
+            usage.metrics.api_calls = 0;
+            usage.metrics.ai_tokens = 0;
+            usage.metrics.bandwidth_bytes = 0;
+            usage.metrics.emails_sent = 0;
+            usage.metrics.video_minutes = 0;
+            usage.period_start = DateTime::now();
+            usage.warnings.clear();
+        }
+    }
+
+    fn create_renewal_invoice(&mut self, subscription: &TenantSubscription) -> Invoice {
+        let now = DateTime::now();
+        let invoice_number = format!("INV-{}", now.format("%Y%m%d%H%M%S"));
+
+        let line_item = InvoiceLineItem {
+            id: generate_uuid(),
+            description: format!("{} - {}", subscription.plan.name, subscription.billing_cycle.to_string()),
+            quantity: subscription.quantity,
+            unit_price_cents: subscription.price_cents / subscription.quantity as i64,
+            amount_cents: subscription.price_cents,
+            period_start: Some(subscription.current_period_end),
+            period_end: Some(subscription.current_period_end + subscription.billing_cycle.duration()),
+            proration: false
+        };
+
+        let discount_cents = subscription.discount.as_ref()
+            .map(|d| match d.discount_type {
+                DiscountType::Percentage => (subscription.price_cents * d.value) / 100,
+                DiscountType::FixedAmount => d.value
+            })
+            .unwrap_or(0);
+
+        let subtotal = subscription.price_cents;
+        let total = subtotal - discount_cents;
+
+        let invoice = Invoice {
+            id: generate_uuid(),
+            number: invoice_number,
+            tenant_id: subscription.tenant_id.clone(),
+            subscription_id: subscription.id.clone(),
+            status: InvoiceStatus::Open,
+            line_items: vec![line_item],
+            subtotal_cents: subtotal,
+            discount_cents,
+            tax_cents: 0, // Would calculate based on tax rules
+            total_cents: total,
+            currency: subscription.currency.clone(),
+            period_start: subscription.current_period_end,
+            period_end: subscription.current_period_end + subscription.billing_cycle.duration(),
+            due_date: now + Duration::days(7),
+            paid_at: None,
+            payment_method: None,
+            external_id: None,
+            invoice_url: None,
+            pdf_url: None,
+            created_at: now,
+            notes: None
+        };
+
+        self.invoices.insert(invoice.id.clone(), invoice.clone());
+        self.tenant_invoices.entry(subscription.tenant_id.clone())
+            .or_insert(vec![])
+            .insert(0, invoice.id.clone());
+
+        invoice
+    }
+
+    fn create_proration_invoice(&mut self, tenant_id: &TenantId, amount: i64, old_plan: &SubscriptionPlan, new_plan: &SubscriptionPlan) {
+        let now = DateTime::now();
+        let invoice_number = format!("INV-PRO-{}", now.format("%Y%m%d%H%M%S"));
+
+        let line_item = InvoiceLineItem {
+            id: generate_uuid(),
+            description: format!("Proration: {} to {}", old_plan.name, new_plan.name),
+            quantity: 1,
+            unit_price_cents: amount,
+            amount_cents: amount,
+            period_start: None,
+            period_end: None,
+            proration: true
+        };
+
+        let invoice = Invoice {
+            id: generate_uuid(),
+            number: invoice_number,
+            tenant_id: tenant_id.clone(),
+            subscription_id: String::new(),
+            status: InvoiceStatus::Open,
+            line_items: vec![line_item],
+            subtotal_cents: amount,
+            discount_cents: 0,
+            tax_cents: 0,
+            total_cents: amount,
+            currency: "USD".to_string(),
+            period_start: now,
+            period_end: now,
+            due_date: now + Duration::days(7),
+            paid_at: None,
+            payment_method: None,
+            external_id: None,
+            invoice_url: None,
+            pdf_url: None,
+            created_at: now,
+            notes: Some("Proration charge for plan change".to_string())
+        };
+
+        self.invoices.insert(invoice.id.clone(), invoice.clone());
+        self.tenant_invoices.entry(tenant_id.clone())
+            .or_insert(vec![])
+            .insert(0, invoice.id.clone());
+    }
+}
+
+// =============================================================================
+// SUPPORTING TYPES
+// =============================================================================
+
+/// Create subscription request
+type CreateSubscriptionRequest {
+    tenant_id: TenantId,
+    plan_id: String,
+    billing_cycle: BillingCycle,
+    quantity: i32,
+    currency: String,
+    trial_days: i32,
+    payment_method_id: Option<String>
+}
+
+/// Billing errors
+enum BillingError {
+    PlanNotFound { plan_id: String },
+    SubscriptionNotFound { tenant_id: TenantId },
+    SubscriptionCancelled { tenant_id: TenantId },
+    UsageNotFound { tenant_id: TenantId },
+    PaymentFailed { message: String },
+    InvalidOperation { message: String }
+}
+
+impl BillingError {
+    fn to_string(&self) -> String {
+        match self {
+            BillingError::PlanNotFound { plan_id } => format!("Plan not found: {}", plan_id),
+            BillingError::SubscriptionNotFound { tenant_id } => format!("Subscription not found for tenant: {}", tenant_id.0),
+            BillingError::SubscriptionCancelled { tenant_id } => format!("Subscription cancelled for tenant: {}", tenant_id.0),
+            BillingError::UsageNotFound { tenant_id } => format!("Usage not found for tenant: {}", tenant_id.0),
+            BillingError::PaymentFailed { message } => format!("Payment failed: {}", message),
+            BillingError::InvalidOperation { message } => format!("Invalid operation: {}", message)
+        }
+    }
+}
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*
+
+    #[test]
+    fn test_plan_pricing() {
+        let plan = SubscriptionPlan {
+            id: "pro".to_string(),
+            name: "Professional".to_string(),
+            description: "For growing teams".to_string(),
+            tier: SubscriptionTier::Professional,
+            features: Set::new(),
+            monthly_price_cents: 9900,
+            annual_price_cents: 99900,
+            per_user_monthly_cents: Some(1000),
+            included_users: 5,
+            storage_gb: 100,
+            course_limit: None,
+            active_user_limit: Some(100),
+            support_level: SupportLevel::Priority,
+            is_active: true,
+            metadata: Map::new()
+        };
+
+        // Monthly with 5 users (included)
+        assert_eq!(plan.price_for_cycle(&BillingCycle::Monthly, 5), 9900);
+
+        // Monthly with 10 users (5 extra)
+        assert_eq!(plan.price_for_cycle(&BillingCycle::Monthly, 10), 14900);
+
+        // Annual with 5 users
+        assert_eq!(plan.price_for_cycle(&BillingCycle::Annual, 5), 99900);
+    }
+
+    #[test]
+    fn test_usage_percentage() {
+        let usage = CurrentUsage {
+            tenant_id: TenantId("test".to_string()),
+            period_start: DateTime::now(),
+            metrics: UsageMetrics {
+                active_users: 50,
+                storage_bytes: 50 * 1024 * 1024 * 1024, // 50 GB
+                ..Default::default()
+            },
+            limits: UsageLimits {
+                max_active_users: Some(100),
+                max_storage_bytes: Some(100 * 1024 * 1024 * 1024), // 100 GB
+                ..Default::default()
+            },
+            warnings: vec![],
+            last_updated: DateTime::now()
+        };
+
+        assert_eq!(usage.percentage_used("users"), 50.0);
+        assert_eq!(usage.percentage_used("storage"), 50.0);
+    }
+}

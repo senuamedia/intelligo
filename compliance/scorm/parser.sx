@@ -1,0 +1,1703 @@
+/// Intelligo LMS - SCORM Content Package Parser
+///
+/// Parses SCORM content packages (PIF - Package Interchange Format).
+/// Extracts imsmanifest.xml, resources, metadata, and builds
+/// the activity tree for sequencing.
+
+module intelligo::compliance::scorm::parser
+
+use intelligo::core::types::*
+use intelligo::compliance::scorm::sequencing::*
+use std::time::{DateTime, Duration}
+use std::collections::{Map, Set, List}
+use std::io::{File, Path}
+use std::xml::{XmlDocument, XmlNode, XmlAttribute}
+use std::zip::{ZipArchive, ZipEntry}
+
+// =============================================================================
+// IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for a parsed package
+type PackageId = String
+
+/// Unique identifier for a resource
+type ResourceId = String
+
+/// Unique identifier for an organization
+type OrganizationId = String
+
+// =============================================================================
+// PARSED PACKAGE STRUCTURE
+// =============================================================================
+
+/// A parsed SCORM content package
+type ScormPackage {
+    /// Package identifier
+    id: PackageId,
+
+    /// Schema version detected
+    schema_version: ScormSchemaVersion,
+
+    /// Package metadata
+    metadata: PackageMetadata,
+
+    /// Organizations (activity trees)
+    organizations: List<Organization>,
+
+    /// Default organization ID
+    default_organization: Option<OrganizationId>,
+
+    /// Resources
+    resources: Map<ResourceId, Resource>,
+
+    /// Extracted file paths
+    files: List<ExtractedFile>,
+
+    /// Base path where files are extracted
+    base_path: String,
+
+    /// Parse warnings
+    warnings: List<ParseWarning>,
+
+    /// Package manifest XML (raw)
+    manifest_xml: Option<String>
+}
+
+impl ScormPackage {
+    fn new(id: PackageId) -> ScormPackage {
+        ScormPackage {
+            id,
+            schema_version: ScormSchemaVersion::Unknown,
+            metadata: PackageMetadata::default(),
+            organizations: vec![],
+            default_organization: None,
+            resources: Map::new(),
+            files: vec![],
+            base_path: String::new(),
+            warnings: vec![],
+            manifest_xml: None
+        }
+    }
+
+    /// Get the default organization
+    fn get_default_organization(&self) -> Option<&Organization> {
+        let default_id = self.default_organization.as_ref()?;
+        self.organizations.iter().find(|o| &o.id == default_id)
+    }
+
+    /// Get a resource by ID
+    fn get_resource(&self, id: &ResourceId) -> Option<&Resource> {
+        self.resources.get(id)
+    }
+
+    /// Build activity tree from default organization
+    fn build_activity_tree(&self) -> Option<SequencingState> {
+        let org = self.get_default_organization()?;
+        let activities = self.build_activities_from_items(&org.items, None);
+
+        if activities.is_empty() {
+            return None
+        }
+
+        let root_id = activities[0].id.clone();
+        Some(build_activity_tree(root_id, activities))
+    }
+
+    /// Build activities from organization items
+    fn build_activities_from_items(&self, items: &List<Item>, parent_id: Option<ActivityId>) -> Vec<Activity> {
+        let mut activities = vec![];
+
+        for item in items {
+            let mut activity = Activity::new(item.identifier.clone(), item.title.clone());
+            activity.parent_id = parent_id.clone();
+
+            // Set resource info if this is a leaf
+            if let Some(ref resource_id) = item.identifierref {
+                if let Some(resource) = self.get_resource(resource_id) {
+                    activity.is_leaf = true;
+                    activity.sco_id = Some(resource_id.clone());
+                    activity.launch_url = resource.href.clone();
+                }
+            }
+
+            // Parse sequencing info
+            if let Some(ref seq) = item.sequencing {
+                activity.sequencing = seq.clone();
+            }
+
+            // Add visibility
+            activity.is_visible = item.is_visible;
+
+            // Process children
+            if !item.items.is_empty() {
+                activity.is_leaf = false;
+                activity.children = item.items.iter().map(|i| i.identifier.clone()).collect();
+
+                let child_activities = self.build_activities_from_items(
+                    &item.items,
+                    Some(activity.id.clone())
+                );
+                activities.extend(child_activities);
+            }
+
+            activities.push(activity);
+        }
+
+        activities
+    }
+}
+
+/// SCORM schema version
+enum ScormSchemaVersion {
+    /// SCORM 1.2
+    Scorm12,
+    /// SCORM 2004 2nd Edition
+    Scorm2004_2nd,
+    /// SCORM 2004 3rd Edition
+    Scorm2004_3rd,
+    /// SCORM 2004 4th Edition
+    Scorm2004_4th,
+    /// Unknown/unrecognized
+    Unknown
+}
+
+impl ScormSchemaVersion {
+    fn from_string(version: &str) -> ScormSchemaVersion {
+        match version.to_lowercase().as_str() {
+            "1.2" | "scorm_1.2" | "scorm 1.2" => ScormSchemaVersion::Scorm12,
+            "2004 2nd edition" | "cam 1.3" => ScormSchemaVersion::Scorm2004_2nd,
+            "2004 3rd edition" | "cam 1.3.1" => ScormSchemaVersion::Scorm2004_3rd,
+            "2004 4th edition" | "cam 1.3.2" => ScormSchemaVersion::Scorm2004_4th,
+            _ => ScormSchemaVersion::Unknown
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            ScormSchemaVersion::Scorm12 => "SCORM 1.2",
+            ScormSchemaVersion::Scorm2004_2nd => "SCORM 2004 2nd Edition",
+            ScormSchemaVersion::Scorm2004_3rd => "SCORM 2004 3rd Edition",
+            ScormSchemaVersion::Scorm2004_4th => "SCORM 2004 4th Edition",
+            ScormSchemaVersion::Unknown => "Unknown"
+        }.to_string()
+    }
+}
+
+/// Package metadata
+type PackageMetadata {
+    /// Schema location
+    schema: Option<String>,
+
+    /// Schema version
+    schema_version: Option<String>,
+
+    /// Title
+    title: Option<String>,
+
+    /// Description
+    description: Option<String>,
+
+    /// Keywords
+    keywords: List<String>,
+
+    /// Language
+    language: Option<String>,
+
+    /// Version
+    version: Option<String>,
+
+    /// Duration (typical learning time)
+    duration: Option<String>,
+
+    /// LOM metadata (if present)
+    lom: Option<LomMetadata>
+}
+
+impl PackageMetadata {
+    fn default() -> PackageMetadata {
+        PackageMetadata {
+            schema: None,
+            schema_version: None,
+            title: None,
+            description: None,
+            keywords: vec![],
+            language: None,
+            version: None,
+            duration: None,
+            lom: None
+        }
+    }
+}
+
+/// LOM (Learning Object Metadata) structure
+type LomMetadata {
+    /// General category
+    general: Option<LomGeneral>,
+
+    /// Lifecycle category
+    lifecycle: Option<LomLifecycle>,
+
+    /// Technical category
+    technical: Option<LomTechnical>,
+
+    /// Educational category
+    educational: Option<LomEducational>,
+
+    /// Rights category
+    rights: Option<LomRights>,
+
+    /// Classification category
+    classification: List<LomClassification>
+}
+
+/// LOM General category
+type LomGeneral {
+    identifier: Option<String>,
+    title: Option<String>,
+    language: List<String>,
+    description: Option<String>,
+    keywords: List<String>,
+    coverage: Option<String>,
+    structure: Option<String>,
+    aggregation_level: Option<i32>
+}
+
+/// LOM Lifecycle category
+type LomLifecycle {
+    version: Option<String>,
+    status: Option<String>,
+    contributors: List<LomContributor>
+}
+
+/// LOM Contributor
+type LomContributor {
+    role: Option<String>,
+    entity: Option<String>,
+    date: Option<String>
+}
+
+/// LOM Technical category
+type LomTechnical {
+    format: List<String>,
+    size: Option<i64>,
+    location: List<String>,
+    requirements: List<LomRequirement>,
+    installation_remarks: Option<String>,
+    other_platform_requirements: Option<String>,
+    duration: Option<String>
+}
+
+/// LOM Requirement
+type LomRequirement {
+    requirement_type: Option<String>,
+    name: Option<String>,
+    minimum_version: Option<String>,
+    maximum_version: Option<String>
+}
+
+/// LOM Educational category
+type LomEducational {
+    interactivity_type: Option<String>,
+    learning_resource_type: List<String>,
+    interactivity_level: Option<String>,
+    semantic_density: Option<String>,
+    intended_end_user_role: List<String>,
+    context: List<String>,
+    typical_age_range: Option<String>,
+    difficulty: Option<String>,
+    typical_learning_time: Option<String>,
+    description: Option<String>,
+    language: List<String>
+}
+
+/// LOM Rights category
+type LomRights {
+    cost: Option<Bool>,
+    copyright: Option<Bool>,
+    description: Option<String>
+}
+
+/// LOM Classification category
+type LomClassification {
+    purpose: Option<String>,
+    taxon_paths: List<LomTaxonPath>,
+    description: Option<String>,
+    keywords: List<String>
+}
+
+/// LOM Taxon Path
+type LomTaxonPath {
+    source: Option<String>,
+    taxons: List<LomTaxon>
+}
+
+/// LOM Taxon
+type LomTaxon {
+    id: Option<String>,
+    entry: Option<String>
+}
+
+/// An organization (activity tree root)
+type Organization {
+    /// Unique identifier
+    id: OrganizationId,
+
+    /// Title
+    title: String,
+
+    /// Structure (hierarchical, linear, etc.)
+    structure: Option<String>,
+
+    /// Child items
+    items: List<Item>,
+
+    /// Sequencing for root
+    sequencing: Option<SequencingDefinition>,
+
+    /// Objectives global to organization
+    objectives_global_to_system: Bool
+}
+
+impl Organization {
+    fn new(id: OrganizationId, title: String) -> Organization {
+        Organization {
+            id,
+            title,
+            structure: None,
+            items: vec![],
+            sequencing: None,
+            objectives_global_to_system: true
+        }
+    }
+}
+
+/// An item in the organization tree
+type Item {
+    /// Unique identifier
+    identifier: String,
+
+    /// Reference to resource
+    identifierref: Option<ResourceId>,
+
+    /// Title
+    title: String,
+
+    /// Is visible in navigation
+    is_visible: Bool,
+
+    /// Parameters to pass to resource
+    parameters: Option<String>,
+
+    /// Child items
+    items: List<Item>,
+
+    /// Sequencing definition
+    sequencing: Option<SequencingDefinition>,
+
+    /// Data from manifest (for SCOs)
+    data_from_lms: Option<String>,
+
+    /// Time limit action
+    time_limit_action: Option<String>,
+
+    /// Completion threshold
+    completion_threshold: Option<CompletionThreshold>,
+
+    /// Presentation info
+    presentation: Option<ItemPresentation>
+}
+
+impl Item {
+    fn new(identifier: String, title: String) -> Item {
+        Item {
+            identifier,
+            identifierref: None,
+            title,
+            is_visible: true,
+            parameters: None,
+            items: vec![],
+            sequencing: None,
+            data_from_lms: None,
+            time_limit_action: None,
+            completion_threshold: None,
+            presentation: None
+        }
+    }
+}
+
+/// Completion threshold for an item
+type CompletionThreshold {
+    /// Minimum progress measure (0-1)
+    min_progress_measure: Option<f32>,
+
+    /// Completed by measure (vs. SCO setting)
+    completed_by_measure: Bool
+}
+
+/// Item presentation info
+type ItemPresentation {
+    /// Hide from choice navigation
+    hide_lms_ui: List<String>
+}
+
+/// A resource in the package
+type Resource {
+    /// Unique identifier
+    identifier: ResourceId,
+
+    /// Resource type (sco, asset)
+    resource_type: ResourceType,
+
+    /// SCORM type (for SCORM 2004)
+    scorm_type: Option<String>,
+
+    /// Launch URL (relative to package)
+    href: Option<String>,
+
+    /// Base directory
+    base: Option<String>,
+
+    /// Associated files
+    files: List<ResourceFile>,
+
+    /// Dependent resources
+    dependencies: List<ResourceId>,
+
+    /// Metadata
+    metadata: Option<ResourceMetadata>
+}
+
+impl Resource {
+    fn new(identifier: ResourceId) -> Resource {
+        Resource {
+            identifier,
+            resource_type: ResourceType::Asset,
+            scorm_type: None,
+            href: None,
+            base: None,
+            files: vec![],
+            dependencies: vec![],
+            metadata: None
+        }
+    }
+
+    /// Check if this is a SCO
+    fn is_sco(&self) -> Bool {
+        matches!(self.resource_type, ResourceType::Sco)
+    }
+}
+
+/// Resource type
+enum ResourceType {
+    /// Sharable Content Object
+    Sco,
+    /// Static asset
+    Asset,
+    /// Unknown type
+    Unknown
+}
+
+impl ResourceType {
+    fn from_string(s: &str) -> ResourceType {
+        match s.to_lowercase().as_str() {
+            "webcontent" | "sco" => ResourceType::Sco,
+            "asset" => ResourceType::Asset,
+            _ => ResourceType::Unknown
+        }
+    }
+}
+
+/// A file in a resource
+type ResourceFile {
+    /// File path (relative to package)
+    href: String
+}
+
+/// Resource metadata
+type ResourceMetadata {
+    /// Description
+    description: Option<String>,
+
+    /// LOM metadata
+    lom: Option<LomMetadata>
+}
+
+/// An extracted file
+type ExtractedFile {
+    /// Original path in package
+    original_path: String,
+
+    /// Extracted path on disk
+    extracted_path: String,
+
+    /// File size
+    size: i64,
+
+    /// MIME type (guessed)
+    mime_type: Option<String>
+}
+
+/// Parse warning
+type ParseWarning {
+    /// Warning message
+    message: String,
+
+    /// Location in manifest
+    location: Option<String>,
+
+    /// Warning code
+    code: ParseWarningCode
+}
+
+/// Parse warning codes
+enum ParseWarningCode {
+    MissingAttribute,
+    UnknownElement,
+    InvalidValue,
+    MissingResource,
+    DuplicateIdentifier,
+    InvalidSequencing,
+    UnsupportedFeature
+}
+
+// =============================================================================
+// PARSE ERROR
+// =============================================================================
+
+/// Parse error type
+enum ParseError {
+    /// File not found
+    FileNotFound { path: String },
+    /// Invalid ZIP file
+    InvalidZip { message: String },
+    /// Manifest not found
+    ManifestNotFound,
+    /// Invalid XML
+    InvalidXml { message: String, line: Option<i32> },
+    /// Missing required element
+    MissingElement { element: String },
+    /// Invalid manifest structure
+    InvalidStructure { message: String },
+    /// IO error
+    IoError { message: String },
+    /// Unsupported SCORM version
+    UnsupportedVersion { version: String }
+}
+
+impl ParseError {
+    fn message(&self) -> String {
+        match self {
+            ParseError::FileNotFound { path } => format!("File not found: {}", path),
+            ParseError::InvalidZip { message } => format!("Invalid ZIP file: {}", message),
+            ParseError::ManifestNotFound => "imsmanifest.xml not found in package".to_string(),
+            ParseError::InvalidXml { message, line } => {
+                match line {
+                    Some(l) => format!("Invalid XML at line {}: {}", l, message),
+                    None => format!("Invalid XML: {}", message)
+                }
+            },
+            ParseError::MissingElement { element } => format!("Missing required element: {}", element),
+            ParseError::InvalidStructure { message } => format!("Invalid manifest structure: {}", message),
+            ParseError::IoError { message } => format!("IO error: {}", message),
+            ParseError::UnsupportedVersion { version } => format!("Unsupported SCORM version: {}", version)
+        }
+    }
+}
+
+// =============================================================================
+// PARSER MESSAGES
+// =============================================================================
+
+/// Messages for PackageParser actor
+enum ParserMessage {
+    /// Parse a package from ZIP file
+    ParsePackage {
+        zip_path: String,
+        extract_to: String,
+        reply_to: Actor<Result<ScormPackage, ParseError>>
+    },
+
+    /// Parse manifest XML directly
+    ParseManifest {
+        xml_content: String,
+        base_path: String,
+        reply_to: Actor<Result<ScormPackage, ParseError>>
+    },
+
+    /// Validate a package
+    ValidatePackage {
+        package: ScormPackage,
+        reply_to: Actor<List<ParseWarning>>
+    },
+
+    /// Extract resource URLs
+    GetResourceUrls {
+        package: ScormPackage,
+        reply_to: Actor<Map<ResourceId, String>>
+    },
+
+    /// Get launch URL for an item
+    GetLaunchUrl {
+        package: ScormPackage,
+        item_identifier: String,
+        reply_to: Actor<Option<String>>
+    }
+}
+
+// =============================================================================
+// PACKAGE PARSER ACTOR
+// =============================================================================
+
+/// Package parser state
+type ParserState {
+    /// Parsed packages cache
+    cache: Map<String, ScormPackage>,
+
+    /// XML namespace mappings
+    namespaces: Map<String, String>
+}
+
+/// Package parser actor
+actor PackageParser {
+    state: ParserState,
+
+    /// Initialize the parser
+    fn init() -> PackageParser {
+        let mut namespaces = Map::new();
+        namespaces.insert("imscp".to_string(), "http://www.imsproject.org/xsd/imscp_rootv1p1p2".to_string());
+        namespaces.insert("adlcp".to_string(), "http://www.adlnet.org/xsd/adlcp_rootv1p2".to_string());
+        namespaces.insert("imsss".to_string(), "http://www.imsglobal.org/xsd/imsss".to_string());
+        namespaces.insert("adlseq".to_string(), "http://www.adlnet.org/xsd/adlseq_v1p3".to_string());
+        namespaces.insert("adlnav".to_string(), "http://www.adlnet.org/xsd/adlnav_v1p3".to_string());
+
+        PackageParser {
+            state: ParserState {
+                cache: Map::new(),
+                namespaces
+            }
+        }
+    }
+
+    /// Handle messages
+    fn receive(&mut self, msg: ParserMessage) {
+        match msg {
+            ParserMessage::ParsePackage { zip_path, extract_to, reply_to } => {
+                let result = self.parse_package(&zip_path, &extract_to);
+                reply_to.send(result);
+            },
+
+            ParserMessage::ParseManifest { xml_content, base_path, reply_to } => {
+                let result = self.parse_manifest(&xml_content, &base_path);
+                reply_to.send(result);
+            },
+
+            ParserMessage::ValidatePackage { package, reply_to } => {
+                let warnings = self.validate_package(&package);
+                reply_to.send(warnings);
+            },
+
+            ParserMessage::GetResourceUrls { package, reply_to } => {
+                let urls = self.get_resource_urls(&package);
+                reply_to.send(urls);
+            },
+
+            ParserMessage::GetLaunchUrl { package, item_identifier, reply_to } => {
+                let url = self.get_launch_url(&package, &item_identifier);
+                reply_to.send(url);
+            }
+        }
+    }
+
+    /// Parse a SCORM package from ZIP
+    fn parse_package(&mut self, zip_path: &str, extract_to: &str) -> Result<ScormPackage, ParseError> {
+        // Open ZIP file
+        let archive = ZipArchive::open(zip_path)
+            .map_err(|e| ParseError::InvalidZip { message: e.to_string() })?;
+
+        // Find manifest
+        let manifest_entry = archive.entries().iter()
+            .find(|e| e.name().to_lowercase() == "imsmanifest.xml")
+            .ok_or(ParseError::ManifestNotFound)?;
+
+        // Extract all files
+        let extracted_files = self.extract_package(&archive, extract_to)?;
+
+        // Read manifest content
+        let manifest_path = format!("{}/imsmanifest.xml", extract_to);
+        let manifest_content = File::read_to_string(&manifest_path)
+            .map_err(|e| ParseError::IoError { message: e.to_string() })?;
+
+        // Parse manifest
+        let mut package = self.parse_manifest(&manifest_content, extract_to)?;
+        package.files = extracted_files;
+        package.base_path = extract_to.to_string();
+        package.manifest_xml = Some(manifest_content);
+
+        // Cache the package
+        self.state.cache.insert(zip_path.to_string(), package.clone());
+
+        Ok(package)
+    }
+
+    /// Extract package files
+    fn extract_package(&self, archive: &ZipArchive, extract_to: &str) -> Result<List<ExtractedFile>, ParseError> {
+        let mut files = vec![];
+
+        for entry in archive.entries() {
+            let entry_name = entry.name();
+            let extract_path = format!("{}/{}", extract_to, entry_name);
+
+            // Create directories
+            if entry.is_directory() {
+                std::fs::create_dir_all(&extract_path)
+                    .map_err(|e| ParseError::IoError { message: e.to_string() })?;
+                continue;
+            }
+
+            // Extract file
+            let parent = Path::parent(&extract_path);
+            if let Some(p) = parent {
+                std::fs::create_dir_all(p)
+                    .map_err(|e| ParseError::IoError { message: e.to_string() })?;
+            }
+
+            entry.extract_to(&extract_path)
+                .map_err(|e| ParseError::IoError { message: e.to_string() })?;
+
+            files.push(ExtractedFile {
+                original_path: entry_name.to_string(),
+                extracted_path: extract_path,
+                size: entry.size() as i64,
+                mime_type: self.guess_mime_type(&entry_name)
+            });
+        }
+
+        Ok(files)
+    }
+
+    /// Parse manifest XML
+    fn parse_manifest(&self, xml_content: &str, base_path: &str) -> Result<ScormPackage, ParseError> {
+        // Parse XML
+        let doc = XmlDocument::parse(xml_content)
+            .map_err(|e| ParseError::InvalidXml { message: e.to_string(), line: None })?;
+
+        let root = doc.root()
+            .ok_or(ParseError::InvalidStructure { message: "No root element".to_string() })?;
+
+        // Check for manifest element
+        if root.name() != "manifest" {
+            return Err(ParseError::InvalidStructure {
+                message: format!("Expected 'manifest' root, got '{}'", root.name())
+            })
+        }
+
+        // Create package
+        let package_id = root.attribute("identifier")
+            .unwrap_or_else(|| generate_uuid());
+        let mut package = ScormPackage::new(package_id);
+
+        // Detect SCORM version
+        package.schema_version = self.detect_scorm_version(&root);
+
+        // Parse metadata
+        if let Some(metadata_node) = root.child("metadata") {
+            package.metadata = self.parse_metadata(&metadata_node);
+        }
+
+        // Parse organizations
+        if let Some(orgs_node) = root.child("organizations") {
+            package.default_organization = orgs_node.attribute("default");
+
+            for org_node in orgs_node.children("organization") {
+                if let Some(org) = self.parse_organization(&org_node, &package.schema_version) {
+                    package.organizations.push(org);
+                }
+            }
+        }
+
+        // Parse resources
+        if let Some(resources_node) = root.child("resources") {
+            for resource_node in resources_node.children("resource") {
+                if let Some(resource) = self.parse_resource(&resource_node) {
+                    package.resources.insert(resource.identifier.clone(), resource);
+                }
+            }
+        }
+
+        Ok(package)
+    }
+
+    /// Detect SCORM version from manifest
+    fn detect_scorm_version(&self, root: &XmlNode) -> ScormSchemaVersion {
+        // Check schema attribute
+        if let Some(schema) = root.attribute("xmlns:adlcp") {
+            if schema.contains("scorm_v1p3") || schema.contains("adlcp_v1p3") {
+                return ScormSchemaVersion::Scorm2004_4th
+            }
+            if schema.contains("adlcp_rootv1p2") {
+                return ScormSchemaVersion::Scorm12
+            }
+        }
+
+        // Check metadata schema
+        if let Some(metadata) = root.child("metadata") {
+            if let Some(schema) = metadata.child("schema") {
+                let schema_text = schema.text().to_lowercase();
+                if schema_text.contains("2004") {
+                    if schema_text.contains("4th") || schema_text.contains("1.3.2") {
+                        return ScormSchemaVersion::Scorm2004_4th
+                    }
+                    if schema_text.contains("3rd") || schema_text.contains("1.3.1") {
+                        return ScormSchemaVersion::Scorm2004_3rd
+                    }
+                    return ScormSchemaVersion::Scorm2004_2nd
+                }
+                if schema_text.contains("1.2") {
+                    return ScormSchemaVersion::Scorm12
+                }
+            }
+        }
+
+        // Check for sequencing elements (SCORM 2004 only)
+        for org in root.children("organizations").flat_map(|o| o.children("organization")) {
+            for item in org.descendants("item") {
+                if item.child("imsss:sequencing").is_some() {
+                    return ScormSchemaVersion::Scorm2004_3rd // Assume 3rd if sequencing present
+                }
+            }
+        }
+
+        ScormSchemaVersion::Unknown
+    }
+
+    /// Parse metadata element
+    fn parse_metadata(&self, node: &XmlNode) -> PackageMetadata {
+        let mut metadata = PackageMetadata::default();
+
+        if let Some(schema) = node.child("schema") {
+            metadata.schema = Some(schema.text());
+        }
+
+        if let Some(schema_version) = node.child("schemaversion") {
+            metadata.schema_version = Some(schema_version.text());
+        }
+
+        // Parse LOM if present
+        if let Some(lom_node) = node.child("lom").or_else(|| node.child("lom:lom")) {
+            metadata.lom = Some(self.parse_lom(&lom_node));
+
+            // Extract common fields from LOM
+            if let Some(ref lom) = metadata.lom {
+                if let Some(ref general) = lom.general {
+                    metadata.title = general.title.clone();
+                    metadata.description = general.description.clone();
+                    metadata.keywords = general.keywords.clone();
+                    if !general.language.is_empty() {
+                        metadata.language = general.language.first().cloned();
+                    }
+                }
+                if let Some(ref lifecycle) = lom.lifecycle {
+                    metadata.version = lifecycle.version.clone();
+                }
+                if let Some(ref educational) = lom.educational {
+                    metadata.duration = educational.typical_learning_time.clone();
+                }
+            }
+        }
+
+        metadata
+    }
+
+    /// Parse LOM metadata
+    fn parse_lom(&self, node: &XmlNode) -> LomMetadata {
+        LomMetadata {
+            general: node.child("general").map(|n| self.parse_lom_general(&n)),
+            lifecycle: node.child("lifecycle").or_else(|| node.child("lifeCycle"))
+                .map(|n| self.parse_lom_lifecycle(&n)),
+            technical: node.child("technical").map(|n| self.parse_lom_technical(&n)),
+            educational: node.child("educational").map(|n| self.parse_lom_educational(&n)),
+            rights: node.child("rights").map(|n| self.parse_lom_rights(&n)),
+            classification: node.children("classification")
+                .filter_map(|n| Some(self.parse_lom_classification(&n)))
+                .collect()
+        }
+    }
+
+    /// Parse LOM general section
+    fn parse_lom_general(&self, node: &XmlNode) -> LomGeneral {
+        LomGeneral {
+            identifier: node.child("identifier").map(|n| n.text()),
+            title: self.get_langstring(node.child("title").as_ref()),
+            language: node.children("language").map(|n| n.text()).collect(),
+            description: self.get_langstring(node.child("description").as_ref()),
+            keywords: node.children("keyword")
+                .filter_map(|n| self.get_langstring(Some(&n)))
+                .collect(),
+            coverage: self.get_langstring(node.child("coverage").as_ref()),
+            structure: node.child("structure").and_then(|n| n.child("value")).map(|n| n.text()),
+            aggregation_level: node.child("aggregationLevel")
+                .and_then(|n| n.child("value"))
+                .and_then(|n| n.text().parse().ok())
+        }
+    }
+
+    /// Parse LOM lifecycle section
+    fn parse_lom_lifecycle(&self, node: &XmlNode) -> LomLifecycle {
+        LomLifecycle {
+            version: self.get_langstring(node.child("version").as_ref()),
+            status: node.child("status").and_then(|n| n.child("value")).map(|n| n.text()),
+            contributors: node.children("contribute")
+                .map(|n| LomContributor {
+                    role: n.child("role").and_then(|r| r.child("value")).map(|v| v.text()),
+                    entity: n.child("entity").map(|e| e.text()),
+                    date: n.child("date").and_then(|d| d.child("dateTime")).map(|dt| dt.text())
+                })
+                .collect()
+        }
+    }
+
+    /// Parse LOM technical section
+    fn parse_lom_technical(&self, node: &XmlNode) -> LomTechnical {
+        LomTechnical {
+            format: node.children("format").map(|n| n.text()).collect(),
+            size: node.child("size").and_then(|n| n.text().parse().ok()),
+            location: node.children("location").map(|n| n.text()).collect(),
+            requirements: node.children("requirement")
+                .map(|n| {
+                    let or_composite = n.child("orComposite");
+                    LomRequirement {
+                        requirement_type: or_composite.as_ref()
+                            .and_then(|o| o.child("type"))
+                            .and_then(|t| t.child("value"))
+                            .map(|v| v.text()),
+                        name: or_composite.as_ref()
+                            .and_then(|o| o.child("name"))
+                            .and_then(|n| n.child("value"))
+                            .map(|v| v.text()),
+                        minimum_version: or_composite.as_ref()
+                            .and_then(|o| o.child("minimumVersion"))
+                            .map(|v| v.text()),
+                        maximum_version: or_composite.as_ref()
+                            .and_then(|o| o.child("maximumVersion"))
+                            .map(|v| v.text())
+                    }
+                })
+                .collect(),
+            installation_remarks: self.get_langstring(node.child("installationRemarks").as_ref()),
+            other_platform_requirements: self.get_langstring(node.child("otherPlatformRequirements").as_ref()),
+            duration: node.child("duration").and_then(|d| d.child("duration")).map(|d| d.text())
+        }
+    }
+
+    /// Parse LOM educational section
+    fn parse_lom_educational(&self, node: &XmlNode) -> LomEducational {
+        LomEducational {
+            interactivity_type: node.child("interactivityType")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text()),
+            learning_resource_type: node.children("learningResourceType")
+                .filter_map(|n| n.child("value").map(|v| v.text()))
+                .collect(),
+            interactivity_level: node.child("interactivityLevel")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text()),
+            semantic_density: node.child("semanticDensity")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text()),
+            intended_end_user_role: node.children("intendedEndUserRole")
+                .filter_map(|n| n.child("value").map(|v| v.text()))
+                .collect(),
+            context: node.children("context")
+                .filter_map(|n| n.child("value").map(|v| v.text()))
+                .collect(),
+            typical_age_range: self.get_langstring(node.child("typicalAgeRange").as_ref()),
+            difficulty: node.child("difficulty")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text()),
+            typical_learning_time: node.child("typicalLearningTime")
+                .and_then(|d| d.child("duration"))
+                .map(|d| d.text()),
+            description: self.get_langstring(node.child("description").as_ref()),
+            language: node.children("language").map(|n| n.text()).collect()
+        }
+    }
+
+    /// Parse LOM rights section
+    fn parse_lom_rights(&self, node: &XmlNode) -> LomRights {
+        LomRights {
+            cost: node.child("cost")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text().to_lowercase() == "yes"),
+            copyright: node.child("copyrightAndOtherRestrictions")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text().to_lowercase() == "yes"),
+            description: self.get_langstring(node.child("description").as_ref())
+        }
+    }
+
+    /// Parse LOM classification section
+    fn parse_lom_classification(&self, node: &XmlNode) -> LomClassification {
+        LomClassification {
+            purpose: node.child("purpose")
+                .and_then(|n| n.child("value"))
+                .map(|v| v.text()),
+            taxon_paths: node.children("taxonPath")
+                .map(|n| LomTaxonPath {
+                    source: self.get_langstring(n.child("source").as_ref()),
+                    taxons: n.children("taxon")
+                        .map(|t| LomTaxon {
+                            id: t.child("id").map(|i| i.text()),
+                            entry: self.get_langstring(t.child("entry").as_ref())
+                        })
+                        .collect()
+                })
+                .collect(),
+            description: self.get_langstring(node.child("description").as_ref()),
+            keywords: node.children("keyword")
+                .filter_map(|n| self.get_langstring(Some(&n)))
+                .collect()
+        }
+    }
+
+    /// Get langstring value (handles multiple language variants)
+    fn get_langstring(&self, node: Option<&XmlNode>) -> Option<String> {
+        let node = node?;
+
+        // Try langstring child
+        if let Some(langstring) = node.child("langstring").or_else(|| node.child("string")) {
+            return Some(langstring.text())
+        }
+
+        // Direct text content
+        let text = node.text();
+        if !text.is_empty() {
+            return Some(text)
+        }
+
+        None
+    }
+
+    /// Parse organization element
+    fn parse_organization(&self, node: &XmlNode, version: &ScormSchemaVersion) -> Option<Organization> {
+        let id = node.attribute("identifier")?;
+        let title = node.child("title").map(|n| n.text()).unwrap_or_default();
+
+        let mut org = Organization::new(id, title);
+        org.structure = node.attribute("structure");
+
+        // Parse items
+        for item_node in node.children("item") {
+            if let Some(item) = self.parse_item(&item_node, version) {
+                org.items.push(item);
+            }
+        }
+
+        // Parse sequencing (SCORM 2004)
+        if let Some(seq_node) = node.child("imsss:sequencing") {
+            org.sequencing = Some(self.parse_sequencing(&seq_node));
+        }
+
+        Some(org)
+    }
+
+    /// Parse item element
+    fn parse_item(&self, node: &XmlNode, version: &ScormSchemaVersion) -> Option<Item> {
+        let identifier = node.attribute("identifier")?;
+        let title = node.child("title").map(|n| n.text()).unwrap_or_default();
+
+        let mut item = Item::new(identifier, title);
+        item.identifierref = node.attribute("identifierref");
+        item.is_visible = node.attribute("isvisible")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        item.parameters = node.attribute("parameters");
+
+        // Parse nested items
+        for child_node in node.children("item") {
+            if let Some(child_item) = self.parse_item(&child_node, version) {
+                item.items.push(child_item);
+            }
+        }
+
+        // Parse SCORM 1.2 specific elements
+        if matches!(version, ScormSchemaVersion::Scorm12) {
+            if let Some(maxtimeallowed) = node.child("adlcp:maxtimeallowed") {
+                // Store as time limit
+            }
+            if let Some(timelimitaction) = node.child("adlcp:timelimitaction") {
+                item.time_limit_action = Some(timelimitaction.text());
+            }
+            if let Some(datafromlms) = node.child("adlcp:datafromlms") {
+                item.data_from_lms = Some(datafromlms.text());
+            }
+            if let Some(masteryscore) = node.child("adlcp:masteryscore") {
+                // Store mastery score
+            }
+        }
+
+        // Parse SCORM 2004 specific elements
+        if !matches!(version, ScormSchemaVersion::Scorm12) {
+            // Completion threshold
+            if let Some(threshold_node) = node.child("adlcp:completionThreshold") {
+                item.completion_threshold = Some(CompletionThreshold {
+                    min_progress_measure: threshold_node.attribute("minProgressMeasure")
+                        .and_then(|v| v.parse().ok()),
+                    completed_by_measure: threshold_node.attribute("completedByMeasure")
+                        .map(|v| v.to_lowercase() == "true")
+                        .unwrap_or(false)
+                });
+            }
+
+            // Data from LMS
+            if let Some(data_node) = node.child("adlcp:dataFromLMS") {
+                item.data_from_lms = Some(data_node.text());
+            }
+
+            // Time limit action
+            if let Some(action_node) = node.child("adlcp:timeLimitAction") {
+                item.time_limit_action = Some(action_node.text());
+            }
+
+            // Presentation
+            if let Some(pres_node) = node.child("adlnav:presentation") {
+                let hide_ui: List<String> = pres_node.children("adlnav:navigationInterface")
+                    .flat_map(|ni| ni.children("adlnav:hideLMSUI"))
+                    .map(|h| h.text())
+                    .collect();
+                if !hide_ui.is_empty() {
+                    item.presentation = Some(ItemPresentation { hide_lms_ui: hide_ui });
+                }
+            }
+
+            // Sequencing
+            if let Some(seq_node) = node.child("imsss:sequencing") {
+                item.sequencing = Some(self.parse_sequencing(&seq_node));
+            }
+        }
+
+        Some(item)
+    }
+
+    /// Parse sequencing definition (SCORM 2004)
+    fn parse_sequencing(&self, node: &XmlNode) -> SequencingDefinition {
+        let mut seq = SequencingDefinition::default();
+
+        // Control mode
+        if let Some(control_node) = node.child("imsss:controlMode") {
+            seq.control_mode.choice = control_node.attribute("choice")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(true);
+            seq.control_mode.flow = control_node.attribute("flow")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            seq.control_mode.forward_only = control_node.attribute("forwardOnly")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            seq.control_mode.choice_exit = control_node.attribute("choiceExit")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(true);
+        }
+
+        // Sequencing rules
+        if let Some(rules_node) = node.child("imsss:sequencingRules") {
+            seq.sequencing_rules = self.parse_sequencing_rules(&rules_node);
+        }
+
+        // Limit conditions
+        if let Some(limit_node) = node.child("imsss:limitConditions") {
+            seq.limit_conditions.attempt_limit = limit_node.attribute("attemptLimit")
+                .and_then(|v| v.parse().ok());
+        }
+
+        // Rollup rules
+        if let Some(rollup_node) = node.child("imsss:rollupRules") {
+            seq.rollup_rules = self.parse_rollup_rules(&rollup_node);
+        }
+
+        // Objectives
+        if let Some(objectives_node) = node.child("imsss:objectives") {
+            seq.objectives = self.parse_objectives(&objectives_node);
+        }
+
+        // Delivery controls
+        if let Some(delivery_node) = node.child("imsss:deliveryControls") {
+            seq.delivery_controls.tracked = delivery_node.attribute("tracked")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(true);
+            seq.delivery_controls.completion_set_by_content = delivery_node.attribute("completionSetByContent")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            seq.delivery_controls.objective_set_by_content = delivery_node.attribute("objectiveSetByContent")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+        }
+
+        // Constrain choice
+        if let Some(constrain_node) = node.child("adlseq:constrainedChoiceConsiderations") {
+            seq.constrain_choice = constrain_node.attribute("constrainChoice")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            seq.prevent_activation = constrain_node.attribute("preventActivation")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+        }
+
+        // Randomization
+        if let Some(random_node) = node.child("imsss:randomizationControls") {
+            seq.randomization_controls.randomize_children = random_node.attribute("randomizeChildren")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            seq.randomization_controls.select_count = random_node.attribute("selectCount")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+
+        seq
+    }
+
+    /// Parse sequencing rules
+    fn parse_sequencing_rules(&self, node: &XmlNode) -> SequencingRules {
+        let mut rules = SequencingRules::default();
+
+        for pre_node in node.children("imsss:preConditionRule") {
+            if let Some(rule) = self.parse_sequencing_rule(&pre_node, true) {
+                rules.pre_condition_rules.push(rule);
+            }
+        }
+
+        for post_node in node.children("imsss:postConditionRule") {
+            if let Some(rule) = self.parse_sequencing_rule(&post_node, false) {
+                rules.post_condition_rules.push(rule);
+            }
+        }
+
+        for exit_node in node.children("imsss:exitConditionRule") {
+            if let Some(rule) = self.parse_sequencing_rule(&exit_node, false) {
+                rules.exit_condition_rules.push(rule);
+            }
+        }
+
+        rules
+    }
+
+    /// Parse a single sequencing rule
+    fn parse_sequencing_rule(&self, node: &XmlNode, is_pre: Bool) -> Option<SequencingRule> {
+        let conditions_node = node.child("imsss:ruleConditions")?;
+        let action_node = node.child("imsss:ruleAction")?;
+
+        let conditions = self.parse_rule_conditions(&conditions_node);
+        let action = action_node.attribute("action")
+            .and_then(|a| self.parse_rule_action(&a, is_pre))?;
+
+        Some(SequencingRule {
+            id: generate_uuid(),
+            conditions,
+            action
+        })
+    }
+
+    /// Parse rule conditions
+    fn parse_rule_conditions(&self, node: &XmlNode) -> RuleConditions {
+        let combination = node.attribute("conditionCombination")
+            .map(|c| {
+                if c.to_lowercase() == "any" {
+                    ConditionCombination::Any
+                } else {
+                    ConditionCombination::All
+                }
+            })
+            .unwrap_or(ConditionCombination::All);
+
+        let conditions: List<RuleCondition> = node.children("imsss:ruleCondition")
+            .filter_map(|n| self.parse_rule_condition(&n))
+            .collect();
+
+        RuleConditions {
+            condition_combination: combination,
+            conditions
+        }
+    }
+
+    /// Parse a single rule condition
+    fn parse_rule_condition(&self, node: &XmlNode) -> Option<RuleCondition> {
+        let condition_str = node.attribute("condition")?;
+
+        let condition = match condition_str.as_str() {
+            "satisfied" => ConditionType::Satisfied,
+            "objectiveStatusKnown" => ConditionType::ObjectiveStatusKnown,
+            "objectiveMeasureKnown" => ConditionType::ObjectiveMeasureKnown,
+            "objectiveMeasureGreaterThan" => ConditionType::ObjectiveMeasureGreaterThan,
+            "objectiveMeasureLessThan" => ConditionType::ObjectiveMeasureLessThan,
+            "completed" => ConditionType::Completed,
+            "activityProgressKnown" => ConditionType::ActivityProgressKnown,
+            "attempted" => ConditionType::Attempted,
+            "attemptLimitExceeded" => ConditionType::AttemptLimitExceeded,
+            "timeLimitExceeded" => ConditionType::TimeLimitExceeded,
+            "outsideAvailableTimeRange" => ConditionType::OutsideAvailableTimeRange,
+            "always" => ConditionType::Always,
+            _ => return None
+        };
+
+        Some(RuleCondition {
+            referenced_objective: node.attribute("referencedObjective"),
+            measure_threshold: node.attribute("measureThreshold").and_then(|v| v.parse().ok()),
+            condition,
+            negate: node.attribute("operator")
+                .map(|o| o.to_lowercase() == "not")
+                .unwrap_or(false)
+        })
+    }
+
+    /// Parse rule action
+    fn parse_rule_action(&self, action: &str, is_pre: Bool) -> Option<RuleAction> {
+        match action {
+            // Pre-condition actions
+            "skip" => Some(RuleAction::Skip),
+            "disabled" => Some(RuleAction::Disabled),
+            "hiddenFromChoice" => Some(RuleAction::HiddenFromChoice),
+            "stopForwardTraversal" => Some(RuleAction::StopForwardTraversal),
+
+            // Post-condition actions
+            "exitParent" => Some(RuleAction::ExitParent),
+            "exitAll" => Some(RuleAction::ExitAll),
+            "retry" => Some(RuleAction::Retry),
+            "retryAll" => Some(RuleAction::RetryAll),
+            "continue" => Some(RuleAction::Continue),
+            "previous" => Some(RuleAction::Previous),
+
+            // Exit condition actions
+            "exit" => Some(RuleAction::Exit),
+
+            _ => None
+        }
+    }
+
+    /// Parse rollup rules
+    fn parse_rollup_rules(&self, node: &XmlNode) -> RollupRules {
+        let mut rules = RollupRules::default();
+
+        rules.rollup_objective_satisfied = node.attribute("rollupObjectiveSatisfied")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(true);
+
+        rules.rollup_progress_completion = node.attribute("rollupProgressCompletion")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(true);
+
+        rules.objective_measure_weight = node.attribute("objectiveMeasureWeight")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
+
+        // Parse individual rollup rules
+        for rule_node in node.children("imsss:rollupRule") {
+            if let Some(rule) = self.parse_rollup_rule(&rule_node) {
+                rules.rules.push(rule);
+            }
+        }
+
+        rules
+    }
+
+    /// Parse a single rollup rule
+    fn parse_rollup_rule(&self, node: &XmlNode) -> Option<RollupRule> {
+        let child_set = node.attribute("childActivitySet")
+            .map(|s| match s.as_str() {
+                "all" => ChildActivitySet::All,
+                "any" => ChildActivitySet::Any,
+                "none" => ChildActivitySet::None,
+                "atLeastCount" => ChildActivitySet::AtLeastCount,
+                "atLeastPercent" => ChildActivitySet::AtLeastPercent,
+                _ => ChildActivitySet::All
+            })
+            .unwrap_or(ChildActivitySet::All);
+
+        let conditions_node = node.child("imsss:rollupConditions")?;
+        let action_node = node.child("imsss:rollupAction")?;
+
+        let action = action_node.attribute("action")
+            .and_then(|a| match a.as_str() {
+                "satisfied" => Some(RollupAction::Satisfied),
+                "notSatisfied" => Some(RollupAction::NotSatisfied),
+                "completed" => Some(RollupAction::Completed),
+                "incomplete" => Some(RollupAction::Incomplete),
+                _ => None
+            })?;
+
+        Some(RollupRule {
+            child_activity_set: child_set,
+            minimum_count: node.attribute("minimumCount").and_then(|v| v.parse().ok()),
+            minimum_percent: node.attribute("minimumPercent").and_then(|v| v.parse().ok()),
+            conditions: self.parse_rule_conditions(&conditions_node),
+            action
+        })
+    }
+
+    /// Parse objectives
+    fn parse_objectives(&self, node: &XmlNode) -> List<Objective> {
+        let mut objectives = vec![];
+
+        // Primary objective
+        if let Some(primary_node) = node.child("imsss:primaryObjective") {
+            let mut obj = Objective::new(
+                primary_node.attribute("objectiveID").unwrap_or_else(|| "primary".to_string()),
+                true
+            );
+            obj.satisfied_by_measure = primary_node.attribute("satisfiedByMeasure")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            obj.min_normalized_measure = primary_node.attribute("minNormalizedMeasure")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0);
+
+            // Parse objective maps
+            for map_node in primary_node.children("imsss:mapInfo") {
+                if let Some(target) = map_node.attribute("targetObjectiveID") {
+                    obj.maps.push(ObjectiveMap {
+                        target_objective_id: target,
+                        read_satisfied_status: map_node.attribute("readSatisfiedStatus")
+                            .map(|v| v.to_lowercase() == "true")
+                            .unwrap_or(false),
+                        read_normalized_measure: map_node.attribute("readNormalizedMeasure")
+                            .map(|v| v.to_lowercase() == "true")
+                            .unwrap_or(false),
+                        write_satisfied_status: map_node.attribute("writeSatisfiedStatus")
+                            .map(|v| v.to_lowercase() == "true")
+                            .unwrap_or(false),
+                        write_normalized_measure: map_node.attribute("writeNormalizedMeasure")
+                            .map(|v| v.to_lowercase() == "true")
+                            .unwrap_or(false)
+                    });
+                }
+            }
+
+            objectives.push(obj);
+        }
+
+        // Secondary objectives
+        for obj_node in node.children("imsss:objective") {
+            if let Some(obj_id) = obj_node.attribute("objectiveID") {
+                let mut obj = Objective::new(obj_id, false);
+                obj.satisfied_by_measure = obj_node.attribute("satisfiedByMeasure")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false);
+
+                for map_node in obj_node.children("imsss:mapInfo") {
+                    if let Some(target) = map_node.attribute("targetObjectiveID") {
+                        obj.maps.push(ObjectiveMap {
+                            target_objective_id: target,
+                            read_satisfied_status: map_node.attribute("readSatisfiedStatus")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false),
+                            read_normalized_measure: map_node.attribute("readNormalizedMeasure")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false),
+                            write_satisfied_status: map_node.attribute("writeSatisfiedStatus")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false),
+                            write_normalized_measure: map_node.attribute("writeNormalizedMeasure")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false)
+                        });
+                    }
+                }
+
+                objectives.push(obj);
+            }
+        }
+
+        objectives
+    }
+
+    /// Parse resource element
+    fn parse_resource(&self, node: &XmlNode) -> Option<Resource> {
+        let identifier = node.attribute("identifier")?;
+        let mut resource = Resource::new(identifier);
+
+        resource.resource_type = node.attribute("type")
+            .map(|t| ResourceType::from_string(&t))
+            .unwrap_or(ResourceType::Unknown);
+
+        resource.scorm_type = node.attribute("adlcp:scormType")
+            .or_else(|| node.attribute("scormType"));
+
+        resource.href = node.attribute("href");
+        resource.base = node.attribute("xml:base");
+
+        // Parse files
+        for file_node in node.children("file") {
+            if let Some(href) = file_node.attribute("href") {
+                resource.files.push(ResourceFile { href });
+            }
+        }
+
+        // Parse dependencies
+        for dep_node in node.children("dependency") {
+            if let Some(identifierref) = dep_node.attribute("identifierref") {
+                resource.dependencies.push(identifierref);
+            }
+        }
+
+        Some(resource)
+    }
+
+    /// Validate a parsed package
+    fn validate_package(&self, package: &ScormPackage) -> List<ParseWarning> {
+        let mut warnings = vec![];
+
+        // Check for organizations
+        if package.organizations.is_empty() {
+            warnings.push(ParseWarning {
+                message: "No organizations found in manifest".to_string(),
+                location: Some("organizations".to_string()),
+                code: ParseWarningCode::MissingAttribute
+            });
+        }
+
+        // Check default organization exists
+        if let Some(ref default_id) = package.default_organization {
+            if !package.organizations.iter().any(|o| &o.id == default_id) {
+                warnings.push(ParseWarning {
+                    message: format!("Default organization '{}' not found", default_id),
+                    location: Some("organizations/@default".to_string()),
+                    code: ParseWarningCode::InvalidValue
+                });
+            }
+        }
+
+        // Check item resources exist
+        for org in &package.organizations {
+            self.validate_items(&org.items, package, &mut warnings);
+        }
+
+        // Check for duplicate identifiers
+        let mut seen_ids: Set<String> = Set::new();
+        for (id, _) in &package.resources {
+            if seen_ids.contains(id) {
+                warnings.push(ParseWarning {
+                    message: format!("Duplicate resource identifier: {}", id),
+                    location: Some(format!("resources/resource[@identifier='{}']", id)),
+                    code: ParseWarningCode::DuplicateIdentifier
+                });
+            }
+            seen_ids.insert(id.clone());
+        }
+
+        warnings
+    }
+
+    /// Validate items recursively
+    fn validate_items(&self, items: &List<Item>, package: &ScormPackage, warnings: &mut List<ParseWarning>) {
+        for item in items {
+            // Check resource reference
+            if let Some(ref identifierref) = item.identifierref {
+                if !package.resources.contains_key(identifierref) {
+                    warnings.push(ParseWarning {
+                        message: format!("Resource '{}' referenced by item '{}' not found", identifierref, item.identifier),
+                        location: Some(format!("item[@identifier='{}']/@identifierref", item.identifier)),
+                        code: ParseWarningCode::MissingResource
+                    });
+                }
+            }
+
+            // Recursively check children
+            self.validate_items(&item.items, package, warnings);
+        }
+    }
+
+    /// Get resource URLs
+    fn get_resource_urls(&self, package: &ScormPackage) -> Map<ResourceId, String> {
+        let mut urls = Map::new();
+
+        for (id, resource) in &package.resources {
+            if let Some(ref href) = resource.href {
+                let full_url = if let Some(ref base) = resource.base {
+                    format!("{}/{}/{}", package.base_path, base, href)
+                } else {
+                    format!("{}/{}", package.base_path, href)
+                };
+                urls.insert(id.clone(), full_url);
+            }
+        }
+
+        urls
+    }
+
+    /// Get launch URL for a specific item
+    fn get_launch_url(&self, package: &ScormPackage, item_identifier: &str) -> Option<String> {
+        // Find item in organizations
+        for org in &package.organizations {
+            if let Some(item) = self.find_item_by_id(&org.items, item_identifier) {
+                if let Some(ref identifierref) = item.identifierref {
+                    if let Some(resource) = package.resources.get(identifierref) {
+                        if let Some(ref href) = resource.href {
+                            let base = resource.base.as_ref().map(|b| format!("{}/", b)).unwrap_or_default();
+                            let params = item.parameters.as_ref().map(|p| format!("?{}", p)).unwrap_or_default();
+                            return Some(format!("{}/{}{}{}", package.base_path, base, href, params))
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Find item by identifier recursively
+    fn find_item_by_id<'a>(&self, items: &'a List<Item>, identifier: &str) -> Option<&'a Item> {
+        for item in items {
+            if item.identifier == identifier {
+                return Some(item)
+            }
+            if let Some(found) = self.find_item_by_id(&item.items, identifier) {
+                return Some(found)
+            }
+        }
+        None
+    }
+
+    /// Guess MIME type from file extension
+    fn guess_mime_type(&self, filename: &str) -> Option<String> {
+        let ext = filename.split('.').last()?.to_lowercase();
+        let mime = match ext.as_str() {
+            "html" | "htm" => "text/html",
+            "js" => "application/javascript",
+            "css" => "text/css",
+            "xml" => "application/xml",
+            "json" => "application/json",
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "mp3" => "audio/mpeg",
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "pdf" => "application/pdf",
+            "swf" => "application/x-shockwave-flash",
+            "woff" | "woff2" => "font/woff2",
+            "ttf" => "font/ttf",
+            _ => return None
+        };
+        Some(mime.to_string())
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Generate UUID
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+/// Create package parser
+fn create_package_parser() -> PackageParser {
+    PackageParser::init()
+}
+
+/// Import a SCORM package (convenience function)
+fn import_scorm_package(zip_path: &str, extract_to: &str) -> Result<ScormPackage, ParseError> {
+    let mut parser = PackageParser::init();
+    parser.parse_package(zip_path, extract_to)
+}

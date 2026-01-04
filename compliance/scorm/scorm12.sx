@@ -1,0 +1,1930 @@
+/// Intelligo LMS - SCORM 1.2 Runtime
+///
+/// This module implements the SCORM 1.2 Run-Time Environment (RTE),
+/// including the CMI data model, API functions, and session management.
+/// Based on SCORM 1.2 Runtime Environment specification (ADL).
+
+module intelligo::compliance::scorm::scorm12
+
+use intelligo::core::types::*
+use std::time::{DateTime, Duration, Instant}
+use std::collections::{Map, Set, List}
+
+// =============================================================================
+// SCORM 1.2 IDENTITY TYPES
+// =============================================================================
+
+/// Unique identifier for a SCORM 1.2 session
+type Scorm12SessionId = String
+
+/// Unique identifier for a CMI data record
+type CmiDataId = String
+
+/// Unique identifier for an objective
+type ObjectiveId = String
+
+/// Unique identifier for an interaction
+type InteractionId = String
+
+// =============================================================================
+// SCORM 1.2 ERROR CODES
+// =============================================================================
+
+/// SCORM 1.2 Error Codes (per specification)
+enum Scorm12Error {
+    /// No error
+    NoError,                        // 0
+    /// General exception
+    GeneralException,               // 101
+    /// Invalid argument error
+    InvalidArgumentError,           // 201
+    /// Element cannot have children
+    ElementCannotHaveChildren,      // 202
+    /// Element not an array - cannot have count
+    ElementNotAnArray,              // 203
+    /// Not initialized
+    NotInitialized,                 // 301
+    /// Not implemented error
+    NotImplementedError,            // 401
+    /// Invalid set value, element is a keyword
+    InvalidSetValueKeyword,         // 402
+    /// Element is read only
+    ElementIsReadOnly,              // 403
+    /// Element is write only
+    ElementIsWriteOnly,             // 404
+    /// Incorrect data type
+    IncorrectDataType               // 405
+}
+
+impl Scorm12Error {
+    /// Get the numeric error code
+    fn code(&self) -> String {
+        match self {
+            Scorm12Error::NoError => "0".to_string(),
+            Scorm12Error::GeneralException => "101".to_string(),
+            Scorm12Error::InvalidArgumentError => "201".to_string(),
+            Scorm12Error::ElementCannotHaveChildren => "202".to_string(),
+            Scorm12Error::ElementNotAnArray => "203".to_string(),
+            Scorm12Error::NotInitialized => "301".to_string(),
+            Scorm12Error::NotImplementedError => "401".to_string(),
+            Scorm12Error::InvalidSetValueKeyword => "402".to_string(),
+            Scorm12Error::ElementIsReadOnly => "403".to_string(),
+            Scorm12Error::ElementIsWriteOnly => "404".to_string(),
+            Scorm12Error::IncorrectDataType => "405".to_string()
+        }
+    }
+
+    /// Get error description
+    fn description(&self) -> String {
+        match self {
+            Scorm12Error::NoError => "No error".to_string(),
+            Scorm12Error::GeneralException => "General Exception".to_string(),
+            Scorm12Error::InvalidArgumentError => "Invalid argument error".to_string(),
+            Scorm12Error::ElementCannotHaveChildren => "Element cannot have children".to_string(),
+            Scorm12Error::ElementNotAnArray => "Element not an array - cannot have count".to_string(),
+            Scorm12Error::NotInitialized => "Not initialized".to_string(),
+            Scorm12Error::NotImplementedError => "Not implemented error".to_string(),
+            Scorm12Error::InvalidSetValueKeyword => "Invalid set value, element is a keyword".to_string(),
+            Scorm12Error::ElementIsReadOnly => "Element is read only".to_string(),
+            Scorm12Error::ElementIsWriteOnly => "Element is write only".to_string(),
+            Scorm12Error::IncorrectDataType => "Incorrect Data Type".to_string()
+        }
+    }
+
+    /// Get diagnostic message for extended error info
+    fn diagnostic(&self, element: Option<String>) -> String {
+        match element {
+            Some(el) => format!("{} - Element: {}", self.description(), el),
+            None => self.description()
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - CORE
+// =============================================================================
+
+/// CMI Core data model element
+type CmiCore {
+    /// Identifies the learner (read-only, LMS provided)
+    student_id: String,
+
+    /// Name of the learner (read-only, LMS provided)
+    student_name: String,
+
+    /// Indicates learner's location in the SCO (read/write)
+    lesson_location: Option<String>,
+
+    /// Current learner credit mode (read-only)
+    credit: CmiCredit,
+
+    /// Current completion status of the SCO
+    lesson_status: CmiLessonStatus,
+
+    /// Asserted by SCO if passed/failed is determined
+    entry: CmiEntry,
+
+    /// Cumulative score for the SCO
+    score: CmiScore,
+
+    /// Total time in this attempt
+    total_time: Option<String>,
+
+    /// Current session time
+    session_time: Option<String>,
+
+    /// SCO can request exit behavior
+    exit: CmiExit,
+
+    /// Indicates how learner left SCO last time
+    lesson_mode: CmiLessonMode
+}
+
+/// Credit mode
+enum CmiCredit {
+    Credit,
+    NoCredit
+}
+
+impl CmiCredit {
+    fn to_string(&self) -> String {
+        match self {
+            CmiCredit::Credit => "credit".to_string(),
+            CmiCredit::NoCredit => "no-credit".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> Option<CmiCredit> {
+        match s {
+            "credit" => Some(CmiCredit::Credit),
+            "no-credit" => Some(CmiCredit::NoCredit),
+            _ => None
+        }
+    }
+}
+
+/// Lesson status
+enum CmiLessonStatus {
+    Passed,
+    Completed,
+    Failed,
+    Incomplete,
+    Browsed,
+    NotAttempted
+}
+
+impl CmiLessonStatus {
+    fn to_string(&self) -> String {
+        match self {
+            CmiLessonStatus::Passed => "passed".to_string(),
+            CmiLessonStatus::Completed => "completed".to_string(),
+            CmiLessonStatus::Failed => "failed".to_string(),
+            CmiLessonStatus::Incomplete => "incomplete".to_string(),
+            CmiLessonStatus::Browsed => "browsed".to_string(),
+            CmiLessonStatus::NotAttempted => "not attempted".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> Option<CmiLessonStatus> {
+        match s {
+            "passed" => Some(CmiLessonStatus::Passed),
+            "completed" => Some(CmiLessonStatus::Completed),
+            "failed" => Some(CmiLessonStatus::Failed),
+            "incomplete" => Some(CmiLessonStatus::Incomplete),
+            "browsed" => Some(CmiLessonStatus::Browsed),
+            "not attempted" => Some(CmiLessonStatus::NotAttempted),
+            _ => None
+        }
+    }
+
+    /// Check if this is a completion status
+    fn is_complete(&self) -> Bool {
+        matches!(self, CmiLessonStatus::Passed | CmiLessonStatus::Completed | CmiLessonStatus::Failed)
+    }
+
+    /// Check if this indicates success
+    fn is_successful(&self) -> Bool {
+        matches!(self, CmiLessonStatus::Passed | CmiLessonStatus::Completed)
+    }
+}
+
+/// Entry state
+enum CmiEntry {
+    AbInitio,
+    Resume,
+    Empty
+}
+
+impl CmiEntry {
+    fn to_string(&self) -> String {
+        match self {
+            CmiEntry::AbInitio => "ab-initio".to_string(),
+            CmiEntry::Resume => "resume".to_string(),
+            CmiEntry::Empty => "".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> CmiEntry {
+        match s {
+            "ab-initio" => CmiEntry::AbInitio,
+            "resume" => CmiEntry::Resume,
+            _ => CmiEntry::Empty
+        }
+    }
+}
+
+/// Exit state (write-only)
+enum CmiExit {
+    TimeOut,
+    Suspend,
+    Logout,
+    Empty
+}
+
+impl CmiExit {
+    fn to_string(&self) -> String {
+        match self {
+            CmiExit::TimeOut => "time-out".to_string(),
+            CmiExit::Suspend => "suspend".to_string(),
+            CmiExit::Logout => "logout".to_string(),
+            CmiExit::Empty => "".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> CmiExit {
+        match s {
+            "time-out" => CmiExit::TimeOut,
+            "suspend" => CmiExit::Suspend,
+            "logout" => CmiExit::Logout,
+            _ => CmiExit::Empty
+        }
+    }
+}
+
+/// Lesson mode (read-only)
+enum CmiLessonMode {
+    Browse,
+    Normal,
+    Review
+}
+
+impl CmiLessonMode {
+    fn to_string(&self) -> String {
+        match self {
+            CmiLessonMode::Browse => "browse".to_string(),
+            CmiLessonMode::Normal => "normal".to_string(),
+            CmiLessonMode::Review => "review".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> Option<CmiLessonMode> {
+        match s {
+            "browse" => Some(CmiLessonMode::Browse),
+            "normal" => Some(CmiLessonMode::Normal),
+            "review" => Some(CmiLessonMode::Review),
+            _ => None
+        }
+    }
+}
+
+/// Score data
+type CmiScore {
+    /// Raw score (actual score achieved)
+    raw: Option<f32>,
+
+    /// Minimum possible score
+    min: Option<f32>,
+
+    /// Maximum possible score
+    max: Option<f32>
+}
+
+impl CmiScore {
+    fn new() -> CmiScore {
+        CmiScore {
+            raw: None,
+            min: None,
+            max: None
+        }
+    }
+
+    /// Calculate scaled score (0-1)
+    fn scaled(&self) -> Option<f32> {
+        match (self.raw, self.min, self.max) {
+            (Some(raw), Some(min), Some(max)) if max > min => {
+                Some((raw - min) / (max - min))
+            },
+            (Some(raw), None, Some(max)) if max > 0.0 => {
+                Some(raw / max)
+            },
+            _ => None
+        }
+    }
+
+    /// Calculate percentage score
+    fn percentage(&self) -> Option<f32> {
+        self.scaled().map(|s| s * 100.0)
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - SUSPEND DATA
+// =============================================================================
+
+/// Suspend data for bookmarking
+type CmiSuspendData {
+    /// Free-form data string (max 4096 chars in SCORM 1.2)
+    data: Option<String>
+}
+
+impl CmiSuspendData {
+    fn new() -> CmiSuspendData {
+        CmiSuspendData { data: None }
+    }
+
+    /// Validate suspend data length
+    fn validate(&self) -> Result<(), Scorm12Error> {
+        if let Some(ref data) = self.data {
+            if data.len() > 4096 {
+                return Err(Scorm12Error::IncorrectDataType)
+            }
+        }
+        Ok(())
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - LAUNCH DATA
+// =============================================================================
+
+/// Launch data provided by LMS (read-only)
+type CmiLaunchData {
+    /// Data from manifest dataFromLMS element
+    data: Option<String>
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - COMMENTS
+// =============================================================================
+
+/// Learner comments
+type CmiComments {
+    /// Free-form comments from learner
+    content: Option<String>
+}
+
+/// Comments from LMS (read-only)
+type CmiCommentsFromLms {
+    /// Comments provided by LMS
+    content: Option<String>
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - OBJECTIVES
+// =============================================================================
+
+/// A learning objective tracked by the SCO
+type CmiObjective {
+    /// Unique identifier for this objective
+    id: ObjectiveId,
+
+    /// Score achieved on this objective
+    score: CmiScore,
+
+    /// Status of this objective
+    status: CmiObjectiveStatus
+}
+
+/// Objective status
+enum CmiObjectiveStatus {
+    Passed,
+    Completed,
+    Failed,
+    Incomplete,
+    Browsed,
+    NotAttempted
+}
+
+impl CmiObjectiveStatus {
+    fn to_string(&self) -> String {
+        match self {
+            CmiObjectiveStatus::Passed => "passed".to_string(),
+            CmiObjectiveStatus::Completed => "completed".to_string(),
+            CmiObjectiveStatus::Failed => "failed".to_string(),
+            CmiObjectiveStatus::Incomplete => "incomplete".to_string(),
+            CmiObjectiveStatus::Browsed => "browsed".to_string(),
+            CmiObjectiveStatus::NotAttempted => "not attempted".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> Option<CmiObjectiveStatus> {
+        match s {
+            "passed" => Some(CmiObjectiveStatus::Passed),
+            "completed" => Some(CmiObjectiveStatus::Completed),
+            "failed" => Some(CmiObjectiveStatus::Failed),
+            "incomplete" => Some(CmiObjectiveStatus::Incomplete),
+            "browsed" => Some(CmiObjectiveStatus::Browsed),
+            "not attempted" => Some(CmiObjectiveStatus::NotAttempted),
+            _ => None
+        }
+    }
+}
+
+impl CmiObjective {
+    fn new(id: ObjectiveId) -> CmiObjective {
+        CmiObjective {
+            id,
+            score: CmiScore::new(),
+            status: CmiObjectiveStatus::NotAttempted
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - INTERACTIONS
+// =============================================================================
+
+/// A learner interaction (question/response)
+type CmiInteraction {
+    /// Unique identifier for this interaction
+    id: InteractionId,
+
+    /// Objectives associated with this interaction
+    objectives: List<ObjectiveId>,
+
+    /// Time interaction occurred (format: HH:MM:SS.SS)
+    time: Option<String>,
+
+    /// Type of interaction
+    interaction_type: CmiInteractionType,
+
+    /// Correct response patterns
+    correct_responses: List<String>,
+
+    /// How the interaction was weighted
+    weighting: Option<f32>,
+
+    /// Learner's response
+    student_response: Option<String>,
+
+    /// Result of the interaction
+    result: CmiInteractionResult,
+
+    /// Latency (time to respond)
+    latency: Option<String>
+}
+
+/// Interaction type
+enum CmiInteractionType {
+    TrueFalse,
+    Choice,
+    FillIn,
+    Matching,
+    Performance,
+    Sequencing,
+    Likert,
+    Numeric
+}
+
+impl CmiInteractionType {
+    fn to_string(&self) -> String {
+        match self {
+            CmiInteractionType::TrueFalse => "true-false".to_string(),
+            CmiInteractionType::Choice => "choice".to_string(),
+            CmiInteractionType::FillIn => "fill-in".to_string(),
+            CmiInteractionType::Matching => "matching".to_string(),
+            CmiInteractionType::Performance => "performance".to_string(),
+            CmiInteractionType::Sequencing => "sequencing".to_string(),
+            CmiInteractionType::Likert => "likert".to_string(),
+            CmiInteractionType::Numeric => "numeric".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> Option<CmiInteractionType> {
+        match s {
+            "true-false" => Some(CmiInteractionType::TrueFalse),
+            "choice" => Some(CmiInteractionType::Choice),
+            "fill-in" => Some(CmiInteractionType::FillIn),
+            "matching" => Some(CmiInteractionType::Matching),
+            "performance" => Some(CmiInteractionType::Performance),
+            "sequencing" => Some(CmiInteractionType::Sequencing),
+            "likert" => Some(CmiInteractionType::Likert),
+            "numeric" => Some(CmiInteractionType::Numeric),
+            _ => None
+        }
+    }
+}
+
+/// Interaction result
+enum CmiInteractionResult {
+    Correct,
+    Wrong,
+    Unanticipated,
+    Neutral,
+    Numeric { value: f32 }
+}
+
+impl CmiInteractionResult {
+    fn to_string(&self) -> String {
+        match self {
+            CmiInteractionResult::Correct => "correct".to_string(),
+            CmiInteractionResult::Wrong => "wrong".to_string(),
+            CmiInteractionResult::Unanticipated => "unanticipated".to_string(),
+            CmiInteractionResult::Neutral => "neutral".to_string(),
+            CmiInteractionResult::Numeric { value } => value.to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> CmiInteractionResult {
+        match s {
+            "correct" => CmiInteractionResult::Correct,
+            "wrong" => CmiInteractionResult::Wrong,
+            "unanticipated" => CmiInteractionResult::Unanticipated,
+            "neutral" => CmiInteractionResult::Neutral,
+            _ => {
+                if let Ok(value) = s.parse::<f32>() {
+                    CmiInteractionResult::Numeric { value }
+                } else {
+                    CmiInteractionResult::Neutral
+                }
+            }
+        }
+    }
+}
+
+impl CmiInteraction {
+    fn new(id: InteractionId) -> CmiInteraction {
+        CmiInteraction {
+            id,
+            objectives: vec![],
+            time: None,
+            interaction_type: CmiInteractionType::Choice,
+            correct_responses: vec![],
+            weighting: None,
+            student_response: None,
+            result: CmiInteractionResult::Neutral,
+            latency: None
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - STUDENT DATA
+// =============================================================================
+
+/// Student data (read-only, LMS provided)
+type CmiStudentData {
+    /// Mastery score required
+    mastery_score: Option<f32>,
+
+    /// Maximum time allowed
+    max_time_allowed: Option<String>,
+
+    /// Time limit action
+    time_limit_action: CmiTimeLimitAction
+}
+
+/// Time limit action
+enum CmiTimeLimitAction {
+    ExitMessage,
+    ExitNoMessage,
+    ContinueMessage,
+    ContinueNoMessage
+}
+
+impl CmiTimeLimitAction {
+    fn to_string(&self) -> String {
+        match self {
+            CmiTimeLimitAction::ExitMessage => "exit,message".to_string(),
+            CmiTimeLimitAction::ExitNoMessage => "exit,no message".to_string(),
+            CmiTimeLimitAction::ContinueMessage => "continue,message".to_string(),
+            CmiTimeLimitAction::ContinueNoMessage => "continue,no message".to_string()
+        }
+    }
+
+    fn from_string(s: &str) -> CmiTimeLimitAction {
+        match s {
+            "exit,message" => CmiTimeLimitAction::ExitMessage,
+            "exit,no message" => CmiTimeLimitAction::ExitNoMessage,
+            "continue,message" => CmiTimeLimitAction::ContinueMessage,
+            "continue,no message" => CmiTimeLimitAction::ContinueNoMessage,
+            _ => CmiTimeLimitAction::ContinueNoMessage
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 CMI DATA MODEL - STUDENT PREFERENCE
+// =============================================================================
+
+/// Student preferences
+type CmiStudentPreference {
+    /// Audio volume (0-100)
+    audio: Option<i32>,
+
+    /// Language preference
+    language: Option<String>,
+
+    /// Playback speed (-100 to 100)
+    speed: Option<i32>,
+
+    /// Text display preference (-1, 0, 1)
+    text: Option<i32>
+}
+
+impl CmiStudentPreference {
+    fn new() -> CmiStudentPreference {
+        CmiStudentPreference {
+            audio: None,
+            language: None,
+            speed: None,
+            text: None
+        }
+    }
+}
+
+// =============================================================================
+// COMPLETE CMI DATA MODEL
+// =============================================================================
+
+/// Complete CMI data model for SCORM 1.2
+type CmiDataModel {
+    /// Core data elements
+    core: CmiCore,
+
+    /// Suspend data for bookmarking
+    suspend_data: CmiSuspendData,
+
+    /// Launch data from LMS
+    launch_data: CmiLaunchData,
+
+    /// Learner comments
+    comments: CmiComments,
+
+    /// Comments from LMS
+    comments_from_lms: CmiCommentsFromLms,
+
+    /// Learning objectives
+    objectives: List<CmiObjective>,
+
+    /// Learner interactions
+    interactions: List<CmiInteraction>,
+
+    /// Student data from LMS
+    student_data: CmiStudentData,
+
+    /// Student preferences
+    student_preference: CmiStudentPreference
+}
+
+impl CmiDataModel {
+    /// Create new CMI data model with initial values
+    fn new(
+        student_id: String,
+        student_name: String,
+        lesson_mode: CmiLessonMode,
+        credit: CmiCredit
+    ) -> CmiDataModel {
+        CmiDataModel {
+            core: CmiCore {
+                student_id,
+                student_name,
+                lesson_location: None,
+                credit,
+                lesson_status: CmiLessonStatus::NotAttempted,
+                entry: CmiEntry::AbInitio,
+                score: CmiScore::new(),
+                total_time: Some("0000:00:00.00".to_string()),
+                session_time: None,
+                exit: CmiExit::Empty,
+                lesson_mode
+            },
+            suspend_data: CmiSuspendData::new(),
+            launch_data: CmiLaunchData { data: None },
+            comments: CmiComments { content: None },
+            comments_from_lms: CmiCommentsFromLms { content: None },
+            objectives: vec![],
+            interactions: vec![],
+            student_data: CmiStudentData {
+                mastery_score: None,
+                max_time_allowed: None,
+                time_limit_action: CmiTimeLimitAction::ContinueNoMessage
+            },
+            student_preference: CmiStudentPreference::new()
+        }
+    }
+
+    /// Initialize for resume (returning learner)
+    fn init_for_resume(&mut self, previous_data: &CmiDataModel) {
+        self.core.entry = CmiEntry::Resume;
+        self.core.lesson_location = previous_data.core.lesson_location.clone();
+        self.core.total_time = previous_data.core.total_time.clone();
+        self.suspend_data = CmiSuspendData {
+            data: previous_data.suspend_data.data.clone()
+        };
+        self.objectives = previous_data.objectives.clone();
+        self.core.lesson_status = previous_data.core.lesson_status.clone();
+        self.core.score = previous_data.core.score.clone();
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 SESSION
+// =============================================================================
+
+/// Active SCORM 1.2 session
+type Scorm12Session {
+    /// Session identifier
+    id: Scorm12SessionId,
+
+    /// User ID
+    user_id: UserId,
+
+    /// SCO identifier
+    sco_id: String,
+
+    /// Package ID
+    package_id: ScormPackageId,
+
+    /// Enrollment ID
+    enrollment_id: EnrollmentId,
+
+    /// CMI data model
+    cmi: CmiDataModel,
+
+    /// Session state
+    state: Scorm12SessionState,
+
+    /// Last error
+    last_error: Scorm12Error,
+
+    /// Error diagnostic info
+    error_diagnostic: Option<String>,
+
+    /// Session start time
+    started_at: DateTime,
+
+    /// Last activity time
+    last_activity_at: DateTime,
+
+    /// Number of LMS API calls
+    api_call_count: i64,
+
+    /// Dirty flag (data changed since last commit)
+    is_dirty: Bool
+}
+
+/// Session state
+enum Scorm12SessionState {
+    /// Not yet initialized
+    NotInitialized,
+    /// Active session
+    Initialized,
+    /// Session terminated
+    Terminated
+}
+
+impl Scorm12Session {
+    fn new(
+        user_id: UserId,
+        sco_id: String,
+        package_id: ScormPackageId,
+        enrollment_id: EnrollmentId,
+        student_name: String,
+        lesson_mode: CmiLessonMode,
+        credit: CmiCredit
+    ) -> Scorm12Session {
+        let now = DateTime::now();
+        Scorm12Session {
+            id: format!("scorm12_session_{}", generate_uuid()),
+            user_id: user_id.clone(),
+            sco_id,
+            package_id,
+            enrollment_id,
+            cmi: CmiDataModel::new(user_id, student_name, lesson_mode, credit),
+            state: Scorm12SessionState::NotInitialized,
+            last_error: Scorm12Error::NoError,
+            error_diagnostic: None,
+            started_at: now,
+            last_activity_at: now,
+            api_call_count: 0,
+            is_dirty: false
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 API RESULT
+// =============================================================================
+
+/// Result of SCORM API call
+type Scorm12ApiResult {
+    /// Return value ("true"/"false" for most calls)
+    value: String,
+
+    /// Error code
+    error: Scorm12Error,
+
+    /// Diagnostic message
+    diagnostic: Option<String>
+}
+
+impl Scorm12ApiResult {
+    fn success() -> Scorm12ApiResult {
+        Scorm12ApiResult {
+            value: "true".to_string(),
+            error: Scorm12Error::NoError,
+            diagnostic: None
+        }
+    }
+
+    fn success_value(value: String) -> Scorm12ApiResult {
+        Scorm12ApiResult {
+            value,
+            error: Scorm12Error::NoError,
+            diagnostic: None
+        }
+    }
+
+    fn error(error: Scorm12Error, diagnostic: Option<String>) -> Scorm12ApiResult {
+        Scorm12ApiResult {
+            value: "false".to_string(),
+            error,
+            diagnostic
+        }
+    }
+
+    fn empty_value(error: Scorm12Error, diagnostic: Option<String>) -> Scorm12ApiResult {
+        Scorm12ApiResult {
+            value: "".to_string(),
+            error,
+            diagnostic
+        }
+    }
+}
+
+// =============================================================================
+// SCORM 1.2 DATA MODEL ELEMENT METADATA
+// =============================================================================
+
+/// Metadata about a CMI data model element
+type CmiElementMetadata {
+    /// Full element path (e.g., "cmi.core.student_id")
+    path: String,
+
+    /// Whether element is readable
+    readable: Bool,
+
+    /// Whether element is writable
+    writable: Bool,
+
+    /// Data type
+    data_type: CmiDataType,
+
+    /// Maximum length (for strings)
+    max_length: Option<i32>,
+
+    /// Vocabulary (allowed values)
+    vocabulary: Option<List<String>>
+}
+
+/// CMI data types
+enum CmiDataType {
+    CMIString255,
+    CMIString4096,
+    CMIIdentifier,
+    CMIInteger,
+    CMIDecimal,
+    CMITimespan,
+    CMITime,
+    CMIBlank,
+    CMIVocabulary
+}
+
+// =============================================================================
+// TIME UTILITIES
+// =============================================================================
+
+/// Parse SCORM 1.2 timespan format (HHHH:MM:SS.SS)
+fn parse_timespan(timespan: &str) -> Option<Duration> {
+    let parts: List<&str> = timespan.split(':').collect();
+    if parts.len() != 3 {
+        return None
+    }
+
+    let hours: i64 = parts[0].parse().ok()?;
+    let minutes: i64 = parts[1].parse().ok()?;
+
+    let seconds_parts: List<&str> = parts[2].split('.').collect();
+    let seconds: i64 = seconds_parts[0].parse().ok()?;
+    let centiseconds: i64 = if seconds_parts.len() > 1 {
+        seconds_parts[1].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let total_ms = (hours * 3600 + minutes * 60 + seconds) * 1000 + centiseconds * 10;
+    Some(Duration::from_millis(total_ms))
+}
+
+/// Format duration as SCORM 1.2 timespan (HHHH:MM:SS.SS)
+fn format_timespan(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let centiseconds = (duration.subsec_millis() / 10) as i64;
+
+    format!("{:04}:{:02}:{:02}.{:02}", hours, minutes, seconds, centiseconds)
+}
+
+/// Add two timespans and return result
+fn add_timespans(time1: &str, time2: &str) -> Option<String> {
+    let d1 = parse_timespan(time1)?;
+    let d2 = parse_timespan(time2)?;
+    Some(format_timespan(d1 + d2))
+}
+
+// =============================================================================
+// SCORM 1.2 RUNTIME ACTOR
+// =============================================================================
+
+/// Messages for ScormRuntime12 actor
+enum Scorm12Message {
+    /// Initialize a new session
+    CreateSession {
+        user_id: UserId,
+        sco_id: String,
+        package_id: ScormPackageId,
+        enrollment_id: EnrollmentId,
+        student_name: String,
+        lesson_mode: CmiLessonMode,
+        credit: CmiCredit,
+        reply_to: Actor<Scorm12SessionId>
+    },
+
+    /// Load previous session data for resume
+    LoadPreviousSession {
+        session_id: Scorm12SessionId,
+        reply_to: Actor<Option<CmiDataModel>>
+    },
+
+    /// LMSInitialize
+    Initialize {
+        session_id: Scorm12SessionId,
+        param: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSFinish
+    Finish {
+        session_id: Scorm12SessionId,
+        param: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSGetValue
+    GetValue {
+        session_id: Scorm12SessionId,
+        element: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSSetValue
+    SetValue {
+        session_id: Scorm12SessionId,
+        element: String,
+        value: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSCommit
+    Commit {
+        session_id: Scorm12SessionId,
+        param: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSGetLastError
+    GetLastError {
+        session_id: Scorm12SessionId,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSGetErrorString
+    GetErrorString {
+        session_id: Scorm12SessionId,
+        error_code: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// LMSGetDiagnostic
+    GetDiagnostic {
+        session_id: Scorm12SessionId,
+        param: String,
+        reply_to: Actor<Scorm12ApiResult>
+    },
+
+    /// Get session data
+    GetSession {
+        session_id: Scorm12SessionId,
+        reply_to: Actor<Option<Scorm12Session>>
+    },
+
+    /// Persist session data to storage
+    PersistSession {
+        session_id: Scorm12SessionId,
+        reply_to: Actor<Result<(), String>>
+    }
+}
+
+/// SCORM 1.2 Runtime actor state
+type Scorm12RuntimeState {
+    /// Active sessions
+    sessions: Map<Scorm12SessionId, Scorm12Session>,
+
+    /// Persisted session data (for resume)
+    persisted_data: Map<String, CmiDataModel>, // key: user_id + sco_id
+
+    /// CMI element metadata
+    element_metadata: Map<String, CmiElementMetadata>
+}
+
+/// SCORM 1.2 Runtime actor
+actor ScormRuntime12 {
+    state: Scorm12RuntimeState,
+
+    /// Initialize the runtime
+    fn init() -> ScormRuntime12 {
+        ScormRuntime12 {
+            state: Scorm12RuntimeState {
+                sessions: Map::new(),
+                persisted_data: Map::new(),
+                element_metadata: build_element_metadata()
+            }
+        }
+    }
+
+    /// Handle incoming messages
+    fn receive(&mut self, msg: Scorm12Message) {
+        match msg {
+            Scorm12Message::CreateSession {
+                user_id, sco_id, package_id, enrollment_id,
+                student_name, lesson_mode, credit, reply_to
+            } => {
+                let session = Scorm12Session::new(
+                    user_id.clone(),
+                    sco_id.clone(),
+                    package_id,
+                    enrollment_id,
+                    student_name,
+                    lesson_mode,
+                    credit
+                );
+
+                // Check for previous data to resume
+                let persist_key = format!("{}_{}", user_id, sco_id);
+                if let Some(previous) = self.state.persisted_data.get(&persist_key) {
+                    session.cmi.init_for_resume(previous);
+                }
+
+                let session_id = session.id.clone();
+                self.state.sessions.insert(session_id.clone(), session);
+                reply_to.send(session_id);
+            },
+
+            Scorm12Message::LoadPreviousSession { session_id, reply_to } => {
+                let result = self.state.sessions.get(&session_id)
+                    .map(|s| {
+                        let key = format!("{}_{}", s.user_id, s.sco_id);
+                        self.state.persisted_data.get(&key).cloned()
+                    })
+                    .flatten();
+                reply_to.send(result);
+            },
+
+            Scorm12Message::Initialize { session_id, param, reply_to } => {
+                let result = self.lms_initialize(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::Finish { session_id, param, reply_to } => {
+                let result = self.lms_finish(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::GetValue { session_id, element, reply_to } => {
+                let result = self.lms_get_value(&session_id, &element);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::SetValue { session_id, element, value, reply_to } => {
+                let result = self.lms_set_value(&session_id, &element, &value);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::Commit { session_id, param, reply_to } => {
+                let result = self.lms_commit(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::GetLastError { session_id, reply_to } => {
+                let result = self.lms_get_last_error(&session_id);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::GetErrorString { session_id, error_code, reply_to } => {
+                let result = self.lms_get_error_string(&error_code);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::GetDiagnostic { session_id, param, reply_to } => {
+                let result = self.lms_get_diagnostic(&session_id, &param);
+                reply_to.send(result);
+            },
+
+            Scorm12Message::GetSession { session_id, reply_to } => {
+                let session = self.state.sessions.get(&session_id).cloned();
+                reply_to.send(session);
+            },
+
+            Scorm12Message::PersistSession { session_id, reply_to } => {
+                let result = self.persist_session(&session_id);
+                reply_to.send(result);
+            }
+        }
+    }
+
+    // =========================================================================
+    // SCORM 1.2 API IMPLEMENTATIONS
+    // =========================================================================
+
+    /// LMSInitialize("") - Initialize communication
+    fn lms_initialize(&mut self, session_id: &Scorm12SessionId, param: &str) -> Scorm12ApiResult {
+        // Parameter must be empty string
+        if !param.is_empty() {
+            return Scorm12ApiResult::error(
+                Scorm12Error::InvalidArgumentError,
+                Some("LMSInitialize parameter must be empty string".to_string())
+            )
+        }
+
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm12ApiResult::error(
+                Scorm12Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm12SessionState::Initialized => {
+                session.last_error = Scorm12Error::GeneralException;
+                session.error_diagnostic = Some("Already initialized".to_string());
+                Scorm12ApiResult::error(
+                    Scorm12Error::GeneralException,
+                    Some("Already initialized".to_string())
+                )
+            },
+            Scorm12SessionState::Terminated => {
+                session.last_error = Scorm12Error::GeneralException;
+                session.error_diagnostic = Some("Session already terminated".to_string());
+                Scorm12ApiResult::error(
+                    Scorm12Error::GeneralException,
+                    Some("Session already terminated".to_string())
+                )
+            },
+            Scorm12SessionState::NotInitialized => {
+                session.state = Scorm12SessionState::Initialized;
+                session.last_error = Scorm12Error::NoError;
+                session.error_diagnostic = None;
+                Scorm12ApiResult::success()
+            }
+        }
+    }
+
+    /// LMSFinish("") - Terminate communication
+    fn lms_finish(&mut self, session_id: &Scorm12SessionId, param: &str) -> Scorm12ApiResult {
+        if !param.is_empty() {
+            return Scorm12ApiResult::error(
+                Scorm12Error::InvalidArgumentError,
+                Some("LMSFinish parameter must be empty string".to_string())
+            )
+        }
+
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm12ApiResult::error(
+                Scorm12Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        match session.state {
+            Scorm12SessionState::NotInitialized => {
+                session.last_error = Scorm12Error::NotInitialized;
+                Scorm12ApiResult::error(Scorm12Error::NotInitialized, None)
+            },
+            Scorm12SessionState::Terminated => {
+                session.last_error = Scorm12Error::GeneralException;
+                session.error_diagnostic = Some("Already terminated".to_string());
+                Scorm12ApiResult::error(
+                    Scorm12Error::GeneralException,
+                    Some("Already terminated".to_string())
+                )
+            },
+            Scorm12SessionState::Initialized => {
+                // Update total time
+                if let Some(session_time) = &session.cmi.core.session_time {
+                    if let Some(total) = &session.cmi.core.total_time {
+                        session.cmi.core.total_time = add_timespans(total, session_time);
+                    }
+                }
+
+                // Persist data if exit is suspend
+                if matches!(session.cmi.core.exit, CmiExit::Suspend) {
+                    let persist_key = format!("{}_{}", session.user_id, session.sco_id);
+                    self.state.persisted_data.insert(persist_key, session.cmi.clone());
+                }
+
+                session.state = Scorm12SessionState::Terminated;
+                session.last_error = Scorm12Error::NoError;
+                Scorm12ApiResult::success()
+            }
+        }
+    }
+
+    /// LMSGetValue(element) - Get data model element value
+    fn lms_get_value(&mut self, session_id: &Scorm12SessionId, element: &str) -> Scorm12ApiResult {
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm12ApiResult::empty_value(
+                Scorm12Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        // Check initialization
+        if !matches!(session.state, Scorm12SessionState::Initialized) {
+            session.last_error = Scorm12Error::NotInitialized;
+            return Scorm12ApiResult::empty_value(Scorm12Error::NotInitialized, None)
+        }
+
+        // Get value based on element path
+        let result = self.get_cmi_value(&session.cmi, element);
+
+        match result {
+            Ok(value) => {
+                session.last_error = Scorm12Error::NoError;
+                Scorm12ApiResult::success_value(value)
+            },
+            Err(error) => {
+                session.last_error = error.clone();
+                session.error_diagnostic = Some(format!("Element: {}", element));
+                Scorm12ApiResult::empty_value(error, Some(element.to_string()))
+            }
+        }
+    }
+
+    /// LMSSetValue(element, value) - Set data model element value
+    fn lms_set_value(&mut self, session_id: &Scorm12SessionId, element: &str, value: &str) -> Scorm12ApiResult {
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm12ApiResult::error(
+                Scorm12Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        // Check initialization
+        if !matches!(session.state, Scorm12SessionState::Initialized) {
+            session.last_error = Scorm12Error::NotInitialized;
+            return Scorm12ApiResult::error(Scorm12Error::NotInitialized, None)
+        }
+
+        // Set value based on element path
+        let result = self.set_cmi_value(&mut session.cmi, element, value);
+
+        match result {
+            Ok(()) => {
+                session.last_error = Scorm12Error::NoError;
+                session.is_dirty = true;
+                Scorm12ApiResult::success()
+            },
+            Err(error) => {
+                session.last_error = error.clone();
+                session.error_diagnostic = Some(format!("Element: {}, Value: {}", element, value));
+                Scorm12ApiResult::error(error, Some(element.to_string()))
+            }
+        }
+    }
+
+    /// LMSCommit("") - Persist data
+    fn lms_commit(&mut self, session_id: &Scorm12SessionId, param: &str) -> Scorm12ApiResult {
+        if !param.is_empty() {
+            return Scorm12ApiResult::error(
+                Scorm12Error::InvalidArgumentError,
+                Some("LMSCommit parameter must be empty string".to_string())
+            )
+        }
+
+        let session = match self.state.sessions.get_mut(session_id) {
+            Some(s) => s,
+            None => return Scorm12ApiResult::error(
+                Scorm12Error::GeneralException,
+                Some("Session not found".to_string())
+            )
+        };
+
+        session.api_call_count += 1;
+        session.last_activity_at = DateTime::now();
+
+        if !matches!(session.state, Scorm12SessionState::Initialized) {
+            session.last_error = Scorm12Error::NotInitialized;
+            return Scorm12ApiResult::error(Scorm12Error::NotInitialized, None)
+        }
+
+        // Persist data to storage
+        let persist_key = format!("{}_{}", session.user_id, session.sco_id);
+        self.state.persisted_data.insert(persist_key, session.cmi.clone());
+        session.is_dirty = false;
+        session.last_error = Scorm12Error::NoError;
+
+        Scorm12ApiResult::success()
+    }
+
+    /// LMSGetLastError() - Get last error code
+    fn lms_get_last_error(&self, session_id: &Scorm12SessionId) -> Scorm12ApiResult {
+        match self.state.sessions.get(session_id) {
+            Some(session) => Scorm12ApiResult::success_value(session.last_error.code()),
+            None => Scorm12ApiResult::success_value("0".to_string())
+        }
+    }
+
+    /// LMSGetErrorString(errorCode) - Get error description
+    fn lms_get_error_string(&self, error_code: &str) -> Scorm12ApiResult {
+        let error = match error_code {
+            "0" => Scorm12Error::NoError,
+            "101" => Scorm12Error::GeneralException,
+            "201" => Scorm12Error::InvalidArgumentError,
+            "202" => Scorm12Error::ElementCannotHaveChildren,
+            "203" => Scorm12Error::ElementNotAnArray,
+            "301" => Scorm12Error::NotInitialized,
+            "401" => Scorm12Error::NotImplementedError,
+            "402" => Scorm12Error::InvalidSetValueKeyword,
+            "403" => Scorm12Error::ElementIsReadOnly,
+            "404" => Scorm12Error::ElementIsWriteOnly,
+            "405" => Scorm12Error::IncorrectDataType,
+            _ => return Scorm12ApiResult::success_value("".to_string())
+        };
+
+        Scorm12ApiResult::success_value(error.description())
+    }
+
+    /// LMSGetDiagnostic(param) - Get diagnostic info
+    fn lms_get_diagnostic(&self, session_id: &Scorm12SessionId, param: &str) -> Scorm12ApiResult {
+        match self.state.sessions.get(session_id) {
+            Some(session) => {
+                let diagnostic = session.error_diagnostic.clone()
+                    .unwrap_or_else(|| session.last_error.description());
+                Scorm12ApiResult::success_value(diagnostic)
+            },
+            None => Scorm12ApiResult::success_value("No session".to_string())
+        }
+    }
+
+    // =========================================================================
+    // CMI DATA MODEL ACCESS
+    // =========================================================================
+
+    /// Get CMI value by element path
+    fn get_cmi_value(&self, cmi: &CmiDataModel, element: &str) -> Result<String, Scorm12Error> {
+        match element {
+            // Core elements (mostly read-only)
+            "cmi.core.student_id" => Ok(cmi.core.student_id.clone()),
+            "cmi.core.student_name" => Ok(cmi.core.student_name.clone()),
+            "cmi.core.lesson_location" => Ok(cmi.core.lesson_location.clone().unwrap_or_default()),
+            "cmi.core.credit" => Ok(cmi.core.credit.to_string()),
+            "cmi.core.lesson_status" => Ok(cmi.core.lesson_status.to_string()),
+            "cmi.core.entry" => Ok(cmi.core.entry.to_string()),
+            "cmi.core.score.raw" => Ok(cmi.core.score.raw.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.core.score.min" => Ok(cmi.core.score.min.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.core.score.max" => Ok(cmi.core.score.max.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.core.score._children" => Ok("raw,min,max".to_string()),
+            "cmi.core.total_time" => Ok(cmi.core.total_time.clone().unwrap_or_default()),
+            "cmi.core.lesson_mode" => Ok(cmi.core.lesson_mode.to_string()),
+            "cmi.core.exit" => Err(Scorm12Error::ElementIsWriteOnly),
+            "cmi.core.session_time" => Err(Scorm12Error::ElementIsWriteOnly),
+            "cmi.core._children" => Ok("student_id,student_name,lesson_location,credit,lesson_status,entry,score,total_time,lesson_mode,exit,session_time".to_string()),
+
+            // Suspend data
+            "cmi.suspend_data" => Ok(cmi.suspend_data.data.clone().unwrap_or_default()),
+
+            // Launch data (read-only)
+            "cmi.launch_data" => Ok(cmi.launch_data.data.clone().unwrap_or_default()),
+
+            // Comments
+            "cmi.comments" => Ok(cmi.comments.content.clone().unwrap_or_default()),
+            "cmi.comments_from_lms" => Ok(cmi.comments_from_lms.content.clone().unwrap_or_default()),
+
+            // Objectives
+            "cmi.objectives._count" => Ok(cmi.objectives.len().to_string()),
+            "cmi.objectives._children" => Ok("id,score,status".to_string()),
+
+            // Interactions
+            "cmi.interactions._count" => Ok(cmi.interactions.len().to_string()),
+            "cmi.interactions._children" => Ok("id,objectives,time,type,correct_responses,weighting,student_response,result,latency".to_string()),
+
+            // Student data (read-only)
+            "cmi.student_data.mastery_score" => Ok(cmi.student_data.mastery_score.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.student_data.max_time_allowed" => Ok(cmi.student_data.max_time_allowed.clone().unwrap_or_default()),
+            "cmi.student_data.time_limit_action" => Ok(cmi.student_data.time_limit_action.to_string()),
+            "cmi.student_data._children" => Ok("mastery_score,max_time_allowed,time_limit_action".to_string()),
+
+            // Student preference
+            "cmi.student_preference.audio" => Ok(cmi.student_preference.audio.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.student_preference.language" => Ok(cmi.student_preference.language.clone().unwrap_or_default()),
+            "cmi.student_preference.speed" => Ok(cmi.student_preference.speed.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.student_preference.text" => Ok(cmi.student_preference.text.map(|v| v.to_string()).unwrap_or_default()),
+            "cmi.student_preference._children" => Ok("audio,language,speed,text".to_string()),
+
+            // Version
+            "cmi._version" => Ok("3.4".to_string()),
+            "cmi._children" => Ok("core,suspend_data,launch_data,comments,comments_from_lms,objectives,student_data,student_preference,interactions".to_string()),
+
+            _ => {
+                // Handle indexed elements (objectives.n.*, interactions.n.*)
+                if element.starts_with("cmi.objectives.") {
+                    return self.get_objective_value(cmi, element)
+                }
+                if element.starts_with("cmi.interactions.") {
+                    return self.get_interaction_value(cmi, element)
+                }
+                Err(Scorm12Error::NotImplementedError)
+            }
+        }
+    }
+
+    /// Get objective value by indexed path
+    fn get_objective_value(&self, cmi: &CmiDataModel, element: &str) -> Result<String, Scorm12Error> {
+        // Parse cmi.objectives.n.element
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm12Error::InvalidArgumentError)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm12Error::InvalidArgumentError)?;
+        if index >= cmi.objectives.len() {
+            return Err(Scorm12Error::InvalidArgumentError)
+        }
+
+        let objective = &cmi.objectives[index];
+        match parts[3] {
+            "id" => Ok(objective.id.clone()),
+            "score" if parts.len() > 4 => match parts[4] {
+                "raw" => Ok(objective.score.raw.map(|v| v.to_string()).unwrap_or_default()),
+                "min" => Ok(objective.score.min.map(|v| v.to_string()).unwrap_or_default()),
+                "max" => Ok(objective.score.max.map(|v| v.to_string()).unwrap_or_default()),
+                "_children" => Ok("raw,min,max".to_string()),
+                _ => Err(Scorm12Error::InvalidArgumentError)
+            },
+            "status" => Ok(objective.status.to_string()),
+            _ => Err(Scorm12Error::InvalidArgumentError)
+        }
+    }
+
+    /// Get interaction value by indexed path
+    fn get_interaction_value(&self, cmi: &CmiDataModel, element: &str) -> Result<String, Scorm12Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm12Error::InvalidArgumentError)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm12Error::InvalidArgumentError)?;
+        if index >= cmi.interactions.len() {
+            return Err(Scorm12Error::InvalidArgumentError)
+        }
+
+        let interaction = &cmi.interactions[index];
+        match parts[3] {
+            "id" => Err(Scorm12Error::ElementIsWriteOnly),
+            "objectives" if parts.len() > 4 => {
+                if parts[4] == "_count" {
+                    Ok(interaction.objectives.len().to_string())
+                } else {
+                    Err(Scorm12Error::ElementIsWriteOnly)
+                }
+            },
+            "time" => Err(Scorm12Error::ElementIsWriteOnly),
+            "type" => Err(Scorm12Error::ElementIsWriteOnly),
+            "correct_responses" if parts.len() > 4 => {
+                if parts[4] == "_count" {
+                    Ok(interaction.correct_responses.len().to_string())
+                } else {
+                    Err(Scorm12Error::ElementIsWriteOnly)
+                }
+            },
+            "weighting" => Err(Scorm12Error::ElementIsWriteOnly),
+            "student_response" => Err(Scorm12Error::ElementIsWriteOnly),
+            "result" => Err(Scorm12Error::ElementIsWriteOnly),
+            "latency" => Err(Scorm12Error::ElementIsWriteOnly),
+            _ => Err(Scorm12Error::InvalidArgumentError)
+        }
+    }
+
+    /// Set CMI value by element path
+    fn set_cmi_value(&self, cmi: &mut CmiDataModel, element: &str, value: &str) -> Result<(), Scorm12Error> {
+        match element {
+            // Read-only core elements
+            "cmi.core.student_id" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.core.student_name" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.core.credit" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.core.entry" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.core.total_time" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.core.lesson_mode" => Err(Scorm12Error::ElementIsReadOnly),
+
+            // Writable core elements
+            "cmi.core.lesson_location" => {
+                if value.len() > 255 {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.core.lesson_location = Some(value.to_string());
+                Ok(())
+            },
+            "cmi.core.lesson_status" => {
+                cmi.core.lesson_status = CmiLessonStatus::from_string(value)
+                    .ok_or(Scorm12Error::IncorrectDataType)?;
+                Ok(())
+            },
+            "cmi.core.score.raw" => {
+                cmi.core.score.raw = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                Ok(())
+            },
+            "cmi.core.score.min" => {
+                cmi.core.score.min = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                Ok(())
+            },
+            "cmi.core.score.max" => {
+                cmi.core.score.max = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                Ok(())
+            },
+            "cmi.core.exit" => {
+                cmi.core.exit = CmiExit::from_string(value);
+                Ok(())
+            },
+            "cmi.core.session_time" => {
+                // Validate timespan format
+                if parse_timespan(value).is_none() {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.core.session_time = Some(value.to_string());
+                Ok(())
+            },
+
+            // Suspend data
+            "cmi.suspend_data" => {
+                if value.len() > 4096 {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.suspend_data.data = Some(value.to_string());
+                Ok(())
+            },
+
+            // Launch data (read-only)
+            "cmi.launch_data" => Err(Scorm12Error::ElementIsReadOnly),
+
+            // Comments
+            "cmi.comments" => {
+                cmi.comments.content = Some(value.to_string());
+                Ok(())
+            },
+            "cmi.comments_from_lms" => Err(Scorm12Error::ElementIsReadOnly),
+
+            // Student data (read-only)
+            "cmi.student_data.mastery_score" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.student_data.max_time_allowed" => Err(Scorm12Error::ElementIsReadOnly),
+            "cmi.student_data.time_limit_action" => Err(Scorm12Error::ElementIsReadOnly),
+
+            // Student preference
+            "cmi.student_preference.audio" => {
+                let vol: i32 = value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?;
+                if vol < -1 || vol > 100 {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.student_preference.audio = Some(vol);
+                Ok(())
+            },
+            "cmi.student_preference.language" => {
+                if value.len() > 255 {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.student_preference.language = Some(value.to_string());
+                Ok(())
+            },
+            "cmi.student_preference.speed" => {
+                let speed: i32 = value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?;
+                if speed < -100 || speed > 100 {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.student_preference.speed = Some(speed);
+                Ok(())
+            },
+            "cmi.student_preference.text" => {
+                let text: i32 = value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?;
+                if text < -1 || text > 1 {
+                    return Err(Scorm12Error::IncorrectDataType)
+                }
+                cmi.student_preference.text = Some(text);
+                Ok(())
+            },
+
+            // Keywords
+            "cmi._version" => Err(Scorm12Error::InvalidSetValueKeyword),
+            "cmi._children" => Err(Scorm12Error::InvalidSetValueKeyword),
+            "cmi.core._children" => Err(Scorm12Error::InvalidSetValueKeyword),
+            "cmi.core.score._children" => Err(Scorm12Error::InvalidSetValueKeyword),
+
+            _ => {
+                // Handle indexed elements
+                if element.starts_with("cmi.objectives.") {
+                    return self.set_objective_value(cmi, element, value)
+                }
+                if element.starts_with("cmi.interactions.") {
+                    return self.set_interaction_value(cmi, element, value)
+                }
+                Err(Scorm12Error::NotImplementedError)
+            }
+        }
+    }
+
+    /// Set objective value by indexed path
+    fn set_objective_value(&self, cmi: &mut CmiDataModel, element: &str, value: &str) -> Result<(), Scorm12Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm12Error::InvalidArgumentError)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm12Error::InvalidArgumentError)?;
+
+        // Auto-expand objectives array if needed
+        while cmi.objectives.len() <= index {
+            cmi.objectives.push(CmiObjective::new(format!("obj_{}", cmi.objectives.len())));
+        }
+
+        let objective = &mut cmi.objectives[index];
+        match parts[3] {
+            "id" => {
+                objective.id = value.to_string();
+                Ok(())
+            },
+            "score" if parts.len() > 4 => match parts[4] {
+                "raw" => {
+                    objective.score.raw = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                    Ok(())
+                },
+                "min" => {
+                    objective.score.min = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                    Ok(())
+                },
+                "max" => {
+                    objective.score.max = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                    Ok(())
+                },
+                _ => Err(Scorm12Error::InvalidArgumentError)
+            },
+            "status" => {
+                objective.status = CmiObjectiveStatus::from_string(value)
+                    .ok_or(Scorm12Error::IncorrectDataType)?;
+                Ok(())
+            },
+            _ => Err(Scorm12Error::InvalidArgumentError)
+        }
+    }
+
+    /// Set interaction value by indexed path
+    fn set_interaction_value(&self, cmi: &mut CmiDataModel, element: &str, value: &str) -> Result<(), Scorm12Error> {
+        let parts: List<&str> = element.split('.').collect();
+        if parts.len() < 4 {
+            return Err(Scorm12Error::InvalidArgumentError)
+        }
+
+        let index: usize = parts[2].parse().map_err(|_| Scorm12Error::InvalidArgumentError)?;
+
+        // Auto-expand interactions array if needed
+        while cmi.interactions.len() <= index {
+            cmi.interactions.push(CmiInteraction::new(format!("int_{}", cmi.interactions.len())));
+        }
+
+        let interaction = &mut cmi.interactions[index];
+        match parts[3] {
+            "id" => {
+                interaction.id = value.to_string();
+                Ok(())
+            },
+            "objectives" if parts.len() > 4 => {
+                let obj_index: usize = parts[4].parse().map_err(|_| Scorm12Error::InvalidArgumentError)?;
+                if parts.len() > 5 && parts[5] == "id" {
+                    while interaction.objectives.len() <= obj_index {
+                        interaction.objectives.push(String::new());
+                    }
+                    interaction.objectives[obj_index] = value.to_string();
+                    Ok(())
+                } else {
+                    Err(Scorm12Error::InvalidArgumentError)
+                }
+            },
+            "time" => {
+                interaction.time = Some(value.to_string());
+                Ok(())
+            },
+            "type" => {
+                interaction.interaction_type = CmiInteractionType::from_string(value)
+                    .ok_or(Scorm12Error::IncorrectDataType)?;
+                Ok(())
+            },
+            "correct_responses" if parts.len() > 4 => {
+                let cr_index: usize = parts[4].parse().map_err(|_| Scorm12Error::InvalidArgumentError)?;
+                if parts.len() > 5 && parts[5] == "pattern" {
+                    while interaction.correct_responses.len() <= cr_index {
+                        interaction.correct_responses.push(String::new());
+                    }
+                    interaction.correct_responses[cr_index] = value.to_string();
+                    Ok(())
+                } else {
+                    Err(Scorm12Error::InvalidArgumentError)
+                }
+            },
+            "weighting" => {
+                interaction.weighting = Some(value.parse().map_err(|_| Scorm12Error::IncorrectDataType)?);
+                Ok(())
+            },
+            "student_response" => {
+                interaction.student_response = Some(value.to_string());
+                Ok(())
+            },
+            "result" => {
+                interaction.result = CmiInteractionResult::from_string(value);
+                Ok(())
+            },
+            "latency" => {
+                interaction.latency = Some(value.to_string());
+                Ok(())
+            },
+            _ => Err(Scorm12Error::InvalidArgumentError)
+        }
+    }
+
+    /// Persist session data to storage
+    fn persist_session(&mut self, session_id: &Scorm12SessionId) -> Result<(), String> {
+        let session = self.state.sessions.get(session_id)
+            .ok_or("Session not found")?;
+
+        let persist_key = format!("{}_{}", session.user_id, session.sco_id);
+        self.state.persisted_data.insert(persist_key, session.cmi.clone());
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Build CMI element metadata map
+fn build_element_metadata() -> Map<String, CmiElementMetadata> {
+    let mut metadata = Map::new();
+
+    // Core elements
+    metadata.insert("cmi.core.student_id".to_string(), CmiElementMetadata {
+        path: "cmi.core.student_id".to_string(),
+        readable: true,
+        writable: false,
+        data_type: CmiDataType::CMIString255,
+        max_length: Some(255),
+        vocabulary: None
+    });
+
+    metadata.insert("cmi.core.student_name".to_string(), CmiElementMetadata {
+        path: "cmi.core.student_name".to_string(),
+        readable: true,
+        writable: false,
+        data_type: CmiDataType::CMIString255,
+        max_length: Some(255),
+        vocabulary: None
+    });
+
+    metadata.insert("cmi.core.lesson_location".to_string(), CmiElementMetadata {
+        path: "cmi.core.lesson_location".to_string(),
+        readable: true,
+        writable: true,
+        data_type: CmiDataType::CMIString255,
+        max_length: Some(255),
+        vocabulary: None
+    });
+
+    metadata.insert("cmi.core.lesson_status".to_string(), CmiElementMetadata {
+        path: "cmi.core.lesson_status".to_string(),
+        readable: true,
+        writable: true,
+        data_type: CmiDataType::CMIVocabulary,
+        max_length: None,
+        vocabulary: Some(vec![
+            "passed".to_string(),
+            "completed".to_string(),
+            "failed".to_string(),
+            "incomplete".to_string(),
+            "browsed".to_string(),
+            "not attempted".to_string()
+        ])
+    });
+
+    metadata.insert("cmi.suspend_data".to_string(), CmiElementMetadata {
+        path: "cmi.suspend_data".to_string(),
+        readable: true,
+        writable: true,
+        data_type: CmiDataType::CMIString4096,
+        max_length: Some(4096),
+        vocabulary: None
+    });
+
+    // Add more metadata as needed...
+
+    metadata
+}
+
+/// Generate unique identifier
+fn generate_uuid() -> String {
+    std::uuid::v4()
+}
+
+// =============================================================================
+// COMPLETION/SUCCESS STATUS TRACKING
+// =============================================================================
+
+/// Track completion and success based on CMI data
+type CompletionTracker {
+    /// Whether learner has completed
+    is_complete: Bool,
+
+    /// Whether learner has passed
+    is_successful: Bool,
+
+    /// Completion percentage (0-100)
+    progress_percent: f32,
+
+    /// Final score
+    final_score: Option<f32>,
+
+    /// Time spent (formatted)
+    total_time: String
+}
+
+impl CompletionTracker {
+    /// Create tracker from CMI data
+    fn from_cmi(cmi: &CmiDataModel) -> CompletionTracker {
+        let is_complete = cmi.core.lesson_status.is_complete();
+        let is_successful = cmi.core.lesson_status.is_successful();
+
+        let progress_percent = if is_complete { 100.0 } else {
+            // Estimate from lesson location if available
+            0.0
+        };
+
+        CompletionTracker {
+            is_complete,
+            is_successful,
+            progress_percent,
+            final_score: cmi.core.score.raw,
+            total_time: cmi.core.total_time.clone().unwrap_or_else(|| "0000:00:00.00".to_string())
+        }
+    }
+
+    /// Check if mastery score is achieved
+    fn check_mastery(&self, mastery_score: Option<f32>) -> Bool {
+        match (self.final_score, mastery_score) {
+            (Some(score), Some(mastery)) => score >= mastery,
+            _ => false
+        }
+    }
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+/// Create and start the SCORM 1.2 runtime actor
+fn create_scorm12_runtime() -> ScormRuntime12 {
+    ScormRuntime12::init()
+}

@@ -1,0 +1,13 @@
+/// Intelligo LMS - Publishing Module
+///
+/// Exports content publishing and generation functionality.
+
+module intelligo::publishing
+
+pub use intelligo::publishing::generator::*
+
+// Re-export commonly used types
+pub use ContentGenerator
+pub use PublishingPipeline
+pub use PublishResult
+pub use ContentFormat
